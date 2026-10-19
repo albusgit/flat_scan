@@ -886,9 +886,25 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
+    const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
+    auto ignored = [&](double x, double y) {
+        if (!masked) return false;
+        int xi = (int)std::lround(x), yi = (int)std::lround(y);
+        if (xi < 0 || yi < 0 || xi >= ignore->cols || yi >= ignore->rows) return false;
+        return ignore->at<uint8_t>(yi, xi) != 0;
+    };
+    // samples (along, ideal, disp) of a horizontal (or vertical) trace sit at (along, ideal + disp)
+    auto drop = [&](std::vector<std::array<double, 3>>& rows, bool hz) {
+        if (!masked) return;
+        size_t n0 = rows.size();
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const std::array<double, 3>& r) {
+                       return hz ? ignored(r[0], r[1] + r[2]) : ignored(r[1] + r[2], r[0]);
+                   }), rows.end());
+        d.n_ignored += (int)(n0 - rows.size());
+    };
     const int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     int h = src.rows, w = src.cols;
     auto t0 = Clock::now();
@@ -900,6 +916,15 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
         build_controls(Hs, Vs, sp, dp);
     } catch (const std::exception&) {
         sp.clear(); dp.clear();
+    }
+    for (const auto& L : Hs) d.G_lines.push_back({1.0, L.target, L.t0, L.t1});
+    for (const auto& L : Vs) d.G_lines.push_back({0.0, L.target, L.t0, L.t1});
+    if (masked) {   // controls at their straightened (destination) position
+        std::vector<cv::Point2d> s2, d2;
+        for (size_t i = 0; i < dp.size(); ++i)
+            if (!ignored(dp[i].x, dp[i].y)) { s2.push_back(sp[i]); d2.push_back(dp[i]); }
+        d.n_ignored += (int)(dp.size() - d2.size());
+        sp = s2; dp = d2;
     }
     d.n_ctrl_raw = (int)dp.size();
     const int GG = 32;
@@ -982,6 +1007,9 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
     d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
+    drop(d.S1.h, true);
+    drop(d.S1.v, false);
+    drop(d.T, true);
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
     Field Fx_prev, Fy_prev;
@@ -992,6 +1020,8 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
         if (it == 1) {
             auto tc = Clock::now();
             d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads);
+            drop(d.S2.h, true);
+            drop(d.S2.v, false);
             d.ms.emplace_back("trace pass2", ms_since(tc));
         }
         const Samples& SS = it == 0 ? d.S1 : d.S2;
@@ -1015,8 +1045,11 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
             xyv.push_back({r[1], ys}); valv.push_back(r[2]);
         }
         Field Fy, Fx;
-        std::thread ty([&] { Fy = solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]); });
-        Fx = solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
+        // every sample of one direction ignored: nothing to straighten that way
+        std::thread ty([&] {
+            Fy = xy.empty() ? zero_field(gw2, gh2, G) : solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]);
+        });
+        Fx = xyv.empty() ? zero_field(gw2, gh2, G) : solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
         ty.join();
         if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
         Fy_prev = Fy; Fx_prev = Fx;

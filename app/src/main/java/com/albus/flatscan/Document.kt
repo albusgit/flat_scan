@@ -27,7 +27,18 @@ data class PageMeta(
     val pageIndex: Int = 0,          // page of a book spread in the source photo (0 = the larger one)
     val forceHomography: Boolean = false,   // the quality gate flagged the automatic crop
     val spreadWith: String? = null,  // the other page of the same book spread
+    val ignore: FloatArray = FloatArray(0),   // areas whose lines the unwarp must not use (page fractions)
+    val perspectiveOnly: Boolean = false,     // the user turned the unwarp off for this page
 ) {
+    /**
+     * Everything the processed geometry depends on: a stored session (DocumentStore.saveSession)
+     * is reused only while this key is unchanged.
+     */
+    fun geometryKey(renderWidth: Int, autoOrient: Boolean, net: Boolean): String = listOf(
+        corners.joinToString(","), detected?.joinToString(",") ?: "-", cropRotation, userRotated, focalPx, pageIndex,
+        forceHomography, ignore.joinToString(","), perspectiveOnly, renderWidth, autoOrient, net,
+    ).joinToString("|")
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
         put("corners", corners.toJson())
@@ -49,6 +60,8 @@ data class PageMeta(
         put("page_index", pageIndex)
         put("force_homography", forceHomography)
         if (spreadWith != null) put("spread_with", spreadWith)
+        put("ignore", ignore.toJson())
+        put("perspective_only", perspectiveOnly)
     }
 
     companion object {
@@ -76,6 +89,8 @@ data class PageMeta(
                 pageIndex = j.optInt("page_index"),
                 forceHomography = j.optBoolean("force_homography"),
                 spreadWith = j.optString("spread_with").ifEmpty { null },
+                ignore = j.optJSONArray("ignore")?.toFloats() ?: FloatArray(0),
+                perspectiveOnly = j.optBoolean("perspective_only"),
             )
         }
 
@@ -86,9 +101,9 @@ data class PageMeta(
 
 /**
  * The current document on disk: cacheDir/document/doc.json (page order) and one folder per
- * page with source.jpg (the upright photo, JPEG q95), meta.json and out.jpg (the rendered,
- * rotated page, JPEG q95: thumbnails and export). All calls do file IO: call them off the
- * main thread.
+ * page with source.jpg (the upright photo, JPEG q95), meta.json, out.jpg (the rendered,
+ * rotated page, JPEG q95: thumbnails and export) and session/ (the processed page, so opening
+ * it again does not re-run the geometry). All calls do file IO: call them off the main thread.
  */
 class DocumentStore(ctx: Context) {
     val root = File(ctx.cacheDir, "document")
@@ -144,6 +159,32 @@ class DocumentStore(ctx: Context) {
     }
 
     fun loadMeta(id: String): PageMeta = PageMeta.fromJson(JSONObject(metaFile(id).readText()))
+
+    /** A stored session of [id] made with geometry [key]: its directory, info JSON and details, or null. */
+    fun loadSession(id: String, key: String): Triple<File, JSONObject, String>? = runCatching {
+        val d = File(dir(id), "session")
+        val j = JSONObject(File(d, "ready.json").readText())
+        if (j.optString("key") != key) null else Triple(d, j.getJSONObject("info"), j.optString("details"))
+    }.getOrNull()
+
+    /**
+     * Stores a processed page: [write] fills a fresh directory (false: give up), which then
+     * replaces session/ of [id] with its key, info JSON and details.
+     */
+    fun saveSession(id: String, key: String, info: JSONObject, details: String, write: (File) -> Boolean): Boolean {
+        if (!dir(id).exists()) return false
+        val tmp = File(dir(id), "session.tmp")
+        tmp.deleteRecursively()
+        tmp.mkdirs()
+        if (!write(tmp)) {
+            tmp.deleteRecursively()
+            return false
+        }
+        File(tmp, "ready.json").writeText(JSONObject().put("key", key).put("info", info).put("details", details).toString())
+        val d = File(dir(id), "session")
+        d.deleteRecursively()
+        return tmp.renameTo(d)
+    }
 
     fun saveOutput(id: String, page: Bitmap) {
         dir(id).mkdirs()

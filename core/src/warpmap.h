@@ -32,6 +32,9 @@ struct WarpDebug {
     Lines H, V;
     Samples S1, S2;
     std::vector<std::array<double, 3>> T;
+    std::vector<std::array<double, 4>> G_lines;   // global-stage grid lines: [horizontal (1/0), straightened
+                                                  // position, start, end] (stage-1 frame)
+    int n_ignored = 0;                            // samples dropped by the ignore mask
     Field GX, GY, Fx1, Fy1, Fx, Fy;
     cv::Mat A_img, D;
     std::vector<std::pair<std::string, double>> ms;   // stage timings
@@ -40,7 +43,10 @@ struct WarpDebug {
 
 // warpmap.unwarp_image(src) -> backward map on the 4-px grid of src (mx4, my4).
 // src: 8-bit BGR. dbg (optional) receives the intermediates for the parity checks.
-GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr);
+// ignore (optional, app only): CV_8U of src's size; line samples and grid controls whose
+// straightened position falls on a non-zero pixel are left out of the fit (the user marked
+// those lines as wrong). Null: the reference behaviour.
+GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr);
 
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);

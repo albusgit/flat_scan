@@ -55,6 +55,7 @@ struct PageAssessment {
 struct PipelineOptions {
     bool corners_edited = false;      // user moved a corner -> homography path
     bool force_homography = false;    // the quality gate flagged the crop: homography path
+    bool perspective_only = false;    // app: the user turned the unwarp off for this page (homography, no warp map)
     const float* seg_logits = nullptr;   // page-finder net output for this photo (2 x 256 x 256);
                                          // null: colour-threshold paper_mask (the feature flag is off)
     int page_index = 0;               // book spread: which page of the photo (0 = the larger one)
@@ -70,6 +71,8 @@ struct PipelineOptions {
     bool use_gpu = true;
     double surface_fallback_px = 3.0; // outline residual median above this -> homography
     int max_analysis_side = 2400;     // detection / fit run on a copy no larger than this (reference inputs: 2212-2300 px)
+    std::vector<std::array<float, 4>> ignore;   // app: areas whose lines the warp map must not use, as
+                                                // fractions [x0, y0, x1, y1] of the output page (rotated frame)
     std::function<void(int, const char*)> progress;   // percent, stage name
 };
 
@@ -96,6 +99,10 @@ struct PipelineResult {
     bool gpu_resample = false;
     std::vector<std::pair<std::string, double>> ms;
     WarpDebug warp;
+    // the lines the warp map was fitted to, for the app's line editor: [kind, x0, y0, x1, y1] with
+    // the ends as fractions of the output page; kind 0 = ruled line, 1 = text row, 2 = grid line
+    // seen by the global stage only. Positions are the straightened ones (on the output page).
+    std::vector<std::array<float, 5>> lines;
 };
 
 // Page detection for the crop screen (and the pipeline): the corner fit runs on a copy scaled

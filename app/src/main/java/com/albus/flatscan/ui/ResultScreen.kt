@@ -1,5 +1,6 @@
 package com.albus.flatscan.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -31,6 +32,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -46,7 +48,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SwapHoriz
-import androidx.compose.material.icons.outlined.SwapVert
+import androidx.compose.material.icons.outlined.Straighten
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
@@ -107,22 +109,33 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     var sheet by remember { mutableStateOf(Sheet.None) }
     var showDetails by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
-    var protectMode by remember { mutableStateOf(false) }
+    var tool by remember {
+        // back from flattening again in the line editor: show the new lines
+        mutableStateOf(if (vm.reopenLines) AreaMode.Lines else AreaMode.None).also { vm.reopenLines = false }
+    }
     val exporter = rememberExportActions(vm)
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
     val viewer = remember(vm.currentId, vm.rotation) { ViewerState() }
     val p = vm.params
     // protect areas only matter (and are only drawn) while Solid colors is in effect
-    val protecting = protectMode && p.solid && p.filter != FilterKind.BlackWhite
+    val mode = when {
+        tool == AreaMode.Protect && !(p.solid && p.filter != FilterKind.BlackWhite) -> AreaMode.None
+        else -> tool
+    }
     val index = vm.pages.indexOf(vm.currentId)
     val ready = vm.page != null && !exporter.busy
+    val closeTool = {
+        if (tool == AreaMode.Lines) vm.revertIgnore()
+        tool = AreaMode.None
+    }
+    BackHandler(enabled = mode != AreaMode.None) { closeTool() }
 
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         Row(
             Modifier.fillMaxWidth().height(64.dp).padding(start = 8.dp, end = 12.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+            IconButton(onClick = { if (mode != AreaMode.None) closeTool() else vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
             Text(
                 buildAnnotatedString {
                     if (vm.pages.size > 1 && index >= 0) {
@@ -135,9 +148,31 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 style = MaterialTheme.typography.titleMedium, maxLines = 1,
                 modifier = Modifier.padding(horizontal = 10.dp).weight(1f),
             )
+            // one tap for an upside-down page: there is no automatic 180-degree turn
+            IconButton(onClick = { vm.rotateResult180() }, enabled = vm.page != null) {
+                Box(
+                    Modifier.size(30.dp).border(1.5.dp, Editor.Inactive, CircleShape).semantics { contentDescription = "Turn 180 degrees" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("180°", style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.ExtraBold), color = Editor.Inactive)
+                }
+            }
             Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreVert, "More") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    if (vm.spreadPartner != null) {
+                        DropdownMenuItem(
+                            text = { Text("Swap the two book pages") },
+                            leadingIcon = { Icon(Icons.Outlined.SwapHoriz, null) },
+                            onClick = { vm.swapSpread(); menu = false },
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text("Unwarp") },
+                        trailingIcon = { Checkbox(checked = !vm.perspectiveOnly, onCheckedChange = null) },
+                        enabled = ready,
+                        onClick = { vm.reflatten(perspective = !vm.perspectiveOnly); menu = false },
+                    )
                     DropdownMenuItem(
                         text = { Text("Show wrinkle map") },
                         trailingIcon = { Checkbox(checked = vm.showWrinkles, onCheckedChange = null) },
@@ -169,23 +204,19 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             PageViewer(
                 page = vm.page, before = vm.before, overlay = if (vm.showWrinkles) vm.overlay else null,
                 pageWidth = vm.pageWidth, pageHeight = vm.pageHeight, rotation = vm.rotation,
-                protect = vm.protect, protectMode = protecting, state = viewer,
+                areas = if (mode == AreaMode.Lines) (if (vm.perspectiveOnly) emptyList() else vm.ignore) else vm.protect, areaMode = mode, lines = vm.lines, state = viewer,
                 onHold = { if (it) vm.holdStarted() },
-                onRect = { x0, y0, x1, y1 -> vm.addProtect(x0, y0, x1, y1) },
+                onRect = { x0, y0, x1, y1 -> if (mode == AreaMode.Lines) vm.addIgnore(x0, y0, x1, y1) else vm.addProtect(x0, y0, x1, y1) },
+                onTap = { x, y, line ->
+                    when {
+                        mode == AreaMode.Protect -> vm.removeProtectAt(x, y)
+                        line >= 0 -> vm.toggleLine(line)
+                        else -> vm.removeIgnoreAt(x, y)
+                    }
+                },
                 modifier = Modifier.fillMaxSize(),
             )
-            if (protecting) {
-                Surface(
-                    Modifier.align(Alignment.TopCenter).padding(8.dp),
-                    shape = RoundedCornerShape(16.dp), color = Editor.Panel, border = BorderStroke(1.dp, Editor.Outline),
-                ) {
-                    Row(Modifier.padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Drag a box around each picture", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f, fill = false))
-                        TextButton(onClick = { vm.clearProtect() }, enabled = vm.protect.isNotEmpty()) { Text("Clear") }
-                        TextButton(onClick = { protectMode = false }) { Text("Done") }
-                    }
-                }
-            } else if (vm.showHoldHint && vm.page != null) {
+            if (mode == AreaMode.None && vm.showHoldHint && vm.page != null) {
                 Text(
                     "Press and hold to see the original",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
@@ -197,30 +228,27 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             if (vm.rendering) {
                 CircularProgressIndicator(Modifier.align(Alignment.TopEnd).padding(12.dp).size(22.dp), strokeWidth = 2.5.dp, color = Editor.Accent)
             }
-            if (!protecting && vm.page != null) {
-                // one tap for an upside-down page: there is no automatic 180-degree turn
-                PageAction("Turn 180°", Icons.Outlined.SwapVert, Modifier.align(Alignment.TopStart).padding(8.dp)) { vm.rotateResult180() }
-                if (vm.spreadPartner != null) {
-                    PageAction("Book spread: swap order", Icons.Outlined.SwapHoriz, Modifier.align(Alignment.BottomStart).padding(8.dp)) { vm.swapSpread() }
-                }
-            }
         }
         if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
 
         // the editor panel: the tool of the selected tab over the tool dock
         Column(Modifier.fillMaxWidth().clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding()) {
-            if (vm.adjustOpen) {
+            if (mode == AreaMode.Protect) {
+                ProtectPanel(vm, onDone = { tool = AreaMode.None })
+            } else if (mode == AreaMode.Lines) {
+                LinesPanel(vm, onClose = closeTool)
+            } else if (vm.adjustOpen) {
                 AdjustPanel(vm)
             } else {
                 FilterPanel(
-                    vm, protecting, onProtect = { protectMode = !protecting },
+                    vm, onProtect = { tool = AreaMode.Protect },
                     onAddPage = {
                         if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                         else vm.startCamera()
                     },
                 )
             }
-            ToolDock(vm)
+            ToolDock(vm, linesOpen = mode == AreaMode.Lines, onLines = { if (mode == AreaMode.Lines) closeTool() else tool = AreaMode.Lines }, onTab = closeTool)
         }
     }
 
@@ -238,28 +266,14 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
 }
 
-/** A small action pill over the page. */
+/** Six tools along the bottom: three tabs (filters, adjust, unwarp lines) and three actions. */
 @Composable
-private fun PageAction(label: String, icon: ImageVector, modifier: Modifier, onClick: () -> Unit) {
-    Row(
-        modifier.height(36.dp).clip(RoundedCornerShape(18.dp)).background(Editor.Panel.copy(alpha = 0.9f))
-            .border(1.dp, Editor.Outline, RoundedCornerShape(18.dp))
-            .clickable(role = Role.Button, onClick = onClick).padding(horizontal = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, null, Modifier.size(16.dp))
-        Spacer(Modifier.width(6.dp))
-        Text(label, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), maxLines = 1)
-    }
-}
-
-/** Five tools along the bottom: two tabs (filters, adjust) and three actions. */
-@Composable
-private fun ToolDock(vm: ScanViewModel) {
+private fun ToolDock(vm: ScanViewModel, linesOpen: Boolean, onLines: () -> Unit, onTab: () -> Unit) {
     HorizontalDivider(color = Editor.Divider)
-    Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 10.dp)) {
-        DockItem("Filters", Icons.Outlined.Palette, Modifier.weight(1f), selected = !vm.adjustOpen) { vm.openAdjust(false) }
-        DockItem("Adjust", Icons.Outlined.Tune, Modifier.weight(1f), selected = vm.adjustOpen) { vm.openAdjust(true) }
+    Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 10.dp)) {
+        DockItem("Filters", Icons.Outlined.Palette, Modifier.weight(1f), selected = !vm.adjustOpen && !linesOpen) { onTab(); vm.openAdjust(false) }
+        DockItem("Adjust", Icons.Outlined.Tune, Modifier.weight(1f), selected = vm.adjustOpen && !linesOpen) { onTab(); vm.openAdjust(true) }
+        DockItem("Lines", Icons.Outlined.Straighten, Modifier.weight(1f), selected = linesOpen) { onLines() }
         DockItem("Crop", Icons.Outlined.Crop, Modifier.weight(1f)) { vm.recrop() }
         DockItem("Rotate", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f)) { vm.rotateResult() }
         DockItem("Pages", Icons.Outlined.Collections, Modifier.weight(1f), badge = vm.pages.size) { vm.open(Screen.Pages) }
@@ -317,7 +331,7 @@ private fun EditorChip(
 }
 
 @Composable
-private fun FilterPanel(vm: ScanViewModel, protectMode: Boolean, onProtect: () -> Unit, onAddPage: () -> Unit) {
+private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onAddPage: () -> Unit) {
     val p = vm.params
     Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
         val enabled = p.filter != FilterKind.Original
@@ -375,13 +389,102 @@ private fun FilterPanel(vm: ScanViewModel, protectMode: Boolean, onProtect: () -
             selected = p.solid && solidOk, enabled = solidOk, role = Role.Switch,
         )
         if (p.solid && solidOk) {
-            EditorChip("Protect a picture", onClick = onProtect, icon = Icons.Outlined.Shield, selected = protectMode, role = Role.Switch)
+            val n = vm.protect.size / 4
+            EditorChip(if (n > 0) "Protected pictures ($n)" else "Protect a picture", onClick = onProtect, icon = Icons.Outlined.Shield)
         }
         if (vm.pending.isNotEmpty()) {
             EditorChip("Next page (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
         } else {
             EditorChip("Add page", onClick = onAddPage, icon = Icons.Outlined.Add)
         }
+    }
+}
+
+/** Protect pictures from Solid colors: boxes are drawn on the page above; this panel explains and edits them. */
+@Composable
+private fun ProtectPanel(vm: ScanViewModel, onDone: () -> Unit) {
+    val n = vm.protect.size / 4
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Shield, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("Protect pictures", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
+            Text(if (n == 0) "none yet" else if (n == 1) "1 box" else "$n boxes", style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+        }
+        Text(
+            "Drag a box over each photo, logo or drawing: Solid colors leaves what is inside as it is. Tap a box to remove it.",
+            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
+        )
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            EditorChip("Undo", onClick = { vm.undoProtect() }, enabled = n > 0)
+            EditorChip("Remove all", onClick = { vm.clearProtect() }, enabled = n > 0)
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = onDone, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
+            ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
+        }
+    }
+}
+
+/**
+ * The lines the unwarp straightened, drawn on the page: tap one it got wrong (a logo, a curved
+ * drawing, a second sheet) to ignore it, or drag a box over an area; then flatten again. The
+ * unwarp can also be turned off (perspective correction only).
+ */
+@Composable
+private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit) {
+    val n = vm.ignore.size / 4
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Straighten, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("Unwarp lines", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
+            EditorChip(
+                if (vm.perspectiveOnly) "Unwarp off" else "Unwarp on", role = Role.Switch, selected = !vm.perspectiveOnly,
+                onClick = { vm.reflatten(perspective = !vm.perspectiveOnly) },
+            )
+        }
+        Text(
+            when {
+                vm.perspectiveOnly -> "Only the perspective is corrected. Turn the unwarp on to straighten curved lines."
+                vm.lines.isEmpty() -> "No lines were found on this page: only its outline flattens it."
+                else -> "Tap a line that should not be straightened (a logo, a drawing, a second sheet), or drag a box over an area. Then flatten again."
+            },
+            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
+        )
+        if (!vm.perspectiveOnly && vm.lines.isNotEmpty()) {
+            Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                LegendDot(Color(0xFF8FB0FF), "Ruled lines")
+                LegendDot(Color(0xFF5BD18B), "Text rows")
+                LegendDot(Color(0xFFFF6B5E), "Ignored")
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            EditorChip("Use all lines", onClick = { vm.clearIgnore() }, enabled = n > 0 && !vm.perspectiveOnly)
+            Spacer(Modifier.weight(1f))
+            if (vm.ignoreChanged) {
+                TextButton(onClick = onClose) { Text("Cancel") }
+                Button(
+                    onClick = { vm.reflatten() }, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                    contentPadding = PaddingValues(horizontal = 18.dp), modifier = Modifier.height(40.dp),
+                ) { Text("Flatten again", style = MaterialTheme.typography.titleSmall) }
+            } else {
+                Button(
+                    onClick = onClose, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                    contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
+                ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LegendDot(color: Color, label: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(width = 14.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium, color = Editor.Inactive)
     }
 }
 

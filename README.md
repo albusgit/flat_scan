@@ -91,6 +91,29 @@ The filters lost colour and punched white holes into pictures. The root causes a
 
 Contact sheets and per-page measurements were made on the 34 pages and on synthetic pages: holes inside pictures at Auto 100% went from 18% to ≤ 0.5%, colour inside pictures is kept (chroma ratio about 1.0), and text marks lost at Auto 70% went from 44 to 4. The GLSL changes compile (glslc) but the GPU path was not run.
 
+## Round 5: user control over the crop and the unwarp
+
+- **Pages open without re-processing.** After processing, the page is stored in `document/<id>/session/`:
+  - the unwarped page (JPEG q95);
+  - the paper alpha;
+  - the before page;
+  - the deformation grid;
+  - the fitted lines.
+
+  Opening the page again restores the session (`NativeLib.restoreSession`). It is reused only while the page's geometry key (corners, rotation, ignore areas, unwarp switch, output width, finder) is unchanged. Otherwise the page is processed again from its source.
+- **Crop screen:**
+  - The quality-gate note sits above the photo, never over a corner. It can be closed, and it goes away when a corner or an edge is moved.
+  - Each edge has a handle. Dragging it moves the edge along its normal while both ends slide along the neighbouring edges.
+  - **Circle the page** (the loop icon): draw a loop around the page. The page finder runs on that part of the photo only; when it finds no page edge there, the loop's extreme points give the corners. Either way the corners count as set by hand (homography path).
+- **Lines** (new result-screen tab) draws the lines the unwarp was fitted to: ruled lines, text rows, and grid lines seen only by the global stage.
+  - Tapping a line ignores it; dragging a box ignores every line inside it. Then **Flatten again** re-runs the page with those areas left out of the fit (`PipelineOptions::ignore`). In the warp map, global-stage controls and local trace / text-row samples whose straightened position falls in an area are dropped (`unwarp_map(..., ignore)`; with no areas the reference behaviour is unchanged).
+  - **Unwarp on/off** (also in the ⋮ menu) turns the unwarp off for the page: perspective correction from the 4 corners only (`PipelineOptions::perspective_only`). This is for flat labels and stickers, or photos where the unwarp makes things worse.
+- **Result screen:**
+  - Turn 180° is a small round "180°" button in the top bar.
+  - Book-spread swap moved to the ⋮ menu.
+  - **Protect pictures** has its own panel (count, Undo, Remove all, Done), and tapping a box removes it.
+- **Known failure the tools work around:** a hand-held page whose edge is covered by the hand (`user` receipt photo). The outline follows the thumb, the surface fit still looks good (1.6 px), so the gate trusts it, and the unwarp pulls the thumb into the page. Unwarp off, or re-cropping, fixes it. Detecting it automatically is not done yet.
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.

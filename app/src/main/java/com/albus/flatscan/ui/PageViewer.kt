@@ -21,6 +21,8 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -101,10 +103,19 @@ private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int) {
     )
 }
 
+/** What the page viewer edits besides zooming: nothing, protected pictures or the unwarp's lines. */
+enum class AreaMode { None, Protect, Lines }
+
+private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF))   // ruled, text row, grid
+private val IgnoreColor = Color(0xFFFF6B5E)
+
 /**
  * The result page with pinch zoom / pan (double tap toggles 1x / 2.5x), press and hold for the
- * original ([before]), an optional [overlay] (wrinkle map) and protected rectangles. In
- * [protectMode] a one-finger drag draws a rectangle, reported as page fractions to [onRect].
+ * original ([before]) and an optional [overlay] (wrinkle map). With an [areaMode] the [areas]
+ * (page fractions x0, y0, x1, y1 ...) are drawn, a one-finger drag draws a new one ([onRect],
+ * page fractions) and a tap is reported to [onTap] (page fractions and the index of the line of
+ * [lines] under the finger, or -1). In [AreaMode.Lines] the unwarp's [lines] (NativeLib.lines
+ * layout) are drawn; a line whose middle is in an area is drawn as ignored.
  */
 @Composable
 fun PageViewer(
@@ -114,13 +125,16 @@ fun PageViewer(
     pageWidth: Int,
     pageHeight: Int,
     rotation: Int,
-    protect: List<Float>,
-    protectMode: Boolean,
+    areas: List<Float>,
+    areaMode: AreaMode,
+    lines: FloatArray,
     state: ViewerState,
     onHold: (Boolean) -> Unit,
     onRect: (Float, Float, Float, Float) -> Unit,
+    onTap: (Float, Float, Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val protectMode = areaMode != AreaMode.None
     val pageImg = remember(page) { page?.asImageBitmap() }
     val beforeImg = remember(before) { before?.asImageBitmap() }
     val overlayImg = remember(overlay) { overlay?.asImageBitmap() }
@@ -135,6 +149,8 @@ fun PageViewer(
     val protecting by rememberUpdatedState(protectMode)
     val hold by rememberUpdatedState(onHold)
     val rect by rememberUpdatedState(onRect)
+    val tap by rememberUpdatedState(onTap)
+    val shownLines by rememberUpdatedState(if (areaMode == AreaMode.Lines) lines else FloatArray(0))
     val outline = androidx.compose.material3.MaterialTheme.colorScheme.primary
 
     fun zoomBy(factor: Float, centroid: Offset, panDelta: Offset) {
@@ -228,7 +244,22 @@ fun PageViewer(
                             }
                             drawFrom = null
                         }
-                        Mode.Pending -> {
+                        Mode.Pending -> if (protecting) {
+                            // a tap while editing areas: the line under the finger (24 dp), if any
+                            val g = geometry()
+                            val q = g.toPage(start)
+                            val l = shownLines
+                            val tol = 24.dp.toPx() / g.k
+                            var best = -1
+                            var bestD = tol
+                            var i = 0
+                            while (5 * i + 4 < l.size) {
+                                val d = segmentDistance(q, Offset(l[5 * i + 1] * g.pw, l[5 * i + 2] * g.ph), Offset(l[5 * i + 3] * g.pw, l[5 * i + 4] * g.ph))
+                                if (d < bestD) { bestD = d; best = i }
+                                i++
+                            }
+                            if (g.pw > 0 && g.ph > 0) tap(q.x / g.pw, q.y / g.ph, best)
+                        } else {
                             val near = (start - lastTapPos).getDistance() < 48.dp.toPx()
                             if (lastTime - lastTapTime < viewConfiguration.doubleTapTimeoutMillis && near) {
                                 if (state.scale > 1.01f) state.reset() else zoomBy(DOUBLE_TAP_ZOOM, start, Offset.Zero)
@@ -263,26 +294,63 @@ fun PageViewer(
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
+                    val areaColor = if (areaMode == AreaMode.Lines) IgnoreColor else outline
+                    if (areaMode == AreaMode.Lines) {
+                        // the lines the unwarp used; ignored ones dashed in red
+                        val lw = 3.dp.toPx() / g.k
+                        var j = 0
+                        while (5 * j + 4 < lines.size) {
+                            val a = Offset(lines[5 * j + 1] * pageWidth, lines[5 * j + 2] * pageHeight)
+                            val b = Offset(lines[5 * j + 3] * pageWidth, lines[5 * j + 4] * pageHeight)
+                            val mid = Offset((lines[5 * j + 1] + lines[5 * j + 3]) / 2, (lines[5 * j + 2] + lines[5 * j + 4]) / 2)
+                            if (inAreas(areas, mid.x, mid.y)) {
+                                drawLine(IgnoreColor, a, b, strokeWidth = lw, cap = StrokeCap.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(3 * lw, 2 * lw)))
+                            } else {
+                                drawLine(Color.Black.copy(alpha = 0.35f), a, b, strokeWidth = lw * 1.8f, cap = StrokeCap.Round)
+                                drawLine(LineColors[lines[5 * j].toInt().coerceIn(0, 2)], a, b, strokeWidth = lw, cap = StrokeCap.Round)
+                            }
+                            j++
+                        }
+                    }
                     var i = 0
-                    while (i + 3 < protect.size) {
-                        val tl = Offset(protect[i] * pageWidth, protect[i + 1] * pageHeight)
-                        val sz = Size((protect[i + 2] - protect[i]) * pageWidth, (protect[i + 3] - protect[i + 1]) * pageHeight)
-                        drawRect(outline.copy(alpha = 0.18f), tl, sz)
-                        drawRect(outline, tl, sz, style = Stroke(sw))
+                    while (i + 3 < areas.size) {
+                        val tl = Offset(areas[i] * pageWidth, areas[i + 1] * pageHeight)
+                        val sz = Size((areas[i + 2] - areas[i]) * pageWidth, (areas[i + 3] - areas[i + 1]) * pageHeight)
+                        // a white rim under a dashed line keeps the box visible on any picture
+                        drawRect(areaColor.copy(alpha = 0.18f), tl, sz)
+                        drawRect(Color.White, tl, sz, style = Stroke(sw * 2.4f))
+                        drawRect(areaColor, tl, sz, style = Stroke(sw * 1.4f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(5 * sw, 3 * sw))))
                         i += 4
                     }
                     val a = drawFrom
                     if (a != null) {
                         val tl = Offset(min(a.x, drawTo.x).coerceIn(0f, pageWidth.toFloat()), min(a.y, drawTo.y).coerceIn(0f, pageHeight.toFloat()))
                         val br = Offset(max(a.x, drawTo.x).coerceIn(0f, pageWidth.toFloat()), max(a.y, drawTo.y).coerceIn(0f, pageHeight.toFloat()))
-                        drawRect(outline.copy(alpha = 0.12f), tl, Size(br.x - tl.x, br.y - tl.y))
+                        drawRect(areaColor.copy(alpha = 0.12f), tl, Size(br.x - tl.x, br.y - tl.y))
                         drawRect(Color.White, tl, Size(br.x - tl.x, br.y - tl.y), style = Stroke(sw * 2))
-                        drawRect(outline, tl, Size(br.x - tl.x, br.y - tl.y), style = Stroke(sw))
+                        drawRect(areaColor, tl, Size(br.x - tl.x, br.y - tl.y), style = Stroke(sw))
                     }
                 }
             }
         }
     }
+}
+
+/** Whether the page point (fractions) lies in one of the rectangles [x0, y0, x1, y1, ...]. */
+fun inAreas(a: List<Float>, x: Float, y: Float): Boolean {
+    var k = 0
+    while (k + 3 < a.size) {
+        if (x >= a[k] && x <= a[k + 2] && y >= a[k + 1] && y <= a[k + 3]) return true
+        k += 4
+    }
+    return false
+}
+
+private fun segmentDistance(p: Offset, a: Offset, b: Offset): Float {
+    val ab = b - a
+    val l2 = ab.x * ab.x + ab.y * ab.y
+    val t = if (l2 <= 0f) 0f else (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / l2).coerceIn(0f, 1f)
+    return (p - (a + ab * t)).getDistance()
 }
 
 /** A small page preview (filter strip): [image] turned [rotation] quarter turns, fitted. */

@@ -193,6 +193,63 @@ inline cv::Point2d rotate_pt(double x, double y, int W, int H, int rot) {
     return {x, y};
 }
 
+// rotated output frame -> unrotated page pixel (analysis W x H), the inverse of rotate_pt
+inline cv::Point2d unrotate_pt(double xr, double yr, int W, int H, int rot) {
+    if (rot == cv::ROTATE_90_CLOCKWISE) return {yr, H - 1 - xr};
+    if (rot == cv::ROTATE_180) return {W - 1 - xr, H - 1 - yr};
+    if (rot == cv::ROTATE_90_COUNTERCLOCKWISE) return {W - 1 - yr, xr};
+    return {xr, yr};
+}
+
+// the user's ignore areas (output-page fractions, rotated frame) as a mask on the stage-1 page
+cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H, int rot) {
+    if (rects.empty()) return cv::Mat();
+    bool swap = rot == cv::ROTATE_90_CLOCKWISE || rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+    int Wr = swap ? H : W, Hr = swap ? W : H;
+    cv::Mat m = cv::Mat::zeros(H, W, CV_8U);
+    for (const auto& q : rects) {
+        double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+        for (int k = 0; k < 4; ++k) {
+            cv::Point2d p = unrotate_pt((k % 3 == 0 ? q[0] : q[2]) * Wr, (k < 2 ? q[1] : q[3]) * Hr, W, H, rot);
+            x0 = std::min(x0, p.x); y0 = std::min(y0, p.y); x1 = std::max(x1, p.x); y1 = std::max(y1, p.y);
+        }
+        cv::Rect r((int)std::floor(x0), (int)std::floor(y0), (int)std::ceil(x1 - x0) + 1, (int)std::ceil(y1 - y0) + 1);
+        r &= cv::Rect(0, 0, W, H);
+        if (r.area() > 0) m(r).setTo(255);
+    }
+    return m;
+}
+
+// the lines the warp map used, as output-page fractions (PipelineResult::lines)
+std::vector<std::array<float, 5>> fitted_lines(const WarpDebug& d, int W, int H, int rot) {
+    bool swap = rot == cv::ROTATE_90_CLOCKWISE || rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+    double Wr = swap ? H : W, Hr = swap ? W : H;
+    std::vector<std::array<float, 5>> out;
+    auto add = [&](int kind, double x0, double y0, double x1, double y1) {
+        cv::Point2d a = rotate_pt(x0, y0, W, H, rot), b = rotate_pt(x1, y1, W, H, rot);
+        out.push_back({(float)kind, (float)(a.x / Wr), (float)(a.y / Hr), (float)(b.x / Wr), (float)(b.y / Hr)});
+    };
+    for (const auto& L : d.H) add(0, L[1], L[0], L[2], L[0]);
+    for (const auto& L : d.V) add(0, L[0], L[1], L[0], L[2]);
+    // text rows: consecutive samples of one row share its ideal position
+    for (size_t i = 0; i < d.T.size();) {
+        size_t j = i;
+        while (j + 1 < d.T.size() && d.T[j + 1][1] == d.T[i][1] && d.T[j + 1][0] > d.T[j][0]) ++j;
+        add(1, d.T[i][0], d.T[i][1], d.T[j][0], d.T[i][1]);
+        i = j + 1;
+    }
+    // grid lines of the global stage that the local stage did not find again
+    for (const auto& G : d.G_lines) {
+        bool hz = G[0] > 0.5, seen = false;
+        for (const auto& L : hz ? d.H : d.V)
+            seen |= std::fabs(L[0] - G[1]) < 12 && std::min(L[2], G[3]) - std::max(L[1], G[2]) > 0.5 * (G[3] - G[2]);
+        if (seen) continue;
+        if (hz) add(2, G[2], G[1], G[3], G[1]);
+        else add(2, G[1], G[2], G[1], G[3]);
+    }
+    return out;
+}
+
 }  // namespace
 
 namespace {
@@ -359,7 +416,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         // crop takes the homography path; the app shows it on the crop screen first
         r.needs_manual_crop = quality_gate(pc, r.model.ok ? r.model.median_px / pc.scale : -1, photo.size());
         if (!r.model.ok) r.needs_manual_crop.push_back("surface fit failed");
-        bool trusted = r.needs_manual_crop.empty() && !opt.force_homography;
+        bool trusted = r.needs_manual_crop.empty() && !opt.force_homography && !opt.perspective_only;
         if (r.model.ok && r.model.median_px <= opt.surface_fallback_px && trusted) {
             U.mode = GeomMode::Surface;
             U.m = r.model;
@@ -386,7 +443,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     }
     t0 = Clock::now();
     report(opt, 30, "Tracing lines and solving the warp map");
-    GridMap warp4 = unwarp_map(stage1, &r.warp);
+    GridMap warp4;
+    if (opt.perspective_only) {
+        warp4 = identity_grid(W, H);
+    } else {
+        cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
+        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore);
+        r.lines = fitted_lines(r.warp, W, H, r.rot);
+    }
     r.stage1 = stage1;
     r.ms.emplace_back("warp map", ms_since(t0));
     for (auto& m : r.warp.ms) r.ms.emplace_back("  " + m.first, m.second);

@@ -2,11 +2,13 @@
 // Implements app/src/main/java/com/albus/flatscan/NativeLib.kt exactly.
 #include <android/bitmap.h>
 #include <jni.h>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -55,6 +57,72 @@ struct Session {
 };
 
 Session* session(jlong h) { return reinterpret_cast<Session*>(h); }
+
+// What a session needs to come back without re-running the geometry (DocumentStore keeps it
+// next to the page): the page (JPEG q95; its alpha is always opaque), the paper alpha (PNG),
+// the before page (JPEG q90), the deformation grid and the fitted lines (raw float32) and the
+// wrinkle legend scale. The Mats share the session's pixels (they are never written after
+// process()), so a snapshot is cheap to take and can be written on another thread.
+struct Snapshot {
+    cv::Mat page, paper, before;
+    GridMap disp;
+    std::vector<std::array<float, 5>> lines;
+    float legend_px = 1.f;
+};
+
+bool write_floats(const std::string& path, const std::vector<int32_t>& head, const std::vector<const std::vector<float>*>& parts) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(head.data(), sizeof(int32_t), head.size(), f) == head.size();
+    for (auto* p : parts) ok = ok && (p->empty() || std::fwrite(p->data(), sizeof(float), p->size(), f) == p->size());
+    return std::fclose(f) == 0 && ok;
+}
+
+bool read_floats(const std::string& path, std::vector<int32_t>& head, size_t nhead, std::vector<float>& data) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    head.assign(nhead, 0);
+    bool ok = std::fread(head.data(), sizeof(int32_t), nhead, f) == nhead;
+    data.clear();
+    float buf[4096];
+    size_t n;
+    while (ok && (n = std::fread(buf, sizeof(float), 4096, f)) > 0) data.insert(data.end(), buf, buf + n);
+    std::fclose(f);
+    return ok;
+}
+
+bool write_snapshot(const Snapshot& s, const std::string& dir) {
+    cv::Mat bgr;
+    if (s.page.channels() == 4) cv::cvtColor(s.page, bgr, cv::COLOR_BGRA2BGR);
+    else bgr = s.page;
+    if (!cv::imwrite(dir + "/page.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 95})) return false;
+    if (!s.paper.empty() && !cv::imwrite(dir + "/paper.png", s.paper, {cv::IMWRITE_PNG_COMPRESSION, 1})) return false;
+    if (!s.before.empty()) {
+        if (s.before.channels() == 4) cv::cvtColor(s.before, bgr, cv::COLOR_BGRA2BGR);
+        else bgr = s.before;
+        if (!cv::imwrite(dir + "/before.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 90})) return false;
+    }
+    const GridMap& g = s.disp;
+    if (!write_floats(dir + "/disp.bin", {g.out_w, g.out_h, g.gw, g.gh, g.stride}, {&g.x, &g.y})) return false;
+    std::vector<float> lf;
+    for (const auto& l : s.lines) lf.insert(lf.end(), l.begin(), l.end());
+    lf.push_back(s.legend_px);
+    return write_floats(dir + "/lines.bin", {(int32_t)s.lines.size()}, {&lf});
+}
+
+cv::Mat read_bgra(const std::string& path) {
+    cv::Mat m = cv::imread(path, cv::IMREAD_COLOR), o;
+    if (m.empty()) return m;
+    cv::cvtColor(m, o, cv::COLOR_BGR2BGRA);
+    return o;
+}
+
+std::string jstr(JNIEnv* env, jstring js) {
+    const char* c = env->GetStringUTFChars(js, nullptr);
+    std::string s = c;
+    env->ReleaseStringUTFChars(js, c);
+    return s;
+}
 
 bool lock(JNIEnv* env, jobject bmp, cv::Mat& m, bool* premul = nullptr) {
     if (!bmp) return false;
@@ -258,7 +326,8 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, 
 JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, jclass, jobject bmp, jfloatArray corners,
                                                                   jboolean edited, jfloat focal_px, jboolean auto_orient,
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
-                                                                  jint page_index, jboolean force_homography, jobject listener) {
+                                                                  jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
+                                                                  jobject listener) {
     auto s = std::make_unique<Session>();
     PipelineResult& r = s->result;
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
@@ -280,6 +349,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.seg_logits = lg.empty() ? nullptr : lg.data();
     o.page_index = page_index;
     o.force_homography = force_homography;
+    o.perspective_only = perspective_only;
+    for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
     o.auto_orient = auto_orient;
     o.render_w = render_w;
     o.use_gpu = use_gpu;
@@ -427,6 +498,82 @@ JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_histogram(JNIEnv* 
 }
 
 JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_release(JNIEnv*, jclass, jlong h) { delete session(h); }
+
+// lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...] as page fractions (PipelineResult::lines)
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_lines(JNIEnv* env, jclass, jlong h) {
+    std::vector<float> v;
+    Session* s = session(h);
+    if (s && s->result.ok)
+        for (const auto& l : s->result.lines) v.insert(v.end(), l.begin(), l.end());
+    jfloatArray a = env->NewFloatArray((jsize)v.size());
+    if (!v.empty()) env->SetFloatArrayRegion(a, 0, (jsize)v.size(), v.data());
+    return a;
+}
+
+// a cheap copy of what restoreSession needs (shares the pixels); writeSnapshot frees it
+JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_snapshot(JNIEnv*, jclass, jlong h) {
+    Session* s = session(h);
+    if (!s || !s->result.ok) return 0;
+    auto* sn = new Snapshot();
+    sn->page = s->result.page;
+    sn->paper = s->result.paper;
+    sn->before = s->result.before;
+    sn->disp = s->result.disp;
+    sn->lines = s->result.lines;
+    sn->legend_px = s->legend_px;
+    return (jlong)sn;
+}
+
+// writes a snapshot into the existing directory `dir` and frees it (any thread)
+JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_writeSnapshot(JNIEnv* env, jclass, jlong h, jstring dir) {
+    std::unique_ptr<Snapshot> sn(reinterpret_cast<Snapshot*>(h));
+    if (!sn) return JNI_FALSE;
+    try {
+        return write_snapshot(*sn, jstr(env, dir)) ? JNI_TRUE : JNI_FALSE;
+    } catch (const std::exception& e) {
+        LOGI("writeSnapshot failed: %s", e.what());
+        return JNI_FALSE;
+    }
+}
+
+// a session from a written snapshot (no geometry is re-run); 0 when it cannot be read
+JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv* env, jclass, jstring dir, jboolean use_gpu) {
+    std::string path = jstr(env, dir);
+    auto s = std::make_unique<Session>();
+    PipelineResult& r = s->result;
+    try {
+        r.page = read_bgra(path + "/page.jpg");
+        if (r.page.empty()) return 0;
+        if (std::ifstream(path + "/paper.png").good()) r.paper = cv::imread(path + "/paper.png", cv::IMREAD_GRAYSCALE);
+        if (!r.paper.empty() && r.paper.size() != r.page.size()) r.paper.release();
+        r.before = read_bgra(path + "/before.jpg");
+        if (!r.before.empty() && r.before.size() != r.page.size()) r.before.release();
+        std::vector<int32_t> head;
+        std::vector<float> data;
+        if (read_floats(path + "/disp.bin", head, 5, data) && head[2] > 0 && head[3] > 0 &&
+            data.size() == 2 * (size_t)head[2] * head[3]) {
+            GridMap& g = r.disp;
+            g.out_w = head[0]; g.out_h = head[1]; g.gw = head[2]; g.gh = head[3]; g.stride = head[4];
+            g.x.assign(data.begin(), data.begin() + data.size() / 2);
+            g.y.assign(data.begin() + data.size() / 2, data.end());
+        }
+        if (read_floats(path + "/lines.bin", head, 1, data) && head[0] >= 0 && data.size() == 5 * (size_t)head[0] + 1) {
+            for (int i = 0; i < head[0]; ++i)
+                r.lines.push_back({data[5 * i], data[5 * i + 1], data[5 * i + 2], data[5 * i + 3], data[5 * i + 4]});
+            s->legend_px = data.back();
+        } else {
+            s->legend_px = r.disp.x.empty() ? 1.f : wrinkle_legend_px(r.disp);
+        }
+        auto t0 = Clock::now();
+        s->pp = page_params(r.page, use_gpu);
+        r.ms.emplace_back("restored; page params", ms_since(t0));
+        r.ok = true;
+    } catch (const std::exception& e) {
+        LOGI("restoreSession failed: %s", e.what());
+        return 0;
+    }
+    return (jlong)s.release();
+}
 
 // ---- on-device self-test and benchmark (brief section 5.1 / 5.2 / 5.6 on a real phone)
 static long peak_rss_kb() {

@@ -63,11 +63,13 @@ object NativeLib {
      * autoOrient: sideways pages are turned upright (no automatic 180-degree turn).
      * logits / pageIndex: page-finder output (null: colour threshold) and the page of a book spread.
      * forceHomography: the quality gate flagged the crop, use the homography path.
+     * perspectiveOnly: the user turned the unwarp off (homography, no warp map).
+     * ignore: areas whose lines the warp map must not use, page fractions [x0, y0, x1, y1, ...].
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
-        forceHomography: Boolean, listener: ProgressListener?,
+        forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?, listener: ProgressListener?,
     ): Long
 
     /**
@@ -103,6 +105,21 @@ object NativeLib {
     @JvmStatic external fun histogram(handle: Long, params: FloatArray): IntArray
 
     @JvmStatic external fun release(handle: Long)
+
+    /**
+     * The lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...], ends as page fractions;
+     * kind 0 = ruled line, 1 = text row, 2 = grid line (global stage only). Empty: no warp map.
+     */
+    @JvmStatic external fun lines(handle: Long): FloatArray
+
+    /** A cheap copy of what [restoreSession] needs (0: none); [writeSnapshot] writes and frees it. */
+    @JvmStatic external fun snapshot(handle: Long): Long
+
+    /** Writes a [snapshot] into the existing directory [dir] and frees it (any thread). */
+    @JvmStatic external fun writeSnapshot(snapshot: Long, dir: String): Boolean
+
+    /** A session from a written snapshot without re-running the geometry; 0 if it cannot be read. */
+    @JvmStatic external fun restoreSession(dir: String, useGpu: Boolean): Long
 
     /**
      * On-device acceptance check: runs the bundled photo [runs] times (+1 warm-up), compares the

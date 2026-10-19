@@ -196,6 +196,20 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var showHoldHint by mutableStateOf(!settings.holdHintShown)
         private set
+    /** The lines the unwarp was fitted to (NativeLib.lines layout: kind, x0, y0, x1, y1 page fractions). */
+    var lines by mutableStateOf(FloatArray(0))
+        private set
+    /** Areas whose lines the unwarp must not use, page fractions [x0, y0, x1, y1, ...] (being edited). */
+    var ignore by mutableStateOf(listOf<Float>())
+        private set
+    /** The ignore areas differ from the ones the current page was flattened with. */
+    val ignoreChanged: Boolean get() = ignore != (sessionGeomState?.ignore?.toList() ?: emptyList<Float>())
+    /** The user turned the unwarp off for the current page (perspective correction only). */
+    val perspectiveOnly: Boolean get() = sessionGeomState?.perspectiveOnly == true
+    /** The page was flattened again from the line editor: the result screen opens it again. */
+    var reopenLines = false
+    /** Serialises writes of stored sessions (DocumentStore.saveSession). */
+    private val sessionStoreMutex = Mutex()
 
     private data class MainKey(val h: Long, val p: RenderParams, val protect: List<Float>)
     private var shownKey by mutableStateOf<MainKey?>(null)
@@ -572,6 +586,62 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * "Circle the page": finds the page inside the loop the user drew around it ([loop], photo
+     * px). The page finder runs on that part of the photo only; when it finds no page edge there,
+     * the loop itself gives the corners. Either way the corners count as set by hand (homography).
+     */
+    fun detectInArea(loop: List<Offset>) {
+        val p = photo ?: return
+        if (loop.size < 8 || detecting) return
+        val focal = focalPx
+        viewModelScope.launch {
+            detecting = true
+            val found = withContext(Dispatchers.Default) {
+                runCatching { findInLoop(p, loop, focal) }.onFailure { Log.e(TAG, "loop detect failed", it) }.getOrNull()
+            }
+            detecting = false
+            if (photo !== p) return@launch
+            if (found == null) {
+                message = "Draw a loop around the whole page"
+                return@launch
+            }
+            corners = found.first
+            cropReasons = emptyList()
+            spreadNext = null
+            message = if (found.second) "Page found inside the loop" else "No page edge found: corners from your loop"
+        }
+    }
+
+    private fun findInLoop(p: Bitmap, loop: List<Offset>, focal: Float): Pair<List<Offset>, Boolean>? {
+        val m = 0.04f * maxOf(p.width, p.height)
+        val x0 = (loop.minOf { it.x } - m).toInt().coerceIn(0, p.width - 1)
+        val y0 = (loop.minOf { it.y } - m).toInt().coerceIn(0, p.height - 1)
+        val x1 = (loop.maxOf { it.x } + m).toInt().coerceIn(x0 + 1, p.width)
+        val y1 = (loop.maxOf { it.y } + m).toInt().coerceIn(y0 + 1, p.height)
+        if (x1 - x0 < 64 || y1 - y0 < 64) return null
+        val origin = Offset(x0.toFloat(), y0.toFloat())
+        val crop = Bitmap.createBitmap(p, x0, y0, x1 - x0, y1 - y0)
+        val logits = if (settings.pageFinderNet) runCatching { finder.logits(crop) }.getOrNull() else null
+        val res = JSONObject(NativeLib.detect(crop, logits, focal))
+        val arr = res.optJSONArray("pages")
+        val centre = Offset(loop.sumOf { it.x.toDouble() }.toFloat() / loop.size, loop.sumOf { it.y.toDouble() }.toFloat() / loop.size) - origin
+        // a page that fills the whole crop is the finder giving up, not a page edge
+        val best = (0 until (arr?.length() ?: 0)).map { arr!!.getJSONObject(it) }
+            .filter { !it.optBoolean("whole_frame") }
+            .map { DetectedPage.from(it) }.filter { it.ok }
+            .minByOrNull { (it.centroid - centre).getDistance() }
+        if (best != null) {
+            return best.corners.map { (it + origin).let { q -> Offset(q.x.coerceIn(0f, p.width - 1f), q.y.coerceIn(0f, p.height - 1f)) } } to true
+        }
+        // the loop's extreme points along the diagonals
+        val tl = loop.minBy { it.x + it.y }
+        val br = loop.maxBy { it.x + it.y }
+        val tr = loop.maxBy { it.x - it.y }
+        val bl = loop.minBy { it.x - it.y }
+        return listOf(tl, tr, br, bl).map { Offset(it.x.coerceIn(0f, p.width - 1f), it.y.coerceIn(0f, p.height - 1f)) } to false
+    }
+
     private fun setCrop(m: PageMeta, bmp: Bitmap) {
         photoPageId = m.id
         cropMeta = m
@@ -620,7 +690,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------ pages
-    /** Opens a page of the document; re-processes it from its source when its session is gone. */
+    private fun geometryKey(m: PageMeta) = m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet)
+
+    /**
+     * Opens a page of the document: from its stored session when its geometry is unchanged (no
+     * re-processing), otherwise re-processed from its source.
+     */
     fun openPage(id: String) {
         if (id == currentId && handle != 0L) {
             screen = Screen.Result
@@ -632,10 +707,31 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             stage = "Opening page"
             commitCurrent()
             try {
-                val (m, bmp) = withContext(Dispatchers.IO) {
-                    val m = store.loadMeta(id)
-                    m to store.loadSource(id).rotatedQuarterTurns(m.cropRotation)
+                val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
+                val stored = withContext(Dispatchers.IO) { store.loadSession(id, geometryKey(m)) }
+                if (stored != null) {
+                    handle = 0L
+                    resetResultState()
+                    val h = withContext(nativeCtx) {
+                        if (nativeHandle != 0L) NativeLib.release(nativeHandle)
+                        nativeHandle = NativeLib.restoreSession(stored.first.absolutePath, true)
+                        nativeHandle
+                    }
+                    if (h != 0L) {
+                        discardStaging()
+                        recropBackup = null
+                        photo = null
+                        photoDisplay = null
+                        photoPageId = null
+                        cropMeta = null
+                        spreadNext = null
+                        spreadCurrent = null
+                        activate(h, m, m.params, m.protect.toList(), m.rotation, stored.third, restored = true)
+                        return@launch
+                    }
+                    Log.w(TAG, "stored session of $id unreadable: re-processing")
                 }
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(m.cropRotation) }
                 discardStaging()
                 recropBackup = null
                 setCrop(m, bmp)
@@ -720,13 +816,18 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         overlay = null
         thumbs = emptyMap()
         histogram = null
+        lines = FloatArray(0)
         shownKey = null
         thumbKey = null
         histKey = null
     }
 
     // ------------------------------------------------------------------ processing
-    fun process() {
+    /**
+     * Processes the photo on the crop screen. [ignoreAreas] / [perspective]: the line editor's
+     * settings; null keeps the page's own (its ignore areas only while the corners are unchanged).
+     */
+    fun process(ignoreAreas: List<Float>? = null, perspective: Boolean? = null) {
         val p = photo ?: return
         val id = photoPageId ?: return
         if (corners.size != 4) return
@@ -735,16 +836,22 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val force = forceHomography
         val pageIndex = cropPageIndex
         val spread = spreadCurrent?.takeIf { pageIndex == 1 }
-        val stored0 = cropMeta?.takeIf { it.id == id }
+        val same = id == currentId
+        val stored = cropMeta?.takeIf { it.id == id }
+        val prev = if (same) sessionGeom else stored
+        val ig = ignoreAreas
+            ?: prev?.takeIf { it.corners.contentEquals(c) && it.cropRotation == cropRotation }?.ignore?.toList()
+            ?: emptyList()
+        val po = perspective ?: prev?.perspectiveOnly ?: false
         val geom = PageMeta(
             id = id, corners = c, detected = detected?.let { d -> FloatArray(8) { i -> if (i % 2 == 0) d[i / 2].x else d[i / 2].y } },
             cropRotation = cropRotation, userRotated = userRotated, focalPx = focalPx,
             params = RenderParams(), protect = FloatArray(0), rotation = 0,
             pageIndex = pageIndex, forceHomography = force,
-            spreadWith = spread?.firstId ?: stored0?.spreadWith ?: (if (id == currentId) sessionGeom?.spreadWith else null),
+            spreadWith = spread?.firstId ?: stored?.spreadWith ?: (if (same) sessionGeom?.spreadWith else null),
+            ignore = ig.toFloatArray(), perspectiveOnly = po,
         )
-        val same = id == currentId
-        val stored = cropMeta?.takeIf { it.id == id }
+        val key = geometryKey(geom)
         val defaults = settings.defaultParams()
         val startParams = when {
             same -> params
@@ -779,7 +886,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 nativeHandle = 0L
                 val hh = try {
                     val logits = logitsFor(p)
-                    NativeLib.process(p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force) { pct, s ->
+                    NativeLib.process(p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray()) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }
                 } catch (e: Exception) {
@@ -798,25 +905,16 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.Crop
                 return@launch
             }
-            val size = withContext(nativeCtx) { NativeLib.pageSize(h) }
-            pageWidth = size[0]
-            pageHeight = size[1]
-            currentId = id
-            sessionGeom = geom
-            params = startParams
-            protect = startProtect
-            rotation = startRotation
-            outVersion++
             if (id !in pages) {
                 val i = spread?.let { pages.indexOf(it.firstId) } ?: -1
                 if (spread != null && i >= 0) pages.add(if (secondGoesFirst(spread)) i else i + 1, id) else pages.add(id)
                 pageVersions[id] = 0
             }
             val order = pages.toList()
-            val meta = currentMeta()
+            val meta = geom.copy(params = startParams, protect = startProtect.toFloatArray(), rotation = startRotation)
             withContext(Dispatchers.IO) {
                 runCatching {
-                    store.saveMeta(meta!!)
+                    store.saveMeta(meta)
                     store.saveOrder(order)
                     // the first page of the spread learns its partner
                     if (spread != null) store.saveMeta(store.loadMeta(spread.firstId).copy(spreadWith = id))
@@ -826,14 +924,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 spreadCurrent = null
                 message = "Book spread: added as 2 pages (${if (settings.bookRightToLeft) "right" else "left"} page first)"
             }
-            details = describe(info, edited, force)
-            firstRenderDetails = true
-            handle = h
-            requestRender(false)
-            awaitRender()
-            if (screen == Screen.Processing) screen = Screen.Result
-            fetchBefore(h)
-            if (showWrinkles) fetchOverlay(h)
+            val text = describe(info, edited, force, po, ig.size / 4)
+            // the processed page is kept on disk: opening it again needs no re-processing
+            storeSession(id, key, info, text, withContext(nativeCtx) { if (h == nativeHandle) NativeLib.snapshot(h) else 0L })
+            activate(h, geom, startParams, startProtect, startRotation, text, restored = false)
             // a book spread: its second page follows from the same photo
             val next = spreadNext
             if (next != null && pageIndex == 0) {
@@ -843,8 +937,138 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun describe(info: JSONObject, edited: Boolean, forced: Boolean): String {
+    /** Makes [h] the live session of page [geom] and shows it on the result screen. */
+    private suspend fun activate(h: Long, geom: PageMeta, p: RenderParams, prot: List<Float>, rot: Int, text: String, restored: Boolean) {
+        val (size, ln) = withContext(nativeCtx) { NativeLib.pageSize(h) to NativeLib.lines(h) }
+        pageWidth = size[0]
+        pageHeight = size[1]
+        currentId = geom.id
+        sessionGeom = geom
+        params = p
+        protect = prot
+        rotation = rot
+        lines = ln
+        ignore = geom.ignore.toList()
+        outVersion++
+        details = text
+        firstRenderDetails = true
+        handle = h
+        requestRender(false)
+        awaitRender()
+        // a stored session renders what out.jpg already holds
+        if (restored) committedVersion = outVersion
+        if (screen == Screen.Processing) screen = Screen.Result
+        fetchBefore(h)
+        if (showWrinkles) fetchOverlay(h)
+    }
+
+    /** Writes a session snapshot as page [id]'s stored session (frees the snapshot). */
+    private fun storeSession(id: String, key: String, info: JSONObject, text: String, snap: Long) {
+        if (snap == 0L) return
+        viewModelScope.launch(Dispatchers.IO) {
+            sessionStoreMutex.withLock {
+                var used = false
+                runCatching {
+                    store.saveSession(id, key, info, text) { dir ->
+                        used = true
+                        NativeLib.writeSnapshot(snap, dir.absolutePath)
+                    }
+                }.onFailure { Log.e(TAG, "session save failed", it) }
+                // the page is gone: writing to a missing directory fails but frees the snapshot
+                if (!used) NativeLib.writeSnapshot(snap, File(store.root, "missing").absolutePath)
+            }
+        }
+    }
+
+    /**
+     * Flattens the current page again with the line editor's ignore areas and/or the unwarp
+     * turned on or off ([perspective]); the filters, protected areas and rotation are kept.
+     */
+    fun reflatten(perspective: Boolean? = null) {
+        val id = currentId ?: return
+        val geom = currentMeta() ?: return
+        val areas = ignore
+        reopenLines = true
+        val p = photo
+        if (photoPageId == id && p != null && recropBackup == null) {
+            process(areas, perspective)
+            return
+        }
+        viewModelScope.launch {
+            screen = Screen.Processing
+            progress = 0f
+            stage = "Opening the photo"
+            try {
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
+                discardStaging()
+                recropBackup = null
+                setCrop(geom, bmp)
+                process(areas, perspective)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "reflatten failed", e)
+                message = "Could not open the photo"
+                screen = Screen.Result
+            }
+        }
+    }
+
+    /** Line editor: ignores line [i] of [lines] (or uses it again when it is ignored). */
+    fun toggleLine(i: Int) {
+        val l = lines
+        if (5 * i + 4 >= l.size) return
+        val cx = (l[5 * i + 1] + l[5 * i + 3]) / 2
+        val cy = (l[5 * i + 2] + l[5 * i + 4]) / 2
+        if (ignoreAt(cx, cy) >= 0) {
+            removeIgnoreAt(cx, cy)
+            return
+        }
+        val pad = 0.008f
+        ignore = ignore + listOf(
+            (minOf(l[5 * i + 1], l[5 * i + 3]) - pad).coerceIn(0f, 1f), (minOf(l[5 * i + 2], l[5 * i + 4]) - pad).coerceIn(0f, 1f),
+            (maxOf(l[5 * i + 1], l[5 * i + 3]) + pad).coerceIn(0f, 1f), (maxOf(l[5 * i + 2], l[5 * i + 4]) + pad).coerceIn(0f, 1f),
+        )
+    }
+
+    /** Index of the first ignore area containing the page point (fractions), or -1. */
+    fun ignoreAt(x: Float, y: Float): Int {
+        val a = ignore
+        var k = 0
+        while (k + 3 < a.size) {
+            if (x >= a[k] && x <= a[k + 2] && y >= a[k + 1] && y <= a[k + 3]) return k / 4
+            k += 4
+        }
+        return -1
+    }
+
+    /** Removes every ignore area containing the page point. */
+    fun removeIgnoreAt(x: Float, y: Float) {
+        ignore = ignore.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
+    }
+
+    /** Line editor: ignores every line inside the rectangle (page fractions, any corner order). */
+    fun addIgnore(x0: Float, y0: Float, x1: Float, y1: Float) {
+        val a = minOf(x0, x1).coerceIn(0f, 1f)
+        val b = minOf(y0, y1).coerceIn(0f, 1f)
+        val c = maxOf(x0, x1).coerceIn(0f, 1f)
+        val d = maxOf(y0, y1).coerceIn(0f, 1f)
+        if (c - a < 0.01f || d - b < 0.01f) return
+        ignore = ignore + listOf(a, b, c, d)
+    }
+
+    fun clearIgnore() {
+        ignore = emptyList()
+    }
+
+    /** Line editor closed without flattening again: back to the areas the page uses. */
+    fun revertIgnore() {
+        ignore = sessionGeomState?.ignore?.toList() ?: emptyList()
+    }
+
+    private fun describe(info: JSONObject, edited: Boolean, forced: Boolean, perspectiveOnly: Boolean, nIgnore: Int): String {
         val sb = StringBuilder()
+        if (perspectiveOnly) sb.append("Unwarp: off (perspective correction only)\n")
+        else if (nIgnore > 0) sb.append("Unwarp: lines in $nIgnore area${if (nIgnore == 1) "" else "s"} ignored\n")
         val mode = info.optString("mode")
         val gate = info.optJSONArray("needs_manual_crop")
         val reasons = if (gate != null) List(gate.length()) { gate.optString(it) } else emptyList()
@@ -962,6 +1186,21 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val d = maxOf(y0, y1).coerceIn(0f, 1f)
         if (c - a < 0.01f || d - b < 0.01f) return
         protect = protect + listOf(a, b, c, d)
+        requestRender(false)
+    }
+
+    /** Removes the protected rectangles containing the page point (fractions). */
+    fun removeProtectAt(x: Float, y: Float) {
+        val next = protect.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
+        if (next.size == protect.size) return
+        protect = next
+        requestRender(false)
+    }
+
+    /** Removes the protected rectangle drawn last. */
+    fun undoProtect() {
+        if (protect.size < 4) return
+        protect = protect.dropLast(4)
         requestRender(false)
     }
 
