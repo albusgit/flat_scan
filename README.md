@@ -130,7 +130,7 @@ Research notes (model survey with licences, verified vs inferred) are in `C:\Use
 2. A grid is used only if its page outline agrees with the page finder's mask (IoU ≥ 0.90, or ≥ 0.85 against hand-set corners). Otherwise the outline's surface model is used, as before.
 3. With both nets, a half-size stage-1 page from each is scored by text-row angle spread. SyntheticDoc wins only if it is straighter by more than 0.3°; UVDoc is the safer default and has the better tail.
 4. The line refinement runs on top. Pieces of one ruled line now share one target height (RDGR's "same row" constraint; fixes the steps at table cells). The refinement is dropped when it would stretch the page locally (|det J − 1| p99 > 0.2 or more than 1% of cells above 0.2): dense staves and broken rules.
-5. **Shadows:** the page is divided by SyntheticDoc's shading map, sampled through the same backward map (as in the reference inference). This removes hand and object shadows.
+5. **Shadows:** the page is divided by SyntheticDoc's shading map, sampled through the same backward map. Unlike the reference inference, which weakens the map on bright photos (k = min(1, 0.4 / brightness)), the whole map is used (`shadow_full_strength`): hand and leaf shadows come out lighter, and nothing else changed visibly on the 35 photos.
 6. **Fingers:** non-paper areas that reach into the page from its border and are skin-coloured, smooth and redder than this page's paper are filled with the surrounding paper (Telea fill at ¼ size, soft edge). Text under a finger is never invented.
 
 **Measured on the 35 real photos** (34 round-4 photos + the hand-held receipt; desktop build of the same core, `tools/uvdoc_check.py`; text-row angle spread in degrees, lower is straighter):

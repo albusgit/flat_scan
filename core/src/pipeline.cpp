@@ -666,6 +666,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         UvShading sh;
         sh.data = opt.uv_shading;
         sh.crop = opt.uv_shading_crop;
+        sh.full_strength = opt.shadow_full_strength;
         cv::Rect box = opt.uv_shading_crop.box & cv::Rect(0, 0, photo.cols, photo.rows);
         cv::Scalar mean = cv::mean(photo(box));
         sh.brightness = (mean[0] + mean[1] + mean[2]) / (3 * 255.0);

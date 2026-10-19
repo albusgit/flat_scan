@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
+    o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
         size_t p = 0;

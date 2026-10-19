@@ -63,6 +63,7 @@ struct UvShading {
     const float* data = nullptr;
     UvCrop crop;
     double brightness = 0.5;
+    bool full_strength = false;   // divide by the whole map (the reference scales it down on bright photos)
 };
 void uv_apply_shading(cv::Mat& page_bgra, int y0, const cv::Mat& map_x, const cv::Mat& map_y, const UvShading& s);
 

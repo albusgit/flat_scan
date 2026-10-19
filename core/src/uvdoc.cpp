@@ -105,7 +105,7 @@ void uv_apply_shading(cv::Mat& page, int y0, const cv::Mat& mx, const cv::Mat& m
     const UvSpec& sp = uv_spec(s.crop.model);
     const cv::Rect& b = s.crop.box;
     const int iw = s.crop.turned ? b.height : b.width, ih = s.crop.turned ? b.width : b.height;
-    const double k = std::min(1.0, 0.4 / std::max(s.brightness, 1e-6));
+    const double k = s.full_strength ? 1.0 : std::min(1.0, 0.4 / std::max(s.brightness, 1e-6));
     const size_t plane = (size_t)sp.in_w * sp.in_h;
     const double fx = (double)sp.in_w / iw, fy = (double)sp.in_h / ih;
     for (int r = 0; r < mx.rows; ++r) {

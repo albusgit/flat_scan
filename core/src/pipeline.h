@@ -69,6 +69,7 @@ struct PipelineOptions {
     const float* uv_shading = nullptr;   // SyntheticDoc's shading map (3 x in_h x in_w) for uv_shading_crop
     UvCrop uv_shading_crop;
     bool remove_shadows = true;       // divide the page by the shading map
+    bool shadow_full_strength = true;    // ... by all of it (the reference weakens it on bright photos)
     double uv_min_agreement = 0.9;    // UVDoc outline vs the page finder's mask (IoU); below: not used
     double uv_min_agreement_quad = 0.85;   // ... vs the corners when they were set by hand (no mask)
     bool line_stage = true;           // the warp map (line refinement) on top of stage 1
