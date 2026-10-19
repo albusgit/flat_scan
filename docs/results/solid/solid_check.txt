@@ -1,0 +1,19 @@
+scan_p1: flat colours (RGB, px): [((255, 255, 255), 6414840), ((232, 194, 215), 68991), ((129, 167, 65), 26180)]
+   near-white but not white, in smooth areas: 31939 px
+   filled areas: 164727 px, of their non-ink pixels exactly the cluster colour: 99.41%
+scan_p2: flat colours (RGB, px): [((255, 255, 255), 5655322), ((235, 192, 181), 189952), ((237, 240, 250), 52680), ((217, 220, 239), 32570), ((240, 237, 195), 7654)]
+   near-white but not white, in smooth areas: 22225 px
+   filled areas: 374803 px, of their non-ink pixels exactly the cluster colour: 99.69%
+scan_p3: flat colours (RGB, px): [((255, 255, 255), 6548191), ((239, 244, 251), 420291), ((251, 249, 226), 131668), ((252, 217, 208), 95017), ((243, 201, 203), 72208), ((255, 255, 254), 2207)]
+   near-white but not white, in smooth areas: 26700 px
+   filled areas: 1469176 px, of their non-ink pixels exactly the cluster colour: 96.96%
+photo1: flat colours (RGB, px): [((255, 255, 255), 1535778), ((222, 194, 211), 24809), ((147, 178, 91), 7102)]
+   near-white but not white, in smooth areas: 72897 px
+   filled areas: 59577 px, of their non-ink pixels exactly the cluster colour: 99.77%
+photo2: flat colours (RGB, px): [((255, 255, 255), 1297213), ((235, 200, 192), 74378), ((228, 229, 190), 2337)]
+   near-white but not white, in smooth areas: 41021 px
+   filled areas: 88209 px, of their non-ink pixels exactly the cluster colour: 99.96%
+
+# note (measured separately): the 2207 flat px of RGB(255,255,254) on scan_p3 are thin slivers
+# (largest 106x3 px) that are already flat (255,255,254) in the Auto color render without Solid
+# colors (f2.png: 5753 such px); Solid colors filled 4 clusters on scan_p3, none of them near-white.
