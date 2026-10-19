@@ -148,6 +148,14 @@ Research notes (model survey with licences, verified vs inferred) are in `C:\Use
 - Phone emulator (x86_64, CPU): both nets together ≈ 0.6 s; the whole page 3.4 s.
 - Settings: Neural flattening on/off; both nets / UVDoc only / SyntheticDoc only; Remove shadows. Processing details show which net won and both scores.
 
+**Evaluated and not shipped:**
+- **GCDRNet GC-Net** (MIT, 3 MB fp16), a dedicated shadow / illumination net. Its full-page divide removes hand and leaf shadows completely (shadow/lit ratio 0.62 → 1.00 on `docres__208_in`, no halo). But it also bleaches pale table tints and projector-slide colour blocks, and turns dark print circles into blobs.
+  - A gate that applies it only where its map is a darker, neutral cast shadow keeps the colours. At settings that protect `docscanner__42_2` and the projector slides, though, it no longer removes the shadows.
+  - It would also add about 0.3–0.5 s per page and ~300 MB of peak memory.
+  - Details and contact sheets: `C:\Users\User\Desktop\model_zoo\shadow_eval\`.
+- **DocShadow** (MIT, 120 MB): barely removes shadows and leaves the paper beige. **DocTr / DocGeoNet / DocScanner**: non-commercial licences. **DocMamba, RDGR**: no code released; RDGR's "same row" idea is used in the line refinement.
+- **Next step:** train a small illumination net on synthetic hard shadows with coloured content, so shadows are separated from colour blocks by training rather than by thresholds.
+
 ### Filters: light colours kept
 
 Light colours (highlighter, pastel boxes and backgrounds, pale photos) were turned white. Root causes and fixes (`core/src/cleanup.cpp`, `solid.cpp`, `gpu.cpp`):
