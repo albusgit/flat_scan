@@ -15,6 +15,7 @@
 #include <string>
 
 #include "npz.h"
+#include "cleanup.h"
 #include "pipeline.h"
 
 using namespace fs;
@@ -187,6 +188,13 @@ int main(int argc, char** argv) {
             cv::rectangle(bgr, cv::Point((int)(a[0] * bgr.cols), (int)(a[1] * bgr.rows)), cv::Point((int)(a[2] * bgr.cols), (int)(a[3] * bgr.rows)),
                           cv::Scalar(0, 140, 255), 4);
         cv::imwrite(std::string(argv[2]) + ".lines.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 80});
+        // FS_RENDER=1: the page as the app shows it by default (Auto color 0.7) -> OUT.jpg.auto.jpg
+        if (std::getenv("FS_RENDER")) {
+            PageParams pp = page_params(r.page, false);
+            cv::Mat shown = render_page(r.page, r.paper, pp, Filter::AutoColor, 0.7f, false, {}, false);
+            cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);
+            cv::imwrite(std::string(argv[2]) + ".auto.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 88});
+        }
     }
     return 0;
 }

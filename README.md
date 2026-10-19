@@ -112,7 +112,41 @@ Contact sheets and per-page measurements were made on the 34 pages and on synthe
   - Turn 180° is a small round "180°" button in the top bar.
   - Book-spread swap moved to the ⋮ menu.
   - **Protect pictures** has its own panel (count, Undo, Remove all, Done), and tapping a box removes it.
-- **Known failure the tools work around:** a hand-held page whose edge is covered by the hand (`user` receipt photo). The outline follows the thumb, the surface fit still looks good (1.6 px), so the gate trusts it, and the unwarp pulls the thumb into the page. Unwarp off, or re-cropping, fixes it. Detecting it automatically is not done yet.
+- **Hand-held pages** (`user` receipt photo): the outline followed the thumb and the unwarp pulled the thumb into the page. The neural flattening below fixes this automatically, and the thumb is erased. Unwarp off and re-cropping are still there.
+
+## Neural flattening, shadow removal, finger erase
+
+Research notes (model survey with licences, verified vs inferred) are in `C:\Users\User\Desktop\model_zoo\`: `dewarping_survey.md`, `enhancement_survey.md` and `occluder_survey.md`.
+
+**Models in the app** (`assets/models/`, ONNX Runtime; fp16 weights with fp32 compute; the outputs match PyTorch to 1e-4 for UVDoc and 4e-4 for the SyntheticDoc grid):
+
+| Model | Paper | Licence | File | Input → output |
+|---|---|---|---|---|
+| UVDoc | Verhoeven et al., SIGGRAPH Asia 2023 | MIT (code and weights in the repo) | `uvdoc.onnx`, 15.8 MB | 488×712 RGB → 45×31 backward grid |
+| SyntheticDoc | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages) | code MIT; **the weights file states no licence**, so confirm with the authors before a release | `syntheticdoc.onnx`, 17 MB | 512×720 RGB → 31×45 grid + 3×720×512 shading map |
+
+**Pipeline** (`core/src/uvdoc.{h,cpp}`, `run_photo`):
+1. The page finder gives the corners. Each net sees the corner box plus a 6% margin, turned upright if the page is landscape (both nets were trained on portrait pages). On a book spread the other page is painted out.
+2. A grid is used only if its page outline agrees with the page finder's mask (IoU ≥ 0.90, or ≥ 0.85 against hand-set corners). Otherwise the outline's surface model is used, as before.
+3. With both nets, a half-size stage-1 page from each is scored by text-row angle spread. SyntheticDoc wins only if it is straighter by more than 0.3°; UVDoc is the safer default and has the better tail.
+4. The line refinement runs on top. Pieces of one ruled line now share one target height (RDGR's "same row" constraint; fixes the steps at table cells). The refinement is dropped when it would stretch the page locally (|det J − 1| p99 > 0.2 or more than 1% of cells above 0.2): dense staves and broken rules.
+5. **Shadows:** the page is divided by SyntheticDoc's shading map, sampled through the same backward map (as in the reference inference). This removes hand and object shadows.
+6. **Fingers:** non-paper areas that reach into the page from its border and are skin-coloured, smooth and redder than this page's paper are filled with the surrounding paper (Telea fill at ¼ size, soft edge). Text under a finger is never invented.
+
+**Measured on the 35 real photos** (34 round-4 photos + the hand-held receipt; desktop build of the same core, `tools/uvdoc_check.py`; text-row angle spread in degrees, lower is straighter):
+
+| Version | median | mean | p90 | ruled-line p90 dev. (px, median) |
+|---|---|---|---|---|
+| Before (outline surface model + lines) | 2.15 | 2.81 | 6.86 | 11.7 |
+| Perspective only | 2.60 | 3.55 | 6.50 | 17.0 |
+| UVDoc + lines | 1.31 | 1.73 | 2.76 | 5.6 |
+| SyntheticDoc + lines | 1.11 | 1.95 | 5.39 | 8.0 |
+| **Both nets, straighter wins, + lines + shadows (default)** | **0.97** | **1.57** | **2.53** | 8.2 |
+
+- I checked the final Auto-color pages of all 35 photos side by side, old against new. New is better or equal on every one: the thumb is gone from the receipt, bent and folded pages are flat, the hand shadow on `docres__208_in` is removed, and the money bill is cropped to the note.
+- Fingers were erased on 2 of 35 photos (the receipt and a book held at its edge). Two earlier false positives were rejected by the paper-relative and smoothness tests: a beige page edge and a photo margin.
+- Phone emulator (x86_64, CPU): both nets together ≈ 0.6 s; the whole page 3.4 s.
+- Settings: Neural flattening on/off; both nets / UVDoc only / SyntheticDoc only; Remove shadows. Processing details show which net won and both scores.
 
 ## Build
 
