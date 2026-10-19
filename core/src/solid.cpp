@@ -339,6 +339,7 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
     // paper colour: the low-chroma cells near the top of the lightness range (after Auto color
     // this is pure white; with Original it is the page's own paper)
     cv::Vec3d paper(100, 0, 0);
+    bool have_paper = false;
     {
         // area-weighted 75th percentile of L, and median a, b, over the low-chroma light cells:
         // the paper itself, not pulled down by grey cells
@@ -355,7 +356,33 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
             for (auto& e : v) { acc += e.second; if (acc >= q * wsum) return (double)e.first; }
             return (double)v.back().first;
         };
-        if (wsum > 0) paper = cv::Vec3d(wq(Ls, 0.75), wq(as, 0.5), wq(bs, 0.5));
+        if (wsum > 0) { paper = cv::Vec3d(wq(Ls, 0.75), wq(as, 0.5), wq(bs, 0.5)); have_paper = true; }
+    }
+    // 1/4-resolution background (ink removed) in Lab: the blob search (e) and, on a page
+    // without light low-chroma cells, the paper colour. That used to default to pure white,
+    // but below strength 100% (or with Original) the paper is not white: a light colour area
+    // and the slightly darker paper around it all counted as "coloured" and were merged into
+    // one rectangle filled with their greyish average.
+    cv::Mat ql;
+    {
+        cv::Mat q, qd, qm, qf;
+        cv::resize(bgr, q, cv::Size(w / 4, h / 4), 0, 0, cv::INTER_AREA);
+        cv::dilate(q, qd, cv::Mat::ones(3, 3, CV_8U));
+        cv::medianBlur(qd, qm, 11);
+        qm.convertTo(qf, CV_32FC3, 1 / 255.0);
+        cv::cvtColor(qf, ql, cv::COLOR_BGR2Lab);
+    }
+    if (!have_paper) {
+        std::vector<float> Ls, as, bs;
+        for (int y = 0; y < ql.rows; ++y)
+            for (int x = 0; x < ql.cols; ++x) {
+                cv::Vec3f c = ql.at<cv::Vec3f>(y, x);
+                if (chroma(c) < 3 && c[0] > 85) { Ls.push_back(c[0]); as.push_back(c[1]); bs.push_back(c[2]); }
+            }
+        if (Ls.size() > 0.05 * ql.total()) {
+            std::sort(Ls.begin(), Ls.end());
+            paper = cv::Vec3d(Ls[(size_t)(0.75 * (Ls.size() - 1))], median_of(as), median_of(bs));
+        }
     }
     auto dE_paper = [&](const cv::Vec3f& lab) { return cv::norm(cv::Vec3d(lab) - paper); };
     // (c) candidates differ from paper at all; the fill / white decision is taken per colour
@@ -366,13 +393,6 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
     }
     // (e) coloured areas not enclosed by lines: large uniform coloured blobs at 1/4 resolution
     {
-        cv::Mat q, qd, qm;
-        cv::resize(bgr, q, cv::Size(w / 4, h / 4), 0, 0, cv::INTER_AREA);
-        cv::dilate(q, qd, cv::Mat::ones(3, 3, CV_8U));
-        cv::medianBlur(qd, qm, 11);
-        cv::Mat qf, ql;
-        qm.convertTo(qf, CV_32FC3, 1 / 255.0);
-        cv::cvtColor(qf, ql, cv::COLOR_BGR2Lab);
         cv::Mat taken = cv::Mat::zeros(h, w, CV_8U);
         for (auto& r : regs)
             if (r.fill) taken(r.box).setTo(255, lab(r.box) == r.label);
@@ -382,7 +402,10 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
         for (int y = 0; y < ql.rows; ++y)
             for (int x = 0; x < ql.cols; ++x) {
                 cv::Vec3f c = ql.at<cv::Vec3f>(y, x);
-                bool coloured = cv::norm(cv::Vec3d(c) - paper) >= 8.0 && c[0] > 35.f;
+                // a colour (a, b off the paper's), or clearly darker than the paper; a slightly
+                // darker paper (a shadow left at strength < 100%) is neither
+                double dab = std::hypot(c[1] - paper[1], c[2] - paper[2]);
+                bool coloured = c[0] > 35.f && (dab >= 6.0 || (cv::norm(cv::Vec3d(c) - paper) >= 8.0 && c[0] < paper[0] - 10.0));
                 col.at<uint8_t>(y, x) = coloured && takenq.at<uint8_t>(y, x) < 64 ? 255 : 0;
             }
         cv::morphologyEx(col, col, cv::MORPH_OPEN, cv::Mat::ones(4, 4, CV_8U));

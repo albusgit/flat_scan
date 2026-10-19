@@ -11,7 +11,9 @@
 //     Auto color stays below dE 5.)
 //  d. the colour is measured only on pixels > 3 px away from any ink or line; ink is re-mixed
 //     with its own coverage (unmixing against the old background), so no halos remain
-//  e. large uniform coloured areas not enclosed by lines are found as blobs at 1/4
+//  e. large uniform coloured areas not enclosed by lines (a, b >= 6 off the paper, or clearly
+//     darker; on a page without light low-chroma cells the paper colour is measured on the
+//     1/4-res background, not assumed white) are found as blobs at 1/4
 //     resolution; their rectangle edges snap to grid lines within 30 px
 //  f. regions with local detail after removing ink (pictures, logos: high-pass 10-90% range
 //     > 18 levels) or a large smooth range (designed gradients: > 45 levels), regions of at

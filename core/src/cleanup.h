@@ -3,19 +3,32 @@
 // Shared analysis, computed once per page (page_params):
 //   * background at 1/4 resolution: 4x4 block mean -> 3x3 dilate -> exact 11x11 median, per
 //     channel (darkness_fast idea, kept in colour)                                 [GPU / CPU]
-//   * paper illumination S: background pixels that are low-chroma and near the local maximum
-//     brightness are paper; their luminance is filled into a smooth field (pull-push)  [CPU]
+//   * paper illumination S: background pixels near the local maximum brightness whose colour
+//     is the paper's own colour are paper; their luminance is filled into a smooth field
+//     (pull-push)                                                                     [CPU]
+//     The colour test is relative to the paper (a, b at a fixed lightness, after dividing by
+//     the paper's chromaticity; cleanup.cpp paper_mask): seeds near the most common bright
+//     colour, grown over slow colour drift (mixed lighting) but not across colour edges, and
+//     separate pieces kept only if their colour matches the paper filled in around them. A
+//     light yellow / blue / pink box, a highlighted line or a pale photo is not paper (the old
+//     absolute test, chroma < 24 levels, took them for paper and flattened them to white, and
+//     rejected the paper itself under warm light).
 //     Islands of such samples that are not connected to the main paper (the inside of a grey
 //     or dark photo, a grey cell) are dropped unless they are at the paper's level or look
 //     like a cast shadow (reach the page edge, plain paper inside); otherwise the area would
 //     be flattened to white
 //   * white balance wb: paper colour per channel, from those paper samples (never from the
-//     brightest pixels); paper noise sigma: robust spread (MAD) of normalised paper luminance
-//     on ink-free paper pixels
-// Every filter starts from v = I / (S * wb): lighting flattened, paper ~ 1.0.
+//     brightest pixels); also filled in locally (PageParams::paper = S x local wb, global wb
+//     far from paper samples), so a cast that changes across the page is removed; paper noise
+//     sigma: robust spread (MAD) of normalised paper luminance on ink-free paper pixels
+//   * light-colour weight tint: the local background is a distinct colour relative to the
+//     paper around it and light. There the curves' white point is raised to 1 (no clipping
+//     band), background cleanup does not whiten and specks are not removed.
+// Every filter starts from v = I / P (P = S x wb per channel): lighting flattened, paper ~ 1.0.
 //   Original      unwarped page only
 //   Lighten       v / (1 - 1.5 sigma), clipped at paper: paper slightly whiter, ink untouched
 //   Auto color    v >= wp ? 1 : (v / wp)^1.25 with wp = 1 - 2.5 sigma: paper white, colours kept
+//                 (Lighten / Auto / Grayscale / High contrast: wp -> wp + (1 - wp) tint)
 //   Grayscale     Auto color, desaturated (Rec.601)
 //   High contrast wp = 1 - 3 sigma, exponent 1.8: whiter paper, darker ink
 //   Black & white adaptive: luminance relative to the LOCAL background (1/4-res median of the
@@ -36,8 +49,8 @@
 //   filter curve t -> speck removal -> levels t = clamp((t - black) / (white - black), 0, 1)^(1/gamma)
 //   -> background cleanup (bg > 0): soft knee towards white, k = 0.02 + 0.16 bg: weight
 //      w = smoothstep(1 - 2k, 1 - k, luma(t)), t += (1 - t) w (luma >= 1 - k -> white; hue kept),
-//      faded out with the chroma of t (max - min, 0.06 -> 0.15): light colours are not grey
-//      artefacts and stay; with bg > 0 the speck limit also grows to 2 + round(10 bg) ink px
+//      faded out with the chroma of t (max - min, 0.06 -> 0.15) and with (1 - tint): light
+//      colours are not grey artefacts and stay; with bg > 0 the speck limit also grows to 2 + round(10 bg) ink px
 //      (and 4 * that + 4 px below 0.75) per 36-px window
 //   -> grayscale -> strength blend with Original.
 // The Original filter uses t = page / 255 (no curve, no specks) when the adjustments are not
@@ -56,8 +69,10 @@ const char* filter_name(Filter f);
 
 struct PageParams {
     cv::Mat illum;            // CV_32F, quarter grid: paper luminance S (0..255)
+    cv::Mat paper;            // CV_32FC4, quarter grid: paper colour per channel, S x local white balance (4th = 0)
     cv::Mat bgv;              // CV_32F, quarter grid: local background luminance of v (B&W, specks)
     cv::Mat pic;              // CV_32F, quarter grid: picture weight 0..1 (B&W tones, specks)
+    cv::Mat tint;             // CV_32F, quarter grid: light-colour weight 0..1 (white point, cleanup, specks)
     float wb[3] = {1, 1, 1};  // per-channel paper colour / paper luminance
     float sigma = 0.02f;      // paper noise of luma(v)
     int page_w = 0, page_h = 0;
