@@ -124,6 +124,12 @@ object NativeLib {
     @JvmStatic external fun release(handle: Long)
 
     /**
+     * Erase tool: the page as processed with every rectangle (page fractions [x0, y0, x1, y1, ...])
+     * filled with the paper around it; an empty array restores the page. Re-render afterwards.
+     */
+    @JvmStatic external fun setErase(handle: Long, rects: FloatArray): Boolean
+
+    /**
      * The lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...], ends as page fractions;
      * kind 0 = ruled line, 1 = text row, 2 = grid line (global stage only). Empty: no warp map.
      */

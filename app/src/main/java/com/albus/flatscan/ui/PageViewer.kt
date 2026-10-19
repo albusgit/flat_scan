@@ -104,10 +104,11 @@ private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int) {
 }
 
 /** What the page viewer edits besides zooming: nothing, protected pictures or the unwarp's lines. */
-enum class AreaMode { None, Protect, Lines }
+enum class AreaMode { None, Protect, Lines, Erase }
 
 private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF))   // ruled, text row, grid
 private val IgnoreColor = Color(0xFFFF6B5E)
+private val EraseColor = Color(0xFFF2B84B)
 
 /**
  * The result page with pinch zoom / pan (double tap toggles 1x / 2.5x), press and hold for the
@@ -294,7 +295,11 @@ fun PageViewer(
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
-                    val areaColor = if (areaMode == AreaMode.Lines) IgnoreColor else outline
+                    val areaColor = when (areaMode) {
+                        AreaMode.Lines -> IgnoreColor
+                        AreaMode.Erase -> EraseColor
+                        else -> outline
+                    }
                     if (areaMode == AreaMode.Lines) {
                         // the lines the unwarp used; ignored ones dashed in red
                         val lw = 3.dp.toPx() / g.k

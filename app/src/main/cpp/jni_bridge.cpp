@@ -42,6 +42,8 @@ struct Session {
     float legend_px = 1.f;
     std::mutex mu;            // guards the downscaled-source cache
     std::vector<std::pair<cv::Size, cv::Mat>> small;   // paper-filled page, INTER_AREA, by size
+    cv::Mat page_orig, paper_orig;   // the page before the Erase tool (kept from its first use)
+    bool use_gpu = true;
 
     // paper-filled page at `sz` (the full page itself when sz is the page size)
     cv::Mat filled_at(cv::Size sz) {
@@ -391,6 +393,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jfloatArray uv_out, jintArray uv_crop_a, jfloatArray uv_out2,
                                                                   jintArray uv_crop2_a, jfloatArray uv_shading, jobject listener) {
     auto s = std::make_unique<Session>();
+    s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
     if (bgr.empty()) {
@@ -581,6 +584,41 @@ JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_histogram(JNIEnv* 
 
 JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_release(JNIEnv*, jclass, jlong h) { delete session(h); }
 
+// Erase tool: the page as processed, then every rectangle (page fractions [x0, y0, x1, y1, ...])
+// filled with the paper around it. An empty array restores the page.
+JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setErase(JNIEnv* env, jclass, jlong h, jfloatArray rects) {
+    Session* s = session(h);
+    if (!s || !s->result.ok) return JNI_FALSE;
+    std::vector<Rect01> rs = parse_protect(env, rects);
+    PipelineResult& r = s->result;
+    try {
+        if (s->page_orig.empty()) {
+            if (rs.empty()) return JNI_TRUE;
+            s->page_orig = r.page.clone();
+            s->paper_orig = r.paper.clone();
+        }
+        r.page = s->page_orig.clone();
+        r.paper = s->paper_orig.clone();
+        if (!rs.empty()) {
+            cv::Mat mask = cv::Mat::zeros(r.page.size(), CV_8U);
+            for (const Rect01& q : rs) {
+                cv::Rect box((int)std::floor(q.x0 * r.page.cols), (int)std::floor(q.y0 * r.page.rows),
+                             (int)std::ceil((q.x1 - q.x0) * r.page.cols), (int)std::ceil((q.y1 - q.y0) * r.page.rows));
+                box &= cv::Rect(0, 0, r.page.cols, r.page.rows);
+                if (box.area() > 0) mask(box).setTo(255);
+            }
+            fill_with_paper(r.page, mask, r.paper.empty() ? nullptr : &r.paper);
+        }
+        s->pp = page_params(r.page, s->use_gpu);
+        std::lock_guard<std::mutex> lk(s->mu);
+        s->small.clear();
+    } catch (const std::exception& e) {
+        LOGI("setErase failed: %s", e.what());
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
 // lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...] as page fractions (PipelineResult::lines)
 JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_lines(JNIEnv* env, jclass, jlong h) {
     std::vector<float> v;
@@ -622,6 +660,7 @@ JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_writeSnapshot(JNIEn
 JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv* env, jclass, jstring dir, jboolean use_gpu) {
     std::string path = jstr(env, dir);
     auto s = std::make_unique<Session>();
+    s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
     try {
         r.page = read_bgra(path + "/page.jpg");

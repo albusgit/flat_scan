@@ -144,6 +144,11 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo_bgr, const float* 
                                          int max_analysis_side = 2400);
 
 PipelineResult run_photo(const cv::Mat& photo_bgr, const PipelineOptions& opt);
+
+// Fills `mask` (CV_8U, page size, non-zero = fill) of a BGRA page with the paper around it (finger
+// erase, the app's Erase tool): a smooth fill, not invented content. paper (optional, CV_8U page
+// size): marked as paper there.
+void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper);
 // Flatbed scan: warp map only (warpmap.py on the scan itself).
 PipelineResult run_scan(const cv::Mat& scan_bgr, const PipelineOptions& opt);
 

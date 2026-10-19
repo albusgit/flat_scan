@@ -40,6 +40,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.GridView
@@ -204,12 +205,24 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             PageViewer(
                 page = vm.page, before = vm.before, overlay = if (vm.showWrinkles) vm.overlay else null,
                 pageWidth = vm.pageWidth, pageHeight = vm.pageHeight, rotation = vm.rotation,
-                areas = if (mode == AreaMode.Lines) (if (vm.perspectiveOnly) emptyList() else vm.ignore) else vm.protect, areaMode = mode, lines = vm.lines, state = viewer,
+                areas = when (mode) {
+                    AreaMode.Lines -> if (vm.perspectiveOnly) emptyList() else vm.ignore
+                    AreaMode.Erase -> vm.erase
+                    else -> vm.protect
+                },
+                areaMode = mode, lines = vm.lines, state = viewer,
                 onHold = { if (it) vm.holdStarted() },
-                onRect = { x0, y0, x1, y1 -> if (mode == AreaMode.Lines) vm.addIgnore(x0, y0, x1, y1) else vm.addProtect(x0, y0, x1, y1) },
+                onRect = { x0, y0, x1, y1 ->
+                    when (mode) {
+                        AreaMode.Lines -> vm.addIgnore(x0, y0, x1, y1)
+                        AreaMode.Erase -> vm.addErase(x0, y0, x1, y1)
+                        else -> vm.addProtect(x0, y0, x1, y1)
+                    }
+                },
                 onTap = { x, y, line ->
                     when {
                         mode == AreaMode.Protect -> vm.removeProtectAt(x, y)
+                        mode == AreaMode.Erase -> vm.removeEraseAt(x, y)
                         line >= 0 -> vm.toggleLine(line)
                         else -> vm.removeIgnoreAt(x, y)
                     }
@@ -237,11 +250,13 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 ProtectPanel(vm, onDone = { tool = AreaMode.None })
             } else if (mode == AreaMode.Lines) {
                 LinesPanel(vm, onClose = closeTool)
+            } else if (mode == AreaMode.Erase) {
+                ErasePanel(vm, onDone = { tool = AreaMode.None })
             } else if (vm.adjustOpen) {
                 AdjustPanel(vm)
             } else {
                 FilterPanel(
-                    vm, onProtect = { tool = AreaMode.Protect },
+                    vm, onProtect = { tool = AreaMode.Protect }, onErase = { tool = AreaMode.Erase },
                     onAddPage = {
                         if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                         else vm.startCamera()
@@ -331,7 +346,7 @@ private fun EditorChip(
 }
 
 @Composable
-private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onAddPage: () -> Unit) {
+private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () -> Unit, onAddPage: () -> Unit) {
     val p = vm.params
     Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
         val enabled = p.filter != FilterKind.Original
@@ -392,10 +407,39 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onAddPage: () 
             val n = vm.protect.size / 4
             EditorChip(if (n > 0) "Protected pictures ($n)" else "Protect a picture", onClick = onProtect, icon = Icons.Outlined.Shield)
         }
+        val ne = vm.erase.size / 4
+        EditorChip(if (ne > 0) "Erased ($ne)" else "Erase", onClick = onErase, icon = Icons.Outlined.AutoFixHigh)
         if (vm.pending.isNotEmpty()) {
             EditorChip("Next page (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
         } else {
             EditorChip("Add page", onClick = onAddPage, icon = Icons.Outlined.Add)
+        }
+    }
+}
+
+/** Erase tool: fingers, stains, stamps, punch holes filled with the paper around them. */
+@Composable
+private fun ErasePanel(vm: ScanViewModel, onDone: () -> Unit) {
+    val n = vm.erase.size / 4
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.AutoFixHigh, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("Erase", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
+            Text(if (n == 0) "nothing erased" else if (n == 1) "1 area" else "$n areas", style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+        }
+        Text(
+            "Drag a box over a finger, a stain, a stamp or a punch hole: it is filled with the paper around it. Tap a box to bring it back.",
+            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
+        )
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            EditorChip("Undo", onClick = { vm.undoErase() }, enabled = n > 0)
+            EditorChip("Restore all", onClick = { vm.clearErase() }, enabled = n > 0)
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = onDone, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
+            ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
         }
     }
 }

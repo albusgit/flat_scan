@@ -270,25 +270,7 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
     if (n_fill == 0) return 0;
     // the fringe of the finger (shadow, blurred edge) goes with it
     cv::dilate(fill, fill, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
-    cv::Mat small, small_mask, filled;
-    cv::resize(bgr, small, cv::Size(w / 4, h / 4), 0, 0, cv::INTER_AREA);
-    cv::resize(fill, small_mask, small.size(), 0, 0, cv::INTER_NEAREST);
-    cv::inpaint(small, small_mask, filled, 5, cv::INPAINT_TELEA);
-    cv::resize(filled, filled, bgr.size(), 0, 0, cv::INTER_LINEAR);
-    cv::Mat soft;
-    cv::GaussianBlur(fill, soft, cv::Size(0, 0), 1.5);
-    for (int y = 0; y < h; ++y) {
-        uint8_t* p = page_bgra.ptr<uint8_t>(y);
-        const uint8_t* f = filled.ptr<uint8_t>(y);
-        const uint8_t* a = soft.ptr<uint8_t>(y);
-        uint8_t* pa = paper.ptr<uint8_t>(y);
-        for (int x = 0; x < w; ++x) {
-            if (!a[x]) continue;
-            float t = a[x] / 255.f;
-            for (int k = 0; k < 3; ++k) p[4 * x + k] = (uint8_t)std::lround(p[4 * x + k] * (1 - t) + f[3 * x + k] * t);
-            pa[x] = std::max(pa[x], a[x]);
-        }
-    }
+    fill_with_paper(page_bgra, fill, &paper);
     return (double)n_fill / (w * h);
 }
 
@@ -734,6 +716,37 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     r.ms.emplace_back("total", ms_since(tall));
     r.ok = true;
     return r;
+}
+
+void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper) {
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    if (mask.empty() || mask.size() != page_bgra.size() || cv::countNonZero(mask) == 0) return;
+    // a Telea fill from the area's surroundings at 1/4 size: paper colour and shading continue
+    // smoothly across; at full size it would be slow and smear text strokes into the hole
+    cv::Mat bgr, small, small_mask, filled;
+    cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
+    cv::Size ss(std::max(1, w / 4), std::max(1, h / 4));
+    cv::resize(bgr, small, ss, 0, 0, cv::INTER_AREA);
+    cv::resize(mask, small_mask, ss, 0, 0, cv::INTER_AREA);
+    small_mask = small_mask > 0;
+    cv::dilate(small_mask, small_mask, cv::Mat::ones(3, 3, CV_8U));
+    cv::inpaint(small, small_mask, filled, 5, cv::INPAINT_TELEA);
+    cv::resize(filled, filled, bgr.size(), 0, 0, cv::INTER_LINEAR);
+    cv::Mat soft;
+    cv::GaussianBlur(mask, soft, cv::Size(0, 0), 1.5);
+    soft = cv::max(soft, mask);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* p = page_bgra.ptr<uint8_t>(y);
+        const uint8_t* f = filled.ptr<uint8_t>(y);
+        const uint8_t* a = soft.ptr<uint8_t>(y);
+        uint8_t* pa = paper && !paper->empty() ? paper->ptr<uint8_t>(y) : nullptr;
+        for (int x = 0; x < w; ++x) {
+            if (!a[x]) continue;
+            float t = a[x] / 255.f;
+            for (int k = 0; k < 3; ++k) p[4 * x + k] = (uint8_t)std::lround(p[4 * x + k] * (1 - t) + f[3 * x + k] * t);
+            if (pa) pa[x] = std::max(pa[x], a[x]);
+        }
+    }
 }
 
 PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {

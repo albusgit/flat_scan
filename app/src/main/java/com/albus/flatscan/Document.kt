@@ -29,6 +29,7 @@ data class PageMeta(
     val spreadWith: String? = null,  // the other page of the same book spread
     val ignore: FloatArray = FloatArray(0),   // areas whose lines the unwarp must not use (page fractions)
     val perspectiveOnly: Boolean = false,     // the user turned the unwarp off for this page
+    val erase: FloatArray = FloatArray(0),    // Erase tool rectangles (page fractions), applied after processing
 ) {
     /**
      * Everything the processed geometry depends on: a stored session (DocumentStore.saveSession)
@@ -62,6 +63,7 @@ data class PageMeta(
         if (spreadWith != null) put("spread_with", spreadWith)
         put("ignore", ignore.toJson())
         put("perspective_only", perspectiveOnly)
+        put("erase", erase.toJson())
     }
 
     companion object {
@@ -91,6 +93,7 @@ data class PageMeta(
                 spreadWith = j.optString("spread_with").ifEmpty { null },
                 ignore = j.optJSONArray("ignore")?.toFloats() ?: FloatArray(0),
                 perspectiveOnly = j.optBoolean("perspective_only"),
+                erase = j.optJSONArray("erase")?.toFloats() ?: FloatArray(0),
             )
         }
 

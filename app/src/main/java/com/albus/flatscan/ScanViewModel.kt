@@ -169,6 +169,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** Protected picture rectangles, page fractions [x0, y0, x1, y1, ...]. */
     var protect by mutableStateOf(listOf<Float>())
         private set
+    /** Erase tool rectangles (filled with paper), page fractions [x0, y0, x1, y1, ...]. */
+    var erase by mutableStateOf(listOf<Float>())
+        private set
     var rotation by mutableIntStateOf(0)
         private set
     /** The cleaned page, unrotated (rotation is applied when drawing and on export). */
@@ -213,7 +216,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** Serialises writes of stored sessions (DocumentStore.saveSession). */
     private val sessionStoreMutex = Mutex()
 
-    private data class MainKey(val h: Long, val p: RenderParams, val protect: List<Float>)
+    private data class MainKey(val h: Long, val p: RenderParams, val protect: List<Float>, val erase: Int)
+    /** Bumped whenever the native page changes under the same handle (Erase tool). */
+    private var pageEdit by mutableIntStateOf(0)
     private var shownKey by mutableStateOf<MainKey?>(null)
     private var thumbKey: Pair<Long, RenderParams>? = null
     private var histKey: Pair<Long, RenderParams>? = null
@@ -975,6 +980,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         rotation = rot
         lines = ln
         ignore = geom.ignore.toList()
+        erase = geom.erase.toList()
+        if (erase.isNotEmpty()) {
+            val rects = erase.toFloatArray()
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setErase(h, rects) }
+        }
         outVersion++
         details = text
         firstRenderDetails = true
@@ -1140,7 +1150,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun currentMeta(): PageMeta? =
-        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation)
+        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray())
 
     /**
      * Writes the current page's settings and (if it changed) its rendered output to disk.
@@ -1242,6 +1252,48 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         requestRender(false)
     }
 
+    // ---- Erase tool
+    /** Fills a rectangle (page fractions, any corner order) with the paper around it. */
+    fun addErase(x0: Float, y0: Float, x1: Float, y1: Float) {
+        val a = minOf(x0, x1).coerceIn(0f, 1f)
+        val b = minOf(y0, y1).coerceIn(0f, 1f)
+        val c = maxOf(x0, x1).coerceIn(0f, 1f)
+        val d = maxOf(y0, y1).coerceIn(0f, 1f)
+        if (c - a < 0.005f || d - b < 0.005f) return
+        setEraseRects(erase + listOf(a, b, c, d))
+    }
+
+    fun undoErase() {
+        if (erase.size >= 4) setEraseRects(erase.dropLast(4))
+    }
+
+    fun clearErase() {
+        if (erase.isNotEmpty()) setEraseRects(emptyList())
+    }
+
+    /** Removes the erased rectangles containing the page point (fractions). */
+    fun removeEraseAt(x: Float, y: Float) {
+        val next = erase.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
+        if (next.size != erase.size) setEraseRects(next)
+    }
+
+    private fun setEraseRects(rects: List<Float>) {
+        val h = handle
+        if (h == 0L) return
+        erase = rects
+        val arr = rects.toFloatArray()
+        viewModelScope.launch {
+            rendering = true
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setErase(h, arr) }
+            if (handle != h) return@launch
+            thumbKey = null
+            histKey = null
+            pageEdit++
+            outVersion++
+            requestRender(false)
+        }
+    }
+
     fun clearProtect() {
         if (protect.isEmpty()) return
         protect = emptyList()
@@ -1277,7 +1329,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         wake.trySend(debounce)
     }
 
-    private fun wantedKey() = MainKey(handle, params, protect)
+    private fun wantedKey() = MainKey(handle, params, protect, pageEdit)
 
     /** Waits (bounded) until the page on screen matches the current parameters. */
     private suspend fun awaitRender() {
