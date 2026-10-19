@@ -9,6 +9,27 @@ on Linux as a test harness. That harness produced all the parity numbers below.
 **Debug APK:** `dist/flatscan-debug.apk` (arm64-v8a, minSdk 26, 34 MB).
 It has **not been run on a phone or an emulator** (see [Not done / not verified](#not-done--not-verified-on-a-real-phone)).
 
+## Result screen features (v2)
+
+- **Filters:** a strip with live thumbnails: Original, Lighten, Auto color (default), Grayscale, High contrast, B&W.
+  - Strength slider, default 70%. The last filter and strength are remembered.
+  - Solid colors is a separate switch (off for B&W), with "Protect a picture" rectangles that Solid colors leaves alone.
+  - Measured on the 5 test pages: 0 text marks lost at 70% and 100%; GPU and CPU differ by at most 1 level.
+- **Adjust panel:**
+  - Background cleanup pushes grey artefacts near paper colour to white.
+  - Levels editor with a histogram and black, midtone and white handles.
+  - At default settings the output is byte-identical to the unadjusted filters.
+- **Hold to see the original:** press and hold shows the page with perspective correction only. A hint appears on first use.
+- **Zoom:** pinch from 1x to 6x, pan, and double tap.
+- **Wrinkle map:** a switch in the menu, off by default. It shows a heat map and grid of how far each area was moved, with a legend in px.
+- **Re-crop:** goes back to the crop screen and keeps the corners, filter and adjustments.
+- **Missing corners and gaps:** filled with clean paper using a soft-edged paper mask.
+- **Multiple pages:**
+  - Import several images from the gallery.
+  - The Pages screen reorders, deletes and adds pages.
+  - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
+- **Orientation:** pages are turned 180° only when the upright cue is confident (score below -0.2). This fixes the upside-down results: the bench pages scored -0.03 and -0.07, were turned 180° before, and now stay upright. The Auto-rotate setting turns this off.
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.
@@ -179,4 +200,6 @@ For orientation only, single host runs of the whole C++ pipeline (not medians, n
   - GPU memory on large photos: a 4096×3072 RGBA texture is about 50 MB; the app falls back to the CPU if a GPU call fails.
   - Behaviour under thermal throttling.
   - The camera focal length from Camera2 on multi-camera phones: only the first lens focal length is read.
-- **Not done:** cancelling a running job, multi-page documents, and text-only pages. Only table pages exist among the test inputs, as in the reference.
+- **Not done:** cancelling a running job, text-only pages, and pinch zoom on the crop screen. Edits are saved to the page cache when you leave the page or the app goes to the background; a process kill before that loses the last edits.
+- **Solid colors GPU vs CPU on scan p3:** up to 22 levels on 33 values (the other pages are within 1 level); scan p3 also keeps 2207 px of (255,255,254) slivers that are already in the plain Auto color render.
+- **Text-only pages:** Only table pages exist among the test inputs, as in the reference.
