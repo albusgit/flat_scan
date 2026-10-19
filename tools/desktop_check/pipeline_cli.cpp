@@ -37,6 +37,16 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: pipeline_cli PHOTO OUT.jpg [LOGITS.npz]\n"); return 2; }
     cv::Mat img = cv::imread(argv[1], cv::IMREAD_COLOR);
     if (img.empty()) { std::fprintf(stderr, "cannot read %s\n", argv[1]); return 1; }
+    // FS_RENDER_ONLY=1: PHOTO is an already flattened page; write its Auto color 0.7 render to OUT.jpg
+    if (std::getenv("FS_RENDER_ONLY")) {
+        cv::Mat bgra, shown, bgr;
+        cv::cvtColor(img, bgra, cv::COLOR_BGR2BGRA);
+        PageParams pp = page_params(bgra, false);
+        shown = render_page(bgra, cv::Mat(), pp, Filter::AutoColor, 0.7f, false, {}, false);
+        cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);
+        cv::imwrite(argv[2], bgr, {cv::IMWRITE_JPEG_QUALITY, 88});
+        return 0;
+    }
     std::vector<float> lg;
     if (argc > 3) {
         Npz z = read_npz(argv[3]);
