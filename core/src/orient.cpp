@@ -131,7 +131,7 @@ double upright_hebrew_score(const cv::Mat& gray) {
     return gag + 0.35 * header;
 }
 
-Orientation decide_orientation(const cv::Mat& page) {
+Orientation decide_orientation(const cv::Mat& page, double min_conf) {
     Orientation o;
     cv::Mat g1;
     cv::cvtColor(page, g1, page.channels() == 4 ? cv::COLOR_BGRA2GRAY : cv::COLOR_BGR2GRAY);
@@ -140,10 +140,10 @@ Orientation decide_orientation(const cv::Mat& page) {
         cv::Mat ccw;
         cv::rotate(g1, ccw, cv::ROTATE_90_COUNTERCLOCKWISE);
         o.upright = upright_hebrew_score(ccw);
-        o.rot = o.upright >= 0 ? cv::ROTATE_90_COUNTERCLOCKWISE : cv::ROTATE_90_CLOCKWISE;
+        o.rot = o.upright < -min_conf ? cv::ROTATE_90_CLOCKWISE : cv::ROTATE_90_COUNTERCLOCKWISE;
     } else {
         o.upright = upright_hebrew_score(g1);
-        o.rot = o.upright < 0 ? cv::ROTATE_180 : -1;
+        o.rot = o.upright < -min_conf ? cv::ROTATE_180 : -1;
     }
     return o;
 }

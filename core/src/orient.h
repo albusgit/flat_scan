@@ -13,6 +13,9 @@ struct Orientation {
 
 double text_axis_score(const cv::Mat& gray, double* sv);
 double upright_hebrew_score(const cv::Mat& gray);
-Orientation decide_orientation(const cv::Mat& bgr_page);
+// Decision rule. min_conf: the upright cue (Hebrew-specific, near 0 on other pages) must be
+// below -min_conf to choose the flipped candidate: 180 deg for an upright-axis page, CW instead of
+// CCW for a sideways one. min_conf = 0 is exactly photo_pipeline.run (reference behaviour).
+Orientation decide_orientation(const cv::Mat& bgr_page, double min_conf = 0.0);
 
 }  // namespace fs

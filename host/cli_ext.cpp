@@ -164,12 +164,14 @@ static void write_outputs(const PipelineResult& r, const std::string& dir, const
     f << "}}\n";
 }
 
-// photo PHOTO OUTDIR [--v8] [--cpu] [--orient-stage1]
+// photo PHOTO OUTDIR [--v8] [--cpu] [--orient-stage1] [--reference-orient] [--no-orient]
 static int cmd_photo(int argc, char** argv) {
     cv::Mat img = cv::imread(argv[2], cv::IMREAD_COLOR);
     PipelineOptions o;
     o.use_gpu = !flag(argc, argv, "--cpu");
     o.orient_on_stage1 = flag(argc, argv, "--orient-stage1");
+    o.reference_orient = flag(argc, argv, "--reference-orient");   // ungated 0/180 cue (section-5 parity)
+    o.auto_orient = !flag(argc, argv, "--no-orient");
     if (flag(argc, argv, "--v8")) o.surface_fallback_px = -1;   // force the homography path
     PipelineResult r = run_photo(img, o);
     if (!r.ok) { std::fprintf(stderr, "%s\n", r.error.c_str()); return 1; }
