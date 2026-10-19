@@ -16,12 +16,16 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.CameraAlt
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.automirrored.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -34,6 +38,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -48,6 +53,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.albus.flatscan.BuildConfigInfo
+import com.albus.flatscan.FilterKind
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
 import com.albus.flatscan.Settings
@@ -56,9 +62,9 @@ import kotlinx.coroutines.delay
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(vm: ScanViewModel) {
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) vm.loadUri(uri)
-    }
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
+    var confirmNew by remember { mutableStateOf(false) }
+    val n = vm.pages.size
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
             title = { },
@@ -79,21 +85,44 @@ fun HomeScreen(vm: ScanViewModel) {
             )
         }
         Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Button(onClick = { vm.open(Screen.Camera) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-                Icon(Icons.Outlined.CameraAlt, null)
-                Spacer(Modifier.size(12.dp))
-                Text("Scan with camera", style = MaterialTheme.typography.titleMedium)
-            }
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-            ) {
-                Icon(Icons.Outlined.PhotoLibrary, null)
-                Spacer(Modifier.size(12.dp))
-                Text("Import from gallery")
+            if (n > 0) {
+                Button(onClick = { vm.open(Screen.Pages) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                    Icon(Icons.Outlined.Description, null)
+                    Spacer(Modifier.size(12.dp))
+                    Text(if (n == 1) "Continue current document (1 page)" else "Continue current document ($n pages)", style = MaterialTheme.typography.titleMedium)
+                }
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(onClick = { confirmNew = true }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                    Icon(Icons.AutoMirrored.Outlined.NoteAdd, null)
+                    Spacer(Modifier.size(12.dp))
+                    Text("New document")
+                }
+            } else {
+                Button(onClick = { vm.startCamera() }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                    Icon(Icons.Outlined.CameraAlt, null)
+                    Spacer(Modifier.size(12.dp))
+                    Text("Scan with camera", style = MaterialTheme.typography.titleMedium)
+                }
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                ) {
+                    Icon(Icons.Outlined.PhotoLibrary, null)
+                    Spacer(Modifier.size(12.dp))
+                    Text("Import from gallery")
+                }
             }
         }
+    }
+    if (confirmNew) {
+        AlertDialog(
+            onDismissRequest = { confirmNew = false },
+            title = { Text("Start a new document?") },
+            text = { Text(if (n == 1) "The current page will be removed from the app. Save it first if you need it." else "The current $n pages will be removed from the app. Save them first if you need them.") },
+            confirmButton = { TextButton(onClick = { vm.newDocument(); confirmNew = false }) { Text("New document") } },
+            dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } },
+        )
     }
 }
 
@@ -116,8 +145,9 @@ fun ProcessingScreen(vm: ScanViewModel) {
 @Composable
 fun SettingsScreen(vm: ScanViewModel) {
     val s = vm.settings
-    var gray by remember { mutableStateOf(s.grayscale) }
+    var filter by remember { mutableStateOf(s.defaultFilter) }
     var solid by remember { mutableStateOf(s.solidColors) }
+    var autoRotate by remember { mutableStateOf(s.autoRotate) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
@@ -125,17 +155,15 @@ fun SettingsScreen(vm: ScanViewModel) {
             navigationIcon = { IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
-            Section("Default color mode")
-            Choice("Auto color", !gray) { gray = false; s.grayscale = false }
-            Choice("Grayscale", gray) { gray = true; s.grayscale = true }
+            Section("Default filter")
+            for (f in FilterKind.entries) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
+            Text(
+                "The filter and strength you choose on a page become the default for the next one.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("Solid colors", style = MaterialTheme.typography.bodyLarge)
-                    Text("Flatten shaded table cells to one colour", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Switch(checked = solid, onCheckedChange = { solid = it; s.solidColors = it })
-            }
+            SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
+            SwitchRow("Auto-rotate pages", "Turn sideways and upside-down pages upright", autoRotate) { autoRotate = it; s.autoRotate = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             Section("Output resolution")
             for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }
@@ -176,6 +204,20 @@ fun SettingsScreen(vm: ScanViewModel) {
             }
             Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+@Composable
+private fun SwitchRow(title: String, caption: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().toggleable(checked, role = Role.Switch, onValueChange = onChange).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(caption, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 

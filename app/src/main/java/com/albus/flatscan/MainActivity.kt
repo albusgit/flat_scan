@@ -17,6 +17,7 @@ import com.albus.flatscan.ui.CropScreen
 import com.albus.flatscan.ui.FlatScanTheme
 import com.albus.flatscan.ui.HomeScreen
 import com.albus.flatscan.ui.MessageHost
+import com.albus.flatscan.ui.PagesScreen
 import com.albus.flatscan.ui.ProcessingScreen
 import com.albus.flatscan.ui.ResultScreen
 import com.albus.flatscan.ui.SettingsScreen
@@ -35,6 +36,12 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStop() {
+        // keep the page being edited on disk: the process may be killed in the background
+        vm.persist()
+        super.onStop()
+    }
 }
 
 @Composable
@@ -47,6 +54,7 @@ private fun App(vm: ScanViewModel) {
             Screen.Crop -> CropScreen(vm)
             Screen.Processing -> ProcessingScreen(vm)
             Screen.Result -> ResultScreen(vm)
+            Screen.Pages -> PagesScreen(vm)
             Screen.Settings -> SettingsScreen(vm)
         }
         MessageHost(vm)

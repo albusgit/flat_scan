@@ -7,40 +7,96 @@ import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.Executors
 import kotlin.math.hypot
 import kotlin.math.min
+import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Settings }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings }
 
+enum class ImportSource { Camera, Gallery }
+
+/**
+ * App state. Native sessions: at most one is alive (the page shown on the result screen) and
+ * every call that touches it runs on one dedicated thread ([nativeCtx]), so renders, thumbnails,
+ * the histogram and release are serialised and a released handle is never used. Every other
+ * page lives on disk ([DocumentStore]).
+ */
 class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val settings = Settings(app)
+    private val store = DocumentStore(app)
 
     var screen by mutableStateOf(Screen.Home)
     private var returnTo = Screen.Home
+    private var pagesReturnTo = Screen.Home
     var message by mutableStateOf<String?>(null)
 
-    // ---- crop
+    private val nativeExec = Executors.newSingleThreadExecutor { r -> Thread(r, "flatscan-native") }
+    private val nativeCtx = nativeExec.asCoroutineDispatcher()
+    /** The live session as the native thread sees it; read and written only on [nativeCtx]. */
+    private var nativeHandle = 0L
+    /** Page-size render targets (ping-pong, so the one on screen is never written); [nativeCtx] only. */
+    private val buffers = arrayOfNulls<Bitmap>(2)
+
+    // ---- document
+    /** Page ids in document order. */
+    val pages = mutableStateListOf<String>()
+    /** Bumped whenever a page's out.jpg is rewritten (thumbnail cache key). */
+    val pageVersions = mutableStateMapOf<String, Int>()
+    /** The page with the live session (result screen). */
+    var currentId by mutableStateOf<String?>(null)
+        private set
+    /** Imported images still to go through crop -> processing. */
+    val pending = mutableStateListOf<Uri>()
+    var pendingTotal by mutableIntStateOf(0)
+        private set
+    var lastSource by mutableStateOf(ImportSource.Camera)
+        private set
+
+    // ---- crop (the photo on the crop screen; may be a new page or the current one)
     var photo by mutableStateOf<Bitmap?>(null)
         private set
     var photoDisplay by mutableStateOf<Bitmap?>(null)
         private set
-    private var focalPx = 0f
     var corners by mutableStateOf(listOf<Offset>())
-    private var detected = listOf<Offset>()
-    private var detectionFailed = false
     var detecting by mutableStateOf(false)
         private set
+    private var photoPageId: String? = null
+    private var cropMeta: PageMeta? = null          // stored page being re-processed
+    private var focalPx = 0f
+    private var detected: List<Offset>? = null
     private var userRotated = false
+    private var cropRotation = 0
+    private var sourceJob: Job? = null
+    private var recropBackup: CropBackup? = null
+
+    private class CropBackup(
+        val photo: Bitmap, val display: Bitmap?, val corners: List<Offset>, val detected: List<Offset>?,
+        val userRotated: Boolean, val cropRotation: Int,
+    )
 
     // ---- processing
     var progress by mutableFloatStateOf(0f)
@@ -49,26 +105,65 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     // ---- result
-    private var handle = 0L
-    var result by mutableStateOf<Bitmap?>(null)
+    /** The live session as the UI sees it (0 = none); main thread. */
+    private var handle by mutableStateOf(0L)
+    val hasSession: Boolean get() = handle != 0L
+    private var sessionGeom: PageMeta? = null
+    var params by mutableStateOf(RenderParams())
+        private set
+    /** Protected picture rectangles, page fractions [x0, y0, x1, y1, ...]. */
+    var protect by mutableStateOf(listOf<Float>())
+        private set
+    var rotation by mutableIntStateOf(0)
+        private set
+    /** The cleaned page, unrotated (rotation is applied when drawing and on export). */
+    var page by mutableStateOf<Bitmap?>(null)
+        private set
+    var pageWidth by mutableIntStateOf(0)
+        private set
+    var pageHeight by mutableIntStateOf(0)
         private set
     var before by mutableStateOf<Bitmap?>(null)
         private set
-    var showBefore by mutableStateOf(false)
-    var grayscale by mutableStateOf(settings.grayscale)
+    var overlay by mutableStateOf<Bitmap?>(null)
         private set
-    var solid by mutableStateOf(settings.solidColors)
+    var overlayMaxPx by mutableFloatStateOf(0f)
         private set
-    var rotation by mutableIntStateOf(0)
+    var showWrinkles by mutableStateOf(false)
+        private set
+    var thumbs by mutableStateOf<Map<FilterKind, Bitmap>>(emptyMap())
+        private set
+    var histogram by mutableStateOf<IntArray?>(null)
+        private set
+    var adjustOpen by mutableStateOf(false)
         private set
     var rendering by mutableStateOf(false)
         private set
     var details by mutableStateOf("")
         private set
-    private var cleaned: Bitmap? = null
-    private var renderJob: Job? = null
+    var showHoldHint by mutableStateOf(!settings.holdHintShown)
+        private set
+
+    private data class MainKey(val h: Long, val p: RenderParams, val protect: List<Float>)
+    private var shownKey by mutableStateOf<MainKey?>(null)
+    private var thumbKey: Pair<Long, RenderParams>? = null
+    private var histKey: Pair<Long, RenderParams>? = null
+    private val wake = Channel<Boolean>(Channel.CONFLATED)
+    private var outVersion = 0
+    private var committedVersion = -1
+    private val commitMutex = Mutex()
+    private var firstRenderDetails = false
 
     val gpuInfo: String by lazy { NativeLib.gpuInfo() }
+
+    init {
+        viewModelScope.launch {
+            val order = withContext(Dispatchers.IO) { store.loadOrder().also { store.prune(it) } }
+            pages.clear()
+            pages.addAll(order)
+        }
+        viewModelScope.launch { renderLoop() }
+    }
 
     // ---- self-test / benchmark
     var selfTestRunning by mutableStateOf(false)
@@ -141,37 +236,130 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         return sb.toString()
     }
 
+    // ------------------------------------------------------------------ navigation
     fun open(s: Screen) {
-        if (s == Screen.Settings) returnTo = screen
+        when (s) {
+            Screen.Settings -> returnTo = screen
+            Screen.Pages -> {
+                pagesReturnTo = screen
+                viewModelScope.launch { commitCurrent() }   // thumbnail of the current page
+            }
+            else -> {}
+        }
         screen = s
+    }
+
+    /** Where to go when the current step is abandoned. */
+    private fun fallback(): Screen = when {
+        handle != 0L -> Screen.Result
+        pages.isNotEmpty() -> Screen.Pages
+        else -> Screen.Home
     }
 
     fun back() {
         screen = when (screen) {
-            Screen.Camera, Screen.Crop -> Screen.Home
-            Screen.Result -> Screen.Crop
+            Screen.Camera -> fallback()
+            Screen.Crop -> {
+                val b = recropBackup
+                if (b != null) {
+                    // re-crop abandoned: the session still matches the previous corners
+                    photo = b.photo
+                    photoDisplay = b.display
+                    corners = b.corners
+                    detected = b.detected
+                    userRotated = b.userRotated
+                    cropRotation = b.cropRotation
+                    recropBackup = null
+                } else {
+                    discardStaging()
+                }
+                fallback()
+            }
+            Screen.Result -> {
+                persist()
+                adjustOpen = false
+                Screen.Home
+            }
+            Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home
             Screen.Settings -> returnTo
             else -> Screen.Home
         }
     }
 
+    /** Writes the current page to disk (the activity stops, or the user leaves the page). */
+    fun persist() {
+        viewModelScope.launch { commitCurrent() }
+    }
+
     // ------------------------------------------------------------------ input
+    fun startCamera() {
+        lastSource = ImportSource.Camera
+        persist()
+        screen = Screen.Camera
+    }
+
+    /** Gallery import: every picked image becomes a page, one after the other. */
+    fun importUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        lastSource = ImportSource.Gallery
+        pending.clear()
+        pending.addAll(uris.drop(1))
+        pendingTotal = uris.size
+        persist()
+        loadUri(uris[0])
+    }
+
+    /** Index (1-based) of the next imported image, for "Next page (k of n)". */
+    val nextPendingIndex: Int get() = pendingTotal - pending.size + 1
+
+    fun nextPage() {
+        val u = pending.removeFirstOrNull() ?: return
+        persist()
+        loadUri(u)
+    }
+
     fun loadUri(uri: Uri, focalMmPerLongSide: Float = 0f) {
         viewModelScope.launch {
             detecting = true
+            recropBackup = null
+            photo = null
+            photoDisplay = null
+            corners = emptyList()
             screen = Screen.Crop
             try {
                 val p = withContext(Dispatchers.IO) { loadPhoto(getApplication(), uri, focalMmPerLongSide) }
+                discardStaging()
+                val id = store.newId()
+                photoPageId = id
+                cropMeta = null
                 usePhoto(p.bitmap)
                 focalPx = p.focalPx
                 userRotated = false
+                cropRotation = 0
+                // the upright photo is the page's source on disk (re-processing, re-crop)
+                sourceJob = viewModelScope.launch(Dispatchers.IO) {
+                    runCatching { store.saveSource(id, p.bitmap) }.onFailure { Log.e(TAG, "source save failed", it) }
+                }
                 detect()
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e(TAG, "load failed", e)
                 message = "Could not open the image"
                 detecting = false
-                screen = Screen.Home
+                screen = fallback()
             }
+        }
+    }
+
+    /** Deletes the source of a new page that never made it into the document. */
+    private fun discardStaging() {
+        val id = photoPageId ?: return
+        if (id in pages || id == currentId) return
+        photoPageId = null
+        val job = sourceJob
+        viewModelScope.launch(Dispatchers.IO) {
+            job?.join()
+            store.delete(id)
         }
     }
 
@@ -184,9 +372,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val p = photo ?: return
         detecting = true
         val c = withContext(Dispatchers.Default) { NativeLib.detect(p) }
-        detectionFailed = c == null
-        detected = if (c != null) List(4) { Offset(c[2 * it], c[2 * it + 1]) } else defaultCorners(p)
-        corners = detected
+        detected = if (c != null) List(4) { Offset(c[2 * it], c[2 * it + 1]) } else null
+        corners = detected ?: defaultCorners(p)
         detecting = false
         if (c == null) message = "Page not found - drag the corners to the page"
     }
@@ -200,8 +387,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** The user moved a corner (more than ~0.3% of the image size) -> homography path. */
     private fun cornersEdited(): Boolean {
         val p = photo ?: return false
+        val d = detected ?: return true
         val tol = 0.003f * min(p.width, p.height)
-        return detectionFailed || corners.zip(detected).any { (a, b) -> hypot(a.x - b.x, a.y - b.y) > tol }
+        return corners.zip(d).any { (a, b) -> hypot(a.x - b.x, a.y - b.y) > tol }
     }
 
     /** Rotate the photo 90 degrees clockwise (corners follow). Disables auto orientation. */
@@ -212,43 +400,252 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         // after a clockwise turn the old bottom-left corner is the new top-left
         val reorder = { l: List<Offset> -> listOf(rot(l[3]), rot(l[0]), rot(l[1]), rot(l[2])) }
         corners = reorder(corners)
-        detected = reorder(detected)
+        detected = detected?.let(reorder)
         usePhoto(p.rotatedQuarterTurns(1))
         userRotated = true
+        cropRotation = (cropRotation + 1) % 4
+    }
+
+    private fun setCrop(m: PageMeta, bmp: Bitmap) {
+        photoPageId = m.id
+        cropMeta = m
+        usePhoto(bmp)
+        corners = List(4) { Offset(m.corners[2 * it], m.corners[2 * it + 1]) }
+        detected = m.detected?.let { d -> List(4) { Offset(d[2 * it], d[2 * it + 1]) } }
+        userRotated = m.userRotated
+        cropRotation = m.cropRotation
+        focalPx = m.focalPx
+    }
+
+    /** Back to the crop screen with the current page's corners; Continue keeps all its settings. */
+    fun recrop() {
+        val id = currentId ?: return
+        val geom = currentMeta() ?: return
+        val p = photo
+        if (photoPageId == id && p != null) {
+            recropBackup = CropBackup(p, photoDisplay, corners, detected, userRotated, cropRotation)
+            screen = Screen.Crop
+            return
+        }
+        viewModelScope.launch {
+            detecting = true
+            photo = null
+            photoDisplay = null
+            screen = Screen.Crop
+            try {
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
+                discardStaging()
+                setCrop(geom, bmp)
+                recropBackup = CropBackup(bmp, photoDisplay, corners, detected, userRotated, cropRotation)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "re-crop load failed", e)
+                message = "Could not open the page"
+                screen = Screen.Result
+            } finally {
+                detecting = false
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ pages
+    /** Opens a page of the document; re-processes it from its source when its session is gone. */
+    fun openPage(id: String) {
+        if (id == currentId && handle != 0L) {
+            screen = Screen.Result
+            return
+        }
+        viewModelScope.launch {
+            screen = Screen.Processing
+            progress = 0f
+            stage = "Opening page"
+            commitCurrent()
+            try {
+                val (m, bmp) = withContext(Dispatchers.IO) {
+                    val m = store.loadMeta(id)
+                    m to store.loadSource(id).rotatedQuarterTurns(m.cropRotation)
+                }
+                discardStaging()
+                recropBackup = null
+                setCrop(m, bmp)
+                process()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "open page failed", e)
+                message = "Could not open the page"
+                screen = fallback()
+            }
+        }
+    }
+
+    fun deletePage(id: String) {
+        viewModelScope.launch {
+            if (id == currentId) closeSession()
+            if (photoPageId == id) photoPageId = null
+            pages.remove(id)
+            pageVersions.remove(id)
+            val order = pages.toList()
+            withContext(Dispatchers.IO) {
+                store.delete(id)
+                store.saveOrder(order)
+            }
+            if (pages.isEmpty() && screen == Screen.Pages) screen = Screen.Home
+        }
+    }
+
+    fun movePage(id: String, delta: Int) {
+        val i = pages.indexOf(id)
+        val j = i + delta
+        if (i < 0 || j !in pages.indices) return
+        pages[i] = pages[j]
+        pages[j] = id
+        val order = pages.toList()
+        viewModelScope.launch(Dispatchers.IO) { store.saveOrder(order) }
+    }
+
+    /** Clears the document (all pages and the live session). */
+    fun newDocument() {
+        viewModelScope.launch {
+            closeSession()
+            pages.clear()
+            pageVersions.clear()
+            pending.clear()
+            pendingTotal = 0
+            photo = null
+            photoDisplay = null
+            photoPageId = null
+            sourceJob?.join()
+            withContext(Dispatchers.IO) { store.deleteAll() }
+        }
+    }
+
+    suspend fun thumbnail(id: String): Bitmap? = withContext(Dispatchers.IO) { runCatching { store.loadThumbnail(id, 480) }.getOrNull() }
+
+    /** The rendered pages in order, for export (writes the current page first). */
+    suspend fun exportPages(): List<File> {
+        commitCurrent()
+        return pages.map { store.outputFile(it) }.filter { withContext(Dispatchers.IO) { it.exists() } }
+    }
+
+    private suspend fun closeSession() {
+        if (handle == 0L) {
+            currentId = null
+            return
+        }
+        commitCurrent()
+        handle = 0L
+        currentId = null
+        sessionGeom = null
+        resetResultState()
+        withContext(nativeCtx) {
+            if (nativeHandle != 0L) NativeLib.release(nativeHandle)
+            nativeHandle = 0L
+        }
+    }
+
+    private fun resetResultState() {
+        page = null
+        before = null
+        overlay = null
+        thumbs = emptyMap()
+        histogram = null
+        shownKey = null
+        thumbKey = null
+        histKey = null
     }
 
     // ------------------------------------------------------------------ processing
     fun process() {
         val p = photo ?: return
+        val id = photoPageId ?: return
+        if (corners.size != 4) return
         val edited = cornersEdited()
         val c = FloatArray(8) { i -> if (i % 2 == 0) corners[i / 2].x else corners[i / 2].y }
+        val geom = PageMeta(
+            id = id, corners = c, detected = detected?.let { d -> FloatArray(8) { i -> if (i % 2 == 0) d[i / 2].x else d[i / 2].y } },
+            cropRotation = cropRotation, userRotated = userRotated, focalPx = focalPx,
+            params = RenderParams(), protect = FloatArray(0), rotation = 0,
+        )
+        val same = id == currentId
+        val stored = cropMeta?.takeIf { it.id == id }
+        val defaults = settings.defaultParams()
+        val startParams = when {
+            same -> params
+            stored != null -> stored.params
+            else -> defaults
+        }
+        val startProtect = when {
+            same -> protect
+            stored != null -> stored.protect.toList()
+            else -> emptyList()
+        }
+        val startRotation = when {
+            same -> rotation
+            stored != null -> stored.rotation
+            else -> 0
+        }
+        val autoOrient = settings.autoRotate && !userRotated
+        val width = settings.outputWidth
+        val focal = focalPx
+        recropBackup = null
         screen = Screen.Processing
         progress = 0f
         stage = "Starting"
         viewModelScope.launch {
-            // a render of the previous session may still be running natively: wait, then free it
-            renderJob?.join()
-            val h = withContext(Dispatchers.Default) {
-                releaseHandle()
-                NativeLib.process(p, c, edited, focalPx, !userRotated, settings.outputWidth, true) { pct, s ->
-                    viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
+            if (!same) commitCurrent()
+            sourceJob?.join()
+            // from here on the UI no longer uses the old session; the native thread frees it
+            handle = 0L
+            resetResultState()
+            val (h, info) = withContext(nativeCtx) {
+                if (nativeHandle != 0L) NativeLib.release(nativeHandle)
+                nativeHandle = 0L
+                val hh = try {
+                    NativeLib.process(p, c, edited, focal, autoOrient, width, true) { pct, s ->
+                        viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "process failed", e)
+                    0L
                 }
+                if (hh == 0L) return@withContext 0L to JSONObject().put("ok", false).put("error", "no session")
+                val j = JSONObject(NativeLib.info(hh))
+                if (j.optBoolean("ok")) nativeHandle = hh else NativeLib.release(hh)
+                hh to j
             }
-            val info = JSONObject(NativeLib.info(h))
             if (!info.optBoolean("ok")) {
-                NativeLib.release(h)
+                currentId = null
+                sessionGeom = null
                 message = "Processing failed: ${info.optString("error")}"
                 screen = Screen.Crop
                 return@launch
             }
-            handle = h
+            val size = withContext(nativeCtx) { NativeLib.pageSize(h) }
+            pageWidth = size[0]
+            pageHeight = size[1]
+            currentId = id
+            sessionGeom = geom
+            params = startParams
+            protect = startProtect
+            rotation = startRotation
+            outVersion++
+            if (id !in pages) {
+                pages.add(id)
+                pageVersions[id] = 0
+            }
+            val order = pages.toList()
+            val meta = currentMeta()
+            withContext(Dispatchers.IO) {
+                runCatching { store.saveMeta(meta!!); store.saveOrder(order) }.onFailure { Log.e(TAG, "meta save failed", it) }
+            }
             details = describe(info, edited)
-            grayscale = settings.grayscale
-            solid = settings.solidColors
-            rotation = 0
-            showBefore = false
-            before = p.forDisplay()
-            render(final = true)
+            firstRenderDetails = true
+            handle = h
+            requestRender(false)
+            awaitRender()
+            if (screen == Screen.Processing) screen = Screen.Result
+            fetchBefore(h)
+            if (showWrinkles) fetchOverlay(h)
         }
     }
 
@@ -263,58 +660,286 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 else -> "Geometry: $mode"
             },
         )
+        if (info.has("rot")) sb.append("\nOrientation: ").append(info.optInt("rot")).append(" degrees")
         sb.append("\nResample: ").append(if (info.optBoolean("gpu_resample")) "GPU" else "CPU fallback")
         sb.append("\n").append(gpuInfo)
         val ms = info.optJSONObject("ms")
         if (ms != null) {
             sb.append("\n\nStage times (ms):")
-            for (k in ms.keys()) sb.append("\n").append(k).append(": ").append(ms.getLong(k))
+            for (k in ms.keys()) sb.append("\n").append(k).append(": ").append(ms.optLong(k))
         }
         return sb.toString()
     }
 
-    fun changeGray(v: Boolean) { if (v != grayscale) { grayscale = v; render() } }
-    fun changeSolid(v: Boolean) { if (v != solid) { solid = v; render() } }
-    fun rotateResult() {
-        rotation = (rotation + 1) % 4
-        cleaned?.let { result = it.rotatedQuarterTurns(rotation) }
-        before = before?.rotatedQuarterTurns(1)
-    }
+    private fun currentMeta(): PageMeta? =
+        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation)
 
-    private fun render(final: Boolean = false) {
-        val h = handle
-        if (h == 0L) return
-        renderJob?.cancel()
-        rendering = true
-        renderJob = viewModelScope.launch {
-            val (bmp, json) = withContext(Dispatchers.Default) {
-                val size = NativeLib.pageSize(h)
-                val b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
-                b to NativeLib.render(h, grayscale, solid, false, true, b)
+    /**
+     * Writes the current page's settings and (if it changed) its rendered output to disk.
+     * Waits for the render of the latest parameters first.
+     */
+    private suspend fun commitCurrent() = withContext(NonCancellable) {
+        commitMutex.withLock {
+            val id = currentId ?: return@withLock
+            if (id !in pages || handle == 0L) return@withLock
+            awaitRender()
+            val meta = currentMeta() ?: return@withLock
+            val v = outVersion
+            val pg = page
+            val rot = rotation
+            // copy on the native thread: no render can write the buffer meanwhile
+            val snap = if (v != committedVersion && pg != null) withContext(nativeCtx) { pg.rotatedCopy(rot) } else null
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    store.saveMeta(meta)
+                    if (snap != null) store.saveOutput(id, snap)
+                }.onFailure { Log.e(TAG, "commit failed", it) }.isSuccess
             }
-            cleaned = bmp
-            result = bmp.rotatedQuarterTurns(rotation)
-            rendering = false
-            val r = JSONObject(json)
-            if (final) details += "\ncleanup: ${r.optLong("cleanup_ms")} (" + (if (r.optInt("gpu_tone") == 1) "GPU" else "CPU") + ")"
-            if (screen == Screen.Processing) screen = Screen.Result
+            snap?.recycle()
+            if (ok && snap != null) {
+                committedVersion = v
+                pageVersions[id] = (pageVersions[id] ?: 0) + 1
+            }
         }
     }
 
-    /** The page as saved: cleaned, rotated. */
-    fun output(): Bitmap? = result
+    // ------------------------------------------------------------------ result edits
+    fun selectFilter(f: FilterKind) {
+        if (f == params.filter) return
+        params = params.copy(filter = f)
+        settings.defaultFilter = f
+        requestRender(false)
+    }
 
-    private fun releaseHandle() {
-        if (handle != 0L) NativeLib.release(handle)
-        handle = 0L
+    fun setStrength(v: Float) {
+        params = params.copy(strength = v.coerceIn(0f, 1f))
+        requestRender(true)
+    }
+
+    /** The strength slider was released: remember it for the next scan. */
+    fun strengthDone() {
+        settings.defaultStrength = params.strength
+    }
+
+    fun setSolid(v: Boolean) {
+        if (v == params.solid) return
+        params = params.copy(solid = v)
+        requestRender(false)
+    }
+
+    fun setBgCleanup(v: Float) {
+        params = params.copy(bgCleanup = v.coerceIn(0f, 1f))
+        requestRender(true)
+    }
+
+    fun setLevels(black: Float, white: Float, gamma: Float) {
+        params = params.copy(black = black.coerceIn(0f, 0.5f), white = white.coerceIn(0.5f, 1f), gamma = gamma.coerceIn(0.3f, 3f))
+        requestRender(true)
+    }
+
+    fun resetAdjustments() {
+        val d = RenderParams()
+        params = params.copy(bgCleanup = d.bgCleanup, black = d.black, white = d.white, gamma = d.gamma)
+        requestRender(false)
+    }
+
+    fun openAdjust(open: Boolean) {
+        adjustOpen = open
+        if (open) requestRender(false)    // histogram
+    }
+
+    /** Adds a protected rectangle (page fractions, any corner order). */
+    fun addProtect(x0: Float, y0: Float, x1: Float, y1: Float) {
+        val a = minOf(x0, x1).coerceIn(0f, 1f)
+        val b = minOf(y0, y1).coerceIn(0f, 1f)
+        val c = maxOf(x0, x1).coerceIn(0f, 1f)
+        val d = maxOf(y0, y1).coerceIn(0f, 1f)
+        if (c - a < 0.01f || d - b < 0.01f) return
+        protect = protect + listOf(a, b, c, d)
+        requestRender(false)
+    }
+
+    fun clearProtect() {
+        if (protect.isEmpty()) return
+        protect = emptyList()
+        requestRender(false)
+    }
+
+    fun rotateResult() {
+        rotation = (rotation + 1) % 4
+        outVersion++
+    }
+
+    fun setWrinkles(v: Boolean) {
+        showWrinkles = v
+        val h = handle
+        if (v && overlay == null && h != 0L) fetchOverlay(h)
+    }
+
+    fun holdStarted() {
+        if (showHoldHint) {
+            showHoldHint = false
+            settings.holdHintShown = true
+        }
+    }
+
+    // ------------------------------------------------------------------ rendering
+    private fun requestRender(debounce: Boolean) {
+        wake.trySend(debounce)
+    }
+
+    private fun wantedKey() = MainKey(handle, params, protect)
+
+    /** Waits (bounded) until the page on screen matches the current parameters. */
+    private suspend fun awaitRender() {
+        if (handle == 0L) return
+        requestRender(false)
+        withTimeoutOrNull(30_000) { snapshotFlow { handle == 0L || shownKey == wantedKey() }.first { it } }
+    }
+
+    private suspend fun renderLoop() {
+        for (debounce in wake) {
+            if (debounce) delay(RENDER_DEBOUNCE_MS)
+            try {
+                renderPending()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "render failed", e)
+            } finally {
+                rendering = false
+            }
+        }
+    }
+
+    /**
+     * Brings the main render, then the filter thumbnails, then (when the adjustments panel is
+     * open) the histogram up to date with the latest parameters; a change made meanwhile is
+     * picked up before the remaining lower-priority work.
+     */
+    private suspend fun renderPending() {
+        while (true) {
+            val h = handle
+            if (h == 0L) return
+            val key = wantedKey()
+            if (key != shownKey) {
+                rendering = true
+                val shown = page
+                val r = withContext(nativeCtx) {
+                    if (h != nativeHandle) return@withContext null
+                    val size = NativeLib.pageSize(h)
+                    val target = pickBuffer(size[0], size[1], shown)
+                    val json = NativeLib.render(h, key.p.toArray(), key.protect.toFloatArray(), true, target)
+                    target to json
+                } ?: return
+                if (handle != h) continue
+                page = r.first
+                shownKey = key
+                outVersion++
+                if (firstRenderDetails) {
+                    firstRenderDetails = false
+                    runCatching {
+                        val j = JSONObject(r.second)
+                        val sb = StringBuilder("\n\nRender:")
+                        for (k in j.keys()) sb.append("\n").append(k).append(": ").append(j.opt(k))
+                        details += sb.toString()
+                    }
+                }
+                continue
+            }
+            rendering = false
+            val tp = key.p.copy(filter = FilterKind.Original, solid = false)
+            if (thumbKey != (h to tp)) {
+                val tw = THUMB_W
+                val th = (THUMB_W.toFloat() * pageHeight / pageWidth.coerceAtLeast(1)).roundToInt().coerceIn(32, 4 * THUMB_W)
+                var complete = true
+                for (f in FilterKind.entries) {
+                    if (handle != h || wantedKey() != key) { complete = false; break }
+                    val b = withContext(nativeCtx) {
+                        if (h != nativeHandle) return@withContext null
+                        val t = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+                        NativeLib.renderThumb(h, key.p.copy(filter = f, solid = false).toArray(), t)
+                        t
+                    } ?: return
+                    if (handle != h) return
+                    thumbs = thumbs + (f to b)
+                }
+                if (complete) thumbKey = h to tp
+                continue
+            }
+            if (adjustOpen) {
+                val hp = key.p.copy(black = 0f, white = 1f, gamma = 1f, solid = false)
+                if (histKey != (h to hp)) {
+                    val hist = withContext(nativeCtx) { if (h == nativeHandle) NativeLib.histogram(h, hp.toArray()) else null } ?: return
+                    if (handle != h) return
+                    histogram = hist
+                    histKey = h to hp
+                    continue
+                }
+            }
+            return
+        }
+    }
+
+    /** A page-size target that is not the bitmap on screen ([nativeCtx] only). */
+    private fun pickBuffer(w: Int, h: Int, shown: Bitmap?): Bitmap {
+        for (b in buffers) if (b != null && b !== shown && b.width == w && b.height == h) return b
+        val slot = if (buffers[0] === shown) 1 else 0
+        return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+            it.setHasMipMap(true)       // smooth downscaling of the full page on screen
+            buffers[slot] = it
+        }
+    }
+
+    private fun fetchBefore(h: Long) {
+        viewModelScope.launch {
+            val b = withContext(nativeCtx) {
+                if (h != nativeHandle) return@withContext null
+                val size = NativeLib.pageSize(h)
+                Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888).also {
+                    it.setHasMipMap(true)
+                    NativeLib.renderBefore(h, it)
+                }
+            }
+            if (b != null && handle == h) before = b
+        }
+    }
+
+    private fun fetchOverlay(h: Long) {
+        viewModelScope.launch {
+            val r = withContext(nativeCtx) {
+                if (h != nativeHandle) return@withContext null
+                val size = NativeLib.pageSize(h)
+                val b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
+                b.setHasMipMap(true)
+                val top = NativeLib.renderOverlay(h, true, true, b)
+                b to top
+            }
+            if (r != null && handle == h) {
+                overlay = r.first
+                overlayMaxPx = r.second
+            }
+        }
     }
 
     override fun onCleared() {
-        releaseHandle()
+        // release on the native thread, after any render still running there
+        nativeExec.execute {
+            if (nativeHandle != 0L) NativeLib.release(nativeHandle)
+            nativeHandle = 0L
+        }
+        nativeExec.shutdown()
         super.onCleared()
     }
 
     companion object {
         const val TAG = "FlatScan"
+        const val RENDER_DEBOUNCE_MS = 120L
+        const val THUMB_W = 96
     }
+}
+
+/** A new bitmap: this one turned [q] clockwise quarter turns (a plain copy for 0). */
+fun Bitmap.rotatedCopy(q: Int): Bitmap {
+    val n = ((q % 4) + 4) % 4
+    return if (n == 0) copy(Bitmap.Config.ARGB_8888, false) else rotatedQuarterTurns(n)
 }
