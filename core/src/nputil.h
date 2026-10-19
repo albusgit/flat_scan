@@ -52,7 +52,11 @@ inline Vec polyfit(const Vec& x, const Vec& y, int deg) { return polyfit(x.data(
 
 // np.percentile(a, q) with the default 'linear' method
 double percentile(Vec a, double q);
-inline double median(const Vec& a) { return percentile(a, 50.0); }
+// np.median: middle element, or the mean of the two middle elements ((a + b) / 2)
+double median(Vec a);
+// np.sum of a contiguous float64 array (numpy's pairwise summation, 8-way unrolled blocks)
+double np_sum(const double* a, size_t n);
+inline double np_sum(const Vec& a) { return np_sum(a.data(), a.size()); }
 
 // scipy.ndimage.median_filter(a, size, mode='nearest') for 1-D input
 Vec median_filter1d_nearest(const Vec& a, int size);

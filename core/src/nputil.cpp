@@ -66,6 +66,35 @@ double percentile(Vec a, double q) {
     return t >= 0.5 ? B - d * (1 - t) : A + d * t;
 }
 
+double median(Vec a) {
+    size_t n = a.size();
+    if (n == 0) return NaN;
+    for (double v : a) if (std::isnan(v)) return NaN;
+    std::sort(a.begin(), a.end());
+    return n % 2 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2.0;
+}
+
+double np_sum(const double* a, size_t n) {
+    if (n < 8) {
+        double r = 0.;
+        for (size_t i = 0; i < n; ++i) r += a[i];
+        return r;
+    }
+    if (n <= 128) {
+        double r[8];
+        for (int j = 0; j < 8; ++j) r[j] = a[j];
+        size_t i = 8;
+        for (; i < n - (n % 8); i += 8)
+            for (int j = 0; j < 8; ++j) r[j] += a[i + j];
+        double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        for (; i < n; ++i) res += a[i];
+        return res;
+    }
+    size_t n2 = n / 2;
+    n2 -= n2 % 8;
+    return np_sum(a, n2) + np_sum(a + n2, n - n2);
+}
+
 Vec median_filter1d_nearest(const Vec& a, int size) {
     int n = (int)a.size(), h = size / 2;
     Vec out(n), w(size);
