@@ -232,9 +232,50 @@ static cv::Mat ink_counts(const cv::Mat& img, const PageParams& p) {
     return cnt;
 }
 
-cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s) {
-    if (f == Filter::Original) return img.clone();
+Adjust Adjust::clamped() const {
+    Adjust a;
+    auto cl = [](float v, float lo, float hi, float def) { return std::isfinite(v) ? std::min(hi, std::max(lo, v)) : def; };
+    a.bg_cleanup = cl(bg_cleanup, 0.f, 1.f, 0.f);
+    a.black = cl(black, 0.f, 0.5f, 0.f);
+    a.white = cl(white, 0.5f, 1.f, 1.f);
+    a.gamma = cl(gamma, 0.3f, 3.f, 1.f);
+    if (a.white - a.black < 0.02f) a.white = std::min(1.f, a.black + 0.02f);
+    return a;
+}
+
+AdjustK adjust_constants(const Adjust& a0, bool specks) {
+    Adjust a = a0.clamped();
+    AdjustK k;
+    k.levels = !a.levels_identity();
+    k.black = a.black;
+    k.inv_range = 1.f / (a.white - a.black);
+    k.inv_gamma = 1.f / a.gamma;
+    k.bg = a.bg_cleanup > 0.f;
+    float kk = 0.02f + 0.16f * a.bg_cleanup;
+    k.knee_lo = 1.f - 2.f * kk;
+    k.knee_hi = 1.f - kk;
+    k.speck_max = specks ? (k.bg ? 2 + (int)std::lround(10.f * a.bg_cleanup) : 2) : 0;
+    return k;
+}
+
+static inline void adjust_px(const AdjustK& k, float* t) {
+    if (k.levels)
+        for (int c = 0; c < 3; ++c) {
+            float u = std::min(std::max((t[c] - k.black) * k.inv_range, 0.f), 1.f);
+            t[c] = std::pow(u, k.inv_gamma);
+        }
+    if (k.bg) {
+        float l = luma(t[0], t[1], t[2]);
+        float e = std::min(std::max((l - k.knee_lo) / (k.knee_hi - k.knee_lo), 0.f), 1.f);
+        float w = e * e * (3.f - 2.f * e);
+        for (int c = 0; c < 3; ++c) t[c] = t[c] + (1.f - t[c]) * w;
+    }
+}
+
+cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, const Adjust& adj) {
+    if (f == Filter::Original && adj.identity()) return img.clone();
     Curve c = filter_curve(f, p.sigma);
+    AdjustK ak = adjust_constants(adj, c.specks);
     bool full = img.cols == p.page_w && img.rows == p.page_h;
     float sx = (float)p.page_w / img.cols, sy = (float)p.page_h / img.rows;
     cv::Mat cnt = full && c.specks ? ink_counts(img, p) : cv::Mat();
@@ -242,29 +283,34 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s) {
     for (int y = 0; y < img.rows; ++y)
         for (int x = 0; x < img.cols; ++x) {
             const uint8_t* q = img.ptr<uint8_t>(y) + 4 * x;
-            float px = full ? (float)x : (x + 0.5f) * sx - 0.5f, py = full ? (float)y : (y + 0.5f) * sy - 0.5f;
-            float v[3];
-            normalise(q, illum_at(p.illum, px, py), p.wb, v);
-            float l = luma(v[0], v[1], v[2]);
             float t[3];
-            if (c.kind == 3) {
-                float b = std::max(illum_at(p.bgv, px, py), 0.05f);
-                float r = l / b;
-                float wp = b < 0.97f ? c.wp_tint : c.wp;
-                float u = std::min(std::max((r - 0.5f) / (wp - 0.5f), 0.f), 1.f);
-                t[0] = t[1] = t[2] = std::pow(u, c.gamma);
+            if (c.kind == 0) {
+                for (int k = 0; k < 3; ++k) t[k] = (float)q[k] * (1.f / 255.f);
             } else {
-                for (int k = 0; k < 3; ++k) t[k] = curve1(c, v[k]);
+                float px = full ? (float)x : (x + 0.5f) * sx - 0.5f, py = full ? (float)y : (y + 0.5f) * sy - 0.5f;
+                float v[3];
+                normalise(q, illum_at(p.illum, px, py), p.wb, v);
+                float l = luma(v[0], v[1], v[2]);
+                if (c.kind == 3) {
+                    float b = std::max(illum_at(p.bgv, px, py), 0.05f);
+                    float r = l / b;
+                    float wp = b < 0.97f ? c.wp_tint : c.wp;
+                    float u = std::min(std::max((r - 0.5f) / (wp - 0.5f), 0.f), 1.f);
+                    t[0] = t[1] = t[2] = std::pow(u, c.gamma);
+                } else {
+                    for (int k = 0; k < 3; ++k) t[k] = curve1(c, v[k]);
+                }
+                if (!cnt.empty() && l < 0.75f) {
+                    int bi = std::min(y / 4, cnt.rows - 1), bj = std::min(x / 4, cnt.cols - 1), n = 0;
+                    for (int di = -4; di <= 4; ++di)
+                        for (int dj = -4; dj <= 4; ++dj) {
+                            int ii = bi + di, jj = bj + dj;
+                            if (ii >= 0 && ii < cnt.rows && jj >= 0 && jj < cnt.cols) n += cnt.at<uint8_t>(ii, jj);
+                        }
+                    if (n >= 1 && n <= ak.speck_max) t[0] = t[1] = t[2] = 1.f;
+                }
             }
-            if (!cnt.empty() && l < 0.75f) {
-                int bi = std::min(y / 4, cnt.rows - 1), bj = std::min(x / 4, cnt.cols - 1), n = 0;
-                for (int di = -4; di <= 4; ++di)
-                    for (int dj = -4; dj <= 4; ++dj) {
-                        int ii = bi + di, jj = bj + dj;
-                        if (ii >= 0 && ii < cnt.rows && jj >= 0 && jj < cnt.cols) n += cnt.at<uint8_t>(ii, jj);
-                    }
-                if (n >= 1 && n <= 2) t[0] = t[1] = t[2] = 1.f;
-            }
+            adjust_px(ak, t);
             if (c.gray) t[0] = t[1] = t[2] = luma(t[0], t[1], t[2]);
             uint8_t* o = out.ptr<uint8_t>(y) + 4 * x;
             for (int k = 0; k < 3; ++k) {
@@ -278,16 +324,35 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s) {
 
 cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams& p, Filter f, float strength, bool solid,
                     const std::vector<Rect01>& protect, bool use_gpu, RenderStats* st) {
+    RenderParams rp;
+    rp.filter = f; rp.strength = strength; rp.solid = solid;
+    return render_page(page, paper, p, rp, protect, use_gpu, st);
+}
+
+std::vector<int> luma_histogram(const cv::Mat& img) {
+    std::vector<int> h(256, 0);
+    for (int y = 0; y < img.rows; ++y) {
+        const uint8_t* q = img.ptr<uint8_t>(y);
+        for (int x = 0; x < img.cols; ++x, q += 4) h[std::min(255, (int)std::lrint(luma(q[0], q[1], q[2])))]++;
+    }
+    return h;
+}
+
+cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams& p, const RenderParams& rp,
+                    const std::vector<Rect01>& protect, bool use_gpu, RenderStats* st) {
     RenderStats local;
     RenderStats& s = st ? *st : local;
+    const Filter f = rp.filter;
+    const float strength = rp.strength;
     auto t0 = std::chrono::steady_clock::now();
     cv::Mat src = apply_paper(page, paper, p);
-    bool sol = solid && f != Filter::BlackWhite;
+    bool sol = rp.solid && f != Filter::BlackWhite;
     // Solid colors in Grayscale: fill in colour, then desaturate
     Filter ff = (sol && f == Filter::Grayscale) ? Filter::AutoColor : f;
     cv::Mat out;
-    s.gpu_filter = ff != Filter::Original && use_gpu && Gpu::instance().filter(src, p, ff, strength, out);
-    if (!s.gpu_filter) out = filter_cpu(src, p, ff, strength);
+    bool trivial = ff == Filter::Original && rp.adj.identity();
+    s.gpu_filter = !trivial && use_gpu && Gpu::instance().filter(src, p, ff, strength, rp.adj, out);
+    if (!s.gpu_filter) out = filter_cpu(src, p, ff, strength, rp.adj);
     s.ms_filter = ms_since(t0);
     if (sol) {
         t0 = std::chrono::steady_clock::now();

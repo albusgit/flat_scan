@@ -396,7 +396,15 @@ layout(std430, binding = 1) writeonly buffer Dst { uint px[]; };
 uniform ivec2 uOut;
 uniform int uRow0;
 uniform int uRows;
-uniform int uKind;        // 1 lighten, 2 power curve, 3 black & white
+uniform int uKind;        // 0 original (adjustments only), 1 lighten, 2 power curve, 3 black & white
+uniform int uLevels;      // levels: t = clamp((t - uBlack) * uInvRange, 0, 1)^uInvGamma
+uniform float uBlack;
+uniform float uInvRange;
+uniform float uInvGamma;
+uniform int uBg;          // background cleanup: smoothstep knee on luma(t) over [uKneeLo, uKneeHi]
+uniform float uKneeLo;
+uniform float uKneeHi;
+uniform uint uSpeckMax;
 uniform float uWp;
 uniform float uWpTint;
 uniform float uGamma;
@@ -422,27 +430,37 @@ void main() {
     if (x >= uOut.x || r >= uRows) return;
     int y = uRow0 + r;
     vec3 q = vec3(texelFetch(uSrc, ivec2(x, y), 0).rgb);
-    vec3 v = normalised(x, y);
-    float l = luma(v);
     vec3 t;
-    if (uKind == 3) {
-        float b = max(bgvAt(x, y), 0.05);
-        float wp = b < 0.97 ? uWpTint : uWp;
-        float u = clamp((l / b - 0.5) / (wp - 0.5), 0.0, 1.0);
-        t = vec3(pow(u, uGamma));
+    if (uKind == 0) {
+        t = q * (1.0 / 255.0);
     } else {
-        t = vec3(curve1(v.r), curve1(v.g), curve1(v.b));
+        vec3 v = normalised(x, y);
+        float l = luma(v);
+        if (uKind == 3) {
+            float b = max(bgvAt(x, y), 0.05);
+            float wp = b < 0.97 ? uWpTint : uWp;
+            float u = clamp((l / b - 0.5) / (wp - 0.5), 0.0, 1.0);
+            t = vec3(pow(u, uGamma));
+        } else {
+            t = vec3(curve1(v.r), curve1(v.g), curve1(v.b));
+        }
+        if (uSpecks != 0 && l < 0.75) {
+            ivec2 nq = textureSize(uCnt, 0);
+            int bi = min(y / 4, nq.y - 1), bj = min(x / 4, nq.x - 1);
+            uint n = 0u;
+            for (int di = -4; di <= 4; ++di)
+                for (int dj = -4; dj <= 4; ++dj) {
+                    int ii = bi + di, jj = bj + dj;
+                    if (ii >= 0 && ii < nq.y && jj >= 0 && jj < nq.x) n += texelFetch(uCnt, ivec2(jj, ii), 0).r;
+                }
+            if (n >= 1u && n <= uSpeckMax) t = vec3(1.0);
+        }
     }
-    if (uSpecks != 0 && l < 0.75) {
-        ivec2 nq = textureSize(uCnt, 0);
-        int bi = min(y / 4, nq.y - 1), bj = min(x / 4, nq.x - 1);
-        uint n = 0u;
-        for (int di = -4; di <= 4; ++di)
-            for (int dj = -4; dj <= 4; ++dj) {
-                int ii = bi + di, jj = bj + dj;
-                if (ii >= 0 && ii < nq.y && jj >= 0 && jj < nq.x) n += texelFetch(uCnt, ivec2(jj, ii), 0).r;
-            }
-        if (n >= 1u && n <= 2u) t = vec3(1.0);
+    if (uLevels != 0) t = pow(clamp((t - vec3(uBlack)) * uInvRange, 0.0, 1.0), vec3(uInvGamma));
+    if (uBg != 0) {
+        float e = clamp((luma(t) - uKneeLo) / (uKneeHi - uKneeLo), 0.0, 1.0);
+        float w = e * e * (3.0 - 2.0 * e);
+        t = t + (vec3(1.0) - t) * w;
     }
     if (uGray != 0) t = vec3(luma(t));
     vec3 o = clamp(q + uStrength * (t * 255.0 - q), 0.0, 255.0);
@@ -507,10 +525,11 @@ bool Gpu::background_quarter(const cv::Mat& img, cv::Mat& bg4) {
     return ok;
 }
 
-bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float strength, cv::Mat& out) {
+bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float strength, const Adjust& adj, cv::Mat& out) {
     if (!available()) return false;
     Curve c = filter_curve(f, p.sigma);
-    if (c.kind == 0) return false;
+    if (c.kind == 0 && adj.identity()) return false;
+    AdjustK ak = adjust_constants(adj, c.specks);
     std::lock_guard<std::mutex> lk(mu_);
     if (img.cols > max_tex_ || img.rows > max_tex_ || img.cols != p.page_w || img.rows != p.page_h) return false;
     if (!make_current()) return false;
@@ -545,6 +564,14 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     glUniform1f(glGetUniformLocation(prog_tone_, "uWpTint"), c.wp_tint);
     set_i(prog_tone_, "uGray", c.gray ? 1 : 0);
     set_i(prog_tone_, "uSpecks", c.specks ? 1 : 0);
+    set_i(prog_tone_, "uLevels", ak.levels ? 1 : 0);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uBlack"), ak.black);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uInvRange"), ak.inv_range);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uInvGamma"), ak.inv_gamma);
+    set_i(prog_tone_, "uBg", ak.bg ? 1 : 0);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uKneeLo"), ak.knee_lo);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uKneeHi"), ak.knee_hi);
+    glUniform1ui(glGetUniformLocation(prog_tone_, "uSpeckMax"), (GLuint)ak.speck_max);
     glUniform1f(glGetUniformLocation(prog_tone_, "uStrength"), strength);
     bool ok = run_banded(prog_tone_, img.cols, img.rows, out);
     GLuint ts[4] = {tsrc, till, tbgv, tcnt};

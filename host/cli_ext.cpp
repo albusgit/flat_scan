@@ -192,6 +192,7 @@ static int cmd_scan(int argc, char** argv) {
 }
 
 // render PAGE.png OUTDIR [--paper PAPER.png] [--filters 0,1,2,3,4,5] [--strength 0.7] [--solid] [--cpu]
+//        [--bg 0..1] [--black 0..0.5] [--white 0.5..1] [--gamma 0.3..3]
 // writes OUTDIR/f<k>.png per filter and prints GPU vs CPU differences and timings
 static int cmd_render(int argc, char** argv) {
     cv::Mat in = cv::imread(argv[2], cv::IMREAD_COLOR), page;
@@ -203,9 +204,14 @@ static int cmd_render(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--paper")) paper = cv::imread(argv[i + 1], cv::IMREAD_GRAYSCALE);
     float strength = 0.7f;
     std::string fl = "0,1,2,3,4,5";
+    Adjust adj;
     for (int i = 0; i + 1 < argc; ++i) {
         if (!std::strcmp(argv[i], "--strength")) strength = (float)std::atof(argv[i + 1]);
         if (!std::strcmp(argv[i], "--filters")) fl = argv[i + 1];
+        if (!std::strcmp(argv[i], "--bg")) adj.bg_cleanup = (float)std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--black")) adj.black = (float)std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--white")) adj.white = (float)std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--gamma")) adj.gamma = (float)std::atof(argv[i + 1]);
     }
     bool solid = flag(argc, argv, "--solid"), gpu = !flag(argc, argv, "--cpu");
     PageParams pp = page_params(page, gpu);
@@ -216,8 +222,10 @@ static int cmd_render(int argc, char** argv) {
         int k = fl[i] - '0';
         Filter f = (Filter)k;
         RenderStats sg, sc;
-        cv::Mat og = render_page(page, paper, pp, f, strength, solid, {}, gpu, &sg);
-        cv::Mat oc = render_page(page, paper, pp, f, strength, solid, {}, false, &sc);
+        RenderParams rp;
+        rp.filter = f; rp.strength = strength; rp.solid = solid; rp.adj = adj;
+        cv::Mat og = render_page(page, paper, pp, rp, {}, gpu, &sg);
+        cv::Mat oc = render_page(page, paper, pp, rp, {}, false, &sc);
         cv::Mat d;
         cv::absdiff(og, oc, d);
         double mx;
