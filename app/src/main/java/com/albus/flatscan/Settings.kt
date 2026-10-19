@@ -1,6 +1,14 @@
 package com.albus.flatscan
 
 import android.content.Context
+import android.text.TextUtils
+import android.view.View
+
+/** Compile-time defaults of feature flags (each can be changed in Settings). */
+object Features {
+    /** The page-finder net (assets/models/pagefinder.onnx); off: the colour-threshold paper mask. */
+    const val PAGE_FINDER_NET = true
+}
 
 /** User settings and remembered choices (SharedPreferences). */
 class Settings(ctx: Context) {
@@ -34,6 +42,23 @@ class Settings(ctx: Context) {
     var outputWidth: Int
         get() = p.getInt("output_width", 1600)
         set(v) = p.edit().putInt("output_width", v).apply()
+
+    /** Feature flag: find the page with the net (falls back to the colour threshold if it cannot run). */
+    var pageFinderNet: Boolean
+        get() = p.getBoolean("page_finder_net", Features.PAGE_FINDER_NET)
+        set(v) = p.edit().putBoolean("page_finder_net", v).apply()
+
+    /** Show the crop screen for every page; otherwise only doubtful crops (quality gate) stop there. */
+    var reviewCrops: Boolean
+        get() = p.getBoolean("review_crops", false)
+        set(v) = p.edit().putBoolean("review_crops", v).apply()
+
+    /** Book spreads: the right page comes first (Hebrew, Arabic). Default: from the app language. */
+    var bookRightToLeft: Boolean
+        get() = if (p.contains("book_rtl")) p.getBoolean("book_rtl", false) else appLanguageRtl
+        set(v) = p.edit().putBoolean("book_rtl", v).apply()
+
+    private val appLanguageRtl = TextUtils.getLayoutDirectionFromLocale(ctx.resources.configuration.locales[0]) == View.LAYOUT_DIRECTION_RTL
 
     /** The one-time "Press and hold to see the original" hint was dismissed. */
     var holdHintShown: Boolean

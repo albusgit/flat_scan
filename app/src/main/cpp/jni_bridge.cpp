@@ -20,6 +20,7 @@
 #include "log.h"
 #include "npz.h"
 #include "overlay.h"
+#include "pagefind.h"
 #include "pipeline.h"
 
 using namespace fs;
@@ -153,6 +154,39 @@ std::vector<Rect01> parse_protect(JNIEnv* env, jfloatArray a) {
     return r;
 }
 
+// page-finder logits (2 x 256 x 256) from a Java float[]; empty when absent or the wrong size
+std::vector<float> read_logits(JNIEnv* env, jfloatArray a) {
+    std::vector<float> v;
+    if (!a || env->GetArrayLength(a) != SEG_OUTPUT_LEN) return v;
+    v.resize(SEG_OUTPUT_LEN);
+    env->GetFloatArrayRegion(a, 0, SEG_OUTPUT_LEN, v.data());
+    return v;
+}
+
+std::string json_num(double v) {
+    if (!std::isfinite(v)) return "null";
+    std::ostringstream f;
+    f << v;
+    return f.str();
+}
+
+std::string json_strings(const std::vector<std::string>& v) {
+    std::string o = "[";
+    for (size_t i = 0; i < v.size(); ++i) o += (i ? ", \"" : "\"") + escape(v[i]) + "\"";
+    return o + "]";
+}
+
+// finder fields shared by detect() and info()
+std::string finder_json(const PageCorners& pc) {
+    std::ostringstream f;
+    f << "\"finder\": \"" << (pc.finder == Finder::Net ? "net" : "colour_threshold") << "\", \"n_pages\": " << pc.n_pages
+      << ", \"page_index\": " << pc.page_index << ", \"whole_frame\": " << (pc.whole_frame ? "true" : "false")
+      << ", \"spread\": " << (pc.spread ? "true" : "false") << ", \"net_margin\": " << json_num(pc.net_margin)
+      << ", \"edge_strength\": " << json_num(pc.edge_strength) << ", \"edge_at_limit\": " << json_num(pc.edge_at_limit)
+      << ", \"centroid\": [" << json_num(pc.centroid.x) << ", " << json_num(pc.centroid.y) << "]";
+    return f.str();
+}
+
 struct Progress {
     JNIEnv* env;
     jobject listener;
@@ -182,28 +216,49 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env,
     return env->NewStringUTF(s.c_str());
 }
 
-// -> float[8] corners TL, TR, BR, BL in bitmap pixels, or null if no page was found
-JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, jclass, jobject bmp) {
+// segnet.to_input of the whole photo: float[3 * 256 * 256] (NCHW, ImageNet-normalised RGB), or null
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_segInput(JNIEnv* env, jclass, jobject bmp) {
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
     if (bgr.empty()) return nullptr;
-    PageCorners pc;
+    std::vector<float> x = seg_input(bgr);
+    jfloatArray a = env->NewFloatArray((jsize)x.size());
+    env->SetFloatArrayRegion(a, 0, (jsize)x.size(), x.data());
+    return a;
+}
+
+// -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
+//    "ok", "fit_median_px", "needs_manual_crop": [reasons], finder fields}, ...]} (2 pages: book spread)
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,
+                                                                   jfloat focal_px) {
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    if (bgr.empty()) return env->NewStringUTF("{\"ok\": false, \"error\": \"could not read the photo bitmap\", \"pages\": []}");
+    std::vector<float> lg = read_logits(env, logits);
+    std::vector<PageAssessment> pages;
     try {
-        pc = detect_corners(bgr);
+        pages = assess_pages(bgr, lg.empty() ? nullptr : lg.data(), focal_px);
     } catch (const std::exception& e) {
         LOGI("detect failed: %s", e.what());
-        return nullptr;
+        return env->NewStringUTF((std::string("{\"ok\": false, \"error\": \"") + escape(e.what()) + "\", \"pages\": []}").c_str());
     }
-    if (!pc.ok) return nullptr;
-    jfloat v[8];
-    for (int k = 0; k < 4; ++k) { v[2 * k] = (jfloat)pc.pts[k].x; v[2 * k + 1] = (jfloat)pc.pts[k].y; }
-    jfloatArray a = env->NewFloatArray(8);
-    env->SetFloatArrayRegion(a, 0, 8, v);
-    return a;
+    std::ostringstream f;
+    bool any = false;
+    for (auto& a : pages) any |= a.pc.ok;
+    f << "{\"ok\": " << (any ? "true" : "false") << ", \"error\": \"" << (any ? "" : "no page found") << "\", \"pages\": [";
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const PageAssessment& a = pages[i];
+        f << (i ? ", " : "") << "{\"ok\": " << (a.pc.ok ? "true" : "false") << ", \"corners\": [";
+        for (int k = 0; k < 4; ++k) f << (k ? ", " : "") << json_num(a.pc.pts[k].x) << ", " << json_num(a.pc.pts[k].y);
+        f << "], \"fit_median_px\": " << json_num(a.fit_median_px) << ", \"needs_manual_crop\": " << json_strings(a.reasons) << ", "
+          << finder_json(a.pc) << "}";
+    }
+    f << "]}";
+    return env->NewStringUTF(f.str().c_str());
 }
 
 JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, jclass, jobject bmp, jfloatArray corners,
                                                                   jboolean edited, jfloat focal_px, jboolean auto_orient,
-                                                                  jint render_w, jboolean use_gpu, jobject listener) {
+                                                                  jint render_w, jboolean use_gpu, jfloatArray logits,
+                                                                  jint page_index, jboolean force_homography, jobject listener) {
     auto s = std::make_unique<Session>();
     PipelineResult& r = s->result;
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
@@ -221,6 +276,10 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         o.corners_edited = false;
     }
     o.focal_px = focal_px;
+    std::vector<float> lg = read_logits(env, logits);
+    o.seg_logits = lg.empty() ? nullptr : lg.data();
+    o.page_index = page_index;
+    o.force_homography = force_homography;
     o.auto_orient = auto_orient;
     o.render_w = render_w;
     o.use_gpu = use_gpu;
@@ -255,7 +314,11 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
     f << "{\"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << escape(r.error) << "\", \"mode\": \""
       << (r.mode == GeomMode::Surface ? "surface" : "homography") << "\", \"fell_back\": " << (r.fell_back ? "true" : "false")
       << ", \"fit_median_px\": " << r.fit_median_px << ", \"rot\": " << r.rot << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false")
-      << ", \"legend_px\": " << s->legend_px << ", \"has_paper_mask\": " << (r.paper.empty() ? "false" : "true") << ", \"ms\": {";
+      << ", \"legend_px\": " << s->legend_px << ", \"has_paper_mask\": " << (r.paper.empty() ? "false" : "true")
+      << ", \"needs_manual_crop\": " << json_strings(r.needs_manual_crop)
+      << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1);
+    if (r.detection.ok) f << ", " << finder_json(r.detection);
+    f << ", \"ms\": {";
     for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << escape(r.ms[i].first) << "\": " << (long)r.ms[i].second;
     f << "}}";
     return env->NewStringUTF(f.str().c_str());

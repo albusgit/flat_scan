@@ -43,21 +43,37 @@ object NativeLib {
     /** Which backend the heavy image passes use, with the GLES driver string. */
     @JvmStatic external fun gpuInfo(): String
 
-    /** Page corners TL, TR, BR, BL as [x0, y0, ... x3, y3] in bitmap pixels, or null. */
-    @JvmStatic external fun detect(photo: Bitmap): FloatArray?
+    /**
+     * Input of the page-finder net for this photo (seg/segnet.py to_input): the whole photo squashed
+     * to 256 x 256, RGB, ImageNet-normalised, NCHW float[3 * 256 * 256]; null if unreadable.
+     */
+    @JvmStatic external fun segInput(photo: Bitmap): FloatArray?
+
+    /**
+     * Page detection for the crop screen. logits: the page-finder net's output for this photo
+     * (float[2 * 256 * 256]) or null for the colour-threshold detector. JSON: ok, error, pages
+     * (1, or 2 for a book spread): [{ok, corners [x0, y0 ... x3, y3] (TL TR BR BL, bitmap px),
+     * fit_median_px, needs_manual_crop [quality-gate reasons], finder, n_pages, page_index,
+     * whole_frame, spread, net_margin, edge_strength, edge_at_limit, centroid [x, y]}].
+     */
+    @JvmStatic external fun detect(photo: Bitmap, logits: FloatArray?, focalPx: Float): String
 
     /**
      * Runs the whole pipeline; returns a session handle (release it with [release]).
-     * autoOrient: 0/90/180/270 decision (180 only when the cue is confident).
+     * autoOrient: sideways pages are turned upright (no automatic 180-degree turn).
+     * logits / pageIndex: page-finder output (null: colour threshold) and the page of a book spread.
+     * forceHomography: the quality gate flagged the crop, use the homography path.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
-        autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, listener: ProgressListener?,
+        autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
+        forceHomography: Boolean, listener: ProgressListener?,
     ): Long
 
     /**
      * JSON: ok, error, mode, fell_back, fit_median_px, rot, gpu_resample, legend_px (wrinkle
-     * map scale top, px), has_paper_mask, per-stage ms.
+     * map scale top, px), has_paper_mask, needs_manual_crop, fit_median_full_px, the finder
+     * fields of [detect] (when detection ran), per-stage ms.
      */
     @JvmStatic external fun info(handle: Long): String
 

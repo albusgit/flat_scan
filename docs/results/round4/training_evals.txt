@@ -1,0 +1,12 @@
+EVAL step 500 real mIoU 0.9436 IoU<0.9: 5
+EVAL step 1000 real mIoU 0.9244 IoU<0.9: 7
+EVAL step 1500 real mIoU 0.9466 IoU<0.9: 4
+EVAL step 2000 real mIoU 0.9209 IoU<0.9: 8
+EVAL step 2500 real mIoU 0.9370 IoU<0.9: 7
+EVAL step 3000 real mIoU 0.9338 IoU<0.9: 5
+EVAL step 3500 real mIoU 0.9331 IoU<0.9: 9
+EVAL step 4000 real mIoU 0.9269 IoU<0.9: 6
+EVAL step 4500 real mIoU 0.9386 IoU<0.9: 6
+EVAL step 5000 real mIoU 0.9395 IoU<0.9: 5
+EVAL step 5500 real mIoU 0.9406 IoU<0.9: 5
+EVAL step 6000 real mIoU 0.9406 IoU<0.9: 5

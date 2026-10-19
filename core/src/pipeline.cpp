@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <thread>
 
 #include "gpu.h"
@@ -194,19 +195,126 @@ inline cv::Point2d rotate_pt(double x, double y, int W, int H, int rot) {
 
 }  // namespace
 
-PageCorners detect_corners(const cv::Mat& photo, int max_side) {
-    PageCorners pc;
+namespace {
+
+// the analysis copy the corner fit and the surface fit run on
+cv::Mat analysis_copy(const cv::Mat& photo, int max_side) {
     double s = std::min(1.0, (double)max_side / std::max(photo.cols, photo.rows));
     cv::Mat small = photo;
     if (s < 1.0) cv::resize(photo, small, cv::Size((int)std::lround(photo.cols * s), (int)std::lround(photo.rows * s)), 0, 0, cv::INTER_AREA);
+    return small;
+}
+
+// corners of page `idx` from the net finder's result (f) or, without it, the colour threshold
+PageCorners make_corners(const cv::Mat& photo, const cv::Mat& small, const PageFindResult* f, int idx) {
+    PageCorners pc;
     NpRng rng = NpRng::seed0();
-    pc.det = detect_page(small, rng);
-    pc.ok = pc.det.ok;
     pc.scale = (double)small.cols / photo.cols;
     double kx = (double)photo.cols / small.cols, ky = (double)photo.rows / small.rows;
+    bool scaled = small.cols != photo.cols || small.rows != photo.rows;
+    if (f) {
+        pc.finder = Finder::Net;
+        pc.n_pages = (int)f->pages.size();
+        pc.page_index = std::min(std::max(idx, 0), pc.n_pages - 1);
+        pc.whole_frame = f->whole_frame;
+        pc.spread = f->spread;
+        pc.net_margin = f->net_margin;
+        const FoundPage& fp = f->pages[pc.page_index];
+        pc.edge_strength = fp.edge_strength;
+        pc.edge_at_limit = fp.edge_at_limit;
+        Detection& D = pc.det;
+        D.whole_frame = f->whole_frame;
+        std::vector<std::vector<cv::Point>> poly(1);
+        cv::Point2d sum(0, 0);
+        for (const auto& p : fp.contour) {
+            cv::Point2d q = scaled ? cv::Point2d((p.x + 0.5) / kx - 0.5, (p.y + 0.5) / ky - 0.5) : p;
+            D.contour.push_back(q);
+            poly[0].emplace_back((int)std::lround(q.x * 4), (int)std::lround(q.y * 4));
+            sum += p;
+        }
+        if (!fp.contour.empty()) pc.centroid = sum / (double)fp.contour.size();
+        D.paper = cv::Mat::zeros(small.size(), CV_8U);
+        if (!poly[0].empty()) cv::fillPoly(D.paper, poly, cv::Scalar(255), cv::LINE_8, 2);
+        corners_from_contour(D, rng);
+    } else {
+        pc.det = detect_page(small, rng);
+        pc.whole_frame = pc.det.whole_frame;
+        cv::Point2d sum(0, 0);
+        for (const auto& q : pc.det.contour) sum += q;
+        if (!pc.det.contour.empty()) {
+            cv::Point2d c = sum / (double)pc.det.contour.size();
+            pc.centroid = scaled ? cv::Point2d((c.x + 0.5) * kx - 0.5, (c.y + 0.5) * ky - 0.5) : c;
+        }
+    }
+    pc.ok = pc.det.ok;
     for (int k = 0; k < 4; ++k)
-        pc.pts[k] = s < 1.0 ? cv::Point2d((pc.det.corners[k].x + 0.5) * kx - 0.5, (pc.det.corners[k].y + 0.5) * ky - 0.5) : pc.det.corners[k];
+        pc.pts[k] = scaled ? cv::Point2d((pc.det.corners[k].x + 0.5) * kx - 0.5, (pc.det.corners[k].y + 0.5) * ky - 0.5) : pc.det.corners[k];
     return pc;
+}
+
+SurfaceModel fit_detected(const cv::Mat& photo, const PageCorners& pc, double focal_px) {
+    const Detection& D = pc.det;
+    double f_low = focal_px > 0 ? focal_px * pc.scale : 0;
+    int sw = (int)std::lround(photo.cols * pc.scale), sh = (int)std::lround(photo.rows * pc.scale);
+    if (pc.scale >= 1.0) { sw = photo.cols; sh = photo.rows; }
+    int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    return fit_surface(D.side_pts, D.corners, sw, sh, D.landscape, f_low, threads);
+}
+
+std::string fmt0(const char* f, double v) {
+    char b[96];
+    std::snprintf(b, sizeof b, f, v);
+    return b;
+}
+
+}  // namespace
+
+PageCorners detect_corners(const cv::Mat& photo, int max_side, const float* seg_logits, int page_index) {
+    cv::Mat small = analysis_copy(photo, max_side);
+    if (!seg_logits) return make_corners(photo, small, nullptr, 0);
+    PageFindResult f = find_page_net(photo, seg_logits);
+    return make_corners(photo, small, &f, page_index);
+}
+
+std::vector<std::string> quality_gate(const PageCorners& pc, double fit_median_full_px, cv::Size photo) {
+    const int h = photo.height, w = photo.width;
+    std::vector<std::string> reasons;
+    if (fit_median_full_px > 15) reasons.push_back(fmt0("surface fit residual %.0f px", fit_median_full_px));
+    bool outside = false;
+    for (const auto& c : pc.pts) {
+        double o = std::max(std::max(-c.x, c.x - w), std::max(-c.y, c.y - h));
+        outside |= o > 0.02 * std::max(h, w);
+    }
+    if (outside) reasons.push_back("corner outside the photo");
+    std::vector<cv::Point2f> q;
+    for (const auto& c : pc.pts) q.emplace_back((float)c.x, (float)c.y);
+    double area = cv::contourArea(q) / ((double)h * w);
+    if (area < 0.05 || area > 1.2) reasons.push_back(fmt0("page area %.0f%% of the photo", 100 * area));
+    // the reference only reports a fallback for the net finder (info['fallback'] == 'whole_frame')
+    if (pc.finder == Finder::Net && pc.whole_frame) reasons.push_back("no page found");
+    return reasons;
+}
+
+std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_logits, double focal_px, int max_side) {
+    cv::Mat small = analysis_copy(photo, max_side);
+    PageFindResult f;
+    if (seg_logits) f = find_page_net(photo, seg_logits);
+    int n = seg_logits ? (int)f.pages.size() : 1;
+    std::vector<PageAssessment> out;
+    for (int i = 0; i < n; ++i) {
+        PageAssessment a;
+        a.pc = make_corners(photo, small, seg_logits ? &f : nullptr, i);
+        if (!a.pc.ok) {
+            a.reasons.push_back("no page found");
+        } else {
+            SurfaceModel m = fit_detected(photo, a.pc, focal_px);
+            a.fit_median_px = m.ok ? m.median_px / a.pc.scale : -1;
+            a.reasons = quality_gate(a.pc, a.fit_median_px, photo.size());
+            if (!m.ok) a.reasons.push_back("surface fit failed");
+        }
+        out.push_back(std::move(a));
+    }
+    return out;
 }
 
 PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
@@ -217,7 +325,8 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     std::array<cv::Point2d, 4> corners;
     PageCorners pc;
     if (!opt.corners_edited) {
-        pc = detect_corners(photo, opt.max_analysis_side);
+        pc = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
+        r.detection = pc;
         if (!pc.ok) { r.error = "no page found"; return r; }
         corners = pc.pts;
     } else {
@@ -242,19 +351,21 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     if (!opt.corners_edited) {
         t0 = Clock::now();
         report(opt, 8, "Fitting the page surface");
-        const Detection& D = pc.det;
-        double f_low = opt.focal_px > 0 ? opt.focal_px * pc.scale : 0;
-        int sw = (int)std::lround(photo.cols * pc.scale), sh = (int)std::lround(photo.rows * pc.scale);
-        if (pc.scale >= 1.0) { sw = photo.cols; sh = photo.rows; }
-        int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-        r.model = fit_surface(D.side_pts, D.corners, sw, sh, D.landscape, f_low, threads);
+        r.model = fit_detected(photo, pc, opt.focal_px);
         r.ms.emplace_back("surface fit", ms_since(t0));
         r.fit_median_px = r.model.median_px;
         r.fit_p90_px = r.model.p90_px;
-        if (r.model.ok && r.model.median_px <= opt.surface_fallback_px) {
+        // quality gate (photo_pipeline.quality_gate, residual in full-resolution px): a doubtful
+        // crop takes the homography path; the app shows it on the crop screen first
+        r.needs_manual_crop = quality_gate(pc, r.model.ok ? r.model.median_px / pc.scale : -1, photo.size());
+        if (!r.model.ok) r.needs_manual_crop.push_back("surface fit failed");
+        bool trusted = r.needs_manual_crop.empty() && !opt.force_homography;
+        if (r.model.ok && r.model.median_px <= opt.surface_fallback_px && trusted) {
             U.mode = GeomMode::Surface;
             U.m = r.model;
             U.scaled = pc.scale < 1.0;
+            int sw = (int)std::lround(photo.cols * pc.scale), sh = (int)std::lround(photo.rows * pc.scale);
+            if (pc.scale >= 1.0) { sw = photo.cols; sh = photo.rows; }
             U.kx = (double)photo.cols / sw;
             U.ky = (double)photo.rows / sh;
             r.mode = GeomMode::Surface;
@@ -290,7 +401,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     // paper mask: from this run's detection, or - when the corners were edited - from a fresh
     // detection if its corners agree with the user's (otherwise the outline is not trusted)
     if (opt.corners_edited) {
-        PageCorners pd = detect_corners(photo, opt.max_analysis_side);
+        PageCorners pd = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
         double diag = std::hypot(photo.cols, photo.rows), worst = 0;
         for (int k = 0; k < 4 && pd.ok; ++k) worst = std::max(worst, cv::norm(pd.pts[k] - corners[k]));
         if (pd.ok && worst < 0.03 * diag) pc = pd;

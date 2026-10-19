@@ -24,6 +24,9 @@ data class PageMeta(
     val params: RenderParams,
     val protect: FloatArray,
     val rotation: Int,               // quarter turns of the result (applied to the output)
+    val pageIndex: Int = 0,          // page of a book spread in the source photo (0 = the larger one)
+    val forceHomography: Boolean = false,   // the quality gate flagged the automatic crop
+    val spreadWith: String? = null,  // the other page of the same book spread
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -43,6 +46,9 @@ data class PageMeta(
         })
         put("protect", protect.toJson())
         put("rotation", rotation)
+        put("page_index", pageIndex)
+        put("force_homography", forceHomography)
+        if (spreadWith != null) put("spread_with", spreadWith)
     }
 
     companion object {
@@ -67,6 +73,9 @@ data class PageMeta(
                 ),
                 protect = j.optJSONArray("protect")?.toFloats() ?: FloatArray(0),
                 rotation = j.optInt("rotation"),
+                pageIndex = j.optInt("page_index"),
+                forceHomography = j.optBoolean("force_homography"),
+                spreadWith = j.optString("spread_with").ifEmpty { null },
             )
         }
 
@@ -111,6 +120,14 @@ class DocumentStore(ctx: Context) {
     fun saveSource(id: String, photo: Bitmap) {
         dir(id).mkdirs()
         writeJpeg(photo, sourceFile(id))
+    }
+
+    /** The other page of a book spread shares its photo: a copy of [from]'s source. */
+    fun copySource(from: String, to: String) {
+        dir(to).mkdirs()
+        val tmp = File(dir(to), "source.jpg.tmp")
+        sourceFile(from).copyTo(tmp, overwrite = true)
+        if (!tmp.renameTo(sourceFile(to))) error("cannot write source of $to")
     }
 
     fun loadSource(id: String): Bitmap {

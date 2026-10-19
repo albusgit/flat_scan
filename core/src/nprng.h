@@ -3,22 +3,54 @@
 // points (warpmap.global_grid) with np.random.default_rng(0); matching those draws keeps
 // the port on the same inlier sets and control points as Python.
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <vector>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 
 namespace fs {
+
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC has no unsigned __int128: the few 128-bit operations PCG64 needs (desktop check tools only)
+struct U128 {
+    uint64_t lo = 0, hi = 0;
+    U128() = default;
+    U128(uint64_t v) : lo(v) {}
+    U128(uint64_t h, uint64_t l) : lo(l), hi(h) {}
+    friend U128 operator*(U128 a, U128 b) {
+        uint64_t h, l = _umul128(a.lo, b.lo, &h);
+        return U128(h + a.lo * b.hi + a.hi * b.lo, l);
+    }
+    friend U128 operator+(U128 a, U128 b) {
+        uint64_t l = a.lo + b.lo;
+        return U128(a.hi + b.hi + (l < a.lo), l);
+    }
+    U128 operator>>(unsigned s) const {
+        if (s == 0) return *this;
+        if (s >= 64) return U128(0, hi >> (s - 64));
+        return U128(hi >> s, (lo >> s) | (hi << (64 - s)));
+    }
+    explicit operator uint64_t() const { return lo; }
+    explicit operator unsigned() const { return (unsigned)lo; }
+};
+inline U128 u128(uint64_t hi, uint64_t lo) { return U128(hi, lo); }
+#else
+using U128 = unsigned __int128;
+inline U128 u128(uint64_t hi, uint64_t lo) { return ((U128)hi << 64) | lo; }
+#endif
 
 class NpRng {
 public:
     // State of np.random.default_rng(0) (SeedSequence(0) -> PCG64), read from numpy 2.2.
     static NpRng seed0() {
-        return NpRng(((unsigned __int128)0x1aa1b5345996452dULL << 64) | 0x09585eb7a69561e3ULL,
-                     ((unsigned __int128)0x418ddadb3af71a82ULL << 64) | 0x588133bc447873a9ULL);
+        return NpRng(u128(0x1aa1b5345996452dULL, 0x09585eb7a69561e3ULL), u128(0x418ddadb3af71a82ULL, 0x588133bc447873a9ULL));
     }
-    NpRng(unsigned __int128 state, unsigned __int128 inc) : state_(state), inc_(inc) {}
+    NpRng(U128 state, U128 inc) : state_(state), inc_(inc) {}
 
     uint64_t next_u64() {
-        static const unsigned __int128 MULT = ((unsigned __int128)2549297995355413924ULL << 64) | 4865540595714422341ULL;
+        static const U128 MULT = u128(2549297995355413924ULL, 4865540595714422341ULL);
         state_ = state_ * MULT + inc_;
         uint64_t hi = (uint64_t)(state_ >> 64), lo = (uint64_t)state_;
         unsigned rot = (unsigned)(state_ >> 122);
@@ -93,16 +125,16 @@ private:
         }
         // 64-bit Lemire (not reached for the population sizes used here)
         uint64_t rng_excl = rng + 1;
-        unsigned __int128 m = (unsigned __int128)next_u64() * rng_excl;
+        U128 m = U128(next_u64()) * rng_excl;
         uint64_t left = (uint64_t)m;
         if (left < rng_excl) {
             uint64_t thr = (UINT64_MAX - rng) % rng_excl;
-            while (left < thr) { m = (unsigned __int128)next_u64() * rng_excl; left = (uint64_t)m; }
+            while (left < thr) { m = U128(next_u64()) * rng_excl; left = (uint64_t)m; }
         }
         return (uint64_t)(m >> 64);
     }
 
-    unsigned __int128 state_, inc_;
+    U128 state_, inc_;
     bool has_u32_ = false;
     uint32_t buf_u32_ = 0;
 };

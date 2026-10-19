@@ -6,8 +6,8 @@ saves or shares it as JPG or PDF. The C++ core is a line-by-line port of the ref
 experimental option off: `UNWARP_PROP_*`, `UNWARP_LSD` and `UNWARP_R3_*`. The same core also builds
 on Linux as a test harness. That harness produced all the parity numbers below.
 
-**Debug APK:** `dist/flatscan-debug.apk` (arm64-v8a, minSdk 26, 34 MB).
-It has **not been run on a phone or an emulator** (see [Not done / not verified](#not-done--not-verified-on-a-real-phone)).
+**Debug APK:** `dist/flatscan-debug.apk` (arm64-v8a, minSdk 26, 54 MB: includes the 12.6 MB page-finder model and ONNX Runtime).
+It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 15 emulator (CPU paths only; see [Not done / not verified](#not-done--not-verified-on-a-real-phone)).
 
 ## Result screen features (v2)
 
@@ -23,12 +23,73 @@ It has **not been run on a phone or an emulator** (see [Not done / not verified]
 - **Zoom:** pinch from 1x to 6x, pan, and double tap.
 - **Wrinkle map:** a switch in the menu, off by default. It shows a heat map and grid of how far each area was moved, with a legend in px.
 - **Re-crop:** goes back to the crop screen and keeps the corners, filter and adjustments.
-- **Missing corners and gaps:** filled with clean paper using a soft-edged paper mask.
+- **Missing corners and gaps:** filled with clean paper using a soft-edged paper mask. Only thin slivers along the page outline are filled; thicker non-paper areas (pictures, colour bands or shadowed text that reach the page edge) are kept.
+- **Pictures and colour are kept:** the inside of grey or dark photos and grey cells is not taken for paper, so it is not flattened to white; speck removal skips light strokes (coloured text) and anything not on white paper; background cleanup only whitens near-neutral pixels; B&W keeps the tones of dark and saturated areas; Solid colors leaves photos and gradients with large darker areas alone.
 - **Multiple pages:**
   - Import several images from the gallery.
   - The Pages screen reorders, deletes and adds pages.
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
-- **Orientation:** pages are turned 180° only when the upright cue is confident (score below -0.2). This fixes the upside-down results: the bench pages scored -0.03 and -0.07, were turned 180° before, and now stay upright. The Auto-rotate setting turns this off.
+- **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
+
+## Round 4: robustness on real photos
+
+What changed (brief: `round4_robustness/README_FOR_APP_AGENT.md`; reference: its `code/` and `seg/`):
+
+1. **Crash fixes** (C++ ports of the reference fixes):
+   - `paper_mask` (`core/src/corners.cpp`): white neutral, then above Otsu with low chroma, then above Otsu; the first whose largest component covers 10-99% of the frame; else the whole frame inset 2 px.
+   - Global stage (`warpmap.cpp`): fewer than 20 control points skip it (identity), as do exceptions in line detection.
+   - Local stage: no horizontal or no vertical lines give a zero field (text rows are skipped too, as in the reference).
+2. **Orientation:** no automatic 180°; sideways detection kept; one-tap **Turn 180°** on the result screen.
+3. **Quality gate** (`quality_gate` in `pipeline.cpp`, the reference rules): surface-fit median residual above 15 px (in full-resolution px), a corner more than 2% outside the photo, page area below 5% or above 120%, or the net found no page.
+   - A trusted crop goes straight from import or capture to the result.
+   - A doubtful crop opens the crop screen with the detected quad and the reasons ("Check the crop: ...") and uses the homography path, even if the corners are kept.
+   - Settings > *Check every crop* restores the old always-show-the-crop-screen flow.
+4. **Page finder** (`core/src/pagefind.{h,cpp}`, `PageFinder.kt`): `assets/models/pagefinder.onnx` runs on ONNX Runtime Android 1.22.0. The core makes its input (`segnet.to_input`) and ports `pagefind.py`:
+   - bicubic logits and sigmoid at 1000 px;
+   - `select_page` (component score, hole fill, gutter PCA split, sliver drop);
+   - the whole-frame fallback below 2%;
+   - `refine_contour` (Lab Scharr gradient, ±8 px normals, Viterbi);
+   - the anti-aliased fill and `net_margin` / `edge_strength` / `edge_at_limit`.
+   - Feature flag: `Features.PAGE_FINDER_NET` (default on) and Settings > *Page finder (neural net)*. When it is off, or the model cannot load or run, the colour-threshold `paper_mask` is used.
+5. **Book spreads:** two pages from one photo become two document pages, each cropped, unwarped and cleaned on its own (the second page is processed right after the first and has its own quality gate).
+   - Order: right page first for right-to-left books, left page first otherwise. The default comes from the app language (RTL locale); Settings > *Book spreads: right page first* changes it.
+   - "Book spread: swap order" on the result screen swaps the pair.
+
+### Measured (Windows desktop build of the same core, `tools/desktop_check`, CPU paths; outputs in `docs/results/round4/`)
+
+| Check | Result |
+|---|---|
+| Page masks, app vs `seg/pagefind.py` + `pagefinder.onnx`, 34 real photos, same OpenCV 4.11 | **bit-identical**: 0 differing pixels on every photo; net input identical; page counts, fallbacks and quality signals equal |
+| Same, 8 synthetic book spreads (`seg/synth.py` at 1024 px) | bit-identical; all 8 split into 2 pages in both |
+| Same, against the training env (OpenCV 5.0, onnxruntime 1.31) | IoU ≥ 0.99989, at most 0.009% of pixels differ (library versions) |
+| Page finder vs hand GT (33 photos) | mean IoU 0.947, 4/33 below 0.9 (colour threshold: 0.712, 18/33) |
+| Pipeline completes, 34 photos | app 34/34, reference 34/34, with either finder |
+| Quality gate decision, app vs reference | same on 33/34 photos with either finder |
+| Orientation correct (GT `up_ccw_turns`), 33 photos | net finder: app 31, reference 30; colour finder: app 29, reference 30; no 180° turns |
+| Emulator (Android 15, x86_64, CPU fallback) | import with auto-advance, gate to crop screen to homography, ONNX Runtime finder, spread split / order / swap, Turn 180°: all ran, no crash |
+
+### Deviations from the reference (`code/`, `seg/`)
+
+- **The second page of a spread is used:** the reference drops `info['other']`. The app runs the same outline, edge snapping and fill on it and processes it as a page.
+- **Detection and surface fit run on a copy capped at 2400 px** (unchanged app design). The page finder itself runs on the full photo, as the reference does. The gate converts the fit residual to full-resolution px.
+  - On the 3000 px photos the fit differs from the reference's, and that is where the gate disagrees once: `math_cheat_sheet` with the colour finder (app 8 px, reference 22 px) and `docres__208_in` with the net finder (app 3.9 px, reference 31.7 px).
+- **Orientation** is decided on the homography page (round-3 brief), and CW is chosen over CCW only when the upright cue is below -0.2 (unchanged app gate). The reference decides on the stage-1 page, ungated. Results are in the table above.
+- **The existing 3 px homography fallback is kept:** between 3 and 15 px the app silently uses the homography; above 15 px the gate also opens the crop screen.
+- **Extra gate reasons:** the app adds "no page found" when detection fails entirely and "surface fit failed" when the C++ fit fails; neither case exists in the reference. As in the reference, the whole-frame fallback of the colour-threshold finder is not a gate reason.
+- **Book-page order uses geometry:** left or right is taken from the outline centroids, turned by the first page's sideways rotation.
+- **ONNX Runtime Android (full package) 1.22.0 instead of "Mobile"**, model in fp32.
+
+### Filters: colour and pictures kept
+
+The filters lost colour and punched white holes into pictures. The root causes and fixes are in `core/src/cleanup.cpp`, `solid.cpp` and `gpu.cpp`:
+- the paper fill painted over coloured content at the page edge;
+- the inside of grey or dark photos was taken for paper and whitened;
+- speck removal hit coloured strokes;
+- background cleanup whitened light colours;
+- Solid colors flattened photos;
+- B&W turned pictures white.
+
+Contact sheets and per-page measurements were made on the 34 pages and on synthetic pages: holes inside pictures at Auto 100% went from 18% to ≤ 0.5%, colour inside pictures is kept (chroma ratio about 1.0), and text marks lost at Auto 70% went from 44 to 4. The GLSL changes compile (glslc) but the GPU path was not run.
 
 ## Build
 
@@ -187,8 +248,8 @@ For orientation only, single host runs of the whole C++ pipeline (not medians, n
 
 ## Not done / not verified on a real phone
 
-- **Nothing has run on Android:** no phone, no emulator (no KVM).
-  - Not verified: the UI, CameraX capture, EXIF handling, JNI calls, save/share, and the PDF output.
+- **Nothing has run on a phone.** Round 4 ran the app on the Android 15 x86_64 emulator: gallery import, crop screen, processing, result screen, filters, the Pages screen, the page finder on ONNX Runtime and book spreads, all on the CPU path (the emulator offers only GLES 3.0).
+  - Not verified: CameraX capture, save/share, the PDF output, the GPU paths on a device, and ONNX Runtime on arm64.
   - GLES 3.1 shader compilation on Adreno or Mali drivers has not been seen; the shaders were compiled and checked only on Mesa llvmpipe.
   - Checked statically: the APK builds, and every Kotlin `external` function has a matching exported JNI symbol.
 - **Timings on two named devices are not measured.** Use the in-app self-test.

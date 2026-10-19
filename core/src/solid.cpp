@@ -15,6 +15,8 @@ namespace fs {
 
 namespace {
 
+const float kDarkArea = 0.1f;   // measure(): a larger share of dark areas -> picture, not a cell
+
 long pyround(double x) { return (long)std::nearbyint(x); }
 
 // numpy slice bounds [start, stop) on an axis of length n (negative indices wrap)
@@ -201,8 +203,13 @@ double median_of(std::vector<float>& v) {
 // `bgr` is the lightly smoothed page (no halftone texture), `raw` the page itself.
 // spread: 10-90% luminance range (smooth unevenness counts); detail: the same range of the
 // high-pass L - blur(L) (pictures, logos and halftone images have detail, uneven print does not).
+// dark_area (regions at least 60 px in both directions): share of the candidate pixels that
+// are darker than the median - 14 in areas at least 15 px wide. Ink is strokes and lines of
+// text (gone after a 15x15 opening); the darker half of a photo or a smooth gradient is an
+// area. Without it a picture lost its darker half to the ink exclusion below, measured as
+// uniform and was filled with one flat colour.
 bool measure(const cv::Mat& bgr, const cv::Mat& use0, const cv::Rect& box, cv::Vec3f& col, float& spread, int& n,
-             const cv::Mat* raw = nullptr, float* raw_spread = nullptr, float* detail = nullptr) {
+             const cv::Mat* raw = nullptr, float* raw_spread = nullptr, float* detail = nullptr, float* dark_area = nullptr) {
     cv::Mat use = use0(box).clone(), L(box.size(), CV_32F);
     std::vector<float> l0;
     for (int y = 0; y < box.height; ++y)
@@ -214,6 +221,12 @@ bool measure(const cv::Mat& bgr, const cv::Mat& use0, const cv::Rect& box, cv::V
     if (l0.size() < 30) return false;
     float m0 = (float)median_of(l0);
     cv::Mat inkm = (L < m0 - 14.f), inkd;
+    if (dark_area) *dark_area = 0.f;
+    if (dark_area && std::min(box.width, box.height) >= 60) {   // thin rows are filled by their text
+        cv::Mat big;
+        cv::morphologyEx(inkm, big, cv::MORPH_OPEN, cv::Mat::ones(15, 15, CV_8U));
+        *dark_area = (float)cv::countNonZero(big & use) / (float)l0.size();
+    }
     cv::dilate(inkm, inkd, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
     use.setTo(0, inkd);
     std::vector<float> ch[3], Ls;
@@ -310,15 +323,16 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
         Region rg{i, R, {}, {}, ar};
         float spread = 0;
         S.regions++;
-        float detail = 0;
-        if (pin > 0.3 * ar || !measure(bgr_s, use, R, rg.bgr, spread, rg.core, &bgr, &rg.noise, &detail)) { S.skipped++; continue; }
+        float detail = 0, dark = 0;
+        if (pin > 0.3 * ar || !measure(bgr_s, use, R, rg.bgr, spread, rg.core, &bgr, &rg.noise, &detail, &dark)) { S.skipped++; continue; }
         // (f) pictures, gradients, logos: too much colour variation once ink is removed
         rg.lab = lab_of(rg.bgr);
         if (getenv("FS_SOLID_DEBUG"))
-            std::fprintf(stderr, "region %d box %d,%d %dx%d area %d core %d  L %.1f a %.1f b %.1f C %.1f spread %.1f detail %.1f noise %.1f\n", i, x, y, ww,
-                         hh, ar, rg.core, rg.lab[0], rg.lab[1], rg.lab[2], chroma(rg.lab), spread, detail, rg.noise);
-        // (f) pictures / logos (local detail) and designed gradients (large smooth range) stay as they are
-        if (detail > 18.f || spread > 45.f) { S.skipped_varied++; continue; }
+            std::fprintf(stderr, "region %d box %d,%d %dx%d area %d core %d  L %.1f a %.1f b %.1f C %.1f spread %.1f detail %.1f noise %.1f dark %.2f\n", i, x, y,
+                         ww, hh, ar, rg.core, rg.lab[0], rg.lab[1], rg.lab[2], chroma(rg.lab), spread, detail, rg.noise, dark);
+        // (f) pictures / logos (local detail), designed gradients (large smooth range) and pictures
+        // or gradients with large darker areas (measure()) stay as they are
+        if (detail > 18.f || spread > 45.f || dark > kDarkArea) { S.skipped_varied++; continue; }
         reg_of_label[i] = (int)regs.size();
         regs.push_back(rg);
     }
@@ -392,8 +406,10 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
             cv::Mat use = cv::Mat::zeros(h, w, CV_8U);
             use(R).setTo(255, away(R) & (taken(R) == 0));
             Region rg{-1, R, {}, {}, R.area()};
-            float spread = 0, detail = 0;
-            if (!measure(bgr_s, use, R, rg.bgr, spread, rg.core, &bgr, &rg.noise, &detail) || detail > 18.f || spread > 45.f) continue;
+            float spread = 0, detail = 0, dark = 0;
+            if (!measure(bgr_s, use, R, rg.bgr, spread, rg.core, &bgr, &rg.noise, &detail, &dark) || detail > 18.f || spread > 45.f ||
+                dark > kDarkArea)
+                continue;
             rg.lab = lab_of(rg.bgr);
             if (dE_paper(rg.lab) < 5.0) continue;
             rg.fill = true;

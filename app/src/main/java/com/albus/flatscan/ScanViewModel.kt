@@ -39,6 +39,38 @@ enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings }
 
 enum class ImportSource { Camera, Gallery }
 
+/** One page found by [NativeLib.detect]. */
+class DetectedPage(
+    val ok: Boolean,
+    val corners: List<Offset>,
+    val reasons: List<String>,          // quality gate: why the automatic crop is doubtful
+    val centroid: Offset,               // outline centroid, photo px
+) {
+    companion object {
+        fun from(j: JSONObject): DetectedPage {
+            val c = j.optJSONArray("corners")
+            val r = j.optJSONArray("needs_manual_crop")
+            val m = j.optJSONArray("centroid")
+            return DetectedPage(
+                ok = j.optBoolean("ok") && c != null && c.length() == 8,
+                corners = if (c != null && c.length() == 8) List(4) { Offset(c.optDouble(2 * it).toFloat(), c.optDouble(2 * it + 1).toFloat()) } else emptyList(),
+                reasons = if (r != null) List(r.length()) { r.optString(it) } else emptyList(),
+                centroid = if (m != null && m.length() == 2) Offset(m.optDouble(0).toFloat(), m.optDouble(1).toFloat()) else Offset.Zero,
+            )
+        }
+    }
+}
+
+/**
+ * The second page of a book spread, processed right after the first one ([firstId]) from the same
+ * photo. [firstRot] is the first page's applied rotation (cv::ROTATE_* code, -1 none): it tells
+ * which way "right" is in the photo.
+ */
+private class SpreadPage(
+    val firstId: String, val photo: Bitmap, val page: DetectedPage, val firstCentroid: Offset,
+    val focalPx: Float, val cropRotation: Int, val userRotated: Boolean, var firstRot: Int = -1,
+)
+
 /**
  * App state. Native sessions: at most one is alive (the page shown on the result screen) and
  * every call that touches it runs on one dedicated thread ([nativeCtx]), so renders, thumbnails,
@@ -93,9 +125,27 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private var sourceJob: Job? = null
     private var recropBackup: CropBackup? = null
 
+    // ---- page finder, quality gate, book spreads
+    private val finder = PageFinder(app)
+    private val logitsLock = Any()
+    /** Page-finder output for one photo bitmap (detection and processing use the same photo). */
+    private var logitsCache: Pair<Bitmap, FloatArray?>? = null
+    /** Why the automatic crop on the crop screen is doubtful (quality gate); empty = trusted. */
+    var cropReasons by mutableStateOf(listOf<String>())
+        private set
+    /** The gate flagged this crop: the homography path is used even if the corners are kept. */
+    private var forceHomography = false
+    /** The page of a book spread the crop screen shows (0 = the larger page of the photo). */
+    var cropPageIndex by mutableIntStateOf(0)
+        private set
+    /** Found with the page on the crop screen: the other page of its book spread (waits for it). */
+    private var spreadNext: SpreadPage? = null
+    /** The spread page being processed now (the second one). */
+    private var spreadCurrent: SpreadPage? = null
+
     private class CropBackup(
         val photo: Bitmap, val display: Bitmap?, val corners: List<Offset>, val detected: List<Offset>?,
-        val userRotated: Boolean, val cropRotation: Int,
+        val userRotated: Boolean, val cropRotation: Int, val reasons: List<String>, val forceHomography: Boolean, val pageIndex: Int,
     )
 
     // ---- processing
@@ -108,7 +158,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** The live session as the UI sees it (0 = none); main thread. */
     private var handle by mutableStateOf(0L)
     val hasSession: Boolean get() = handle != 0L
-    private var sessionGeom: PageMeta? = null
+    private var sessionGeom: PageMeta?
+        get() = sessionGeomState
+        set(v) { sessionGeomState = v }
+    private var sessionGeomState by mutableStateOf<PageMeta?>(null)
     var params by mutableStateOf(RenderParams())
         private set
     /** Protected picture rectangles, page fractions [x0, y0, x1, y1, ...]. */
@@ -269,9 +322,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     detected = b.detected
                     userRotated = b.userRotated
                     cropRotation = b.cropRotation
+                    cropReasons = b.reasons
+                    forceHomography = b.forceHomography
+                    cropPageIndex = b.pageIndex
                     recropBackup = null
                 } else {
                     discardStaging()
+                    spreadNext = null
+                    spreadCurrent = null
                 }
                 fallback()
             }
@@ -325,6 +383,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             photo = null
             photoDisplay = null
             corners = emptyList()
+            cropReasons = emptyList()
+            spreadNext = null
+            spreadCurrent = null
             screen = Screen.Crop
             try {
                 val p = withContext(Dispatchers.IO) { loadPhoto(getApplication(), uri, focalMmPerLongSide) }
@@ -340,7 +401,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 sourceJob = viewModelScope.launch(Dispatchers.IO) {
                     runCatching { store.saveSource(id, p.bitmap) }.onFailure { Log.e(TAG, "source save failed", it) }
                 }
-                detect()
+                detect(auto = true)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "load failed", e)
@@ -368,14 +429,111 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         photoDisplay = b.forDisplay()
     }
 
-    private suspend fun detect() {
+    /** Page-finder logits for [b] (null: the flag is off or the net cannot run -> colour threshold). */
+    private fun logitsFor(b: Bitmap): FloatArray? {
+        if (!settings.pageFinderNet) return null
+        synchronized(logitsLock) {
+            logitsCache?.let { if (it.first === b) return it.second }
+            val l = runCatching { finder.logits(b) }.onFailure { Log.e(TAG, "page finder failed", it) }.getOrNull()
+            logitsCache = b to l
+            return l
+        }
+    }
+
+    /**
+     * Finds the page(s) of the photo on the crop screen. [auto]: a trusted crop (quality gate)
+     * goes straight on to processing; a doubtful one stays on the crop screen with its reasons and
+     * takes the homography path. A book spread queues its second page.
+     */
+    private suspend fun detect(auto: Boolean = false) {
         val p = photo ?: return
         detecting = true
-        val c = withContext(Dispatchers.Default) { NativeLib.detect(p) }
-        detected = if (c != null) List(4) { Offset(c[2 * it], c[2 * it + 1]) } else null
+        val focal = focalPx
+        val res = withContext(Dispatchers.Default) {
+            runCatching { JSONObject(NativeLib.detect(p, logitsFor(p), focal)) }
+                .onFailure { Log.e(TAG, "detect failed", it) }.getOrElse { JSONObject() }
+        }
+        if (photo !== p) return
+        val arr = res.optJSONArray("pages")
+        val found = if (arr != null) List(arr.length()) { DetectedPage.from(arr.getJSONObject(it)) } else emptyList()
+        val first = found.firstOrNull()?.takeIf { it.ok }
+        detected = first?.corners
         corners = detected ?: defaultCorners(p)
+        cropPageIndex = 0
+        cropReasons = first?.reasons ?: emptyList()
+        forceHomography = first == null || first.reasons.isNotEmpty()
+        val second = found.getOrNull(1)?.takeIf { it.ok }
+        spreadNext = if (first != null && second != null) SpreadPage(
+            firstId = photoPageId ?: "", photo = p, page = second, firstCentroid = first.centroid,
+            focalPx = focalPx, cropRotation = cropRotation, userRotated = userRotated,
+        ) else null
         detecting = false
-        if (c == null) message = "Page not found - drag the corners to the page"
+        if (first == null) message = "Page not found - drag the corners to the page"
+        else if (auto && cropReasons.isEmpty() && !settings.reviewCrops) process()
+    }
+
+    /** The second page of a book spread: same photo, its own corners and gate, a new document page. */
+    private fun startSpreadPage(sp: SpreadPage) {
+        val id = store.newId()
+        val firstSource = sourceJob
+        discardStaging()
+        photoPageId = id
+        cropMeta = null
+        recropBackup = null
+        usePhoto(sp.photo)
+        focalPx = sp.focalPx
+        userRotated = sp.userRotated
+        cropRotation = sp.cropRotation
+        detected = sp.page.corners
+        corners = sp.page.corners
+        cropPageIndex = 1
+        cropReasons = sp.page.reasons
+        forceHomography = sp.page.reasons.isNotEmpty()
+        spreadNext = null
+        spreadCurrent = sp
+        sourceJob = viewModelScope.launch(Dispatchers.IO) {
+            firstSource?.join()
+            runCatching { store.copySource(sp.firstId, id) }.onFailure { Log.e(TAG, "spread source copy failed", it) }
+        }
+        if (cropReasons.isEmpty() && !settings.reviewCrops) {
+            process()
+        } else {
+            screen = Screen.Crop
+            message = "Book spread: check the second page"
+        }
+    }
+
+    /**
+     * Where the second page of a spread goes: the right page first for right-to-left books, the
+     * left page first otherwise. "Right" is taken in the upright frame of the first page.
+     */
+    private fun secondGoesFirst(sp: SpreadPage): Boolean {
+        val d = sp.page.centroid - sp.firstCentroid
+        val dxUpright = when (sp.firstRot) {
+            0 -> -d.y           // cv::ROTATE_90_CLOCKWISE
+            1 -> -d.x           // cv::ROTATE_180
+            2 -> d.y            // cv::ROTATE_90_COUNTERCLOCKWISE
+            else -> d.x
+        }
+        val secondIsRight = dxUpright > 0
+        return if (settings.bookRightToLeft) secondIsRight else !secondIsRight
+    }
+
+    /** The other page of the current page's book spread, if it is in the document. */
+    val spreadPartner: String?
+        get() = sessionGeomState?.spreadWith?.takeIf { it in pages }
+
+    /** Swaps the two pages of the current book spread in the document. */
+    fun swapSpread() {
+        val a = currentId ?: return
+        val b = spreadPartner ?: return
+        val i = pages.indexOf(a)
+        val j = pages.indexOf(b)
+        if (i < 0 || j < 0) return
+        pages[i] = b
+        pages[j] = a
+        val order = pages.toList()
+        viewModelScope.launch(Dispatchers.IO) { store.saveOrder(order) }
     }
 
     private fun defaultCorners(p: Bitmap): List<Offset> {
@@ -404,6 +562,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         usePhoto(p.rotatedQuarterTurns(1))
         userRotated = true
         cropRotation = (cropRotation + 1) % 4
+        // a waiting second page of a book spread turns with the photo
+        spreadNext = spreadNext?.let { sp ->
+            val q = sp.page
+            SpreadPage(
+                firstId = sp.firstId, photo = photo!!, page = DetectedPage(q.ok, reorder(q.corners), q.reasons, rot(q.centroid)),
+                firstCentroid = rot(sp.firstCentroid), focalPx = sp.focalPx, cropRotation = cropRotation, userRotated = true,
+            )
+        }
     }
 
     private fun setCrop(m: PageMeta, bmp: Bitmap) {
@@ -415,6 +581,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         userRotated = m.userRotated
         cropRotation = m.cropRotation
         focalPx = m.focalPx
+        cropPageIndex = m.pageIndex
+        forceHomography = m.forceHomography
+        cropReasons = emptyList()
+        spreadNext = null
+        spreadCurrent = null
     }
 
     /** Back to the crop screen with the current page's corners; Continue keeps all its settings. */
@@ -423,7 +594,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val geom = currentMeta() ?: return
         val p = photo
         if (photoPageId == id && p != null) {
-            recropBackup = CropBackup(p, photoDisplay, corners, detected, userRotated, cropRotation)
+            recropBackup = CropBackup(p, photoDisplay, corners, detected, userRotated, cropRotation, cropReasons, forceHomography, cropPageIndex)
             screen = Screen.Crop
             return
         }
@@ -436,7 +607,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
                 discardStaging()
                 setCrop(geom, bmp)
-                recropBackup = CropBackup(bmp, photoDisplay, corners, detected, userRotated, cropRotation)
+                recropBackup = CropBackup(bmp, photoDisplay, corners, detected, userRotated, cropRotation, cropReasons, forceHomography, cropPageIndex)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "re-crop load failed", e)
@@ -561,10 +732,16 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (corners.size != 4) return
         val edited = cornersEdited()
         val c = FloatArray(8) { i -> if (i % 2 == 0) corners[i / 2].x else corners[i / 2].y }
+        val force = forceHomography
+        val pageIndex = cropPageIndex
+        val spread = spreadCurrent?.takeIf { pageIndex == 1 }
+        val stored0 = cropMeta?.takeIf { it.id == id }
         val geom = PageMeta(
             id = id, corners = c, detected = detected?.let { d -> FloatArray(8) { i -> if (i % 2 == 0) d[i / 2].x else d[i / 2].y } },
             cropRotation = cropRotation, userRotated = userRotated, focalPx = focalPx,
             params = RenderParams(), protect = FloatArray(0), rotation = 0,
+            pageIndex = pageIndex, forceHomography = force,
+            spreadWith = spread?.firstId ?: stored0?.spreadWith ?: (if (id == currentId) sessionGeom?.spreadWith else null),
         )
         val same = id == currentId
         val stored = cropMeta?.takeIf { it.id == id }
@@ -601,7 +778,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 if (nativeHandle != 0L) NativeLib.release(nativeHandle)
                 nativeHandle = 0L
                 val hh = try {
-                    NativeLib.process(p, c, edited, focal, autoOrient, width, true) { pct, s ->
+                    val logits = logitsFor(p)
+                    NativeLib.process(p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }
                 } catch (e: Exception) {
@@ -630,15 +808,25 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             rotation = startRotation
             outVersion++
             if (id !in pages) {
-                pages.add(id)
+                val i = spread?.let { pages.indexOf(it.firstId) } ?: -1
+                if (spread != null && i >= 0) pages.add(if (secondGoesFirst(spread)) i else i + 1, id) else pages.add(id)
                 pageVersions[id] = 0
             }
             val order = pages.toList()
             val meta = currentMeta()
             withContext(Dispatchers.IO) {
-                runCatching { store.saveMeta(meta!!); store.saveOrder(order) }.onFailure { Log.e(TAG, "meta save failed", it) }
+                runCatching {
+                    store.saveMeta(meta!!)
+                    store.saveOrder(order)
+                    // the first page of the spread learns its partner
+                    if (spread != null) store.saveMeta(store.loadMeta(spread.firstId).copy(spreadWith = id))
+                }.onFailure { Log.e(TAG, "meta save failed", it) }
             }
-            details = describe(info, edited)
+            if (spread != null) {
+                spreadCurrent = null
+                message = "Book spread: added as 2 pages (${if (settings.bookRightToLeft) "right" else "left"} page first)"
+            }
+            details = describe(info, edited, force)
             firstRenderDetails = true
             handle = h
             requestRender(false)
@@ -646,21 +834,39 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             if (screen == Screen.Processing) screen = Screen.Result
             fetchBefore(h)
             if (showWrinkles) fetchOverlay(h)
+            // a book spread: its second page follows from the same photo
+            val next = spreadNext
+            if (next != null && pageIndex == 0) {
+                next.firstRot = info.optInt("rot", -1)
+                startSpreadPage(next)
+            }
         }
     }
 
-    private fun describe(info: JSONObject, edited: Boolean): String {
+    private fun describe(info: JSONObject, edited: Boolean, forced: Boolean): String {
         val sb = StringBuilder()
         val mode = info.optString("mode")
+        val gate = info.optJSONArray("needs_manual_crop")
+        val reasons = if (gate != null) List(gate.length()) { gate.optString(it) } else emptyList()
         sb.append(
             when {
                 edited -> "Geometry: homography (corners adjusted by hand)"
+                reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"
                 info.optBoolean("fell_back") -> "Geometry: homography (surface fit rejected, outline residual %.1f px)".format(info.optDouble("fit_median_px"))
                 mode == "surface" -> "Geometry: page surface model (outline residual %.2f px)".format(info.optDouble("fit_median_px"))
                 else -> "Geometry: $mode"
             },
         )
-        if (info.has("rot")) sb.append("\nOrientation: ").append(info.optInt("rot")).append(" degrees")
+        if (info.has("rot")) sb.append("\nOrientation: ").append(
+            when (info.optInt("rot")) { 0 -> "turned 90 degrees clockwise"; 2 -> "turned 90 degrees counter-clockwise"; 1 -> "turned 180 degrees"; else -> "as photographed" },
+        )
+        if (info.has("finder")) {
+            sb.append("\nPage finder: ").append(if (info.optString("finder") == "net") "net + edge snapping" else "colour threshold")
+            if (info.optBoolean("whole_frame")) sb.append(" (no page found: whole frame)")
+            if (info.optInt("n_pages", 1) == 2) sb.append(", book spread page ").append(info.optInt("page_index") + 1).append(" of 2")
+            if (info.optString("finder") == "net") sb.append("\n  net margin %.2f, edge strength %.2f, at limit %.2f".format(
+                info.optDouble("net_margin"), info.optDouble("edge_strength"), info.optDouble("edge_at_limit")))
+        }
         sb.append("\nResample: ").append(if (info.optBoolean("gpu_resample")) "GPU" else "CPU fallback")
         sb.append("\n").append(gpuInfo)
         val ms = info.optJSONObject("ms")
@@ -767,6 +973,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     fun rotateResult() {
         rotation = (rotation + 1) % 4
+        outVersion++
+    }
+
+    /** One tap for an upside-down page (there is no automatic 180-degree turn). */
+    fun rotateResult180() {
+        rotation = (rotation + 2) % 4
         outVersion++
     }
 

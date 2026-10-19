@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -69,7 +70,11 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
             Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Adjust corners", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    if (vm.detecting) "Finding the page" else "Fit the corners to the page",
+                    when {
+                        vm.detecting -> "Finding the page"
+                        vm.cropPageIndex == 1 -> "Second page of the book spread"
+                        else -> "Fit the corners to the page"
+                    },
                     style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
                 )
             }
@@ -84,6 +89,22 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
         ) {
             if (photo != null && display != null) CornerEditor(vm, photo.width, photo.height, display)
             if (vm.detecting) CircularProgressIndicator(color = Editor.Accent)
+            if (!vm.detecting && vm.cropReasons.isNotEmpty()) {
+                // quality gate: the automatic crop is doubtful (it will use the homography path)
+                Row(
+                    Modifier.align(Alignment.TopCenter).padding(12.dp)
+                        .background(Editor.Ground.copy(alpha = 0.85f), RoundedCornerShape(14.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Outlined.WarningAmber, null, tint = Color(0xFFF2B84B), modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Check the crop: " + vm.cropReasons.joinToString("; "),
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                    )
+                }
+            }
             if (!vm.detecting && photo != null) {
                 Text(
                     "Drag a corner to move it",

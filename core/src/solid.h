@@ -14,7 +14,9 @@
 //  e. large uniform coloured areas not enclosed by lines are found as blobs at 1/4
 //     resolution; their rectangle edges snap to grid lines within 30 px
 //  f. regions with local detail after removing ink (pictures, logos: high-pass 10-90% range
-//     > 18 levels) or a large smooth range (designed gradients: > 45 levels), and
+//     > 18 levels) or a large smooth range (designed gradients: > 45 levels), regions of at
+//     least 60x60 px with > 10% darker areas at least 15 px wide (the darker half of a photo
+//     or a gradient, which the ink exclusion would otherwise drop from the measurement), and
 //     regions mostly inside a protected rectangle are left untouched
 //  g. ink is never recoloured: its colour is the darkest nearby pixel's own colour
 //  h. the fill reaches the line centres (line pixels take the nearest cell's fill as background)

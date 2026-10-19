@@ -1,0 +1,111 @@
+$ python seg/evalseg.py old
+dewarpnet__13_2_copy                 IoU 0.241  edge err 19.48% 
+dewarpnet__14_2_copy                 IoU 0.052  edge err 12.57% 
+dewarpnet__1_1_copy                  IoU 0.914  edge err  1.51% 
+dewarpnet__4_2_copy                  IoU 0.884  edge err  2.96% 
+docgeonet__63_2_copy                 IoU 0.947  edge err  1.05% 
+docres__151_in                       IoU 0.725  edge err  4.19% 
+docres__189_origin                   IoU 0.940  edge err  0.80% 
+docres__190_in                       IoU 0.579  edge err  6.46% 
+docres__208_in                       IoU 0.321  edge err  8.23% 
+docres__218_in                       IoU 0.682  edge err  1.93% 
+docres__for_appearance               IoU 1.000  edge err   nan% 
+docres__for_binarization             IoU 0.968  edge err  3.36% 
+docres__for_deshadowing              IoU 0.621  edge err   nan% 
+docres__for_dewarping                IoU 0.510  edge err  8.71% 
+docscanner__27_2_copy                IoU 0.960  edge err  0.75% 
+docscanner__42_2_copy                IoU 0.775  edge err  4.22% 
+docscanner__48_1_copy                IoU 0.722  edge err  6.26% 
+doctr__25                            IoU 0.999  edge err  0.01% 
+doctr__48_2_copy                     IoU 0.919  edge err  2.98% 
+doctr__51_1_copy                     IoU 0.937  edge err  1.25% 
+page_dewarp__boston_cooking_a        IoU 0.155  edge err 22.80% 
+page_dewarp__boston_cooking_b        IoU 0.873  edge err  4.87% 
+page_dewarp__linguistics_thesis_a    IoU 0.310  edge err 19.10% 
+page_dewarp__linguistics_thesis_b    IoU 0.250  edge err 20.02% 
+scanner_samples__cell_pic            IoU 0.944  edge err  0.72% 
+scanner_samples__chart               IoU 0.495  edge err  9.77% 
+scanner_samples__desk                IoU 0.994  edge err  0.03% 
+scanner_samples__dollar_bill         IoU 0.289  edge err 14.67% 
+scanner_samples__math_cheat_sheet    IoU 0.616  edge err 21.49% 
+scanner_samples__notepad             IoU 0.991  edge err  0.33% 
+scanner_samples__receipt             IoU 0.991  edge err  0.06% 
+scanner_samples__tax                 IoU 0.993  edge err   nan% 
+user__page3_sideways                 IoU 0.908  edge err  3.19% 
+MEAN IoU 0.712  median 0.873  IoU<0.9: 18/33  edge err mean 6.79% median 3.77%
+(exit 0)
+
+$ python seg/evalseg.py net:work/runs/run1/best.pt
+dewarpnet__13_2_copy                 IoU 0.891  edge err  2.44% 
+dewarpnet__14_2_copy                 IoU 0.939  edge err  1.05% 
+dewarpnet__1_1_copy                  IoU 0.940  edge err  1.09% 
+dewarpnet__4_2_copy                  IoU 0.887  edge err  2.00% 
+docgeonet__63_2_copy                 IoU 0.946  edge err  1.07% 
+docres__151_in                       IoU 0.873  edge err  2.03% 
+docres__189_origin                   IoU 0.939  edge err  0.83% 
+docres__190_in                       IoU 0.912  edge err  1.49% 
+docres__208_in                       IoU 0.942  edge err  1.08% 
+docres__218_in                       IoU 0.948  edge err  0.70% 
+docres__for_appearance               IoU 0.958  edge err   nan% 
+docres__for_binarization             IoU 0.997  edge err  0.05% 
+docres__for_deshadowing              IoU 1.000  edge err   nan% 
+docres__for_dewarping                IoU 0.960  edge err  0.62% 
+docscanner__27_2_copy                IoU 0.961  edge err  0.72% 
+docscanner__42_2_copy                IoU 0.943  edge err  1.11% 
+docscanner__48_1_copy                IoU 0.915  edge err  1.56% 
+doctr__25                            IoU 0.992  edge err  0.09% 
+doctr__48_2_copy                     IoU 0.943  edge err  1.16% 
+doctr__51_1_copy                     IoU 0.936  edge err  1.26% 
+page_dewarp__boston_cooking_a        IoU 0.960  edge err  1.18% 
+page_dewarp__boston_cooking_b        IoU 0.910  edge err  3.07% 
+page_dewarp__linguistics_thesis_a    IoU 0.942  edge err  1.97% 
+page_dewarp__linguistics_thesis_b    IoU 0.879  edge err  5.88% 
+scanner_samples__cell_pic            IoU 0.945  edge err  0.72% 
+scanner_samples__chart               IoU 0.994  edge err  0.06% 
+scanner_samples__desk                IoU 0.991  edge err  0.06% 
+scanner_samples__dollar_bill         IoU 0.968  edge err  0.26% 
+scanner_samples__math_cheat_sheet    IoU 0.929  edge err 11.09% 
+scanner_samples__notepad             IoU 0.992  edge err  0.12% 
+scanner_samples__receipt             IoU 0.993  edge err  0.04% 
+scanner_samples__tax                 IoU 1.000  edge err   nan% 
+user__page3_sideways                 IoU 0.909  edge err  2.24% 
+MEAN IoU 0.947  median 0.943  IoU<0.9: 4/33  edge err mean 1.57% median 1.08%
+(exit 0)
+
+$ python seg/evalseg.py netr:work/runs/run1/best.pt
+dewarpnet__13_2_copy                 IoU 0.892  edge err  2.43% 
+dewarpnet__14_2_copy                 IoU 0.941  edge err  1.01% 
+dewarpnet__1_1_copy                  IoU 0.942  edge err  1.06% 
+dewarpnet__4_2_copy                  IoU 0.885  edge err  2.01% 
+docgeonet__63_2_copy                 IoU 0.947  edge err  1.05% 
+docres__151_in                       IoU 0.874  edge err  1.99% 
+docres__189_origin                   IoU 0.941  edge err  0.79% 
+docres__190_in                       IoU 0.913  edge err  1.47% 
+docres__208_in                       IoU 0.943  edge err  1.05% 
+docres__218_in                       IoU 0.944  edge err  0.75% 
+docres__for_appearance               IoU 0.956  edge err   nan% 
+docres__for_binarization             IoU 0.997  edge err  0.05% 
+docres__for_deshadowing              IoU 1.000  edge err   nan% 
+docres__for_dewarping                IoU 0.961  edge err  0.61% 
+docscanner__27_2_copy                IoU 0.959  edge err  0.75% 
+docscanner__42_2_copy                IoU 0.940  edge err  1.15% 
+docscanner__48_1_copy                IoU 0.919  edge err  1.50% 
+doctr__25                            IoU 0.997  edge err  0.03% 
+doctr__48_2_copy                     IoU 0.941  edge err  1.19% 
+doctr__51_1_copy                     IoU 0.937  edge err  1.22% 
+page_dewarp__boston_cooking_a        IoU 0.961  edge err  1.14% 
+page_dewarp__boston_cooking_b        IoU 0.914  edge err  2.93% 
+page_dewarp__linguistics_thesis_a    IoU 0.939  edge err  2.08% 
+page_dewarp__linguistics_thesis_b    IoU 0.881  edge err  5.94% 
+scanner_samples__cell_pic            IoU 0.946  edge err  0.71% 
+scanner_samples__chart               IoU 0.996  edge err  0.04% 
+scanner_samples__desk                IoU 0.998  edge err  0.01% 
+scanner_samples__dollar_bill         IoU 0.966  edge err  0.28% 
+scanner_samples__math_cheat_sheet    IoU 0.929  edge err 11.22% 
+scanner_samples__notepad             IoU 0.996  edge err  0.08% 
+scanner_samples__receipt             IoU 0.996  edge err  0.02% 
+scanner_samples__tax                 IoU 0.999  edge err   nan% 
+user__page3_sideways                 IoU 0.909  edge err  2.04% 
+MEAN IoU 0.947  median 0.943  IoU<0.9: 4/33  edge err mean 1.55% median 1.06%
+(exit 0)
+

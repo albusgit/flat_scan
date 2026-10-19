@@ -41,6 +41,9 @@ android {
             version = "3.22.1"
         }
     }
+    androidResources {
+        noCompress += "onnx"
+    }
     buildFeatures {
         compose = true
         prefab = true
@@ -63,6 +66,8 @@ android {
 
 dependencies {
     implementation("org.opencv:opencv:4.11.0")
+    // page finder net (assets/models/pagefinder.onnx)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation(platform("androidx.compose:compose-bom:2025.05.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")

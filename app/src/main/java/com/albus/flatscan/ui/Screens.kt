@@ -270,6 +270,9 @@ fun SettingsScreen(vm: ScanViewModel) {
     var filter by remember { mutableStateOf(s.defaultFilter) }
     var solid by remember { mutableStateOf(s.solidColors) }
     var autoRotate by remember { mutableStateOf(s.autoRotate) }
+    var pageFinder by remember { mutableStateOf(s.pageFinderNet) }
+    var reviewCrops by remember { mutableStateOf(s.reviewCrops) }
+    var bookRtl by remember { mutableStateOf(s.bookRightToLeft) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
@@ -286,7 +289,12 @@ fun SettingsScreen(vm: ScanViewModel) {
             )
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
-            SwitchRow("Auto-rotate pages", "Turn sideways and upside-down pages upright", autoRotate) { autoRotate = it; s.autoRotate = it }
+            SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            Section("Finding the page")
+            SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
+            SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
+            SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Output resolution")
             for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }

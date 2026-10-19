@@ -45,6 +45,8 @@ import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.SwapHoriz
+import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
@@ -195,6 +197,13 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             if (vm.rendering) {
                 CircularProgressIndicator(Modifier.align(Alignment.TopEnd).padding(12.dp).size(22.dp), strokeWidth = 2.5.dp, color = Editor.Accent)
             }
+            if (!protecting && vm.page != null) {
+                // one tap for an upside-down page: there is no automatic 180-degree turn
+                PageAction("Turn 180°", Icons.Outlined.SwapVert, Modifier.align(Alignment.TopStart).padding(8.dp)) { vm.rotateResult180() }
+                if (vm.spreadPartner != null) {
+                    PageAction("Book spread: swap order", Icons.Outlined.SwapHoriz, Modifier.align(Alignment.BottomStart).padding(8.dp)) { vm.swapSpread() }
+                }
+            }
         }
         if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
 
@@ -226,6 +235,21 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             title = { Text("Processing details") },
             text = { Text(vm.details, style = MaterialTheme.typography.bodySmall, modifier = Modifier.verticalScroll(rememberScrollState())) },
         )
+    }
+}
+
+/** A small action pill over the page. */
+@Composable
+private fun PageAction(label: String, icon: ImageVector, modifier: Modifier, onClick: () -> Unit) {
+    Row(
+        modifier.height(36.dp).clip(RoundedCornerShape(18.dp)).background(Editor.Panel.copy(alpha = 0.9f))
+            .border(1.dp, Editor.Outline, RoundedCornerShape(18.dp))
+            .clickable(role = Role.Button, onClick = onClick).padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, null, Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text(label, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), maxLines = 1)
     }
 }
 

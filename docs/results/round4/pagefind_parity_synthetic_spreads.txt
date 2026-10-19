@@ -1,0 +1,13 @@
+opencv 4.11.0  numpy 2.2.6  onnxruntime 1.22.0
+spread_0                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.8630/0.8630  strength 0.3262/0.3262  GT IoU app n/a  ref n/a 
+spread_1                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.8176/0.8176  strength 0.6843/0.6843  GT IoU app n/a  ref n/a 
+spread_2                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.7804/0.7804  strength 0.5688/0.5688  GT IoU app n/a  ref n/a 
+spread_3                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.8509/0.8509  strength 0.1531/0.1531  GT IoU app n/a  ref n/a 
+spread_4                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.8161/0.8161  strength 0.7549/0.7549  GT IoU app n/a  ref n/a 
+spread_5                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.7716/0.7716  strength 0.7290/0.7290  GT IoU app n/a  ref n/a 
+spread_6                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.8627/0.8627  strength 0.0004/0.0004  GT IoU app n/a  ref n/a 
+spread_7                             input max|d| 0.0e+00  app~ref IoU 1.000000  diff px      0 (0.0000%)  edge mean/max 0.000/0.00 px  pages 2/2  fallback 0/0  margin 0.7670/0.7670  strength 0.8246/0.8246  GT IoU app n/a  ref n/a 
+
+8 photos. app vs reference mask IoU: min 1.000000 mean 1.000000; max differing pixels 0.0000% of the photo; max outline distance 0.00 px, worst mean 0.000 px
+net input max |C++ - Python|: 0.00e+00
+page count mismatches: 0; whole-frame fallback mismatches: 0

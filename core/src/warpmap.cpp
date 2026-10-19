@@ -864,6 +864,26 @@ std::vector<std::array<double, 3>> text_rows(const cv::Mat& Dm, const Lines& H, 
     return rows;
 }
 
+Field zero_field(int gw, int gh, int g) {
+    Field f;
+    f.gw = gw; f.gh = gh; f.g = g;
+    f.v.assign((size_t)gw * gh, 0.0);
+    return f;
+}
+
+// compose global o local on the 4-px grid
+GridMap compose_maps(const WarpDebug& d, int w, int h) {
+    GridMap g = GridMap::make(w, h, 4);
+    for (int i = 0; i < g.gh; ++i)
+        for (int j = 0; j < g.gw; ++j) {
+            float X4 = (float)(j * 4), Y4 = (float)(i * 4);
+            float lx = X4 + d.Fx.sample(X4, Y4), ly = Y4 + d.Fy.sample(X4, Y4);
+            g.X(i, j) = lx + d.GX.sample(lx, ly);
+            g.Y(i, j) = ly + d.GY.sample(lx, ly);
+        }
+    return g;
+}
+
 }  // namespace
 
 GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
@@ -874,10 +894,18 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
     auto t0 = Clock::now();
     // ---- global stage (global_grid)
     std::vector<DLine> Hs, Vs;
-    dewarp_detect(src, Hs, Vs);
     std::vector<cv::Point2d> sp, dp;
-    build_controls(Hs, Vs, sp, dp);
+    try {
+        dewarp_detect(src, Hs, Vs);
+        build_controls(Hs, Vs, sp, dp);
+    } catch (const std::exception&) {
+        sp.clear(); dp.clear();
+    }
     d.n_ctrl_raw = (int)dp.size();
+    const int GG = 32;
+    int gw = w / GG + 2, gh = h / GG + 2;
+    // no usable grid lines (plain text, photos, projector): skip the global stage (round 4 fix)
+    const bool skip_global = dp.size() < 20;
     {
         std::map<long, size_t> first;
         for (size_t i = 0; i < dp.size(); ++i) {
@@ -896,12 +924,14 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
         }
     }
     d.n_ctrl = (int)dp.size();
-    const int GG = 32;
-    int gw = w / GG + 2, gh = h / GG + 2;
     std::vector<std::array<double, 2>> cxy;
     Vec vx, vy;
     for (size_t i = 0; i < dp.size(); ++i) { cxy.push_back({dp[i].x, dp[i].y}); vx.push_back(sp[i].x - dp[i].x); vy.push_back(sp[i].y - dp[i].y); }
-    {   // the x and y fields are independent solves
+    if (skip_global) {
+        d.n_ctrl = 0;
+        d.GX = zero_field(gw, gh, GG);
+        d.GY = zero_field(gw, gh, GG);
+    } else {   // the x and y fields are independent solves
         std::thread tx([&] { d.GX = solve_field(cxy, vx, nullptr, gw, gh, GG, nullptr, &d.cg_iters[0]); });
         d.GY = solve_field(cxy, vy, nullptr, gw, gh, GG, nullptr, &d.cg_iters[1]);
         tx.join();
@@ -909,7 +939,9 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
     d.ms.emplace_back("global", ms_since(t0));
     t0 = Clock::now();
     // A_img = remap(src, xx + GX(xx/32, yy/32), ...): exact bilinear at x/32 (no border taps needed)
-    {
+    if (skip_global) {
+        d.A_img = src.clone();
+    } else {
         std::vector<float> gx(d.GX.v.begin(), d.GX.v.end()), gy(d.GY.v.begin(), d.GY.v.end());
         d.A_img.create(h, w, src.type());
         const int band = 64;
@@ -938,12 +970,20 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
     t0 = Clock::now();
     // ---- local stage (local_field)
     get_lines(d.D, d.H, d.V);
+    const int GC = 16, GF = 8;
+    if (d.H.empty() || d.V.empty()) {
+        // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
+        // pages then get the surface model only.
+        d.n_text = 0;
+        d.Fx = d.Fy = d.Fx1 = d.Fy1 = zero_field(w / GF + 2, h / GF + 2, GF);
+        d.ms.emplace_back("lines (none: zero field)", ms_since(t0));
+        return compose_maps(d, w, h);
+    }
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
     d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
-    const int GC = 16, GF = 8;
     Field Fx_prev, Fy_prev;
     for (int it = 0; it < 2; ++it) {
         int G = it == 1 ? GF : GC;
@@ -983,16 +1023,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
     }
     d.Fx = Fx_prev; d.Fy = Fy_prev;
     d.ms.emplace_back("solves", ms_since(t0));
-    // ---- compose global o local on the 4-px grid
-    GridMap g = GridMap::make(w, h, 4);
-    for (int i = 0; i < g.gh; ++i)
-        for (int j = 0; j < g.gw; ++j) {
-            float X4 = (float)(j * 4), Y4 = (float)(i * 4);
-            float lx = X4 + d.Fx.sample(X4, Y4), ly = Y4 + d.Fy.sample(X4, Y4);
-            g.X(i, j) = lx + d.GX.sample(lx, ly);
-            g.Y(i, j) = ly + d.GY.sample(lx, ly);
-        }
-    return g;
+    return compose_maps(d, w, h);
 }
 
 }  // namespace fs

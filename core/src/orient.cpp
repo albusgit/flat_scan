@@ -142,8 +142,10 @@ Orientation decide_orientation(const cv::Mat& page, double min_conf) {
         o.upright = upright_hebrew_score(ccw);
         o.rot = o.upright < -min_conf ? cv::ROTATE_90_CLOCKWISE : cv::ROTATE_90_COUNTERCLOCKWISE;
     } else {
+        // no automatic 180-degree flip (round 4): in the 34-photo test every auto-180 was wrong,
+        // the upright score is Hebrew-only. The result screen has a one-tap rotate instead.
         o.upright = upright_hebrew_score(g1);
-        o.rot = o.upright < -min_conf ? cv::ROTATE_180 : -1;
+        o.rot = -1;
     }
     return o;
 }

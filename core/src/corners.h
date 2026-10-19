@@ -28,10 +28,19 @@ struct Detection {
     std::vector<cv::Point2d> contour;
     cv::Mat paper;                               // filled page outline (255 = paper), analysis size
     bool landscape = false;
+    bool whole_frame = false;                    // colour-threshold finder found no page: whole frame
 };
 
 // img: 8-bit BGR. rng: corners.py's module-level default_rng(0); the reference creates it
 // once per process and every call continues its stream.
 Detection detect_page(const cv::Mat& bgr, NpRng& rng);
+
+// corners.paper_mask: (contour, filled mask 255 = paper). whole_frame: no candidate covered
+// 10-99% of the frame, so the frame inset 2 px was returned.
+bool paper_mask(const cv::Mat& bgr, std::vector<cv::Point2d>& contour, cv::Mat& full, bool* whole_frame = nullptr);
+
+// corners.curved_corners on an outline already in D.contour (from either page finder): fills
+// sides, side_pts, corners, fold_d and landscape; D.ok tells whether it succeeded.
+void corners_from_contour(Detection& D, NpRng& rng);
 
 }  // namespace fs

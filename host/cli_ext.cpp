@@ -170,7 +170,7 @@ static int cmd_photo(int argc, char** argv) {
     PipelineOptions o;
     o.use_gpu = !flag(argc, argv, "--cpu");
     o.orient_on_stage1 = flag(argc, argv, "--orient-stage1");
-    o.reference_orient = flag(argc, argv, "--reference-orient");   // ungated 0/180 cue (section-5 parity)
+    o.reference_orient = flag(argc, argv, "--reference-orient");   // ungated CW/CCW cue for sideways pages (reference)
     o.auto_orient = !flag(argc, argv, "--no-orient");
     if (flag(argc, argv, "--v8")) o.surface_fallback_px = -1;   // force the homography path
     PipelineResult r = run_photo(img, o);

@@ -23,12 +23,13 @@ double Side::signed_dist(const cv::Point2d& X) const {
     return o - polyval(p, s);
 }
 
-// paper mask: L > 150 and chroma < 7 (Lab), largest component, its outer contour
-static bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour, cv::Mat& full) {
+// corners.paper_mask (round 4): tries progressively looser definitions of paper and keeps the
+// first whose largest component covers 10-99% of the frame; otherwise the whole frame, inset 2 px
+bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour, cv::Mat& full, bool* whole_frame) {
     cv::Mat blur, lab8;
     cv::GaussianBlur(img, blur, cv::Size(7, 7), 0);
     cv::cvtColor(blur, lab8, cv::COLOR_BGR2Lab);
-    cv::Mat chroma8(img.size(), CV_8U), Lm(img.size(), CV_32F);
+    cv::Mat chroma8(img.size(), CV_8U), L8(img.size(), CV_8U);
     for (int y = 0; y < img.rows; ++y) {
         const uint8_t* q = lab8.ptr<uint8_t>(y);
         for (int x = 0; x < img.cols; ++x) {
@@ -36,37 +37,61 @@ static bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour, cv
             float c = std::hypot(a, b) * 8.f;                       // float32, as numpy
             c = std::min(std::max(c, 0.f), 255.f);
             chroma8.at<uint8_t>(y, x) = (uint8_t)c;                 // astype(uint8) truncates
-            Lm.at<float>(y, x) = q[3 * x];
+            L8.at<uint8_t>(y, x) = q[3 * x];
         }
     }
-    cv::Mat chroma_med;
+    cv::Mat chroma_med, tmp;
     cv::medianBlur(chroma8, chroma_med, 5);
-    cv::Mat m(img.size(), CV_8U);
-    for (int y = 0; y < img.rows; ++y)
-        for (int x = 0; x < img.cols; ++x)
-            m.at<uint8_t>(y, x) = (Lm.at<float>(y, x) > 150.f && chroma_med.at<uint8_t>(y, x) / 8.0 < 7.0) ? 1 : 0;
-    cv::morphologyEx(m, m, cv::MORPH_CLOSE, cv::Mat::ones(25, 25, CV_8U));
-    cv::morphologyEx(m, m, cv::MORPH_OPEN, cv::Mat::ones(9, 9, CV_8U));
-    cv::Mat labels, stats, cent;
-    int n = cv::connectedComponentsWithStats(m, labels, stats, cent, 8);
-    if (n < 2) return false;
-    int k = 1;
-    for (int i = 2; i < n; ++i)
-        if (stats.at<int>(i, cv::CC_STAT_AREA) > stats.at<int>(k, cv::CC_STAT_AREA)) k = i;
-    cv::Mat mk = (labels == k) / 255;
-    std::vector<std::vector<cv::Point>> cs;
-    cv::findContours(mk, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    if (cs.empty()) return false;
-    size_t best = 0;
-    double ba = -1;
-    for (size_t i = 0; i < cs.size(); ++i) {           // max(cs, key=contourArea): first maximum
-        double a = cv::contourArea(cs[i]);
-        if (a > ba) { ba = a; best = i; }
+    double otsu = cv::threshold(L8, tmp, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    const double area = (double)img.rows * img.cols;
+    if (whole_frame) *whole_frame = false;
+    for (int cand = 0; cand < 3; ++cand) {
+        cv::Mat m(img.size(), CV_8U);
+        for (int y = 0; y < img.rows; ++y)
+            for (int x = 0; x < img.cols; ++x) {
+                double L = L8.at<uint8_t>(y, x), ch = chroma_med.at<uint8_t>(y, x) / 8.0;
+                bool v = cand == 0 ? (L > 150.0 && ch < 7.0)          // white, neutral paper (original rule)
+                       : cand == 1 ? (L > otsu && ch < 25.0)          // dimmer / tinted light
+                                   : (L > otsu);                      // coloured paper (e.g. blue)
+                m.at<uint8_t>(y, x) = v ? 1 : 0;
+            }
+        cv::morphologyEx(m, m, cv::MORPH_CLOSE, cv::Mat::ones(25, 25, CV_8U));
+        cv::morphologyEx(m, m, cv::MORPH_OPEN, cv::Mat::ones(9, 9, CV_8U));
+        cv::Mat labels, stats, cent;
+        int n = cv::connectedComponentsWithStats(m, labels, stats, cent, 8);
+        if (n < 2) continue;
+        int k = 1;
+        for (int i = 2; i < n; ++i)
+            if (stats.at<int>(i, cv::CC_STAT_AREA) > stats.at<int>(k, cv::CC_STAT_AREA)) k = i;
+        double frac = stats.at<int>(k, cv::CC_STAT_AREA) / area;
+        if (!(0.10 <= frac && frac <= 0.99)) continue;
+        cv::Mat mk = (labels == k) / 255;
+        std::vector<std::vector<cv::Point>> cs;
+        cv::findContours(mk, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+        if (cs.empty()) continue;
+        size_t best = 0;
+        double ba = -1;
+        for (size_t i = 0; i < cs.size(); ++i) {           // max(cs, key=contourArea): first maximum
+            double a = cv::contourArea(cs[i]);
+            if (a > ba) { ba = a; best = i; }
+        }
+        contour.clear();
+        for (auto& p : cs[best]) contour.emplace_back(p.x, p.y);
+        full = cv::Mat::zeros(img.size(), CV_8U);                // corners.paper_mask's `full`
+        cv::drawContours(full, cs, (int)best, cv::Scalar(255), cv::FILLED);
+        return contour.size() >= 20;
     }
+    // fallback: whole frame (inset 2 px so the outline has four clean sides)
+    if (whole_frame) *whole_frame = true;
+    full = cv::Mat::zeros(img.size(), CV_8U);
+    if (img.rows <= 4 || img.cols <= 4) return false;
+    full(cv::Rect(2, 2, img.cols - 4, img.rows - 4)).setTo(255);
+    cv::Mat m01 = full / 255;
+    std::vector<std::vector<cv::Point>> cs;
+    cv::findContours(m01, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     contour.clear();
-    for (auto& p : cs[best]) contour.emplace_back(p.x, p.y);
-    full = cv::Mat::zeros(img.size(), CV_8U);                // corners.paper_mask's `full`
-    cv::drawContours(full, cs, (int)best, cv::Scalar(255), cv::FILLED);
+    if (cs.empty()) return false;
+    for (auto& p : cs[0]) contour.emplace_back(p.x, p.y);
     return contour.size() >= 20;
 }
 
@@ -158,8 +183,18 @@ static cv::Point2d intersect(const Side& A, const Side& B) {
 
 Detection detect_page(const cv::Mat& img, NpRng& rng) {
     Detection D;
-    if (!paper_mask(img, D.contour, D.paper)) return D;
+    bool whole = false;
+    if (!paper_mask(img, D.contour, D.paper, &whole)) return D;
+    D.whole_frame = whole;
+    corners_from_contour(D, rng);
+    return D;
+}
+
+// corners.curved_corners on D.contour (any page finder) -> sides, corners, fold gaps, landscape
+void corners_from_contour(Detection& D, NpRng& rng) {
+    D.ok = false;
     const auto& contour = D.contour;
+    if (contour.size() < 20) return;
     std::vector<cv::Point2f> c32(contour.size());
     for (size_t i = 0; i < contour.size(); ++i) c32[i] = cv::Point2f((float)contour[i].x, (float)contour[i].y);
     std::vector<cv::Point2f> hull;
@@ -181,7 +216,7 @@ Detection detect_page(const cv::Mat& img, NpRng& rng) {
         pts[best].push_back(c);
     }
     for (int k = 0; k < 4; ++k) {
-        if (pts[k].size() < 3) return D;
+        if (pts[k].size() < 3) return;
         D.sides[k] = make_side(box[k], box[(k + 1) % 4], pts[k], rng);
     }
     for (int k = 0; k < 4; ++k) D.corners[k] = intersect(D.sides[(k + 3) % 4], D.sides[k]);
@@ -194,7 +229,6 @@ Detection detect_page(const cv::Mat& img, NpRng& rng) {
     cv::Point2d w = D.corners[1] - D.corners[0], h = D.corners[3] - D.corners[0];
     D.landscape = norm(w) > norm(h);
     D.ok = true;
-    return D;
 }
 
 }  // namespace fs

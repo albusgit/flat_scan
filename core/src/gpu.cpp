@@ -378,12 +378,14 @@ uniform ivec2 uQ;
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);
     if (q.x >= uQ.x || q.y >= uQ.y) return;
-    uint n = 0u;
+    uint n = 0u;   // ink px + (px below 0.75) << 16, as ink_counts in cleanup.cpp
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c) {
             int y = 4 * q.y + r, x = 4 * q.x + c;
             if (y >= uImg.y || x >= uImg.x) continue;
-            if (luma(normalised(x, y)) < 0.55) n++;
+            float l = luma(normalised(x, y));
+            if (l < 0.55) n++;
+            if (l < 0.75) n += 65536u;
         }
     imageStore(uCnt, q, uvec4(n));
 }
@@ -405,6 +407,9 @@ uniform int uBg;          // background cleanup: smoothstep knee on luma(t) over
 uniform float uKneeLo;
 uniform float uKneeHi;
 uniform uint uSpeckMax;
+uniform uint uSpeckLight;
+uniform float uSpeckBg;
+uniform highp sampler2D uPic;
 uniform float uWp;
 uniform float uWpTint;
 uniform float uGamma;
@@ -421,6 +426,16 @@ float bgvAt(int x, int y) {
     return (texelFetch(uBgv, ivec2(x0, y0), 0).r * (1.0 - a) + texelFetch(uBgv, ivec2(x1, y0), 0).r * a) * (1.0 - b) +
            (texelFetch(uBgv, ivec2(x0, y1), 0).r * (1.0 - a) + texelFetch(uBgv, ivec2(x1, y1), 0).r * a) * b;
 }
+float picAt(int x, int y) {
+    ivec2 n = textureSize(uPic, 0);
+    float fx = clamp((float(x) + 0.5) * 0.25 - 0.5, 0.0, float(n.x - 1));
+    float fy = clamp((float(y) + 0.5) * 0.25 - 0.5, 0.0, float(n.y - 1));
+    int x0 = int(fx), y0 = int(fy);
+    int x1 = min(x0 + 1, n.x - 1), y1 = min(y0 + 1, n.y - 1);
+    float a = fx - float(x0), b = fy - float(y0);
+    return (texelFetch(uPic, ivec2(x0, y0), 0).r * (1.0 - a) + texelFetch(uPic, ivec2(x1, y0), 0).r * a) * (1.0 - b) +
+           (texelFetch(uPic, ivec2(x0, y1), 0).r * (1.0 - a) + texelFetch(uPic, ivec2(x1, y1), 0).r * a) * b;
+}
 float curve1(float v) {
     if (uKind == 1) return min(v / uWp, 1.0);
     return v >= uWp ? 1.0 : pow(v / uWp, uGamma);
@@ -436,15 +451,18 @@ void main() {
     } else {
         vec3 v = normalised(x, y);
         float l = luma(v);
+        float b = max(bgvAt(x, y), 0.05), w = 0.0;
         if (uKind == 3) {
-            float b = max(bgvAt(x, y), 0.05);
             float wp = b < 0.97 ? uWpTint : uWp;
             float u = clamp((l / b - 0.5) / (wp - 0.5), 0.0, 1.0);
-            t = vec3(pow(u, uGamma));
+            float tr = pow(u, uGamma);
+            w = picAt(x, y);   // pictures and dark areas: their own tones (Auto color curve)
+            float ta = l >= uWp ? 1.0 : pow(l / uWp, 1.25);
+            t = vec3(tr + (ta - tr) * w);
         } else {
             t = vec3(curve1(v.r), curve1(v.g), curve1(v.b));
         }
-        if (uSpecks != 0 && l < 0.75) {
+        if (uSpecks != 0 && l < 0.75 && b >= uSpeckBg && w < 0.5) {
             ivec2 nq = textureSize(uCnt, 0);
             int bi = min(y / 4, nq.y - 1), bj = min(x / 4, nq.x - 1);
             uint n = 0u;
@@ -453,13 +471,17 @@ void main() {
                     int ii = bi + di, jj = bj + dj;
                     if (ii >= 0 && ii < nq.y && jj >= 0 && jj < nq.x) n += texelFetch(uCnt, ivec2(jj, ii), 0).r;
                 }
-            if (n >= 1u && n <= uSpeckMax) t = vec3(1.0);
+            uint ink = n & 65535u, light = n >> 16;
+            if (ink >= 1u && ink <= uSpeckMax && light <= uSpeckLight) t = vec3(1.0);
         }
     }
     if (uLevels != 0) t = pow(clamp((t - vec3(uBlack)) * uInvRange, 0.0, 1.0), vec3(uInvGamma));
     if (uBg != 0) {
         float e = clamp((luma(t) - uKneeLo) / (uKneeHi - uKneeLo), 0.0, 1.0);
         float w = e * e * (3.0 - 2.0 * e);
+        float ch = max(t.r, max(t.g, t.b)) - min(t.r, min(t.g, t.b));   // near-neutral only
+        float f = clamp((ch - 0.06) / (0.15 - 0.06), 0.0, 1.0);
+        w = w * (1.0 - f * f * (3.0 - 2.0 * f));
         t = t + (vec3(1.0) - t) * w;
     }
     if (uGray != 0) t = vec3(luma(t));
@@ -536,10 +558,12 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     cv::Mat s = img.isContinuous() ? img : img.clone();
     cv::Mat ill = p.illum.isContinuous() ? p.illum : p.illum.clone();
     cv::Mat bgv = p.bgv.isContinuous() ? p.bgv : p.bgv.clone();
+    cv::Mat pic = p.pic.isContinuous() ? p.pic : p.pic.clone();
     int qw = std::max(1, img.cols / 4), qh = std::max(1, img.rows / 4);
     GLuint tsrc = gpu_tex_rgba8ui(s);
     GLuint till = tex_r32f(ill.cols, ill.rows, ill.ptr<float>());
     GLuint tbgv = tex_r32f(bgv.cols, bgv.rows, bgv.ptr<float>());
+    GLuint tpic = tex_r32f(pic.cols, pic.rows, pic.ptr<float>());
     GLuint tcnt = tex_storage(GL_R32UI, qw, qh);
     for (GLuint prog : {prog_count_, prog_tone_}) {
         glUseProgram(prog);
@@ -558,6 +582,7 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     glUseProgram(prog_tone_);
     bind_tex(prog_tone_, 2, tcnt, "uCnt");
     bind_tex(prog_tone_, 3, tbgv, "uBgv");
+    bind_tex(prog_tone_, 4, tpic, "uPic");
     set_i(prog_tone_, "uKind", c.kind);
     glUniform1f(glGetUniformLocation(prog_tone_, "uWp"), c.wp);
     glUniform1f(glGetUniformLocation(prog_tone_, "uGamma"), c.gamma);
@@ -572,10 +597,12 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     glUniform1f(glGetUniformLocation(prog_tone_, "uKneeLo"), ak.knee_lo);
     glUniform1f(glGetUniformLocation(prog_tone_, "uKneeHi"), ak.knee_hi);
     glUniform1ui(glGetUniformLocation(prog_tone_, "uSpeckMax"), (GLuint)ak.speck_max);
+    glUniform1ui(glGetUniformLocation(prog_tone_, "uSpeckLight"), (GLuint)ak.speck_light);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uSpeckBg"), c.speck_bg);
     glUniform1f(glGetUniformLocation(prog_tone_, "uStrength"), strength);
     bool ok = run_banded(prog_tone_, img.cols, img.rows, out);
-    GLuint ts[4] = {tsrc, till, tbgv, tcnt};
-    glDeleteTextures(4, ts);
+    GLuint ts[5] = {tsrc, till, tbgv, tcnt, tpic};
+    glDeleteTextures(5, ts);
     glFinish();
     release();
     return ok;
