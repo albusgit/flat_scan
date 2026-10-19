@@ -12,6 +12,7 @@
 namespace fs {
 
 struct PageParams;
+struct Adjust;
 enum class Filter : int;
 
 class Gpu {
@@ -28,7 +29,7 @@ public:
     // Filter passes (cleanup.h): the 1/4-resolution background (same bytes as
     // background_quarter_cpu) and the filter (same as filter_cpu up to float rounding).
     bool background_quarter(const cv::Mat& img_rgba, cv::Mat& bg4_rgba);
-    bool filter(const cv::Mat& img_rgba, const PageParams& p, Filter f, float strength, cv::Mat& out_rgba);
+    bool filter(const cv::Mat& img_rgba, const PageParams& p, Filter f, float strength, const Adjust& adj, cv::Mat& out_rgba);
 
 private:
     Gpu() = default;

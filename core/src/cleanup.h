@@ -22,6 +22,16 @@
 // strength s in [0, 1]: out = Original + s * (filter - Original); s = 0 is Original.
 // Isolated specks (<= 2 ink pixels in a 36 px window) are removed in Auto, Grayscale, High
 // contrast and B&W.
+//
+// User adjustments (Adjust; NativeLib.kt RenderParams), per pixel and channel, in this order:
+//   filter curve t -> speck removal -> levels t = clamp((t - black) / (white - black), 0, 1)^(1/gamma)
+//   -> background cleanup (bg > 0): soft knee towards white, k = 0.02 + 0.16 bg: weight
+//      w = smoothstep(1 - 2k, 1 - k, luma(t)), t += (1 - t) w (luma >= 1 - k -> white; hue kept);
+//      with bg > 0 the speck limit also grows to 2 + round(10 bg) ink px per 36-px window
+//   -> grayscale -> strength blend with Original.
+// The Original filter uses t = page / 255 (no curve, no specks) when the adjustments are not
+// identity; with identity adjustments Original is the page itself. Defaults are identity, and
+// an identity step is skipped (bit-identical to the unadjusted filters).
 #pragma once
 #include <opencv2/core.hpp>
 #include <vector>
@@ -52,6 +62,34 @@ struct Curve {
 };
 Curve filter_curve(Filter f, float sigma);
 
+// User adjustments (defaults: identity).
+struct Adjust {
+    float bg_cleanup = 0.f;   // 0..1
+    float black = 0.f;        // 0..0.5
+    float white = 1.f;        // 0.5..1
+    float gamma = 1.f;        // 0.3..3 (> 1 brightens mid-tones)
+    bool levels_identity() const { return black == 0.f && white == 1.f && gamma == 1.f; }
+    bool identity() const { return bg_cleanup <= 0.f && levels_identity(); }
+    Adjust clamped() const;   // ranges enforced, white - black >= 0.02
+};
+
+// Everything a render depends on besides the page (NativeLib.kt RenderParams).
+struct RenderParams {
+    Filter filter = Filter::AutoColor;
+    float strength = 0.7f;
+    bool solid = false;
+    Adjust adj;
+};
+
+// Adjustment constants (shared by the CPU and GPU code).
+struct AdjustK {
+    bool levels = false, bg = false;
+    float black = 0, inv_range = 1, inv_gamma = 1;
+    float knee_lo = 1, knee_hi = 1;
+    int speck_max = 2;        // speck removal: 1..speck_max ink px per 36-px window (0 = off)
+};
+AdjustK adjust_constants(const Adjust& a, bool specks);
+
 PageParams page_params(const cv::Mat& page_bgra, bool use_gpu);
 cv::Mat background_quarter_cpu(const cv::Mat& bgra);
 
@@ -62,7 +100,7 @@ cv::Mat apply_paper(const cv::Mat& page_bgra, const cv::Mat& paper, const PagePa
 
 // CPU filter. img may be a downscaled copy of the page (live thumbnails): its pixels are
 // mapped to page coordinates for the illumination lookup. Specks are only removed at full size.
-cv::Mat filter_cpu(const cv::Mat& img_bgra, const PageParams& p, Filter f, float strength);
+cv::Mat filter_cpu(const cv::Mat& img_bgra, const PageParams& p, Filter f, float strength, const Adjust& adj = Adjust());
 
 struct RenderStats {
     bool gpu_filter = false;
@@ -74,5 +112,10 @@ struct RenderStats {
 // Paper fill, filter (GPU or CPU), then Solid colors (not with Black & white).
 cv::Mat render_page(const cv::Mat& page_bgra, const cv::Mat& paper, const PageParams& p, Filter f, float strength, bool solid,
                     const std::vector<Rect01>& protect, bool use_gpu, RenderStats* st = nullptr);
+cv::Mat render_page(const cv::Mat& page_bgra, const cv::Mat& paper, const PageParams& p, const RenderParams& rp,
+                    const std::vector<Rect01>& protect, bool use_gpu, RenderStats* st = nullptr);
+
+// 256-bin histogram of the luma (Rec.601, rounded) of an 8-bit BGRA image.
+std::vector<int> luma_histogram(const cv::Mat& bgra);
 
 }  // namespace fs

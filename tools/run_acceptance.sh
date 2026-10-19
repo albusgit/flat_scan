@@ -14,10 +14,14 @@ mkdir -p $OUT
 for path in gpu cpu; do
   flag=""; [ $path = cpu ] && flag="--cpu"
   O=$OUT/$path; mkdir -p $O
-  for p in photo1 photo2; do $CLI photo $IMG/$p.jpg $O/$p $flag; done
-  for c in P1 P2; do $CLI photo $BENCH/photo$c.png $O/bench_$c $flag; done
+  # --reference-orient: the reference's ungated 0/180 decision, so the parity rows stay like-for-like
+  for p in photo1 photo2; do $CLI photo $IMG/$p.jpg $O/$p $flag --reference-orient; done
+  for c in P1 P2; do $CLI photo $BENCH/photo$c.png $O/bench_$c $flag --reference-orient; done
   for s in p1 p2 p3; do $CLI scan $IMG/scan_$s.jpg $O/scan_$s $flag; done
 done
+# the app's default (gated) orientation on the synthetic bench pages: they must stay upright
+mkdir -p $OUT/gated
+for c in P1 P2; do $CLI photo $BENCH/photo$c.png $OUT/gated/bench_$c; done
 echo
 echo "=== 1. map parity: port_compare.py reference candidate --limit 0.1"
 for path in gpu cpu; do
@@ -44,6 +48,20 @@ PY
 echo
 echo "=== 3-5. ground truth, straightness, photo-1 title border (GPU path outputs)"
 $PY -I $HERE/acceptance.py $CODE $OUT/gpu --flat $IMG/flat_page.png --bench $BENCH | tee $OUT/acceptance_gpu.json
+echo
+echo "=== 6. orientation: app default (orient_min_conf 0.2) vs the reference rule (GPU path)"
+$PY -I - $OUT <<'PY'
+import sys, json
+out = sys.argv[1]
+names = {-1: 'none', 0: '90 CW', 1: '180', 2: '90 CCW'}
+for n in ('photo1', 'photo2', 'bench_P1', 'bench_P2'):
+    ref = json.load(open(f'{out}/gpu/{n}/info.json'))
+    line = f'{n:9s} reference rule: rot {ref["rot"]:2d} ({names[ref["rot"]]:6s}) orient [sh, sv, upright] {ref["orient"]}'
+    if n.startswith('bench'):
+        g = json.load(open(f'{out}/gated/{n}/info.json'))
+        line += f' | default: rot {g["rot"]:2d} ({names[g["rot"]]}) -> ' + ('upright, not rotated: PASS' if g['rot'] == -1 else 'ROTATED: FAIL')
+    print(line)
+PY
 echo
 echo "=== timings (host, ms)"
 for n in photo1 photo2 bench_P1 bench_P2 scan_p1 scan_p2 scan_p3; do echo "$n: $(cat $OUT/gpu/$n/info.json)"; done

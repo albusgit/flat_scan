@@ -269,7 +269,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     if (opt.auto_orient) {
         t0 = Clock::now();
         cv::Mat op = (opt.orient_on_stage1 || r.mode == GeomMode::Homography) ? stage1 : remap_unroll(photo, Uh);
-        Orientation o = decide_orientation(op);
+        Orientation o = decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf);
         r.rot = o.rot; r.orient_sh = o.sh; r.orient_sv = o.sv; r.orient_upright = o.upright;
         r.ms.emplace_back("orientation", ms_since(t0));
     }

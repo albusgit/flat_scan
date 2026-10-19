@@ -36,6 +36,9 @@ struct PipelineOptions {
     double focal_px = 0;              // full-res focal length from EXIF / camera; 0 = 0.72*max side
     bool auto_orient = true;          // decide 0/90/180/270 on the homography page
     bool orient_on_stage1 = false;    // reference-code behaviour (decide on stage 1); off = brief
+    double orient_min_conf = 0.2;     // 180 deg / CW only if the upright cue is below -this (it is
+                                      // Hebrew-specific: ~0 on other or low-confidence pages)
+    bool reference_orient = false;    // ungated decision, exactly the reference (parity tests)
     int out_w = 1600;                 // analysis page width (portrait; landscape swaps) - the reference's
     int render_w = 0;                 // output page width (portrait) if different from out_w; 0 = same
     bool use_gpu = true;

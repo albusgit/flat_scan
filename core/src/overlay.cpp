@@ -7,18 +7,33 @@
 
 namespace fs {
 
-cv::Mat wrinkle_overlay(const GridMap& d, bool heat, bool grid, float* legend_px, int spacing) {
-    int w = d.out_w, h = d.out_h;
-    cv::Mat mag(d.gh, d.gw, CV_32F);
+namespace {
+// |d| on the grid and the legend top (99.5th percentile, rounded up, >= 1 px)
+float magnitudes(const GridMap& d, cv::Mat& mag) {
+    mag.create(d.gh, d.gw, CV_32F);
     std::vector<float> all;
+    all.reserve((size_t)d.gh * d.gw);
     for (int i = 0; i < d.gh; ++i)
         for (int j = 0; j < d.gw; ++j) {
             float v = std::hypot(d.x[(size_t)i * d.gw + j], d.y[(size_t)i * d.gw + j]);
             mag.at<float>(i, j) = v;
             all.push_back(v);
         }
+    if (all.empty()) return 1.f;
     std::nth_element(all.begin(), all.begin() + (size_t)(all.size() * 0.995), all.end());
-    float top = std::max(1.f, std::ceil(all[(size_t)(all.size() * 0.995)]));
+    return std::max(1.f, std::ceil(all[(size_t)(all.size() * 0.995)]));
+}
+}  // namespace
+
+float wrinkle_legend_px(const GridMap& d) {
+    cv::Mat mag;
+    return magnitudes(d, mag);
+}
+
+cv::Mat wrinkle_overlay(const GridMap& d, bool heat, bool grid, float* legend_px, int spacing) {
+    int w = d.out_w, h = d.out_h;
+    cv::Mat mag;
+    float top = magnitudes(d, mag);
     if (legend_px) *legend_px = top;
     cv::Mat out(h, w, CV_8UC4, cv::Scalar(0, 0, 0, 0));
     if (heat) {

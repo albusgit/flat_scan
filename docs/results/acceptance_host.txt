@@ -1,17 +1,19 @@
-/home/user/ref/app_ref/test_images/photo1.jpg: mode surface rot -1 gpu 1 total 1613 ms
-/home/user/ref/app_ref/test_images/photo2.jpg: mode surface rot 2 gpu 1 total 1733 ms
-/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot 1 gpu 1 total 1581 ms
-/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot 1 gpu 1 total 1486 ms
-/home/user/ref/app_ref/test_images/scan_p1.jpg: gpu 1 total 2610 ms
-/home/user/ref/app_ref/test_images/scan_p2.jpg: gpu 1 total 2481 ms
-/home/user/ref/app_ref/test_images/scan_p3.jpg: gpu 1 total 2884 ms
-/home/user/ref/app_ref/test_images/photo1.jpg: mode surface rot -1 gpu 0 total 1691 ms
-/home/user/ref/app_ref/test_images/photo2.jpg: mode surface rot 2 gpu 0 total 1557 ms
-/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot 1 gpu 0 total 1578 ms
-/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot 1 gpu 0 total 1691 ms
-/home/user/ref/app_ref/test_images/scan_p1.jpg: gpu 0 total 2611 ms
-/home/user/ref/app_ref/test_images/scan_p2.jpg: gpu 0 total 2246 ms
-/home/user/ref/app_ref/test_images/scan_p3.jpg: gpu 0 total 2409 ms
+/home/user/ref/app_ref/test_images/photo1.jpg: mode surface rot -1 gpu 1 total 1856 ms
+/home/user/ref/app_ref/test_images/photo2.jpg: mode surface rot 2 gpu 1 total 1691 ms
+/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot 1 gpu 1 total 1552 ms
+/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot 1 gpu 1 total 1643 ms
+/home/user/ref/app_ref/test_images/scan_p1.jpg: gpu 1 total 2259 ms
+/home/user/ref/app_ref/test_images/scan_p2.jpg: gpu 1 total 2411 ms
+/home/user/ref/app_ref/test_images/scan_p3.jpg: gpu 1 total 2443 ms
+/home/user/ref/app_ref/test_images/photo1.jpg: mode surface rot -1 gpu 0 total 1811 ms
+/home/user/ref/app_ref/test_images/photo2.jpg: mode surface rot 2 gpu 0 total 1619 ms
+/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot 1 gpu 0 total 1539 ms
+/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot 1 gpu 0 total 1805 ms
+/home/user/ref/app_ref/test_images/scan_p1.jpg: gpu 0 total 2334 ms
+/home/user/ref/app_ref/test_images/scan_p2.jpg: gpu 0 total 2313 ms
+/home/user/ref/app_ref/test_images/scan_p3.jpg: gpu 0 total 2346 ms
+/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot -1 gpu 1 total 1779 ms
+/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot -1 gpu 1 total 1773 ms
 
 === 1. map parity: port_compare.py reference candidate --limit 0.1
 gpu  photo1   {"max_epe_px":0.08862407505512238,"p99_epe_px":0.015138687565922737,"mean_epe_px":0.0005459169042296708,"threshold_px":0.1,"passed":true}
@@ -121,11 +123,17 @@ scan_p3  reference resampled from its grid:  max   0  pixels>1       0 (0.000%) 
  }
 }
 
+=== 6. orientation: app default (orient_min_conf 0.2) vs the reference rule (GPU path)
+photo1    reference rule: rot -1 (none  ) orient [sh, sv, upright] [16572, 658, 0.494653]
+photo2    reference rule: rot  2 (90 CCW) orient [sh, sv, upright] [1070, 23343, 0.335858]
+bench_P1  reference rule: rot  1 (180   ) orient [sh, sv, upright] [17915, 58, -0.0302004] | default: rot -1 (none) -> upright, not rotated: PASS
+bench_P2  reference rule: rot  1 (180   ) orient [sh, sv, upright] [15740, 783, -0.0741597] | default: rot -1 (none) -> upright, not rotated: PASS
+
 === timings (host, ms)
-photo1: {"mode": "surface", "fell_back": false, "fit_median_px": 1.69305, "fit_p90_px": 6.73719, "axis": "v", "rot": -1, "orient": [16572, 658, 0.494653], "gpu_resample": true, "ms": {"detect": 232, "surface fit": 317, "stage-1 page": 58, "orientation": 121, "warp map": 686, "  global": 187, "  global_remap+darkness": 78, "  lines+trace pass1+text": 113, "  trace pass2": 24, "  solves": 297, "compose (4-px grid)": 11, "final resample (GPU)": 186, "total": 1613}}
-photo2: {"mode": "surface", "fell_back": false, "fit_median_px": 1.41716, "fit_p90_px": 24.6698, "axis": "v", "rot": 2, "orient": [1070, 23343, 0.335858], "gpu_resample": true, "ms": {"detect": 236, "surface fit": 192, "stage-1 page": 81, "orientation": 172, "warp map": 845, "  global": 251, "  global_remap+darkness": 101, "  lines+trace pass1+text": 144, "  trace pass2": 30, "  solves": 335, "compose (4-px grid)": 23, "final resample (GPU)": 185, "total": 1733}}
-bench_P1: {"mode": "surface", "fell_back": false, "fit_median_px": 0.285329, "fit_p90_px": 1.07077, "axis": "u", "rot": 1, "orient": [17915, 58, -0.0302004], "gpu_resample": true, "ms": {"detect": 260, "surface fit": 112, "stage-1 page": 81, "orientation": 133, "warp map": 765, "  global": 195, "  global_remap+darkness": 96, "  lines+trace pass1+text": 119, "  trace pass2": 34, "  solves": 334, "compose (4-px grid)": 19, "final resample (GPU)": 208, "total": 1581}}
-bench_P2: {"mode": "surface", "fell_back": false, "fit_median_px": 0.255211, "fit_p90_px": 0.765486, "axis": "v", "rot": 1, "orient": [15740, 783, -0.0741597], "gpu_resample": true, "ms": {"detect": 234, "surface fit": 110, "stage-1 page": 57, "orientation": 125, "warp map": 757, "  global": 177, "  global_remap+darkness": 91, "  lines+trace pass1+text": 116, "  trace pass2": 35, "  solves": 362, "compose (4-px grid)": 12, "final resample (GPU)": 188, "total": 1486}}
-scan_p1: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2167, "  global": 654, "  global_remap+darkness": 266, "  lines+trace pass1+text": 328, "  trace pass2": 46, "  solves": 874, "final resample (GPU)": 440, "total": 2610}}
-scan_p2: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2065, "  global": 498, "  global_remap+darkness": 236, "  lines+trace pass1+text": 374, "  trace pass2": 43, "  solves": 922, "final resample (GPU)": 414, "total": 2481}}
-scan_p3: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2419, "  global": 589, "  global_remap+darkness": 229, "  lines+trace pass1+text": 378, "  trace pass2": 27, "  solves": 1171, "final resample (GPU)": 463, "total": 2884}}
+photo1: {"mode": "surface", "fell_back": false, "fit_median_px": 1.69305, "fit_p90_px": 6.73719, "axis": "v", "rot": -1, "orient": [16572, 658, 0.494653], "gpu_resample": true, "ms": {"detect": 242, "surface fit": 252, "stage-1 page": 69, "orientation": 118, "warp map": 760, "  global": 171, "  global_remap+darkness": 95, "  lines+trace pass1+text": 141, "  trace pass2": 33, "  solves": 336, "compose (4-px grid)": 11, "final resample (GPU)": 195, "paper mask + before page": 209, "total": 1856}}
+photo2: {"mode": "surface", "fell_back": false, "fit_median_px": 1.41716, "fit_p90_px": 24.6698, "axis": "v", "rot": 2, "orient": [1070, 23343, 0.335858], "gpu_resample": true, "ms": {"detect": 226, "surface fit": 167, "stage-1 page": 55, "orientation": 124, "warp map": 717, "  global": 178, "  global_remap+darkness": 81, "  lines+trace pass1+text": 147, "  trace pass2": 30, "  solves": 299, "compose (4-px grid)": 26, "final resample (GPU)": 173, "paper mask + before page": 202, "total": 1691}}
+bench_P1: {"mode": "surface", "fell_back": false, "fit_median_px": 0.285329, "fit_p90_px": 1.07077, "axis": "u", "rot": 1, "orient": [17915, 58, -0.0302004], "gpu_resample": true, "ms": {"detect": 233, "surface fit": 96, "stage-1 page": 54, "orientation": 111, "warp map": 672, "  global": 164, "  global_remap+darkness": 81, "  lines+trace pass1+text": 104, "  trace pass2": 25, "  solves": 311, "compose (4-px grid)": 26, "final resample (GPU)": 174, "paper mask + before page": 184, "total": 1552}}
+bench_P2: {"mode": "surface", "fell_back": false, "fit_median_px": 0.255211, "fit_p90_px": 0.765486, "axis": "v", "rot": 1, "orient": [15740, 783, -0.0741597], "gpu_resample": true, "ms": {"detect": 278, "surface fit": 112, "stage-1 page": 52, "orientation": 130, "warp map": 686, "  global": 170, "  global_remap+darkness": 94, "  lines+trace pass1+text": 105, "  trace pass2": 28, "  solves": 302, "compose (4-px grid)": 13, "final resample (GPU)": 180, "paper mask + before page": 191, "total": 1643}}
+scan_p1: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 1849, "  global": 507, "  global_remap+darkness": 216, "  lines+trace pass1+text": 334, "  trace pass2": 41, "  solves": 758, "final resample (GPU)": 370, "total": 2259}}
+scan_p2: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2004, "  global": 534, "  global_remap+darkness": 229, "  lines+trace pass1+text": 332, "  trace pass2": 49, "  solves": 864, "final resample (GPU)": 370, "total": 2411}}
+scan_p3: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2015, "  global": 485, "  global_remap+darkness": 227, "  lines+trace pass1+text": 344, "  trace pass2": 31, "  solves": 914, "final resample (GPU)": 388, "total": 2443}}
