@@ -1,0 +1,31 @@
+photo1: ink px 583652, faint 154361, coloured 12577, marks 1448
+   Lighten        ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Auto color     ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Grayscale      ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   High contrast  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Black & white  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+photo2: ink px 704628, faint 183065, coloured 11887, marks 2126
+   Lighten        ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Auto color     ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Grayscale      ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   High contrast  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Black & white  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+scan_p1: ink px 1820839, faint 429077, coloured 136995, marks 5017
+   Lighten        ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Auto color     ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Grayscale      ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   High contrast  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Black & white  ink retained 100.00%  faint  99.99%  coloured 100.00%  marks lost 0
+scan_p2: ink px 1998022, faint 432711, coloured 155758, marks 4320
+   Lighten        ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Auto color     ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Grayscale      ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   High contrast  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Black & white  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+scan_p3: ink px 1271830, faint 259604, coloured 186224, marks 3134
+   Lighten        ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Auto color     ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Grayscale      ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   High contrast  ink retained 100.00%  faint 100.00%  coloured 100.00%  marks lost 0
+   Black & white  ink retained 100.00%  faint  99.98%  coloured 100.00%  marks lost 0
+worst marks lost in any filter/page: 0

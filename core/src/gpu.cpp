@@ -346,7 +346,7 @@ void main() {
 }
 )";
 
-// shared by the count and tone passes; mirrors tone_cpu in cleanup.cpp
+// shared by the count and filter passes; mirrors filter_cpu in cleanup.cpp
 #define TONE_COMMON R"(
 precision highp float;
 precision highp int;
@@ -391,22 +391,49 @@ void main() {
 
 static const char* kToneCS = "#version 310 es\nlayout(local_size_x = 16, local_size_y = 8) in;\n" TONE_COMMON R"(
 uniform highp usampler2D uCnt;
+uniform highp sampler2D uBgv;
 layout(std430, binding = 1) writeonly buffer Dst { uint px[]; };
 uniform ivec2 uOut;
 uniform int uRow0;
 uniform int uRows;
-uniform float uBlack;
-uniform float uScale;
-uniform int uSpeckMax;
+uniform int uKind;        // 1 lighten, 2 power curve, 3 black & white
+uniform float uWp;
+uniform float uWpTint;
+uniform float uGamma;
 uniform int uGray;
+uniform int uSpecks;
+uniform float uStrength;
+float bgvAt(int x, int y) {
+    ivec2 n = textureSize(uBgv, 0);
+    float fx = clamp((float(x) + 0.5) * 0.25 - 0.5, 0.0, float(n.x - 1));
+    float fy = clamp((float(y) + 0.5) * 0.25 - 0.5, 0.0, float(n.y - 1));
+    int x0 = int(fx), y0 = int(fy);
+    int x1 = min(x0 + 1, n.x - 1), y1 = min(y0 + 1, n.y - 1);
+    float a = fx - float(x0), b = fy - float(y0);
+    return (texelFetch(uBgv, ivec2(x0, y0), 0).r * (1.0 - a) + texelFetch(uBgv, ivec2(x1, y0), 0).r * a) * (1.0 - b) +
+           (texelFetch(uBgv, ivec2(x0, y1), 0).r * (1.0 - a) + texelFetch(uBgv, ivec2(x1, y1), 0).r * a) * b;
+}
+float curve1(float v) {
+    if (uKind == 1) return min(v / uWp, 1.0);
+    return v >= uWp ? 1.0 : pow(v / uWp, uGamma);
+}
 void main() {
     int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
     if (x >= uOut.x || r >= uRows) return;
     int y = uRow0 + r;
+    vec3 q = vec3(texelFetch(uSrc, ivec2(x, y), 0).rgb);
     vec3 v = normalised(x, y);
     float l = luma(v);
-    bool speck = false;
-    if (l < 0.75) {
+    vec3 t;
+    if (uKind == 3) {
+        float b = max(bgvAt(x, y), 0.05);
+        float wp = b < 0.97 ? uWpTint : uWp;
+        float u = clamp((l / b - 0.5) / (wp - 0.5), 0.0, 1.0);
+        t = vec3(pow(u, uGamma));
+    } else {
+        t = vec3(curve1(v.r), curve1(v.g), curve1(v.b));
+    }
+    if (uSpecks != 0 && l < 0.75) {
         ivec2 nq = textureSize(uCnt, 0);
         int bi = min(y / 4, nq.y - 1), bj = min(x / 4, nq.x - 1);
         uint n = 0u;
@@ -415,13 +442,12 @@ void main() {
                 int ii = bi + di, jj = bj + dj;
                 if (ii >= 0 && ii < nq.y && jj >= 0 && jj < nq.x) n += texelFetch(uCnt, ivec2(jj, ii), 0).r;
             }
-        speck = n >= 1u && int(n) <= uSpeckMax;
+        if (n >= 1u && n <= 2u) t = vec3(1.0);
     }
-    vec3 t = speck ? vec3(1.0) : clamp((v - uBlack) * uScale, 0.0, 1.0);
-    uvec3 o;
-    if (uGray != 0) o = uvec3(uint(roundEven(luma(t) * 255.0)));
-    else o = uvec3(roundEven(t * 255.0));
-    px[r * uOut.x + x] = o.r | (o.g << 8) | (o.b << 16) | (255u << 24);
+    if (uGray != 0) t = vec3(luma(t));
+    vec3 o = clamp(q + uStrength * (t * 255.0 - q), 0.0, 255.0);
+    uvec3 ou = uvec3(roundEven(o));
+    px[r * uOut.x + x] = ou.r | (ou.g << 8) | (ou.b << 16) | (255u << 24);
 }
 )";
 
@@ -481,16 +507,20 @@ bool Gpu::background_quarter(const cv::Mat& img, cv::Mat& bg4) {
     return ok;
 }
 
-bool Gpu::tone(const cv::Mat& img, const CleanParams& p, cv::Mat& out) {
+bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float strength, cv::Mat& out) {
     if (!available()) return false;
+    Curve c = filter_curve(f, p.sigma);
+    if (c.kind == 0) return false;
     std::lock_guard<std::mutex> lk(mu_);
-    if (img.cols > max_tex_ || img.rows > max_tex_) return false;
+    if (img.cols > max_tex_ || img.rows > max_tex_ || img.cols != p.page_w || img.rows != p.page_h) return false;
     if (!make_current()) return false;
     cv::Mat s = img.isContinuous() ? img : img.clone();
     cv::Mat ill = p.illum.isContinuous() ? p.illum : p.illum.clone();
+    cv::Mat bgv = p.bgv.isContinuous() ? p.bgv : p.bgv.clone();
     int qw = std::max(1, img.cols / 4), qh = std::max(1, img.rows / 4);
     GLuint tsrc = gpu_tex_rgba8ui(s);
     GLuint till = tex_r32f(ill.cols, ill.rows, ill.ptr<float>());
+    GLuint tbgv = tex_r32f(bgv.cols, bgv.rows, bgv.ptr<float>());
     GLuint tcnt = tex_storage(GL_R32UI, qw, qh);
     for (GLuint prog : {prog_count_, prog_tone_}) {
         glUseProgram(prog);
@@ -499,20 +529,26 @@ bool Gpu::tone(const cv::Mat& img, const CleanParams& p, cv::Mat& out) {
         glUniform3f(glGetUniformLocation(prog, "uWb"), p.wb[0], p.wb[1], p.wb[2]);
         set_i2(prog, "uImg", img.cols, img.rows);
     }
-    glUseProgram(prog_count_);
-    glBindImageTexture(0, tcnt, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
-    set_i2(prog_count_, "uQ", qw, qh);
-    glDispatchCompute((qw + 15) / 16, (qh + 7) / 8, 1);
-    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+    if (c.specks) {
+        glUseProgram(prog_count_);
+        glBindImageTexture(0, tcnt, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+        set_i2(prog_count_, "uQ", qw, qh);
+        glDispatchCompute((qw + 15) / 16, (qh + 7) / 8, 1);
+        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
     glUseProgram(prog_tone_);
     bind_tex(prog_tone_, 2, tcnt, "uCnt");
-    glUniform1f(glGetUniformLocation(prog_tone_, "uBlack"), p.black);
-    glUniform1f(glGetUniformLocation(prog_tone_, "uScale"), 1.f / (p.white - p.black));
-    set_i(prog_tone_, "uSpeckMax", p.speck_max);
-    set_i(prog_tone_, "uGray", p.grayscale ? 1 : 0);
+    bind_tex(prog_tone_, 3, tbgv, "uBgv");
+    set_i(prog_tone_, "uKind", c.kind);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uWp"), c.wp);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uGamma"), c.gamma);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uWpTint"), c.wp_tint);
+    set_i(prog_tone_, "uGray", c.gray ? 1 : 0);
+    set_i(prog_tone_, "uSpecks", c.specks ? 1 : 0);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uStrength"), strength);
     bool ok = run_banded(prog_tone_, img.cols, img.rows, out);
-    GLuint ts[3] = {tsrc, till, tcnt};
-    glDeleteTextures(3, ts);
+    GLuint ts[4] = {tsrc, till, tbgv, tcnt};
+    glDeleteTextures(4, ts);
     glFinish();
     release();
     return ok;

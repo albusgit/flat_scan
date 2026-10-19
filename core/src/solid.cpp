@@ -160,25 +160,68 @@ void snap(Lines& H, Lines& V, double tol = 30) {
     one(V, H);
 }
 
-cv::Vec3f hsv_of(const cv::Vec3f& bgr) {
-    cv::Mat m(1, 1, CV_8UC3, cv::Scalar((uint8_t)bgr[0], (uint8_t)bgr[1], (uint8_t)bgr[2])), o;
-    cv::cvtColor(m, o, cv::COLOR_BGR2HSV);
-    cv::Vec3b v = o.at<cv::Vec3b>(0, 0);
-    return cv::Vec3f(v[0], v[1], v[2]);
+// Lab (L 0..100, a, b) of an 8-bit BGR colour, in float (not the 8-bit-scaled Lab)
+cv::Vec3f lab_of(const cv::Vec3f& bgr) {
+    cv::Mat m(1, 1, CV_32FC3, cv::Scalar(bgr[0] / 255.f, bgr[1] / 255.f, bgr[2] / 255.f)), o;
+    cv::cvtColor(m, o, cv::COLOR_BGR2Lab);
+    return o.at<cv::Vec3f>(0, 0);
+}
+cv::Vec3f bgr_of(const cv::Vec3f& lab) {
+    cv::Mat m(1, 1, CV_32FC3, cv::Scalar(lab[0], lab[1], lab[2])), o;
+    cv::cvtColor(m, o, cv::COLOR_Lab2BGR);
+    cv::Vec3f v = o.at<cv::Vec3f>(0, 0);
+    for (int c = 0; c < 3; ++c) v[c] = std::min(255.f, std::max(0.f, v[c] * 255.f));
+    return v;
+}
+inline float chroma(const cv::Vec3f& lab) { return std::hypot(lab[1], lab[2]); }
+inline float lum8(const uint8_t* p) { return 0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]; }
+
+struct Region {
+    int label;                 // in the region label image (enclosed cells) or -1 (blob rectangle)
+    cv::Rect box;
+    cv::Vec3f bgr, lab;        // measured background colour (median, ink excluded)
+    int area = 0, core = 0;
+    bool fill = false, white = false;
+    int cluster = -1;
+};
+
+double median_of(std::vector<float>& v) {
+    if (v.empty()) return 0;
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    return v[v.size() / 2];
+}
+
+// median colour and luminance spread of the pixels where `use` is set inside box
+bool measure(const cv::Mat& bgr, const cv::Mat& use, const cv::Rect& box, cv::Vec3f& col, float& spread, int& n) {
+    std::vector<float> ch[3], L;
+    for (int y = box.y; y < box.y + box.height; ++y)
+        for (int x = box.x; x < box.x + box.width; ++x) {
+            if (!use.at<uint8_t>(y, x)) continue;
+            const uint8_t* p = bgr.ptr<uint8_t>(y) + 3 * x;
+            for (int c = 0; c < 3; ++c) ch[c].push_back(p[c]);
+            L.push_back(lum8(p));
+        }
+    n = (int)L.size();
+    if (n < 30) return false;
+    for (int c = 0; c < 3; ++c) col[c] = (float)median_of(ch[c]);
+    // robust spread: 90th - 10th percentile of luminance
+    std::sort(L.begin(), L.end());
+    spread = L[(size_t)(0.9 * (n - 1))] - L[(size_t)(0.1 * (n - 1))];
+    return true;
 }
 
 }  // namespace
 
-cv::Mat solid_colors(const cv::Mat& img, SolidStats* st) {
+cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, SolidStats* st) {
     auto t0 = std::chrono::steady_clock::now();
-    int h = img.rows, w = img.cols;
-    cv::Mat bgr, g, bg;
+    const int h = img.rows, w = img.cols;
+    cv::Mat bgr, g, bg, diff;
     cv::cvtColor(img, bgr, cv::COLOR_BGRA2BGR);
     cv::cvtColor(bgr, g, cv::COLOR_BGR2GRAY);
     cv::dilate(g, bg, cv::Mat::ones(9, 9, CV_8U));
     cv::medianBlur(bg, bg, 41);
-    cv::Mat diff;
     cv::subtract(bg, g, diff, cv::noArray(), CV_16S);
+    // ---- grid lines (clean.py): segments, short segments, inferred borders, wobbly ends, snap
     cv::Mat ink = diff > 45;
     Lines H = clean_segments(ink, true), V = clean_segments(ink, false);
     Lines Vs = clean_short_segments(ink, false, V, H);
@@ -190,78 +233,176 @@ cv::Mat solid_colors(const cv::Mat& img, SolidStats* st) {
     infer_borders(H, V, ink);
     extend_wobbly(V, H, ink);
     snap(H, V);
-    cv::Mat lines = draw_lines(h, w, H, V);              // region separators only, never drawn
-    cv::Mat textish;
-    cv::dilate(diff > 22, textish, cv::Mat::ones(5, 5, CV_8U));
+    // (a) region separators: line centres only, never drawn; collinear gaps up to ~15 px closed
+    cv::Mat mh = draw_lines(h, w, H, {}), mv = draw_lines(h, w, {}, V);
+    cv::morphologyEx(mh, mh, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(17, 1)));
+    cv::morphologyEx(mv, mv, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 17)));
+    cv::Mat lines = mh | mv;
+    // protected (picture) areas
+    cv::Mat prot = cv::Mat::zeros(h, w, CV_8U);
+    for (const auto& r : protect)
+        cv::rectangle(prot, cv::Point((int)(r.x0 * w), (int)(r.y0 * h)), cv::Point((int)(r.x1 * w), (int)(r.y1 * h)), cv::Scalar(255), cv::FILLED);
+    // (d) colour measurement only well away from ink and lines: any visible mark, dilated 3 px
+    cv::Mat away;
+    cv::dilate((diff > 16) | lines, away, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+    away = (away == 0) & (prot == 0);
     cv::Mat lab, stats, cen;
     int n = cv::connectedComponentsWithStats(lines == 0, lab, stats, cen, 4);
-    struct Region { int i; cv::Rect r; cv::Vec3f col; int area; bool coloured; };
-    std::vector<Region> regions;
+    std::vector<Region> regs;
+    std::vector<int> reg_of_label(n, -1);
+    SolidStats S;
     for (int i = 1; i < n; ++i) {
         int x = stats.at<int>(i, 0), y = stats.at<int>(i, 1), ww = stats.at<int>(i, 2), hh = stats.at<int>(i, 3), ar = stats.at<int>(i, 4);
-        if (x == 0 || y == 0 || x + ww >= w || y + hh >= h || ar > 0.3 * h * w) continue;
+        if (x == 0 || y == 0 || x + ww >= w || y + hh >= h || ar > 0.3 * h * w || ar < 60) continue;
         cv::Rect R(x, y, ww, hh);
         cv::Mat sl = lab(R) == i, core;
         cv::erode(sl, core, cv::Mat::ones(9, 9, CV_8U));
-        if (cv::countNonZero(core) < 30) core = sl;
-        cv::Mat pc = core & ~textish(R);
-        if (cv::countNonZero(pc) < 30) pc = core;
-        cv::Vec3f col;
-        for (int c = 0; c < 3; ++c) {
-            Vec v;
-            for (int yy = 0; yy < hh; ++yy)
-                for (int xx = 0; xx < ww; ++xx)
-                    if (pc.at<uint8_t>(yy, xx)) v.push_back(bgr.at<cv::Vec3b>(y + yy, x + xx)[c]);
-            col[c] = (float)median(v);
-        }
-        cv::Vec3f hsv = hsv_of(col);
-        bool coloured = (hsv[1] > 12 || hsv[2] < 238) && hsv[2] > 110;
-        regions.push_back({i, R, col, ar, coloured});
+        cv::Mat use = cv::Mat::zeros(h, w, CV_8U);
+        use(R).setTo(255, core & away(R));
+        if (cv::countNonZero(use(R)) < 30) use(R).setTo(255, sl & away(R));
+        int pin = cv::countNonZero(prot(R) & sl);
+        Region rg{i, R, {}, {}, ar};
+        float spread = 0;
+        S.regions++;
+        if (pin > 0.3 * ar || !measure(bgr, use, R, rg.bgr, spread, rg.core)) { S.skipped++; continue; }
+        // (f) pictures, gradients, logos: too much colour variation once ink is removed
+        if (spread > 14.f) { S.skipped_varied++; continue; }
+        rg.lab = lab_of(rg.bgr);
+        reg_of_label[i] = (int)regs.size();
+        regs.push_back(rg);
     }
-    // merge similar colours (Lab distance < 8, greedy, area-weighted), lift as clean.py
-    std::vector<int> grp(regions.size(), -1);
-    std::vector<cv::Vec3f> fillc;
-    std::vector<cv::Vec3f> labc(regions.size());
-    for (size_t k = 0; k < regions.size(); ++k) {
-        cv::Mat m(1, 1, CV_8UC3, cv::Scalar((uint8_t)regions[k].col[0], (uint8_t)regions[k].col[1], (uint8_t)regions[k].col[2])), o;
-        cv::cvtColor(m, o, cv::COLOR_BGR2Lab);
-        cv::Vec3b v = o.at<cv::Vec3b>(0, 0);
-        labc[k] = cv::Vec3f(v[0], v[1], v[2]);
+    // paper lightness: the low-chroma regions near the top of the lightness range
+    std::vector<float> Lp;
+    for (auto& r : regs)
+        if (chroma(r.lab) < 6 && r.lab[0] > 80) Lp.push_back(r.lab[0]);
+    float Lpaper = Lp.empty() ? 100.f : (float)percentile(Vec(Lp.begin(), Lp.end()), 75);
+    // (c) fill only colours that clearly differ from paper; the rest becomes pure white
+    for (auto& r : regs) {
+        r.fill = chroma(r.lab) > 10.f || r.lab[0] < Lpaper - 8.f;
+        r.white = !r.fill;
     }
-    int ngroups = 0, ncol = 0;
-    for (size_t k = 0; k < regions.size(); ++k) {
-        if (!regions[k].coloured || grp[k] >= 0) continue;
-        double wsum = 0;
-        cv::Vec3d acc(0, 0, 0);
-        std::vector<size_t> members;
-        for (size_t q = 0; q < regions.size(); ++q)
-            if (regions[q].coloured && grp[q] < 0 && cv::norm(labc[q] - labc[k]) < 8) { grp[q] = ngroups; members.push_back(q); }
-        for (size_t q : members) { acc += cv::Vec3d(regions[q].col) * regions[q].area; wsum += regions[q].area; }
-        cv::Vec3f c(acc / wsum);
-        for (int i = 0; i < 3; ++i) c[i] = std::min(255.f, std::max(0.f, c[i] * 1.03f + 3.f));
-        fillc.push_back(c);
-        ++ngroups;
-        ncol += (int)members.size();
-    }
-    // composite: fill under the page's own ink, lines and text untouched
-    cv::Mat out = img.clone();
-    for (size_t k = 0; k < regions.size(); ++k) {
-        const Region& R = regions[k];
-        cv::Vec3f fc = R.coloured ? fillc[grp[k]] : cv::Vec3f(255, 255, 255);
-        for (int yy = R.r.y; yy < R.r.y + R.r.height; ++yy)
-            for (int xx = R.r.x; xx < R.r.x + R.r.width; ++xx) {
-                if (lab.at<int>(yy, xx) != R.i) continue;
-                float a = std::min(1.f, std::max(0.f, (diff.at<short>(yy, xx) - 20.f) / 40.f));
-                cv::Vec4b& o = out.at<cv::Vec4b>(yy, xx);
-                for (int c = 0; c < 3; ++c) o[c] = (uint8_t)std::lrint(fc[c] * (1.f - a) + o[c] * a);
+    // (e) coloured areas not enclosed by lines: large uniform coloured blobs at 1/4 resolution
+    {
+        cv::Mat q, qd, qm;
+        cv::resize(bgr, q, cv::Size(w / 4, h / 4), 0, 0, cv::INTER_AREA);
+        cv::dilate(q, qd, cv::Mat::ones(3, 3, CV_8U));
+        cv::medianBlur(qd, qm, 11);
+        cv::Mat qf, ql;
+        qm.convertTo(qf, CV_32FC3, 1 / 255.0);
+        cv::cvtColor(qf, ql, cv::COLOR_BGR2Lab);
+        cv::Mat taken = cv::Mat::zeros(h, w, CV_8U);
+        for (auto& r : regs)
+            if (r.fill) taken(r.box).setTo(255, lab(r.box) == r.label);
+        cv::Mat takenq, linesq;
+        cv::resize(taken, takenq, ql.size(), 0, 0, cv::INTER_AREA);
+        cv::Mat col(ql.size(), CV_8U);
+        for (int y = 0; y < ql.rows; ++y)
+            for (int x = 0; x < ql.cols; ++x) {
+                cv::Vec3f c = ql.at<cv::Vec3f>(y, x);
+                bool coloured = (chroma(c) > 12.f || c[0] < Lpaper - 12.f) && c[0] > 35.f;
+                col.at<uint8_t>(y, x) = coloured && takenq.at<uint8_t>(y, x) < 64 ? 255 : 0;
             }
+        cv::morphologyEx(col, col, cv::MORPH_OPEN, cv::Mat::ones(4, 4, CV_8U));
+        cv::morphologyEx(col, col, cv::MORPH_CLOSE, cv::Mat::ones(9, 9, CV_8U));
+        cv::Mat bl, bs, bc;
+        int nb = cv::connectedComponentsWithStats(col, bl, bs, bc, 4);
+        Vec vx, hy;
+        for (auto& L : V) vx.push_back(L[0]);
+        for (auto& L : H) hy.push_back(L[0]);
+        auto snapv = [](double v, const Vec& c, double tol) {
+            double best = v, bd = tol;
+            for (double q : c) if (std::fabs(q - v) < bd) { bd = std::fabs(q - v); best = q; }
+            return (int)std::lround(best);
+        };
+        for (int i = 1; i < nb; ++i) {
+            int x = bs.at<int>(i, 0) * 4, y = bs.at<int>(i, 1) * 4, ww = bs.at<int>(i, 2) * 4, hh = bs.at<int>(i, 3) * 4, ar = bs.at<int>(i, 4) * 16;
+            if (ar < 4000 || ar < 0.5 * ww * hh) continue;
+            int x0 = snapv(x, vx, 30), x1 = snapv(x + ww, vx, 30), y0 = snapv(y, hy, 30), y1 = snapv(y + hh, hy, 30);
+            cv::Rect R = cv::Rect(cv::Point(x0, y0), cv::Point(x1, y1)) & cv::Rect(0, 0, w, h);
+            if (R.area() < 4000) continue;
+            cv::Mat use = cv::Mat::zeros(h, w, CV_8U);
+            use(R).setTo(255, away(R) & (taken(R) == 0));
+            Region rg{-1, R, {}, {}, R.area()};
+            float spread = 0;
+            if (!measure(bgr, use, R, rg.bgr, spread, rg.core) || spread > 14.f) continue;
+            rg.lab = lab_of(rg.bgr);
+            if (!(chroma(rg.lab) > 10.f || rg.lab[0] < Lpaper - 8.f)) continue;
+            rg.fill = true;
+            regs.push_back(rg);
+            S.blobs++;
+        }
     }
-    if (st) {
-        st->regions = (int)regions.size();
-        st->coloured = ncol;
-        st->colour_groups = ngroups;
-        st->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // (b) one colour per cluster: agglomerative merge in Lab while the closest pair is < dE 7
+    struct Cl { cv::Vec3d lab; double wgt; std::vector<int> mem; };
+    std::vector<Cl> cl;
+    for (size_t k = 0; k < regs.size(); ++k)
+        if (regs[k].fill) cl.push_back({cv::Vec3d(regs[k].lab), (double)regs[k].area, {(int)k}});
+    while (cl.size() > 1) {
+        double bd = 1e30;
+        size_t ba = 0, bb = 0;
+        for (size_t a = 0; a < cl.size(); ++a)
+            for (size_t b = a + 1; b < cl.size(); ++b) {
+                double d = cv::norm(cl[a].lab - cl[b].lab);
+                if (d < bd) { bd = d; ba = a; bb = b; }
+            }
+        if (bd >= 7.0) break;
+        double W = cl[ba].wgt + cl[bb].wgt;
+        cl[ba].lab = (cl[ba].lab * cl[ba].wgt + cl[bb].lab * cl[bb].wgt) / W;
+        cl[ba].wgt = W;
+        cl[ba].mem.insert(cl[ba].mem.end(), cl[bb].mem.begin(), cl[bb].mem.end());
+        cl.erase(cl.begin() + bb);
     }
+    std::vector<cv::Vec3f> fillc(regs.size(), cv::Vec3f(255, 255, 255));
+    for (size_t c = 0; c < cl.size(); ++c)
+        for (int k : cl[c].mem) { regs[k].cluster = (int)c; fillc[k] = bgr_of(cv::Vec3f(cl[c].lab)); }
+    S.clusters = (int)cl.size();
+    // ---- fill map: region index per pixel, propagated into the line-centre pixels (h)
+    cv::Mat owner(h, w, CV_32F, cv::Scalar(0));     // region index + 1
+    for (size_t k = 0; k < regs.size(); ++k) {
+        const Region& r = regs[k];
+        if (!r.fill && !r.white) continue;
+        if (r.label >= 0) owner(r.box).setTo((float)(k + 1), lab(r.box) == r.label);
+        else owner(r.box).setTo((float)(k + 1), owner(r.box) == 0);
+        if (r.fill) S.filled++;
+        else S.white++;
+    }
+    for (int it = 0; it < 4; ++it) {
+        cv::Mat d;
+        cv::dilate(owner, d, cv::Mat::ones(3, 3, CV_8U));
+        d.copyTo(owner, (owner == 0) & (lines > 0));
+    }
+    // ---- composite (d, g): unmix each pixel into ink colour I (darkest pixel nearby) and the
+    // cell's original background B, then re-mix I with the new fill. Anti-aliased ink keeps its
+    // coverage, coloured ink keeps its colour, and no trace of the old background is left.
+    cv::Mat out = img.clone();
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            int k = (int)owner.at<float>(y, x) - 1;
+            if (k < 0 || prot.at<uint8_t>(y, x)) continue;
+            const Region& r = regs[k];
+            const cv::Vec3f& F = fillc[k];
+            const uint8_t* P = bgr.ptr<uint8_t>(y) + 3 * x;
+            float lb = 0.114f * r.bgr[0] + 0.587f * r.bgr[1] + 0.299f * r.bgr[2], lp = lum8(P);
+            const uint8_t* I = P;
+            float li = lp;
+            for (int dy = -2; dy <= 2; ++dy) {
+                int yy = y + dy;
+                if (yy < 0 || yy >= h) continue;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    int xx = x + dx;
+                    if (xx < 0 || xx >= w) continue;
+                    const uint8_t* Q = bgr.ptr<uint8_t>(yy) + 3 * xx;
+                    float lq = lum8(Q);
+                    if (lq < li) { li = lq; I = Q; }
+                }
+            }
+            float t = 0.f;
+            if (lb - li >= 12.f && lb - lp >= 6.f) t = std::min(1.f, std::max(0.f, (lb - lp) / (lb - li)));
+            uint8_t* o = out.ptr<uint8_t>(y) + 4 * x;
+            for (int c = 0; c < 3; ++c) o[c] = (uint8_t)std::lrint(t * I[c] + (1.f - t) * F[c]);
+        }
+    S.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (st) *st = S;
     return out;
 }
 

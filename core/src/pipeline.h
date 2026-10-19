@@ -57,6 +57,11 @@ struct PipelineResult {
     GridMap render_map;               // the same map at the output resolution (used for the resample)
     cv::Mat page;                     // BGRA, unwarped (before cleanup)
     cv::Mat stage1;                   // stage-1 page the warp map was estimated on (BGR)
+    cv::Mat paper;                    // CV_8U, render size: 255 = paper per the detection outline (soft
+                                      // 1-2 px edge); 0 = folded / torn / missing -> filled white. Empty = no mask
+    cv::Mat before;                   // BGRA, render size: perspective-corrected only (homography), same frame
+    GridMap disp;                     // render size, 4-px grid: (dx, dy) in output px from each page point to
+                                      // where it sat on the `before` page (scans: on the scan)
     bool gpu_resample = false;
     std::vector<std::pair<std::string, double>> ms;
     WarpDebug warp;

@@ -16,6 +16,7 @@
 #include "pipeline.h"
 #include "cleanup.h"
 #include "solid.h"
+#include "overlay.h"
 #include <sys/stat.h>
 #include <fstream>
 #include <chrono>
@@ -132,6 +133,25 @@ static void write_outputs(const PipelineResult& r, const std::string& dir, const
     cv::imwrite(dir + "/" + img_name, bgr);
     save_grid(dir + "/warpmap.npz", r.final_map, {});
     if (!r.stage1.empty()) cv::imwrite(dir + "/stage1.png", r.stage1);
+    if (!r.paper.empty()) cv::imwrite(dir + "/paper.png", r.paper);
+    if (!r.before.empty()) { cv::Mat b; cv::cvtColor(r.before, b, cv::COLOR_BGRA2BGR); cv::imwrite(dir + "/before.png", b); }
+    if (!r.disp.x.empty()) {
+        float top = 0;
+        cv::Mat ov = wrinkle_overlay(r.disp, true, true, &top);
+        cv::imwrite(dir + "/wrinkle_overlay.png", ov);
+        // overlay composited on the page, for inspection
+        cv::Mat comp = r.page.clone();
+        for (int y = 0; y < comp.rows; ++y)
+            for (int x = 0; x < comp.cols; ++x) {
+                cv::Vec4b o = ov.at<cv::Vec4b>(y, x);
+                cv::Vec4b& c = comp.at<cv::Vec4b>(y, x);
+                for (int k = 0; k < 3; ++k) c[k] = (uint8_t)((c[k] * (255 - o[3]) + o[k] * o[3]) / 255);
+            }
+        cv::Mat c3;
+        cv::cvtColor(comp, c3, cv::COLOR_BGRA2BGR);
+        cv::imwrite(dir + "/wrinkle_composite.png", c3);
+        std::ofstream(dir + "/wrinkle_legend.txt") << top << "\n";
+    }
     std::ofstream f(dir + "/info.json");
     f << "{\"mode\": \"" << (r.mode == GeomMode::Surface ? "surface" : "homography") << "\"";
     if (photo) {
@@ -169,33 +189,51 @@ static int cmd_scan(int argc, char** argv) {
     return 0;
 }
 
-// clean IN.png OUT.png [--gray] [--solid] [--cpu]; also reports GPU vs CPU difference
-static int cmd_clean(int argc, char** argv) {
-    cv::Mat in = cv::imread(argv[2], cv::IMREAD_COLOR), bgra;
-    cv::cvtColor(in, bgra, cv::COLOR_BGR2BGRA);
-    bool gray = flag(argc, argv, "--gray"), solid = flag(argc, argv, "--solid");
-    CleanStats sg, sc;
-    auto t0 = std::chrono::steady_clock::now();
-    cv::Mat og = finish_page(bgra, gray, solid, !flag(argc, argv, "--cpu"), &sg);
-    double ms_g = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    t0 = std::chrono::steady_clock::now();
-    cv::Mat oc = finish_page(bgra, gray, solid, false, &sc);
-    double ms_c = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    cv::Mat d;
-    cv::absdiff(og, oc, d);
-    double mx;
-    cv::minMaxLoc(d.reshape(1), nullptr, &mx);
-    int n1 = cv::countNonZero(d.reshape(1) > 1), n0 = cv::countNonZero(d.reshape(1) > 0);
-    cv::Mat o3;
-    cv::cvtColor(og, o3, cv::COLOR_BGRA2BGR);
-    cv::imwrite(argv[3], o3);
-    std::printf("{\"gpu_background\": %d, \"gpu_tone\": %d, \"gpu_ms\": %.0f, \"cpu_ms\": %.0f, \"gpu_vs_cpu_max\": %.0f, \"values_gt1\": %d, \"values_gt0\": %d}\n",
-                (int)sg.gpu_background, (int)sg.gpu_tone, ms_g, ms_c, mx, n1, n0);
+// render PAGE.png OUTDIR [--paper PAPER.png] [--filters 0,1,2,3,4,5] [--strength 0.7] [--solid] [--cpu]
+// writes OUTDIR/f<k>.png per filter and prints GPU vs CPU differences and timings
+static int cmd_render(int argc, char** argv) {
+    cv::Mat in = cv::imread(argv[2], cv::IMREAD_COLOR), page;
+    cv::cvtColor(in, page, cv::COLOR_BGR2BGRA);
+    std::string dir = argv[3];
+    mkdir(dir.c_str(), 0755);
+    cv::Mat paper;
+    for (int i = 0; i + 1 < argc; ++i)
+        if (!std::strcmp(argv[i], "--paper")) paper = cv::imread(argv[i + 1], cv::IMREAD_GRAYSCALE);
+    float strength = 0.7f;
+    std::string fl = "0,1,2,3,4,5";
+    for (int i = 0; i + 1 < argc; ++i) {
+        if (!std::strcmp(argv[i], "--strength")) strength = (float)std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--filters")) fl = argv[i + 1];
+    }
+    bool solid = flag(argc, argv, "--solid"), gpu = !flag(argc, argv, "--cpu");
+    PageParams pp = page_params(page, gpu);
+    std::printf("{\"page_params_ms\": %.0f, \"gpu_background\": %d, \"sigma\": %.4f, \"wb\": [%.3f, %.3f, %.3f], \"filters\": [", pp.ms,
+                (int)pp.gpu_background, pp.sigma, pp.wb[0], pp.wb[1], pp.wb[2]);
+    bool first = true;
+    for (size_t i = 0; i < fl.size(); i += 2) {
+        int k = fl[i] - '0';
+        Filter f = (Filter)k;
+        RenderStats sg, sc;
+        cv::Mat og = render_page(page, paper, pp, f, strength, solid, {}, gpu, &sg);
+        cv::Mat oc = render_page(page, paper, pp, f, strength, solid, {}, false, &sc);
+        cv::Mat d;
+        cv::absdiff(og, oc, d);
+        double mx;
+        cv::minMaxLoc(d.reshape(1), nullptr, &mx);
+        cv::Mat o3;
+        cv::cvtColor(og, o3, cv::COLOR_BGRA2BGR);
+        cv::imwrite(dir + "/f" + std::to_string(k) + (solid ? "_solid" : "") + ".png", o3);
+        std::printf("%s{\"filter\": \"%s\", \"gpu\": %d, \"gpu_ms\": %.0f, \"cpu_ms\": %.0f, \"solid_ms\": %.0f, \"gpu_vs_cpu_max\": %.0f, \"values_gt1\": %d, \"regions\": %d, \"clusters\": %d}",
+                    first ? "" : ", ", filter_name(f), (int)sg.gpu_filter, sg.ms_filter, sc.ms_filter, sg.ms_solid, mx,
+                    cv::countNonZero(d.reshape(1) > 1), sg.solid_regions, sg.solid_clusters);
+        first = false;
+    }
+    std::printf("]}\n");
     return 0;
 }
 
 int cli_ext(const std::string& cmd, int argc, char** argv) {
-    if (cmd == "clean" && argc >= 4) return cmd_clean(argc, argv);
+    if (cmd == "render" && argc >= 4) return cmd_render(argc, argv);
     if (cmd == "photo" && argc >= 4) return cmd_photo(argc, argv);
     if (cmd == "scan" && argc >= 4) return cmd_scan(argc, argv);
     if (cmd == "warp" && argc >= 4) return cmd_warp(argc, argv);

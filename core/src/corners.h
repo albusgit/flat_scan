@@ -26,6 +26,7 @@ struct Detection {
     std::array<std::vector<cv::Point2d>, 4> side_pts;   // outline points assigned to each side
     std::array<double, 4> fold_d{};              // contour gap at each virtual corner
     std::vector<cv::Point2d> contour;
+    cv::Mat paper;                               // filled page outline (255 = paper), analysis size
     bool landscape = false;
 };
 

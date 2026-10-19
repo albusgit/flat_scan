@@ -145,6 +145,53 @@ void final_resample(const cv::Mat& photo, PipelineResult& r, const PipelineOptio
     r.ms.emplace_back(r.gpu_resample ? "final resample (GPU)" : "final resample (CPU)", ms_since(t0));
 }
 
+// paper mask (analysis-copy pixels, 255 = paper) sampled through the render map: photo
+// pixel P -> mask pixel (P + 0.5) * s - 0.5. Eroded 2 px first so the dark fringe of the
+// outline is filled too, then blurred to a 1-2 px soft edge.
+cv::Mat paper_alpha(const cv::Mat& mask, double s, const GridMap& g) {
+    cv::Mat m;
+    cv::erode(mask, m, cv::Mat::ones(5, 5, CV_8U));
+    cv::Mat out(g.out_h, g.out_w, CV_8U), mx, my;
+    for (int y0 = 0; y0 < g.out_h; y0 += 64) {
+        int y1 = std::min(g.out_h, y0 + 64);
+        expand_rows(g, y0, y1, mx, my);
+        if (s != 1.0) {
+            mx = (mx + 0.5f) * (float)s - 0.5f;
+            my = (my + 0.5f) * (float)s - 0.5f;
+        }
+        cv::Mat dst = out.rowRange(y0, y1);
+        cv::remap(m, dst, mx, my, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
+    }
+    cv::GaussianBlur(out, out, cv::Size(0, 0), 0.8);
+    return out;
+}
+
+GridMap identity_grid(int W, int H) {
+    GridMap g = GridMap::make(W, H, 4);
+    for (int i = 0; i < g.gh; ++i)
+        for (int j = 0; j < g.gw; ++j) { g.X(i, j) = (float)(4 * j); g.Y(i, j) = (float)(4 * i); }
+    return g;
+}
+
+GridMap at_render_size(const GridMap& g, const PipelineOptions& opt) {
+    if (opt.render_w <= 0 || opt.render_w == opt.out_w) return g;
+    bool portrait = g.out_w <= g.out_h;
+    int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
+    return rescale_grid(g, portrait ? opt.render_w : long_side, portrait ? long_side : opt.render_w);
+}
+
+void resample_any(const cv::Mat& src_bgra, const GridMap& g, bool gpu, cv::Mat& out) {
+    if (!(gpu && Gpu::instance().resample(src_bgra, g, out))) out = resample_cpu(src_bgra, g);
+}
+
+// unrotated page pixel (analysis W x H) -> rotated output frame
+inline cv::Point2d rotate_pt(double x, double y, int W, int H, int rot) {
+    if (rot == cv::ROTATE_90_CLOCKWISE) return {H - 1 - y, x};
+    if (rot == cv::ROTATE_180) return {W - 1 - x, H - 1 - y};
+    if (rot == cv::ROTATE_90_COUNTERCLOCKWISE) return {y, W - 1 - x};
+    return {x, y};
+}
+
 }  // namespace
 
 PageCorners detect_corners(const cv::Mat& photo, int max_side) {
@@ -238,6 +285,40 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");
     final_resample(photo, r, opt);
+    t0 = Clock::now();
+    report(opt, 95, "Finishing");
+    // paper mask: from this run's detection, or - when the corners were edited - from a fresh
+    // detection if its corners agree with the user's (otherwise the outline is not trusted)
+    if (opt.corners_edited) {
+        PageCorners pd = detect_corners(photo, opt.max_analysis_side);
+        double diag = std::hypot(photo.cols, photo.rows), worst = 0;
+        for (int k = 0; k < 4 && pd.ok; ++k) worst = std::max(worst, cv::norm(pd.pts[k] - corners[k]));
+        if (pd.ok && worst < 0.03 * diag) pc = pd;
+    }
+    if (pc.ok && !pc.det.paper.empty()) r.paper = paper_alpha(pc.det.paper, pc.scale, r.render_map);
+    // before page: perspective only, same rotation and size
+    cv::Mat src = to_bgra(photo);
+    GridMap hb = at_render_size(compose(Uh, identity_grid(W, H), r.rot, true), opt);
+    resample_any(src, hb, opt.use_gpu, r.before);
+    // deformation: page point p -> where it sat on the before page
+    {
+        const GridMap& g = r.render_map;
+        bool swap = r.rot == cv::ROTATE_90_CLOCKWISE || r.rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+        int Wa = swap ? H : W;
+        double k = (double)g.out_w / Wa;
+        r.disp = GridMap::make(g.out_w, g.out_h, 4);
+        const double* m = M.ptr<double>();
+        for (int i = 0; i < g.gh; ++i)
+            for (int j = 0; j < g.gw; ++j) {
+                double X = g.x[(size_t)i * g.gw + j], Y = g.y[(size_t)i * g.gw + j];
+                double w = X * m[6] + Y * m[7] + m[8];
+                double u = (X * m[0] + Y * m[1] + m[2]) / w, v = (X * m[3] + Y * m[4] + m[5]) / w;
+                cv::Point2d q = rotate_pt(u, v, W, H, r.rot);
+                r.disp.X(i, j) = (float)((q.x + 0.5) * k - 0.5 - 4 * j);
+                r.disp.Y(i, j) = (float)((q.y + 0.5) * k - 0.5 - 4 * i);
+            }
+    }
+    r.ms.emplace_back("paper mask + before page", ms_since(t0));
     r.ms.emplace_back("total", ms_since(tall));
     r.ok = true;
     return r;
@@ -252,6 +333,15 @@ PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {
     for (auto& m : r.warp.ms) r.ms.emplace_back("  " + m.first, m.second);
     report(opt, 90, "Resampling");
     final_resample(scan, r, opt);
+    r.before = to_bgra(scan).clone();
+    if (r.before.cols != r.page.cols || r.before.rows != r.page.rows) cv::resize(r.before, r.before, r.page.size(), 0, 0, cv::INTER_AREA);
+    const GridMap& g = r.render_map;
+    double k = (double)g.out_w / scan.cols;
+    r.disp = GridMap::make(g.out_w, g.out_h, 4);
+    for (size_t i = 0; i < g.x.size(); ++i) {
+        r.disp.x[i] = (float)((g.x[i] + 0.5) * k - 0.5 - 4.0 * (i % g.gw));
+        r.disp.y[i] = (float)((g.y[i] + 0.5) * k - 0.5 - 4.0 * (i / g.gw));
+    }
     r.ms.emplace_back("total", ms_since(t0));
     r.ok = true;
     return r;

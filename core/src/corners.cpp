@@ -24,7 +24,7 @@ double Side::signed_dist(const cv::Point2d& X) const {
 }
 
 // paper mask: L > 150 and chroma < 7 (Lab), largest component, its outer contour
-static bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour) {
+static bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour, cv::Mat& full) {
     cv::Mat blur, lab8;
     cv::GaussianBlur(img, blur, cv::Size(7, 7), 0);
     cv::cvtColor(blur, lab8, cv::COLOR_BGR2Lab);
@@ -65,6 +65,8 @@ static bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour) {
     }
     contour.clear();
     for (auto& p : cs[best]) contour.emplace_back(p.x, p.y);
+    full = cv::Mat::zeros(img.size(), CV_8U);                // corners.paper_mask's `full`
+    cv::drawContours(full, cs, (int)best, cv::Scalar(255), cv::FILLED);
     return contour.size() >= 20;
 }
 
@@ -156,7 +158,7 @@ static cv::Point2d intersect(const Side& A, const Side& B) {
 
 Detection detect_page(const cv::Mat& img, NpRng& rng) {
     Detection D;
-    if (!paper_mask(img, D.contour)) return D;
+    if (!paper_mask(img, D.contour, D.paper)) return D;
     const auto& contour = D.contour;
     std::vector<cv::Point2f> c32(contour.size());
     for (size_t i = 0; i < contour.size(); ++i) c32[i] = cv::Point2f((float)contour[i].x, (float)contour[i].y);

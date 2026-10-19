@@ -11,7 +11,8 @@
 
 namespace fs {
 
-struct CleanParams;
+struct PageParams;
+enum class Filter : int;
 
 class Gpu {
 public:
@@ -24,10 +25,10 @@ public:
     bool resample(const cv::Mat& src_rgba, const GridMap& g, cv::Mat& out_rgba);
     // Parity/debug: dense maps as reconstructed on the GPU (float32).
     bool expand_maps(const GridMap& g, cv::Mat& mx, cv::Mat& my);
-    // Cleanup steps 1 and 4 (cleanup.h); same bytes as background_quarter_cpu / tone_cpu
-    // up to float rounding in the tone mapping.
+    // Filter passes (cleanup.h): the 1/4-resolution background (same bytes as
+    // background_quarter_cpu) and the filter (same as filter_cpu up to float rounding).
     bool background_quarter(const cv::Mat& img_rgba, cv::Mat& bg4_rgba);
-    bool tone(const cv::Mat& img_rgba, const CleanParams& p, cv::Mat& out_rgba);
+    bool filter(const cv::Mat& img_rgba, const PageParams& p, Filter f, float strength, cv::Mat& out_rgba);
 
 private:
     Gpu() = default;
