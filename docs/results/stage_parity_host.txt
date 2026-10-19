@@ -1,0 +1,119 @@
+=== page detection (corners.py) and surface fit (surface.py)
+photo1    contour identical: True  RANSAC inliers equal: True  corner max diff 4.3e-14 px
+          surface axis v/v  cost 1077.394791 / 1077.394792 (app / reference)  max |c diff| 1.5e-04 rad  fit 472 ms
+photo2    contour identical: True  RANSAC inliers equal: True  corner max diff 4.5e-13 px
+          surface axis v/v  cost 1659.488815 / 1659.488814 (app / reference)  max |c diff| 4.6e-04 rad  fit 271 ms
+bench_P1  contour identical: True  RANSAC inliers equal: True  corner max diff 1.6e-12 px
+          surface axis u/u  cost 654.313713 / 654.313713 (app / reference)  max |c diff| 5.0e-06 rad  fit 159 ms
+bench_P2  contour identical: True  RANSAC inliers equal: True  corner max diff 4.5e-13 px
+          surface axis v/v  cost 478.212087 / 478.212087 (app / reference)  max |c diff| 2.1e-06 rad  fit 249 ms
+
+=== warp map (warpmap.unwarp_image) on the reference's own input for this stage
+--- photo1
+{"total_ms": 972, "global": 221, "global_remap+darkness": 112, "lines+trace pass1+text": 220, "trace pass2": 60, "solves": 401, "cg_iters": [13, 13, 19, 19, 18, 21]}
+A_img  max |diff| 0 levels, pixels differing 0
+GX     max |diff| 2.4e-07 px
+GY     max |diff| 1.78e-07 px
+D      max |diff| 0
+H      n=    68 max |diff| 0
+V      n=     7 max |diff| 0
+S1_h   n= 20777 max |diff| 1.36e-12
+S1_v   n=  3152 max |diff| 1.82e-12
+T      n=  2750 max |diff| 2.05e-12
+Fx1    max |diff| 4.22e-07 px
+Fy1    max |diff| 9.46e-07 px
+S2_h   n= 20792 max |diff| 1.36e-12
+S2_v   n=  3271 max |diff| 1.82e-12
+Fx     max |diff| 0.000653 px
+Fy     max |diff| 0.00103 px
+map4   max endpoint error 0.00123 px, p99 0.0005193 px
+--- photo2
+{"total_ms": 1126, "global": 211, "global_remap+darkness": 190, "lines+trace pass1+text": 214, "trace pass2": 45, "solves": 492, "cg_iters": [13, 13, 19, 18, 19, 18]}
+A_img  max |diff| 1 levels, pixels differing 1
+GX     max |diff| 2.87e-07 px
+GY     max |diff| 1.72e-07 px
+D      max |diff| 1
+H      n=     7 max |diff| 0
+V      n=    71 max |diff| 0
+S1_h   n=  3561 max |diff| 4.55e-13
+S1_v   n= 23025 max |diff| 1.82e-12
+T      n=     0 max |diff| 0
+Fx1    max |diff| 1.45e-06 px
+Fy1    max |diff| 7.92e-07 px
+S2_h   n=  3561 max |diff| 4.55e-13
+S2_v   n= 23025 max |diff| 1.82e-12
+Fx     max |diff| 0.00502 px
+Fy     max |diff| 0.0018 px
+map4   max endpoint error 0.004853 px, p99 0.001315 px
+--- scan_p1
+{"total_ms": 2157, "global": 576, "global_remap+darkness": 241, "lines+trace pass1+text": 358, "trace pass2": 39, "solves": 944, "cg_iters": [16, 16, 20, 21, 19, 20]}
+A_img  max |diff| 0 levels, pixels differing 0
+GX     max |diff| 1.28e-07 px
+GY     max |diff| 1.53e-07 px
+D      max |diff| 0
+H      n=    67 max |diff| 0
+V      n=     6 max |diff| 0
+S1_h   n= 34449 max |diff| 5e-12
+S1_v   n=  4586 max |diff| 3.87e-12
+T      n=  6104 max |diff| 3.18e-12
+Fx1    max |diff| 1.01e-06 px
+Fy1    max |diff| 1.8e-06 px
+S2_h   n= 34449 max |diff| 5e-12
+S2_v   n=  4586 max |diff| 3.87e-12
+Fx     max |diff| 0.00241 px
+Fy     max |diff| 0.00492 px
+map4   max endpoint error 0.005158 px, p99 0.002397 px
+--- scan_p2
+{"total_ms": 1988, "global": 494, "global_remap+darkness": 241, "lines+trace pass1+text": 335, "trace pass2": 49, "solves": 883, "cg_iters": [17, 17, 21, 22, 20, 19]}
+A_img  max |diff| 1 levels, pixels differing 1
+GX     max |diff| 1.32e-07 px
+GY     max |diff| 3.19e-07 px
+D      max |diff| 0
+H      n=    70 max |diff| 0
+V      n=     5 max |diff| 0
+S1_h   n= 37237 max |diff| 6.82e-12
+S1_v   n=  4883 max |diff| 3.18e-12
+T      n=  9597 max |diff| 4.09e-12
+Fx1    max |diff| 1.7e-06 px
+Fy1    max |diff| 2.35e-06 px
+S2_h   n= 37237 max |diff| 6.82e-12
+S2_v   n=  4885 max |diff| 3.18e-12
+Fx     max |diff| 0.00109 px
+Fy     max |diff| 0.002 px
+map4   max endpoint error 0.002132 px, p99 0.0007432 px
+--- scan_p3
+{"total_ms": 2422, "global": 536, "global_remap+darkness": 258, "lines+trace pass1+text": 445, "trace pass2": 29, "solves": 1146, "cg_iters": [17, 17, 24, 22, 23, 21]}
+A_img  max |diff| 0 levels, pixels differing 0
+GX     max |diff| 3.29e-07 px
+GY     max |diff| 9.37e-08 px
+D      max |diff| 0
+H      n=    52 max |diff| 0
+V      n=    14 max |diff| 0
+S1_h   n= 20903 max |diff| 5.46e-12
+S1_v   n=  2811 max |diff| 2.73e-12
+T      n=  7061 max |diff| 3.64e-12
+Fx1    max |diff| 2.87e-07 px
+Fy1    max |diff| 1.4e-06 px
+S2_h   n= 20934 max |diff| 5.46e-12
+S2_v   n=  2811 max |diff| 2.73e-12
+Fx     max |diff| 0.000549 px
+Fy     max |diff| 0.00359 px
+map4   max endpoint error 0.003619 px, p99 0.002059 px
+
+=== sparse solver on the reference's exported pass-2 systems
+--- scan_p1/scan pass 2 (y)
+  rtol 1e-05: 12 iterations, 6 levels, rel.res 8.2e-06, 406 ms | max |x - exact| 3.13e-03 px, max |x - reference| 5.57e-03 px
+  rtol 1e-08: 22 iterations, 6 levels, rel.res 6.2e-09, 815 ms | max |x - exact| 1.73e-06 px, max |x - reference| 4.92e-03 px
+  rtol 1e-10: 28 iterations, 6 levels, rel.res 7.3e-11, 940 ms | max |x - exact| 2.00e-08 px, max |x - reference| 4.92e-03 px
+--- scan_p1/scan pass 2 (x)
+  rtol 1e-05: 13 iterations, 6 levels, rel.res 9.6e-06, 616 ms | max |x - exact| 8.43e-04 px, max |x - reference| 2.97e-03 px
+  rtol 1e-08: 23 iterations, 6 levels, rel.res 8.5e-09, 842 ms | max |x - exact| 9.26e-07 px, max |x - reference| 2.41e-03 px
+  rtol 1e-10: 30 iterations, 6 levels, rel.res 6.3e-11, 1103 ms | max |x - exact| 4.88e-09 px, max |x - reference| 2.41e-03 px
+--- photo1/stage1 pass 2 (y)
+  rtol 1e-05: 12 iterations, 5 levels, rel.res 8.3e-06, 190 ms | max |x - exact| 1.80e-03 px, max |x - reference| 1.79e-03 px
+  rtol 1e-08: 21 iterations, 5 levels, rel.res 7.9e-09, 206 ms | max |x - exact| 1.50e-06 px, max |x - reference| 1.03e-03 px
+  rtol 1e-10: 27 iterations, 5 levels, rel.res 5.7e-11, 263 ms | max |x - exact| 1.14e-08 px, max |x - reference| 1.03e-03 px
+--- photo1/stage1 pass 2 (x)
+  rtol 1e-05: 14 iterations, 5 levels, rel.res 6.3e-06, 160 ms | max |x - exact| 2.44e-04 px, max |x - reference| 6.12e-04 px
+  rtol 1e-08: 23 iterations, 5 levels, rel.res 5.4e-09, 240 ms | max |x - exact| 2.77e-07 px, max |x - reference| 6.53e-04 px
+  rtol 1e-10: 29 iterations, 5 levels, rel.res 5.1e-11, 309 ms | max |x - exact| 3.53e-09 px, max |x - reference| 6.53e-04 px

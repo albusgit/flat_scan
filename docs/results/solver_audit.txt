@@ -1,0 +1,6 @@
+scan_p1 scan pass2_y: n=160075  reference rel. residual 9.42e-06  |AMG - exact| max 0.0049 px, p99 0.0021 px
+scan_p1 scan pass2_x: n=160075  reference rel. residual 8.63e-06  |AMG - exact| max 0.0024 px, p99 0.0014 px
+scan_p2 scan pass2_y: n=155044  reference rel. residual 9.24e-06  |AMG - exact| max 0.0017 px, p99 0.0006 px
+scan_p2 scan pass2_x: n=155044  reference rel. residual 7.89e-06  |AMG - exact| max 0.0011 px, p99 0.0006 px
+photo1 stage1 pass2_y: n=57368  reference rel. residual 8.82e-06  |AMG - exact| max 0.0010 px, p99 0.0004 px
+photo1 stage1 pass2_x: n=57368  reference rel. residual 8.73e-06  |AMG - exact| max 0.0007 px, p99 0.0004 px

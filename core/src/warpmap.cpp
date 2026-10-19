@@ -613,6 +613,11 @@ void trace_bounds(const Line& L, const Lines& perp, double lo, double hi, double
 
 }  // namespace
 
+Lines clean_segments(const cv::Mat& ink, bool hz, int klen, int minlen) { return segments(ink, hz, klen, minlen); }
+Lines clean_short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp) {
+    return short_segments(ink, hz, long_segs, perp);
+}
+
 float Field::sample(double x, double y) const {
     double gy = y / g, gx = x / g;
     gy = std::min(std::max(gy, 0.0), (double)(gh - 1));

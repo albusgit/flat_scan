@@ -1,0 +1,9 @@
+<resources>
+    <style name="Theme.FlatScan" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+    <color name="background">#FAFAF9</color>
+    <color name="icon_background">#1F4ED8</color>
+</resources>

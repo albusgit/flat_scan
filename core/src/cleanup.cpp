@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "gpu.h"
+#include "solid.h"
 
 #pragma STDC FP_CONTRACT OFF
 
@@ -208,6 +209,20 @@ cv::Mat cleanup(const cv::Mat& rgba, bool grayscale, bool use_gpu, CleanStats* s
     s.gpu_tone = use_gpu && Gpu::instance().tone(rgba, p, out);
     if (!s.gpu_tone) out = tone_cpu(rgba, p);
     s.ms_tone = ms_since(t0);
+    return out;
+}
+
+cv::Mat finish_page(const cv::Mat& page, bool grayscale, bool solid, bool use_gpu, CleanStats* st) {
+    if (!solid) return cleanup(page, grayscale, use_gpu, st);
+    cv::Mat out = solid_colors(cleanup(page, false, use_gpu, st));
+    if (grayscale) {
+        for (int y = 0; y < out.rows; ++y)
+            for (int x = 0; x < out.cols; ++x) {
+                cv::Vec4b& o = out.at<cv::Vec4b>(y, x);
+                uint8_t g = (uint8_t)std::lrint(luma(o[0] / 255.f, o[1] / 255.f, o[2] / 255.f) * 255.f);
+                o[0] = o[1] = o[2] = g;
+            }
+    }
     return out;
 }
 

@@ -1,0 +1,7 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- a page with a flattened grid -->
+    <path android:fillColor="#FFFFFF" android:pathData="M38,30h26l8,8v40h-34z" />
+    <path android:fillColor="#C7D2FE" android:pathData="M64,30v8h8z" />
+    <path android:strokeColor="#1F4ED8" android:strokeWidth="2" android:pathData="M43,46h24M43,54h24M43,62h24M43,70h24M55,42v32" />
+</vector>

@@ -134,8 +134,14 @@ cv::Mat to_bgra(const cv::Mat& m) {
 void final_resample(const cv::Mat& photo, PipelineResult& r, const PipelineOptions& opt) {
     auto t0 = Clock::now();
     cv::Mat src = to_bgra(photo);
-    r.gpu_resample = opt.use_gpu && Gpu::instance().resample(src, r.final_map, r.page);
-    if (!r.gpu_resample) r.page = resample_cpu(src, r.final_map);
+    r.render_map = r.final_map;
+    if (opt.render_w > 0 && opt.render_w != opt.out_w) {
+        bool portrait = r.final_map.out_w <= r.final_map.out_h;
+        int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
+        r.render_map = rescale_grid(r.final_map, portrait ? opt.render_w : long_side, portrait ? long_side : opt.render_w);
+    }
+    r.gpu_resample = opt.use_gpu && Gpu::instance().resample(src, r.render_map, r.page);
+    if (!r.gpu_resample) r.page = resample_cpu(src, r.render_map);
     r.ms.emplace_back(r.gpu_resample ? "final resample (GPU)" : "final resample (CPU)", ms_since(t0));
 }
 

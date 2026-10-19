@@ -29,6 +29,11 @@ void expand_rows(const GridMap& g, int y0, int y1, cv::Mat& mx, cv::Mat& my);
 // Full dense maps (host harness / parity export only; the app never calls this).
 void expand_full(const GridMap& g, cv::Mat& mx, cv::Mat& my);
 
+// The same backward map for a page rendered at another size (output resolution setting):
+// output pixel p' maps to analysis pixel (p' + 0.5) * out_w / new_w - 0.5, interpolated
+// bilinearly on the grid. Geometry is unchanged; the photo is still sampled once.
+GridMap rescale_grid(const GridMap& g, int new_w, int new_h);
+
 // CPU path: cv::remap INTER_CUBIC in horizontal bands, so no full-resolution float map is
 // ever allocated. src is CV_8UC3 or CV_8UC4.
 cv::Mat resample_cpu(const cv::Mat& src, const GridMap& g, int band_rows = 64);

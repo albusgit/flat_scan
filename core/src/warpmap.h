@@ -45,5 +45,8 @@ GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr);
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);
 void get_lines(const cv::Mat& D, Lines& H, Lines& V);
+// clean.segments / clean.short_segments (morphological axis-aligned line segments)
+Lines clean_segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150);
+Lines clean_short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp);
 
 }  // namespace fs

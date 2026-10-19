@@ -46,6 +46,28 @@ void expand_rows(const GridMap& g, int y0, int y1, cv::Mat& mx, cv::Mat& my) {
     }
 }
 
+GridMap rescale_grid(const GridMap& g, int new_w, int new_h) {
+    if (new_w == g.out_w && new_h == g.out_h) return g;
+    GridMap o = GridMap::make(new_w, new_h, g.stride);
+    double sx = (double)g.out_w / new_w, sy = (double)g.out_h / new_h;
+    for (int i = 0; i < o.gh; ++i)
+        for (int j = 0; j < o.gw; ++j) {
+            double u = ((j * o.stride + 0.5) * sx - 0.5) / g.stride, v = ((i * o.stride + 0.5) * sy - 0.5) / g.stride;
+            u = std::min(std::max(u, 0.0), (double)(g.gw - 1));
+            v = std::min(std::max(v, 0.0), (double)(g.gh - 1));
+            int x0 = std::min((int)u, g.gw - 2 < 0 ? 0 : g.gw - 2), y0 = std::min((int)v, g.gh - 2 < 0 ? 0 : g.gh - 2);
+            int x1 = std::min(x0 + 1, g.gw - 1), y1 = std::min(y0 + 1, g.gh - 1);
+            double a = u - x0, b = v - y0;
+            auto L = [&](const std::vector<float>& f) {
+                return (float)((f[(size_t)y0 * g.gw + x0] * (1 - a) + f[(size_t)y0 * g.gw + x1] * a) * (1 - b) +
+                               (f[(size_t)y1 * g.gw + x0] * (1 - a) + f[(size_t)y1 * g.gw + x1] * a) * b);
+            };
+            o.X(i, j) = L(g.x);
+            o.Y(i, j) = L(g.y);
+        }
+    return o;
+}
+
 void expand_full(const GridMap& g, cv::Mat& mx, cv::Mat& my) { expand_rows(g, 0, g.out_h, mx, my); }
 
 cv::Mat resample_cpu(const cv::Mat& src, const GridMap& g, int band_rows) {

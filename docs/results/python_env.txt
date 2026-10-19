@@ -1,0 +1,16 @@
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.67.0
+kiwisolver==1.5.1
+llvmlite==0.44.0
+matplotlib==3.10.8
+numba==0.61.2
+numpy==2.2.6
+opencv-python-headless==4.11.0.86
+packaging==26.3
+pillow==13.0.0
+pyamg==5.3.0
+pyparsing==3.3.3
+python-dateutil==2.9.0.post0
+scipy==1.15.3
+six==1.17.0

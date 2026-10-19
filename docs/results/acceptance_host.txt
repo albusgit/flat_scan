@@ -1,0 +1,131 @@
+/home/user/ref/app_ref/test_images/photo1.jpg: mode surface rot -1 gpu 1 total 1613 ms
+/home/user/ref/app_ref/test_images/photo2.jpg: mode surface rot 2 gpu 1 total 1733 ms
+/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot 1 gpu 1 total 1581 ms
+/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot 1 gpu 1 total 1486 ms
+/home/user/ref/app_ref/test_images/scan_p1.jpg: gpu 1 total 2610 ms
+/home/user/ref/app_ref/test_images/scan_p2.jpg: gpu 1 total 2481 ms
+/home/user/ref/app_ref/test_images/scan_p3.jpg: gpu 1 total 2884 ms
+/home/user/ref/app_ref/test_images/photo1.jpg: mode surface rot -1 gpu 0 total 1691 ms
+/home/user/ref/app_ref/test_images/photo2.jpg: mode surface rot 2 gpu 0 total 1557 ms
+/home/user/ref/app_ref/bench_photo/photoP1.png: mode surface rot 1 gpu 0 total 1578 ms
+/home/user/ref/app_ref/bench_photo/photoP2.png: mode surface rot 1 gpu 0 total 1691 ms
+/home/user/ref/app_ref/test_images/scan_p1.jpg: gpu 0 total 2611 ms
+/home/user/ref/app_ref/test_images/scan_p2.jpg: gpu 0 total 2246 ms
+/home/user/ref/app_ref/test_images/scan_p3.jpg: gpu 0 total 2409 ms
+
+=== 1. map parity: port_compare.py reference candidate --limit 0.1
+gpu  photo1   {"max_epe_px":0.08862407505512238,"p99_epe_px":0.015138687565922737,"mean_epe_px":0.0005459169042296708,"threshold_px":0.1,"passed":true}
+gpu  photo2   {"max_epe_px":0.0842638909816742,"p99_epe_px":0.016479605808854103,"mean_epe_px":0.0006746016442775726,"threshold_px":0.1,"passed":true}
+gpu  scan_p1  {"max_epe_px":0.005412892904132605,"p99_epe_px":0.0023963707499206066,"mean_epe_px":0.00023740751203149557,"threshold_px":0.1,"passed":true}
+gpu  scan_p2  {"max_epe_px":0.0023575692903250456,"p99_epe_px":0.0007720404537394643,"mean_epe_px":0.00013617819058708847,"threshold_px":0.1,"passed":true}
+gpu  scan_p3  {"max_epe_px":0.003636449109762907,"p99_epe_px":0.002056121826171875,"mean_epe_px":0.00023642907035537064,"threshold_px":0.1,"passed":true}
+gpu  bench_P1 {"max_epe_px":0.030785929411649704,"p99_epe_px":0.0001220703125,"mean_epe_px":4.7780955355847254e-05,"threshold_px":0.1,"passed":true}
+gpu  bench_P2 {"max_epe_px":0.026736190542578697,"p99_epe_px":3.0517578125e-05,"mean_epe_px":2.2605821868637577e-05,"threshold_px":0.1,"passed":true}
+cpu  photo1   {"max_epe_px":0.08862407505512238,"p99_epe_px":0.015138687565922737,"mean_epe_px":0.0005459169042296708,"threshold_px":0.1,"passed":true}
+cpu  photo2   {"max_epe_px":0.0842638909816742,"p99_epe_px":0.016479605808854103,"mean_epe_px":0.0006746016442775726,"threshold_px":0.1,"passed":true}
+cpu  scan_p1  {"max_epe_px":0.005412892904132605,"p99_epe_px":0.0023963707499206066,"mean_epe_px":0.00023740751203149557,"threshold_px":0.1,"passed":true}
+cpu  scan_p2  {"max_epe_px":0.0023575692903250456,"p99_epe_px":0.0007720404537394643,"mean_epe_px":0.00013617819058708847,"threshold_px":0.1,"passed":true}
+cpu  scan_p3  {"max_epe_px":0.003636449109762907,"p99_epe_px":0.002056121826171875,"mean_epe_px":0.00023642907035537064,"threshold_px":0.1,"passed":true}
+cpu  bench_P1 {"max_epe_px":0.030785929411649704,"p99_epe_px":0.0001220703125,"mean_epe_px":4.7780955355847254e-05,"threshold_px":0.1,"passed":true}
+cpu  bench_P2 {"max_epe_px":0.026736190542578697,"p99_epe_px":3.0517578125e-05,"mean_epe_px":2.2605821868637577e-05,"threshold_px":0.1,"passed":true}
+
+=== 2. image parity (8-bit), GPU vs CPU path and against the reference
+photo1   GPU vs CPU path:                    max   0  pixels>1       0 (0.000%)  pixels>0       0
+photo1   GPU vs reference image:             max 118  pixels>1  122622 (3.387%)  pixels>0  360361
+photo1   reference resampled from its grid:  max 118  pixels>1  121970 (3.369%)  pixels>0  358236   (reference vs itself)
+photo2   GPU vs CPU path:                    max   0  pixels>1       0 (0.000%)  pixels>0       0
+photo2   GPU vs reference image:             max 140  pixels>1  162681 (4.493%)  pixels>0  432447
+photo2   reference resampled from its grid:  max 140  pixels>1  161885 (4.471%)  pixels>0  429386   (reference vs itself)
+scan_p1  GPU vs CPU path:                    max   0  pixels>1       0 (0.000%)  pixels>0       0
+scan_p1  GPU vs reference image:             max   6  pixels>1    1217 (0.012%)  pixels>0    4817
+scan_p1  reference resampled from its grid:  max   0  pixels>1       0 (0.000%)  pixels>0       0   (reference vs itself)
+scan_p2  GPU vs CPU path:                    max   0  pixels>1       0 (0.000%)  pixels>0       0
+scan_p2  GPU vs reference image:             max   5  pixels>1    1250 (0.013%)  pixels>0    4653
+scan_p2  reference resampled from its grid:  max   0  pixels>1       0 (0.000%)  pixels>0       0   (reference vs itself)
+scan_p3  GPU vs CPU path:                    max   0  pixels>1       0 (0.000%)  pixels>0       0
+scan_p3  GPU vs reference image:             max   5  pixels>1     435 (0.004%)  pixels>0    2058
+scan_p3  reference resampled from its grid:  max   0  pixels>1       0 (0.000%)  pixels>0       0   (reference vs itself)
+
+=== 3-5. ground truth, straightness, photo-1 title border (GPU path outputs)
+{
+ "bench_P1": {
+  "epe_inner": 0.956,
+  "epe_edge": 1.577,
+  "epe_mean": 1.082,
+  "epe_p95": 1.987,
+  "epe_max": 2.833,
+  "scale_x_p95": 200.363,
+  "scale_y_p95": 200.476,
+  "sim_scale": 1.672
+ },
+ "bench_P2": {
+  "epe_inner": 0.967,
+  "epe_edge": 2.111,
+  "epe_mean": 1.199,
+  "epe_p95": 2.494,
+  "epe_max": 6.011,
+  "scale_x_p95": 200.334,
+  "scale_y_p95": 200.463,
+  "sim_scale": 1.672
+ },
+ "photo1": {
+  "lines": 72,
+  "median": 0.228,
+  "p90": 0.373,
+  "worst": 1.41,
+  "within_1px_pct": 98.6,
+  "end_p90": 0.279,
+  "end_worst": 2.137
+ },
+ "photo2": {
+  "lines": 75,
+  "median": 0.251,
+  "p90": 0.418,
+  "worst": 0.621,
+  "within_1px_pct": 100.0,
+  "end_p90": 0.228,
+  "end_worst": 0.415
+ },
+ "scan_p1": {
+  "lines": 72,
+  "median": 0.225,
+  "p90": 0.297,
+  "worst": 0.463,
+  "within_1px_pct": 100.0,
+  "end_p90": 0.289,
+  "end_worst": 0.351
+ },
+ "scan_p2": {
+  "lines": 75,
+  "median": 0.238,
+  "p90": 0.363,
+  "worst": 0.773,
+  "within_1px_pct": 100.0,
+  "end_p90": 0.257,
+  "end_worst": 0.376
+ },
+ "scan_p3": {
+  "lines": 65,
+  "median": 0.293,
+  "p90": 0.447,
+  "worst": 0.572,
+  "within_1px_pct": 100.0,
+  "end_p90": 0.276,
+  "end_worst": 0.866
+ },
+ "photo1_title_border": {
+  "seed_y": 67,
+  "coverage": 0.955,
+  "p98_px": 0.261,
+  "end_max_px": 0.191
+ }
+}
+
+=== timings (host, ms)
+photo1: {"mode": "surface", "fell_back": false, "fit_median_px": 1.69305, "fit_p90_px": 6.73719, "axis": "v", "rot": -1, "orient": [16572, 658, 0.494653], "gpu_resample": true, "ms": {"detect": 232, "surface fit": 317, "stage-1 page": 58, "orientation": 121, "warp map": 686, "  global": 187, "  global_remap+darkness": 78, "  lines+trace pass1+text": 113, "  trace pass2": 24, "  solves": 297, "compose (4-px grid)": 11, "final resample (GPU)": 186, "total": 1613}}
+photo2: {"mode": "surface", "fell_back": false, "fit_median_px": 1.41716, "fit_p90_px": 24.6698, "axis": "v", "rot": 2, "orient": [1070, 23343, 0.335858], "gpu_resample": true, "ms": {"detect": 236, "surface fit": 192, "stage-1 page": 81, "orientation": 172, "warp map": 845, "  global": 251, "  global_remap+darkness": 101, "  lines+trace pass1+text": 144, "  trace pass2": 30, "  solves": 335, "compose (4-px grid)": 23, "final resample (GPU)": 185, "total": 1733}}
+bench_P1: {"mode": "surface", "fell_back": false, "fit_median_px": 0.285329, "fit_p90_px": 1.07077, "axis": "u", "rot": 1, "orient": [17915, 58, -0.0302004], "gpu_resample": true, "ms": {"detect": 260, "surface fit": 112, "stage-1 page": 81, "orientation": 133, "warp map": 765, "  global": 195, "  global_remap+darkness": 96, "  lines+trace pass1+text": 119, "  trace pass2": 34, "  solves": 334, "compose (4-px grid)": 19, "final resample (GPU)": 208, "total": 1581}}
+bench_P2: {"mode": "surface", "fell_back": false, "fit_median_px": 0.255211, "fit_p90_px": 0.765486, "axis": "v", "rot": 1, "orient": [15740, 783, -0.0741597], "gpu_resample": true, "ms": {"detect": 234, "surface fit": 110, "stage-1 page": 57, "orientation": 125, "warp map": 757, "  global": 177, "  global_remap+darkness": 91, "  lines+trace pass1+text": 116, "  trace pass2": 35, "  solves": 362, "compose (4-px grid)": 12, "final resample (GPU)": 188, "total": 1486}}
+scan_p1: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2167, "  global": 654, "  global_remap+darkness": 266, "  lines+trace pass1+text": 328, "  trace pass2": 46, "  solves": 874, "final resample (GPU)": 440, "total": 2610}}
+scan_p2: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2065, "  global": 498, "  global_remap+darkness": 236, "  lines+trace pass1+text": 374, "  trace pass2": 43, "  solves": 922, "final resample (GPU)": 414, "total": 2481}}
+scan_p3: {"mode": "surface", "gpu_resample": true, "ms": {"warp map": 2419, "  global": 589, "  global_remap+darkness": 229, "  lines+trace pass1+text": 378, "  trace pass2": 27, "  solves": 1171, "final resample (GPU)": 463, "total": 2884}}

@@ -1,0 +1,30 @@
+== photo1 cpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== photo1 gpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== photo2 cpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== photo2 gpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== scan_p1 cpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== scan_p1 gpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== scan_p2 cpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== scan_p2 gpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== scan_p3 cpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS
+== scan_p3 gpu: map parity (port_compare --limit 0.1)
+{"max_epe_px":0.0,"p99_epe_px":0.0,"mean_epe_px":0.0,"threshold_px":0.1,"passed":true}
+   image parity vs reference resample: max 0 levels, pixels>1: 0, pixels>0: 0  -> PASS

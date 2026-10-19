@@ -14,6 +14,8 @@
 #include "sparse.h"
 #include "warpmap.h"
 #include "pipeline.h"
+#include "cleanup.h"
+#include "solid.h"
 #include <sys/stat.h>
 #include <fstream>
 #include <chrono>
@@ -167,7 +169,33 @@ static int cmd_scan(int argc, char** argv) {
     return 0;
 }
 
+// clean IN.png OUT.png [--gray] [--solid] [--cpu]; also reports GPU vs CPU difference
+static int cmd_clean(int argc, char** argv) {
+    cv::Mat in = cv::imread(argv[2], cv::IMREAD_COLOR), bgra;
+    cv::cvtColor(in, bgra, cv::COLOR_BGR2BGRA);
+    bool gray = flag(argc, argv, "--gray"), solid = flag(argc, argv, "--solid");
+    CleanStats sg, sc;
+    auto t0 = std::chrono::steady_clock::now();
+    cv::Mat og = finish_page(bgra, gray, solid, !flag(argc, argv, "--cpu"), &sg);
+    double ms_g = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    t0 = std::chrono::steady_clock::now();
+    cv::Mat oc = finish_page(bgra, gray, solid, false, &sc);
+    double ms_c = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    cv::Mat d;
+    cv::absdiff(og, oc, d);
+    double mx;
+    cv::minMaxLoc(d.reshape(1), nullptr, &mx);
+    int n1 = cv::countNonZero(d.reshape(1) > 1), n0 = cv::countNonZero(d.reshape(1) > 0);
+    cv::Mat o3;
+    cv::cvtColor(og, o3, cv::COLOR_BGRA2BGR);
+    cv::imwrite(argv[3], o3);
+    std::printf("{\"gpu_background\": %d, \"gpu_tone\": %d, \"gpu_ms\": %.0f, \"cpu_ms\": %.0f, \"gpu_vs_cpu_max\": %.0f, \"values_gt1\": %d, \"values_gt0\": %d}\n",
+                (int)sg.gpu_background, (int)sg.gpu_tone, ms_g, ms_c, mx, n1, n0);
+    return 0;
+}
+
 int cli_ext(const std::string& cmd, int argc, char** argv) {
+    if (cmd == "clean" && argc >= 4) return cmd_clean(argc, argv);
     if (cmd == "photo" && argc >= 4) return cmd_photo(argc, argv);
     if (cmd == "scan" && argc >= 4) return cmd_scan(argc, argv);
     if (cmd == "warp" && argc >= 4) return cmd_warp(argc, argv);

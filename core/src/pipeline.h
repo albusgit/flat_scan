@@ -36,7 +36,8 @@ struct PipelineOptions {
     double focal_px = 0;              // full-res focal length from EXIF / camera; 0 = 0.72*max side
     bool auto_orient = true;          // decide 0/90/180/270 on the homography page
     bool orient_on_stage1 = false;    // reference-code behaviour (decide on stage 1); off = brief
-    int out_w = 1600;                 // A4 page width (portrait); landscape swaps
+    int out_w = 1600;                 // analysis page width (portrait; landscape swaps) - the reference's
+    int render_w = 0;                 // output page width (portrait) if different from out_w; 0 = same
     bool use_gpu = true;
     double surface_fallback_px = 3.0; // outline residual median above this -> homography
     int max_analysis_side = 2400;     // detection / fit run on a copy no larger than this (reference inputs: 2212-2300 px)
@@ -52,7 +53,8 @@ struct PipelineResult {
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;
-    GridMap final_map;                // backward map (photo px), rotated frame, 4-px grid
+    GridMap final_map;                // backward map (photo px), rotated frame, 4-px grid, analysis size
+    GridMap render_map;               // the same map at the output resolution (used for the resample)
     cv::Mat page;                     // BGRA, unwarped (before cleanup)
     cv::Mat stage1;                   // stage-1 page the warp map was estimated on (BGR)
     bool gpu_resample = false;

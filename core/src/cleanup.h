@@ -41,4 +41,8 @@ CleanParams clean_params(const cv::Mat& bg4, const cv::Mat& rgba, bool grayscale
 // Whole cleanup; use_gpu=false forces the CPU path.
 cv::Mat cleanup(const cv::Mat& rgba, bool grayscale, bool use_gpu, CleanStats* st = nullptr);
 
+// App entry point: Auto color or Grayscale, optionally Solid colors (applied to the colour
+// result, then desaturated for Grayscale).
+cv::Mat finish_page(const cv::Mat& page_bgra, bool grayscale, bool solid, bool use_gpu, CleanStats* st = nullptr);
+
 }  // namespace fs
