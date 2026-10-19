@@ -153,7 +153,7 @@ static void write_outputs(const PipelineResult& r, const std::string& dir, const
         std::ofstream(dir + "/wrinkle_legend.txt") << top << "\n";
     }
     std::ofstream f(dir + "/info.json");
-    f << "{\"mode\": \"" << (r.mode == GeomMode::Surface ? "surface" : "homography") << "\"";
+    f << "{\"mode\": \"" << geom_mode_name(r.mode) << "\"";
     if (photo) {
         f << ", \"fell_back\": " << (r.fell_back ? "true" : "false") << ", \"fit_median_px\": " << r.fit_median_px
           << ", \"fit_p90_px\": " << r.fit_p90_px << ", \"axis\": \"" << r.model.axis << "\", \"rot\": " << r.rot
@@ -176,7 +176,7 @@ static int cmd_photo(int argc, char** argv) {
     PipelineResult r = run_photo(img, o);
     if (!r.ok) { std::fprintf(stderr, "%s\n", r.error.c_str()); return 1; }
     write_outputs(r, argv[3], "out.png", true);
-    std::printf("%s: mode %s rot %d gpu %d total %.0f ms\n", argv[2], r.mode == GeomMode::Surface ? "surface" : "homography", r.rot,
+    std::printf("%s: mode %s rot %d gpu %d total %.0f ms\n", argv[2], geom_mode_name(r.mode), r.rot,
                 (int)r.gpu_resample, r.ms.back().second);
     return 0;
 }

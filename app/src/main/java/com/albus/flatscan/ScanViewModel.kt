@@ -127,6 +127,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- page finder, quality gate, book spreads
     private val finder = PageFinder(app)
+    private val uvdoc = UvDoc(app)
     private val logitsLock = Any()
     /** Page-finder output for one photo bitmap (detection and processing use the same photo). */
     private var logitsCache: Pair<Bitmap, FloatArray?>? = null
@@ -690,7 +691,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------ pages
-    private fun geometryKey(m: PageMeta) = m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet)
+    private fun geometryKey(m: PageMeta) =
+        m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) + "|uv=" + settings.uvDoc
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
@@ -870,6 +872,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         val autoOrient = settings.autoRotate && !userRotated
         val width = settings.outputWidth
+        val useUv = settings.uvDoc
         val focal = focalPx
         recropBackup = null
         screen = Screen.Processing
@@ -886,7 +889,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 nativeHandle = 0L
                 val hh = try {
                     val logits = logitsFor(p)
-                    NativeLib.process(p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray()) { pct, s ->
+                    // UVDoc on the page's box (the core checks it against the page finder)
+                    val uvCrop = if (useUv && !po) NativeLib.uvCrop(p.width, p.height, c) else null
+                    val uvOut = uvCrop?.let { cr ->
+                        viewModelScope.launch(Dispatchers.Main) { stage = "Flattening (neural net)" }
+                        runCatching { uvdoc.grid(p, cr) }.onFailure { Log.e(TAG, "UVDoc failed", it) }.getOrNull()
+                    }
+                    NativeLib.process(p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), uvOut, uvCrop) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }
                 } catch (e: Exception) {
@@ -1074,8 +1083,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val reasons = if (gate != null) List(gate.length()) { gate.optString(it) } else emptyList()
         sb.append(
             when {
+                mode == "uvdoc" -> "Geometry: UVDoc neural flattening (outline agreement %.2f)".format(info.optDouble("uv_agreement")) +
+                    if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
+                    else "\nLine refinement: applied"
                 edited -> "Geometry: homography (corners adjusted by hand)"
                 reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"
+                info.optBoolean("uv_rejected") && mode == "surface" ->
+                    "Geometry: page surface model (UVDoc disagreed with the page outline, %.2f)".format(info.optDouble("uv_agreement"))
                 info.optBoolean("fell_back") -> "Geometry: homography (surface fit rejected, outline residual %.1f px)".format(info.optDouble("fit_median_px"))
                 mode == "surface" -> "Geometry: page surface model (outline residual %.2f px)".format(info.optDouble("fit_median_px"))
                 else -> "Geometry: $mode"

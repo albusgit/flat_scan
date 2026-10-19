@@ -8,6 +8,8 @@ import android.view.View
 object Features {
     /** The page-finder net (assets/models/pagefinder.onnx); off: the colour-threshold paper mask. */
     const val PAGE_FINDER_NET = true
+    /** UVDoc flattening (assets/models/uvdoc.onnx); off: the page outline's surface model. */
+    const val UVDOC = true
 }
 
 /** User settings and remembered choices (SharedPreferences). */
@@ -47,6 +49,11 @@ class Settings(ctx: Context) {
     var pageFinderNet: Boolean
         get() = p.getBoolean("page_finder_net", Features.PAGE_FINDER_NET)
         set(v) = p.edit().putBoolean("page_finder_net", v).apply()
+
+    /** Feature flag: flatten with UVDoc (falls back to the outline's surface model when it disagrees). */
+    var uvDoc: Boolean
+        get() = p.getBoolean("uvdoc", Features.UVDOC)
+        set(v) = p.edit().putBoolean("uvdoc", v).apply()
 
     /** Show the crop screen for every page; otherwise only doubtful crops (quality gate) stop there. */
     var reviewCrops: Boolean

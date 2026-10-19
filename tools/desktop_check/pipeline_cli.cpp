@@ -9,6 +9,7 @@
 #include <opencv2/imgproc.hpp>
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
     o.use_gpu = false;
     o.seg_logits = logits;
     o.perspective_only = std::getenv("FS_PERSPECTIVE_ONLY") != nullptr;
+    o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
         size_t p = 0;
@@ -73,18 +75,77 @@ int main(int argc, char** argv) {
             p = q + 1;
         }
     }
+    // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
+    // net input for the detected corners and exits; FS_UVOUT=Y.npz ("out": 2 x 45 x 31) uses it
+    std::vector<float> uv;
+    if (std::getenv("FS_UVIN") || std::getenv("FS_UVOUT")) {
+        PageCorners pc = detect_corners(img, o.max_analysis_side, logits, 0);
+        if (!pc.ok) { std::printf("%s, \"ok\": false, \"error\": \"no page found\"}\n", f.str().c_str()); return 0; }
+        o.uv_crop = uv_crop(img.size(), pc.pts);
+        if (const char* in = std::getenv("FS_UVIN")) {
+            std::vector<float> x = uv_input(img, o.uv_crop);
+            write_npz(in, {{"x", NpyArray::f32({1, 3, (size_t)UV_IN_H, (size_t)UV_IN_W}, x.data())}});
+            return 0;
+        }
+        Npz z = read_npz(std::getenv("FS_UVOUT"));
+        const NpyArray& a = z.at("out");
+        uv.assign(a.as<float>(), a.as<float>() + a.count());
+        if (uv.size() == (size_t)UV_OUTPUT_LEN) o.uv_out = uv.data();
+    }
     PipelineResult r;
     try {
-        r = run_photo(img, o);
+        // FS_SCAN=1: the warp map on the image itself (run_scan), e.g. on an already flattened page
+        r = std::getenv("FS_SCAN") ? run_scan(img, o) : run_photo(img, o);
     } catch (const std::exception& e) {
         r.ok = false;
         r.error = std::string("exception: ") + e.what();
     }
     f << ", \"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << r.error << "\", \"mode\": \""
-      << (r.mode == GeomMode::Surface ? "surface" : "homography") << "\", \"fit_median_full_px\": "
+      << geom_mode_name(r.mode) << "\", \"fit_median_full_px\": "
       << num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1) << ", \"needs_manual_crop\": " << strs(r.needs_manual_crop)
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
-      << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << "}";
+      << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
+      << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << "}";
+    // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
+    auto field_stats = [&](const char* name, const Field& a, const Field& b) {
+        double mx = 0, gr = 0;
+        for (const Field* F : {&a, &b}) {
+            if (F->v.empty()) continue;
+            for (int i = 0; i < F->gh; ++i)
+                for (int j = 0; j < F->gw; ++j) {
+                    double v = F->v[(size_t)i * F->gw + j];
+                    mx = std::max(mx, std::fabs(v));
+                    if (j + 1 < F->gw) gr = std::max(gr, std::fabs(F->v[(size_t)i * F->gw + j + 1] - v) / F->g);
+                    if (i + 1 < F->gh) gr = std::max(gr, std::fabs(F->v[(size_t)(i + 1) * F->gw + j] - v) / F->g);
+                }
+        }
+        f << ", \"" << name << "_max\": " << num(mx) << ", \"" << name << "_grad\": " << num(gr);
+    };
+    if (r.ok) {
+        std::string s = f.str();
+        s.pop_back();   // reopen the object
+        f.str(s);
+        f.seekp(0, std::ios_base::end);
+        field_stats("global", r.warp.GX, r.warp.GY);
+        field_stats("local", r.warp.Fx, r.warp.Fy);
+        // local area change: |det(I + dF) - 1| per grid cell, the outer 2 cells left out
+        const Field &Fx = r.warp.Fx, &Fy = r.warp.Fy;
+        std::vector<double> dets;
+        for (int i = 2; i + 3 < Fx.gh; ++i)
+            for (int j = 2; j + 3 < Fx.gw; ++j) {
+                auto V = [&](const Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
+                double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
+                double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
+                dets.push_back(std::fabs((1 + xx) * (1 + yy) - xy * yx - 1));
+            }
+        if (!dets.empty()) {
+            std::sort(dets.begin(), dets.end());
+            size_t n20 = 0;
+            for (double d : dets) n20 += d > 0.2;
+            f << ", \"det_p99\": " << num(dets[(size_t)(0.99 * (dets.size() - 1))]) << ", \"det_frac20\": " << num((double)n20 / dets.size());
+        }
+        f << "}";
+    }
     std::printf("%s\n", f.str().c_str());
     if (r.ok && std::string(argv[2]) != "-") {
         cv::Mat bgr;

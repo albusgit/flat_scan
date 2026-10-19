@@ -25,6 +25,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 struct Unroll {
     GeomMode mode = GeomMode::Homography;
     SurfaceModel m;
+    UvGrid uv;
     double Minv[9];
     int W = 0, H = 0;              // page size (px)
     bool scaled = false;           // model fitted on the analysis copy
@@ -37,6 +38,10 @@ struct Unroll {
             if (std::fabs(w) <= FLT_EPSILON) return cv::Point2f(0, 0);
             w = 1. / w;
             return cv::Point2f((float)((xf * Minv[0] + yf * Minv[1] + Minv[2]) * w), (float)((xf * Minv[3] + yf * Minv[4] + Minv[5]) * w));
+        }
+        if (mode == GeomMode::Neural) {
+            cv::Point2d q = uv.at((double)x, (double)y, W, H);
+            return cv::Point2f((float)q.x, (float)q.y);
         }
         cv::Point2d p = m.unroll_at((double)x, (double)y, W, H);
         if (scaled) p = cv::Point2d((p.x + 0.5) * kx - 0.5, (p.y + 0.5) * ky - 0.5);
@@ -218,6 +223,28 @@ cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H
         if (r.area() > 0) m(r).setTo(255);
     }
     return m;
+}
+
+// local area change of the warp map's line stage, |det(I + dF) - 1| per grid cell (the outer 2
+// cells left out): its 99th percentile; frac = the share of cells above 0.2
+double local_distortion(const WarpDebug& d, double* frac) {
+    const Field &Fx = d.Fx, &Fy = d.Fy;
+    std::vector<double> v;
+    for (int i = 2; i + 3 < Fx.gh; ++i)
+        for (int j = 2; j + 3 < Fx.gw; ++j) {
+            auto V = [&](const Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
+            double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
+            double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
+            v.push_back(std::fabs((1 + xx) * (1 + yy) - xy * yx - 1));
+        }
+    *frac = 0;
+    if (v.empty()) return 0;
+    size_t n = 0;
+    for (double q : v) n += q > 0.2;
+    *frac = (double)n / v.size();
+    size_t k = (size_t)(0.99 * (v.size() - 1));
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k];
 }
 
 // the lines the warp map used, as output-page fractions (PipelineResult::lines)
@@ -430,6 +457,28 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
             r.fell_back = true;
         }
     }
+    // UVDoc (app): its grid replaces the surface model / homography as stage 1 when its page outline
+    // agrees with the page finder (or with corners set by hand); the line stage still runs on top
+    if (opt.uv_out && !opt.perspective_only) {
+        UvGrid g = uv_grid(opt.uv_out, opt.uv_crop);
+        bool frame_ok = g.ok && g.turned == landscape;
+        double need = opt.uv_min_agreement;
+        if (!opt.corners_edited && pc.ok && !pc.det.paper.empty()) {
+            r.uv_agreement = uv_agreement(g, pc.det.paper, pc.scale);
+        } else {
+            r.uv_agreement = uv_agreement(g, corners, photo.size());
+            need = opt.uv_min_agreement_quad;
+        }
+        if (frame_ok && r.uv_agreement >= need) {
+            U = Uh;
+            U.mode = GeomMode::Neural;
+            U.uv = std::move(g);
+            r.mode = GeomMode::Neural;
+            r.fell_back = false;
+        } else {
+            r.uv_rejected = true;
+        }
+    }
     t0 = Clock::now();
     report(opt, 20, "Unrolling the page");
     cv::Mat stage1 = remap_unroll(photo, U);
@@ -444,12 +493,23 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     t0 = Clock::now();
     report(opt, 30, "Tracing lines and solving the warp map");
     GridMap warp4;
-    if (opt.perspective_only) {
+    if (opt.perspective_only || !opt.line_stage) {
         warp4 = identity_grid(W, H);
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
         warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore);
         r.lines = fitted_lines(r.warp, W, H, r.rot);
+        // on a UVDoc page the line refinement only corrects what is left: a correction that
+        // stretches or squeezes the page locally is a tracing failure (dense staves, broken table
+        // rules), and the UVDoc page is kept as it is
+        if (r.mode == GeomMode::Neural) {
+            double frac = 0, p99 = local_distortion(r.warp, &frac);
+            r.line_distortion = p99;
+            if (p99 > opt.max_line_distortion || frac > opt.max_line_distortion_frac) {
+                warp4 = identity_grid(W, H);
+                r.lines_rejected = true;
+            }
+        }
     }
     r.stage1 = stage1;
     r.ms.emplace_back("warp map", ms_since(t0));

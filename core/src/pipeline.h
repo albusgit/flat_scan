@@ -18,11 +18,16 @@
 #include "pagefind.h"
 #include "resample.h"
 #include "surface.h"
+#include "uvdoc.h"
 #include "warpmap.h"
 
 namespace fs {
 
-enum class GeomMode { Surface, Homography };
+// stage 1: the outline's surface model, the 4-corner homography, or the UVDoc grid (app)
+enum class GeomMode { Surface, Homography, Neural };
+inline const char* geom_mode_name(GeomMode m) {
+    return m == GeomMode::Surface ? "surface" : m == GeomMode::Neural ? "uvdoc" : "homography";
+}
 
 enum class Finder { ColourThreshold, Net };
 
@@ -56,6 +61,13 @@ struct PipelineOptions {
     bool corners_edited = false;      // user moved a corner -> homography path
     bool force_homography = false;    // the quality gate flagged the crop: homography path
     bool perspective_only = false;    // app: the user turned the unwarp off for this page (homography, no warp map)
+    const float* uv_out = nullptr;    // app: UVDoc output (2 x 45 x 31) for uv_crop of this photo; null: not run
+    UvCrop uv_crop;
+    double uv_min_agreement = 0.9;    // UVDoc outline vs the page finder's mask (IoU); below: not used
+    double uv_min_agreement_quad = 0.85;   // ... vs the corners when they were set by hand (no mask)
+    bool line_stage = true;           // the warp map (line refinement) on top of stage 1
+    double max_line_distortion = 0.2;        // UVDoc pages: line refinement kept only below these
+    double max_line_distortion_frac = 0.01;  // (local area change p99, share of cells above 0.2)
     const float* seg_logits = nullptr;   // page-finder net output for this photo (2 x 256 x 256);
                                          // null: colour-threshold paper_mask (the feature flag is off)
     int page_index = 0;               // book spread: which page of the photo (0 = the larger one)
@@ -84,6 +96,10 @@ struct PipelineResult {
     double fit_median_px = 0, fit_p90_px = 0;
     std::vector<std::string> needs_manual_crop;   // quality_gate reasons (homography path when any)
     PageCorners detection;            // the automatic detection (finder info); ok = false if not run
+    double uv_agreement = -1;         // UVDoc outline vs the page (IoU); -1: UVDoc not run
+    bool uv_rejected = false;         // UVDoc ran but disagreed with the page finder (fallback used)
+    double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
+    bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;

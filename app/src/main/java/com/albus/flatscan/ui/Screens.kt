@@ -271,6 +271,7 @@ fun SettingsScreen(vm: ScanViewModel) {
     var solid by remember { mutableStateOf(s.solidColors) }
     var autoRotate by remember { mutableStateOf(s.autoRotate) }
     var pageFinder by remember { mutableStateOf(s.pageFinderNet) }
+    var uvDoc by remember { mutableStateOf(s.uvDoc) }
     var reviewCrops by remember { mutableStateOf(s.reviewCrops) }
     var bookRtl by remember { mutableStateOf(s.bookRightToLeft) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
@@ -293,6 +294,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Finding the page")
             SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
+            SwitchRow("Neural flattening (UVDoc)", "Off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
             SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
             SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

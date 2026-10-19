@@ -24,6 +24,7 @@
 #include "overlay.h"
 #include "pagefind.h"
 #include "pipeline.h"
+#include "uvdoc.h"
 
 using namespace fs;
 
@@ -231,6 +232,17 @@ std::vector<float> read_logits(JNIEnv* env, jfloatArray a) {
     return v;
 }
 
+// UVDoc crop from NativeLib.uvCrop's IntArray [x, y, w, h, turned]
+bool read_uv_crop(JNIEnv* env, jintArray a, UvCrop& c) {
+    if (!a || env->GetArrayLength(a) != 5) return false;
+    jint v[5];
+    env->GetIntArrayRegion(a, 0, 5, v);
+    if (v[2] <= 0 || v[3] <= 0) return false;
+    c.box = cv::Rect(v[0], v[1], v[2], v[3]);
+    c.turned = v[4] != 0;
+    return true;
+}
+
 std::string json_num(double v) {
     if (!std::isfinite(v)) return "null";
     std::ostringstream f;
@@ -296,6 +308,31 @@ JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_segInput(JNIEnv*
 
 // -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
 //    "ok", "fit_median_px", "needs_manual_crop": [reasons], finder fields}, ...]} (2 pages: book spread)
+// UVDoc: the part of the photo the net sees for these corners -> [x, y, w, h, turned]
+JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvCrop(JNIEnv* env, jclass, jint w, jint h, jfloatArray corners) {
+    std::array<cv::Point2d, 4> c;
+    jfloat v[8] = {0};
+    if (corners && env->GetArrayLength(corners) == 8) env->GetFloatArrayRegion(corners, 0, 8, v);
+    for (int k = 0; k < 4; ++k) c[k] = cv::Point2d(v[2 * k], v[2 * k + 1]);
+    UvCrop u = uv_crop(cv::Size(w, h), c);
+    jint o[5] = {u.box.x, u.box.y, u.box.width, u.box.height, u.turned ? 1 : 0};
+    jintArray a = env->NewIntArray(5);
+    env->SetIntArrayRegion(a, 0, 5, o);
+    return a;
+}
+
+// UVDoc input for a crop: float[3 * 712 * 488] (RGB 0..1, NCHW), or null
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_uvInput(JNIEnv* env, jclass, jobject bmp, jintArray crop) {
+    UvCrop c;
+    if (!read_uv_crop(env, crop, c)) return nullptr;
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    if (bgr.empty()) return nullptr;
+    std::vector<float> x = uv_input(bgr, c);
+    jfloatArray a = env->NewFloatArray((jsize)x.size());
+    env->SetFloatArrayRegion(a, 0, (jsize)x.size(), x.data());
+    return a;
+}
+
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,
                                                                    jfloat focal_px) {
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
@@ -327,7 +364,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jboolean edited, jfloat focal_px, jboolean auto_orient,
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
-                                                                  jobject listener) {
+                                                                  jfloatArray uv_out, jintArray uv_crop_a, jobject listener) {
     auto s = std::make_unique<Session>();
     PipelineResult& r = s->result;
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
@@ -350,6 +387,12 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.page_index = page_index;
     o.force_homography = force_homography;
     o.perspective_only = perspective_only;
+    std::vector<float> uv;
+    if (uv_out && env->GetArrayLength(uv_out) == UV_OUTPUT_LEN && read_uv_crop(env, uv_crop_a, o.uv_crop)) {
+        uv.resize(UV_OUTPUT_LEN);
+        env->GetFloatArrayRegion(uv_out, 0, UV_OUTPUT_LEN, uv.data());
+        o.uv_out = uv.data();
+    }
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
     o.auto_orient = auto_orient;
     o.render_w = render_w;
@@ -383,11 +426,13 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
     const PipelineResult& r = s->result;
     std::ostringstream f;
     f << "{\"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << escape(r.error) << "\", \"mode\": \""
-      << (r.mode == GeomMode::Surface ? "surface" : "homography") << "\", \"fell_back\": " << (r.fell_back ? "true" : "false")
+      << geom_mode_name(r.mode) << "\", \"fell_back\": " << (r.fell_back ? "true" : "false")
       << ", \"fit_median_px\": " << r.fit_median_px << ", \"rot\": " << r.rot << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false")
       << ", \"legend_px\": " << s->legend_px << ", \"has_paper_mask\": " << (r.paper.empty() ? "false" : "true")
       << ", \"needs_manual_crop\": " << json_strings(r.needs_manual_crop)
-      << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1);
+      << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
+      << ", \"uv_agreement\": " << json_num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
+      << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
     f << ", \"ms\": {";
     for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << escape(r.ms[i].first) << "\": " << (long)r.ms[i].second;
