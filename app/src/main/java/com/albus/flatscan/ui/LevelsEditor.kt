@@ -4,7 +4,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -12,10 +11,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -45,10 +46,12 @@ fun LevelsEditor(
     onChange: (black: Float, white: Float, gamma: Float) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val fill = MaterialTheme.colorScheme.onSurfaceVariant
-    val track = MaterialTheme.colorScheme.outlineVariant
-    val dim = MaterialTheme.colorScheme.surface
-    val accent = MaterialTheme.colorScheme.primary
+    // drawn for the dark editor panel
+    val fill = Editor.Histogram
+    val track = Editor.Outline
+    val dim = Editor.Ground
+    val line = Editor.Text
+    val accent = Editor.Accent
     val b by rememberUpdatedState(black)
     val w by rememberUpdatedState(white)
     val g by rememberUpdatedState(gamma)
@@ -101,8 +104,8 @@ fun LevelsEditor(
         val x0 = m
         val x1 = size.width - m
         fun xOf(v: Float) = x0 + v * (x1 - x0)
-        // histogram
-        drawRect(track.copy(alpha = 0.35f), Offset(x0, 0f), Size(x1 - x0, histH))
+        // histogram on a rounded well
+        drawRoundRect(Editor.Ground, Offset.Zero, Size(size.width, histH), CornerRadius(12.dp.toPx()))
         if (curve != null) {
             val path = Path().apply {
                 moveTo(x0, histH)
@@ -111,24 +114,29 @@ fun LevelsEditor(
                 lineTo(x1, histH)
                 close()
             }
-            drawPath(path, fill.copy(alpha = 0.55f))
+            drawPath(path, fill)
         }
         // clipped ranges are dimmed
         drawRect(dim.copy(alpha = 0.6f), Offset(x0, 0f), Size(xOf(black) - x0, histH))
         drawRect(dim.copy(alpha = 0.6f), Offset(xOf(white), 0f), Size(x1 - xOf(white), histH))
         val mid = midPos(black, white, gamma)
-        for (v in listOf(black, mid, white)) drawLine(accent.copy(alpha = 0.5f), Offset(xOf(v), 0f), Offset(xOf(v), histH), 1.dp.toPx())
+        drawLine(line, Offset(xOf(black), 0f), Offset(xOf(black), histH), 1.5.dp.toPx())
+        drawLine(line, Offset(xOf(white), 0f), Offset(xOf(white), histH), 1.5.dp.toPx())
+        drawLine(
+            accent, Offset(xOf(mid), 0f), Offset(xOf(mid), histH), 1.5.dp.toPx(),
+            pathEffect = PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 3.dp.toPx())),
+        )
         // handle track and handles
         val ty = histH + 6.dp.toPx()
         drawLine(track, Offset(x0, ty), Offset(x1, ty), 2.dp.toPx())
-        handle(xOf(black), ty, Color(0xFF111111), accent, active == 0)
-        handle(xOf(mid), ty, Color(0xFF8A8A8A), accent, active == 1)
-        handle(xOf(white), ty, Color.White, accent, active == 2)
+        handle(xOf(black), ty, dim, line, accent, active == 0)
+        handle(xOf(mid), ty, accent, accent, line, active == 1)
+        handle(xOf(white), ty, line, line, accent, active == 2)
     }
 }
 
 /** An upward triangle with its tip on the track. */
-private fun DrawScope.handle(x: Float, y: Float, color: Color, accent: Color, active: Boolean) {
+private fun DrawScope.handle(x: Float, y: Float, color: Color, edge: Color, activeEdge: Color, active: Boolean) {
     val hw = 11.dp.toPx()
     val hh = 20.dp.toPx()
     val p = Path().apply {
@@ -138,5 +146,5 @@ private fun DrawScope.handle(x: Float, y: Float, color: Color, accent: Color, ac
         close()
     }
     drawPath(p, color)
-    drawPath(p, if (active) accent else Color(0xFF6B6B6B), style = Stroke(if (active) 2.5.dp.toPx() else 1.dp.toPx()))
+    drawPath(p, if (active) activeEdge else edge, style = Stroke(if (active) 2.5.dp.toPx() else 1.5.dp.toPx()))
 }

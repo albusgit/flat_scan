@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -50,6 +49,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -58,7 +58,7 @@ import java.io.File
 import kotlin.math.max
 
 @Composable
-fun CameraScreen(vm: ScanViewModel) {
+fun CameraScreen(vm: ScanViewModel) = EditorTheme {
     val ctx = LocalContext.current
     var granted by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
@@ -71,12 +71,15 @@ fun CameraScreen(vm: ScanViewModel) {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("Camera access is needed to scan a page.", style = MaterialTheme.typography.bodyLarge)
-            Button(onClick = { request.launch(Manifest.permission.CAMERA) }, modifier = Modifier.padding(top = 16.dp)) { Text("Allow camera") }
+            Text("Camera access is needed to scan a page.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+            PrimaryPill(
+                onClick = { request.launch(Manifest.permission.CAMERA) }, container = Palette.Accent, content = Color.White,
+                modifier = Modifier.padding(top = 20.dp),
+            ) { PillText("Allow camera") }
         }
-        return
+    } else {
+        CameraPreview(vm)
     }
-    CameraPreview(vm)
 }
 
 @OptIn(ExperimentalCamera2Interop::class)
@@ -110,10 +113,10 @@ private fun CameraPreview(vm: ScanViewModel) {
         }, ContextCompat.getMainExecutor(ctx))
         onDispose { runCatching { future.get().unbindAll() } }
     }
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
+    Box(Modifier.fillMaxSize().background(Editor.Ground)) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
         IconButton(onClick = { vm.back() }, modifier = Modifier.safeDrawingPadding().padding(8.dp)) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Editor.Text)
         }
         Box(
             Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 32.dp).size(80.dp)
@@ -140,7 +143,7 @@ private fun CameraPreview(vm: ScanViewModel) {
                 },
             contentAlignment = Alignment.Center,
         ) {
-            if (busy) CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp)
+            if (busy) CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp, color = Palette.Accent)
         }
     }
 }

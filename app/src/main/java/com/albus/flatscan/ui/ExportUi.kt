@@ -4,16 +4,21 @@ import android.net.Uri
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.PictureAsPdf
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -23,7 +28,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.albus.flatscan.ExportFormat
@@ -121,16 +129,17 @@ fun rememberExportActions(vm: ScanViewModel): ExportActions {
 fun ExportSheet(share: Boolean, pageCount: Int, onPick: (ExportFormat) -> Unit, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.navigationBarsPadding().padding(bottom = 16.dp)) {
-            Text(if (share) "Share as" else "Save as", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
+            Text(if (share) "Share as" else "Save as", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
             val many = pageCount > 1
             ListItem(
-                headlineContent = { Text("PDF document") },
+                headlineContent = { Text("PDF document", style = MaterialTheme.typography.titleMedium) },
                 supportingContent = { Text(if (many) "All $pageCount pages in one PDF, A4" else "One A4 page") },
-                leadingContent = { Icon(Icons.Outlined.PictureAsPdf, null) },
+                leadingContent = { FormatIcon(Icons.Outlined.PictureAsPdf) },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier.clickable { onDismiss(); onPick(ExportFormat.PDF) },
             )
             ListItem(
-                headlineContent = { Text(if (many) "JPG images" else "JPG image") },
+                headlineContent = { Text(if (many) "JPG images" else "JPG image", style = MaterialTheme.typography.titleMedium) },
                 supportingContent = {
                     Text(
                         when {
@@ -140,9 +149,19 @@ fun ExportSheet(share: Boolean, pageCount: Int, onPick: (ExportFormat) -> Unit, 
                         },
                     )
                 },
-                leadingContent = { Icon(Icons.Outlined.Image, null) },
+                leadingContent = { FormatIcon(Icons.Outlined.Image) },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier.clickable { onDismiss(); onPick(ExportFormat.JPG) },
             )
         }
     }
+}
+
+/** A format icon on a rounded accent tile. */
+@Composable
+private fun FormatIcon(icon: ImageVector) {
+    Box(
+        Modifier.size(44.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(14.dp)),
+        contentAlignment = Alignment.Center,
+    ) { Icon(icon, null, tint = MaterialTheme.colorScheme.primary) }
 }

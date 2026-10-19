@@ -246,6 +246,17 @@ fun PageViewer(
         val g = PageGeometry(pageWidth, pageHeight, rotation, size, state.scale, state.pan)
         val shown = if (holding && beforeImg != null) beforeImg else pageImg
         if (shown == null || pageWidth == 0 || pageHeight == 0) return@Canvas
+        // a soft shadow under the page lifts it off the dark ground
+        val pageSize = Size(g.rw * g.k, g.rh * g.k)
+        val pageTl = g.center + state.pan - Offset(pageSize.width / 2, pageSize.height / 2)
+        val blur = 18.dp.toPx()
+        for (i in 1..6) {
+            val grow = blur * i / 6f
+            drawRoundRect(
+                Color.Black.copy(alpha = 0.07f), pageTl + Offset(-grow, -grow + blur * 0.5f), Size(pageSize.width + 2 * grow, pageSize.height + 2 * grow),
+                androidx.compose.ui.geometry.CornerRadius(grow),
+            )
+        }
         with(g) {
             inPage {
                 drawPageImage(shown, pageWidth, pageHeight)
