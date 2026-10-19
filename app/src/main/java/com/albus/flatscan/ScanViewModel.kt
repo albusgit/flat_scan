@@ -127,7 +127,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- page finder, quality gate, book spreads
     private val finder = PageFinder(app)
-    private val uvdoc = UvDoc(app)
+    private val uvNet = FlatNet(app, FlatNet.UVDOC)
+    private val sdNet = FlatNet(app, FlatNet.SYNTHDOC)
     private val logitsLock = Any()
     /** Page-finder output for one photo bitmap (detection and processing use the same photo). */
     private var logitsCache: Pair<Bitmap, FloatArray?>? = null
@@ -692,7 +693,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ pages
     private fun geometryKey(m: PageMeta) =
-        m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) + "|uv=" + settings.uvDoc
+        m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
+            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
@@ -873,6 +875,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val autoOrient = settings.autoRotate && !userRotated
         val width = settings.outputWidth
         val useUv = settings.uvDoc
+        val nets = settings.flatNets
+        val shadows = settings.neuralShadows
         val focal = focalPx
         recropBackup = null
         screen = Screen.Processing
@@ -889,13 +893,26 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 nativeHandle = 0L
                 val hh = try {
                     val logits = logitsFor(p)
-                    // UVDoc on the page's box (the core checks it against the page finder)
-                    val uvCrop = if (useUv && !po) NativeLib.uvCrop(p.width, p.height, c) else null
-                    val uvOut = uvCrop?.let { cr ->
-                        viewModelScope.launch(Dispatchers.Main) { stage = "Flattening (neural net)" }
-                        runCatching { uvdoc.grid(p, cr) }.onFailure { Log.e(TAG, "UVDoc failed", it) }.getOrNull()
+                    // the flattening nets on the page's box (the core checks them against the page finder
+                    // and keeps the straighter page); SyntheticDoc also gives the shading map
+                    fun runNet(net: FlatNet): Pair<IntArray, FlatNet.Output>? {
+                        val cr = NativeLib.uvCrop(p.width, p.height, c, net.model)
+                        val out = runCatching { net.run(p, cr, logits, pageIndex) }.onFailure { Log.e(TAG, "flattening net ${net.model} failed", it) }.getOrNull()
+                        return out?.let { cr to it }
                     }
-                    NativeLib.process(p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), uvOut, uvCrop) { pct, s ->
+                    if (useUv || shadows) viewModelScope.launch(Dispatchers.Main) { stage = "Flattening (neural nets)" }
+                    val uv = if (useUv && !po && nets != 2) runNet(uvNet) else null
+                    val sd = if ((useUv && !po && nets != 1) || shadows) runNet(sdNet) else null
+                    val sdGrid = sd?.takeIf { useUv && !po && nets != 1 }
+                    val first = uv ?: sdGrid
+                    // the second slot: SyntheticDoc's grid next to UVDoc's, or only its crop (for the shading map)
+                    val secondGrid = if (uv != null) sdGrid?.second?.grid else null
+                    val secondCrop = if (uv != null || sdGrid == null) sd?.first else null
+                    NativeLib.process(
+                        p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(),
+                        first?.second?.grid, first?.first, secondGrid, secondCrop,
+                        if (shadows) sd?.second?.shading else null,
+                    ) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }
                 } catch (e: Exception) {
@@ -1083,7 +1100,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val reasons = if (gate != null) List(gate.length()) { gate.optString(it) } else emptyList()
         sb.append(
             when {
-                mode == "uvdoc" -> "Geometry: UVDoc neural flattening (outline agreement %.2f)".format(info.optDouble("uv_agreement")) +
+                mode == "uvdoc" -> "Geometry: %s neural flattening (outline agreement %.2f)".format(
+                    if (info.optInt("uv_model") == 1) "SyntheticDoc" else "UVDoc", info.optDouble("uv_agreement")) +
+                    (info.optJSONArray("uv_spread")?.let { a ->
+                        if (a.optDouble(0, -1.0) >= 0 && a.optDouble(1, -1.0) >= 0)
+                            "\nNets compared: text-row spread %.2f / %.2f deg".format(a.optDouble(0), a.optDouble(1)) else ""
+                    } ?: "") +
                     if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
                     else "\nLine refinement: applied"
                 edited -> "Geometry: homography (corners adjusted by hand)"
@@ -1105,6 +1127,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             if (info.optString("finder") == "net") sb.append("\n  net margin %.2f, edge strength %.2f, at limit %.2f".format(
                 info.optDouble("net_margin"), info.optDouble("edge_strength"), info.optDouble("edge_at_limit")))
         }
+        if (info.optBoolean("shadows_removed")) sb.append("\nShadows: removed (SyntheticDoc shading map)")
+        if (info.optDouble("fingers_erased", 0.0) > 0) sb.append("\nFingers: erased (%.1f%% of the page)".format(100 * info.optDouble("fingers_erased")))
         sb.append("\nResample: ").append(if (info.optBoolean("gpu_resample")) "GPU" else "CPU fallback")
         sb.append("\n").append(gpuInfo)
         val ms = info.optJSONObject("ms")

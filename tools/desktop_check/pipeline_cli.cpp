@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
     o.seg_logits = logits;
     o.perspective_only = std::getenv("FS_PERSPECTIVE_ONLY") != nullptr;
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
+    o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
+    o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
         size_t p = 0;
@@ -77,20 +79,45 @@ int main(int argc, char** argv) {
     }
     // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
     // net input for the detected corners and exits; FS_UVOUT=Y.npz ("out": 2 x 45 x 31) uses it
-    std::vector<float> uv;
+    std::vector<float> uv, uv_sh, uv2;
     if (std::getenv("FS_UVIN") || std::getenv("FS_UVOUT")) {
         PageCorners pc = detect_corners(img, o.max_analysis_side, logits, 0);
         if (!pc.ok) { std::printf("%s, \"ok\": false, \"error\": \"no page found\"}\n", f.str().c_str()); return 0; }
-        o.uv_crop = uv_crop(img.size(), pc.pts);
+        const char* um = std::getenv("FS_UVMODEL");
+        o.uv_crop = uv_crop(img.size(), pc.pts, um ? std::atoi(um) : 0);
         if (const char* in = std::getenv("FS_UVIN")) {
-            std::vector<float> x = uv_input(img, o.uv_crop);
-            write_npz(in, {{"x", NpyArray::f32({1, 3, (size_t)UV_IN_H, (size_t)UV_IN_W}, x.data())}});
+            cv::Mat blank;
+            if (logits) {
+                PageFindResult pf = find_page_net(img, logits);
+                if (pf.pages.size() == 2) blank = pf.pages[1].mask;
+            }
+            std::vector<float> x = uv_input(img, o.uv_crop, blank);
+            const UvSpec& sp = uv_spec(o.uv_crop.model);
+            write_npz(in, {{"x", NpyArray::f32({1, 3, (size_t)sp.in_h, (size_t)sp.in_w}, x.data())}});
             return 0;
         }
         Npz z = read_npz(std::getenv("FS_UVOUT"));
         const NpyArray& a = z.at("out");
         uv.assign(a.as<float>(), a.as<float>() + a.count());
-        if (uv.size() == (size_t)UV_OUTPUT_LEN) o.uv_out = uv.data();
+        if (uv.size() == (size_t)uv_spec(o.uv_crop.model).output_len()) o.uv_out = uv.data();
+        // FS_UVOUT2=Z.npz ("out"): the other net's grid for the same corners, the second candidate
+        Npz z2;
+        if (const char* o2 = std::getenv("FS_UVOUT2")) {
+            z2 = read_npz(o2);
+            const NpyArray& a2 = z2.at("out");
+            uv2.assign(a2.as<float>(), a2.as<float>() + a2.count());
+            o.uv_crop2 = uv_crop(img.size(), pc.pts, 1 - o.uv_crop.model);
+            if (uv2.size() == (size_t)uv_spec(o.uv_crop2.model).output_len()) o.uv_out2 = uv2.data();
+        }
+        // the shading map of whichever net has one (SyntheticDoc)
+        for (int k = 0; k < 2; ++k) {
+            const Npz& zz = k == 0 ? z : z2;
+            const UvCrop& cr = k == 0 ? o.uv_crop : o.uv_crop2;
+            if (!zz.count("shading") || std::getenv("FS_NO_SHADOWS")) continue;
+            const NpyArray& s = zz.at("shading");
+            uv_sh.assign(s.as<float>(), s.as<float>() + s.count());
+            if (uv_sh.size() == (size_t)uv_spec(cr.model).input_len()) { o.uv_shading = uv_sh.data(); o.uv_shading_crop = cr; }
+        }
     }
     PipelineResult r;
     try {
@@ -105,7 +132,8 @@ int main(int argc, char** argv) {
       << num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1) << ", \"needs_manual_crop\": " << strs(r.needs_manual_crop)
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
-      << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << "}";
+      << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;

@@ -61,11 +61,19 @@ struct PipelineOptions {
     bool corners_edited = false;      // user moved a corner -> homography path
     bool force_homography = false;    // the quality gate flagged the crop: homography path
     bool perspective_only = false;    // app: the user turned the unwarp off for this page (homography, no warp map)
-    const float* uv_out = nullptr;    // app: UVDoc output (2 x 45 x 31) for uv_crop of this photo; null: not run
-    UvCrop uv_crop;
+    const float* uv_out = nullptr;    // app: the flattening net's grid (uv_spec(uv_crop.model)) for uv_crop of this
+    UvCrop uv_crop;                   // photo; null: not run
+    const float* uv_out2 = nullptr;   // a second net's grid (e.g. UVDoc next to SyntheticDoc) for uv_crop2: both
+    UvCrop uv_crop2;                  // are tried, the straighter stage-1 page wins (see uv_prefer_margin)
+    double uv_prefer_margin = 0.3;    // the second net is chosen only if its text-row angle spread is lower by this (deg)
+    const float* uv_shading = nullptr;   // SyntheticDoc's shading map (3 x in_h x in_w) for uv_shading_crop
+    UvCrop uv_shading_crop;
+    bool remove_shadows = true;       // divide the page by the shading map
     double uv_min_agreement = 0.9;    // UVDoc outline vs the page finder's mask (IoU); below: not used
     double uv_min_agreement_quad = 0.85;   // ... vs the corners when they were set by hand (no mask)
     bool line_stage = true;           // the warp map (line refinement) on top of stage 1
+    bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
+    bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
     double max_line_distortion = 0.2;        // UVDoc pages: line refinement kept only below these
     double max_line_distortion_frac = 0.01;  // (local area change p99, share of cells above 0.2)
     const float* seg_logits = nullptr;   // page-finder net output for this photo (2 x 256 x 256);
@@ -97,9 +105,13 @@ struct PipelineResult {
     std::vector<std::string> needs_manual_crop;   // quality_gate reasons (homography path when any)
     PageCorners detection;            // the automatic detection (finder info); ok = false if not run
     double uv_agreement = -1;         // UVDoc outline vs the page (IoU); -1: UVDoc not run
+    int uv_model = -1;                // the net whose grid was used (UvCrop::model); -1: none
+    double uv_spread[2] = {-1, -1};   // text-row angle spread of each net's stage-1 page (deg; -1: not measured)
     bool uv_rejected = false;         // UVDoc ran but disagreed with the page finder (fallback used)
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
+    double fingers_erased = 0;        // share of the page filled where fingers held it
+    bool shadows_removed = false;     // the shading map was applied to the page
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;

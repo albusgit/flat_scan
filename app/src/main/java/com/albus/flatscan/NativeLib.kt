@@ -65,20 +65,29 @@ object NativeLib {
      * forceHomography: the quality gate flagged the crop, use the homography path.
      * perspectiveOnly: the user turned the unwarp off (homography, no warp map).
      * ignore: areas whose lines the warp map must not use, page fractions [x0, y0, x1, y1, ...].
-     * uvOut / uvCrop: the UVDoc grid ([UvDoc.grid]) for that crop of this photo, or null.
+     * uvOut / uvCrop, uvOut2 / uvCrop2: flattening-net grids ([FlatNet.run]) for those crops of this
+     * photo (the first is preferred; the straighter stage-1 page wins), or null. uvShading:
+     * SyntheticDoc's shading map for its crop (shadow removal), or null.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        uvOut: FloatArray?, uvCrop: IntArray?, listener: ProgressListener?,
+        uvOut: FloatArray?, uvCrop: IntArray?, uvOut2: FloatArray?, uvCrop2: IntArray?, uvShading: FloatArray?,
+        listener: ProgressListener?,
     ): Long
 
-    /** UVDoc: the part of a [width] x [height] photo the net sees for [corners] -> [x, y, w, h, turned]. */
-    @JvmStatic external fun uvCrop(width: Int, height: Int, corners: FloatArray): IntArray
+    /**
+     * Flattening net [model] (0 UVDoc, 1 SyntheticDoc): the part of a [width] x [height] photo it
+     * sees for [corners] -> [x, y, w, h, turned, model].
+     */
+    @JvmStatic external fun uvCrop(width: Int, height: Int, corners: FloatArray, model: Int): IntArray
 
-    /** UVDoc input for [crop] of [photo]: float[3 * 712 * 488] (RGB 0..1, NCHW), or null. */
-    @JvmStatic external fun uvInput(photo: Bitmap, crop: IntArray): FloatArray?
+    /**
+     * Flattening-net input for [crop] of [photo]: float[3 * in_h * in_w] (RGB 0..1, NCHW), or null. With the
+     * page finder's [logits], the other page of a book spread (not [pageIndex]) is hidden.
+     */
+    @JvmStatic external fun uvInput(photo: Bitmap, crop: IntArray, logits: FloatArray?, pageIndex: Int): FloatArray?
 
     /**
      * JSON: ok, error, mode, fell_back, fit_median_px, rot, gpu_resample, legend_px (wrinkle

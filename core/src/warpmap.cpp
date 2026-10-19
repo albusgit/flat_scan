@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <thread>
@@ -699,7 +700,40 @@ namespace {
 const int BIN = 4;
 
 // warpmap.collect
-Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* prior_dx, const Field* prior_dy, int threads) {
+// Pieces of one ruled line (split at table rules, gaps) traced separately each get their own
+// ideal position, so a slightly tilted rule becomes a staircase. share_rows (app, UVDoc pages):
+// pieces that continue each other (ideals within 6 px, gap along the line < 80 px) share one
+// ideal, the sample-weighted mean of theirs (RDGR's "same row, same height" constraint).
+void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
+    size_t n = per.size();
+    std::vector<size_t> parent(n);
+    for (size_t i = 0; i < n; ++i) parent[i] = i;
+    std::function<size_t(size_t)> find = [&](size_t i) { return parent[i] == i ? i : parent[i] = find(parent[i]); };
+    std::vector<double> ideal(n, 0), t0(n, 0), t1(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (per[i].empty()) continue;
+        ideal[i] = per[i][0][1];
+        t0[i] = 1e300; t1[i] = -1e300;
+        for (const auto& r : per[i]) { t0[i] = std::min(t0[i], r[0]); t1[i] = std::max(t1[i], r[0]); }
+    }
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j) {
+            if (per[i].empty() || per[j].empty() || std::fabs(ideal[i] - ideal[j]) > 6) continue;
+            double gap = std::max(t0[i], t0[j]) - std::min(t1[i], t1[j]);
+            if (gap < 80) parent[find(i)] = find(j);
+        }
+    std::vector<double> sum(n, 0), cnt(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        if (!per[i].empty()) { sum[find(i)] += ideal[i] * per[i].size(); cnt[find(i)] += per[i].size(); }
+    for (size_t i = 0; i < n; ++i) {
+        if (per[i].empty()) continue;
+        double g = sum[find(i)] / cnt[find(i)];
+        for (auto& r : per[i]) { double c = r[1] + r[2]; r[1] = g; r[2] = c - g; }
+    }
+}
+
+Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* prior_dx, const Field* prior_dy, int threads,
+                bool share_rows = false) {
     Samples out;
     for (int pass = 0; pass < 2; ++pass) {
         bool hz = pass == 0;
@@ -799,6 +833,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         for (int k = 0; k < nt; ++k)
             ts.emplace_back([&, k] { for (size_t li = k; li < lines.size(); li += nt) one(li); });
         for (auto& q : ts) q.join();
+        if (share_rows) share_ideals(per);
         for (auto& r : per) rows_out.insert(rows_out.end(), r.begin(), r.end());
     }
     return out;
@@ -886,7 +921,7 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore) {
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1005,7 +1040,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore) {
         return compose_maps(d, w, h);
     }
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
-    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads);
+    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
     drop(d.S1.h, true);
     drop(d.S1.v, false);
@@ -1019,7 +1054,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore) {
         const Samples& S = it == 0 ? d.S1 : d.S2;
         if (it == 1) {
             auto tc = Clock::now();
-            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads);
+            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows);
             drop(d.S2.h, true);
             drop(d.S2.v, false);
             d.ms.emplace_back("trace pass2", ms_since(tc));

@@ -232,15 +232,25 @@ std::vector<float> read_logits(JNIEnv* env, jfloatArray a) {
     return v;
 }
 
-// UVDoc crop from NativeLib.uvCrop's IntArray [x, y, w, h, turned]
+// flattening-net crop from NativeLib.uvCrop's IntArray [x, y, w, h, turned, model]
 bool read_uv_crop(JNIEnv* env, jintArray a, UvCrop& c) {
-    if (!a || env->GetArrayLength(a) != 5) return false;
-    jint v[5];
-    env->GetIntArrayRegion(a, 0, 5, v);
+    if (!a || env->GetArrayLength(a) != 6) return false;
+    jint v[6];
+    env->GetIntArrayRegion(a, 0, 6, v);
     if (v[2] <= 0 || v[3] <= 0) return false;
     c.box = cv::Rect(v[0], v[1], v[2], v[3]);
     c.turned = v[4] != 0;
+    c.model = v[5] == 1 ? 1 : 0;
     return true;
+}
+
+// a Java float[] of exactly n values, or empty
+std::vector<float> read_floats_exact(JNIEnv* env, jfloatArray a, size_t n) {
+    std::vector<float> v;
+    if (!a || (size_t)env->GetArrayLength(a) != n) return v;
+    v.resize(n);
+    env->GetFloatArrayRegion(a, 0, (jsize)n, v.data());
+    return v;
 }
 
 std::string json_num(double v) {
@@ -308,26 +318,40 @@ JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_segInput(JNIEnv*
 
 // -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
 //    "ok", "fit_median_px", "needs_manual_crop": [reasons], finder fields}, ...]} (2 pages: book spread)
-// UVDoc: the part of the photo the net sees for these corners -> [x, y, w, h, turned]
-JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvCrop(JNIEnv* env, jclass, jint w, jint h, jfloatArray corners) {
+// flattening net (0 UVDoc, 1 SyntheticDoc): the part of the photo it sees for these corners
+// -> [x, y, w, h, turned, model]
+JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvCrop(JNIEnv* env, jclass, jint w, jint h, jfloatArray corners,
+                                                                    jint model) {
     std::array<cv::Point2d, 4> c;
     jfloat v[8] = {0};
     if (corners && env->GetArrayLength(corners) == 8) env->GetFloatArrayRegion(corners, 0, 8, v);
     for (int k = 0; k < 4; ++k) c[k] = cv::Point2d(v[2 * k], v[2 * k + 1]);
-    UvCrop u = uv_crop(cv::Size(w, h), c);
-    jint o[5] = {u.box.x, u.box.y, u.box.width, u.box.height, u.turned ? 1 : 0};
-    jintArray a = env->NewIntArray(5);
-    env->SetIntArrayRegion(a, 0, 5, o);
+    UvCrop u = uv_crop(cv::Size(w, h), c, model);
+    jint o[6] = {u.box.x, u.box.y, u.box.width, u.box.height, u.turned ? 1 : 0, u.model};
+    jintArray a = env->NewIntArray(6);
+    env->SetIntArrayRegion(a, 0, 6, o);
     return a;
 }
 
-// UVDoc input for a crop: float[3 * 712 * 488] (RGB 0..1, NCHW), or null
-JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_uvInput(JNIEnv* env, jclass, jobject bmp, jintArray crop) {
+// flattening-net input for a crop: float[3 * in_h * in_w] (RGB 0..1, NCHW), or null. With the page finder's
+// logits, the other page of a book spread (not pageIndex) is hidden from the net.
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_uvInput(JNIEnv* env, jclass, jobject bmp, jintArray crop,
+                                                                       jfloatArray logits, jint page_index) {
     UvCrop c;
     if (!read_uv_crop(env, crop, c)) return nullptr;
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
     if (bgr.empty()) return nullptr;
-    std::vector<float> x = uv_input(bgr, c);
+    cv::Mat blank;
+    std::vector<float> lg = read_logits(env, logits);
+    if (!lg.empty()) {
+        try {
+            PageFindResult f = find_page_net(bgr, lg.data());
+            if (f.pages.size() == 2) blank = f.pages[page_index == 1 ? 0 : 1].mask;
+        } catch (const std::exception& e) {
+            LOGI("uvInput: page finder failed: %s", e.what());
+        }
+    }
+    std::vector<float> x = uv_input(bgr, c, blank);
     jfloatArray a = env->NewFloatArray((jsize)x.size());
     env->SetFloatArrayRegion(a, 0, (jsize)x.size(), x.data());
     return a;
@@ -364,7 +388,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jboolean edited, jfloat focal_px, jboolean auto_orient,
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
-                                                                  jfloatArray uv_out, jintArray uv_crop_a, jobject listener) {
+                                                                  jfloatArray uv_out, jintArray uv_crop_a, jfloatArray uv_out2,
+                                                                  jintArray uv_crop2_a, jfloatArray uv_shading, jobject listener) {
     auto s = std::make_unique<Session>();
     PipelineResult& r = s->result;
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
@@ -387,11 +412,20 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.page_index = page_index;
     o.force_homography = force_homography;
     o.perspective_only = perspective_only;
-    std::vector<float> uv;
-    if (uv_out && env->GetArrayLength(uv_out) == UV_OUTPUT_LEN && read_uv_crop(env, uv_crop_a, o.uv_crop)) {
-        uv.resize(UV_OUTPUT_LEN);
-        env->GetFloatArrayRegion(uv_out, 0, UV_OUTPUT_LEN, uv.data());
-        o.uv_out = uv.data();
+    // flattening nets: up to two grids (the first preferred) and SyntheticDoc's shading map
+    std::vector<float> uv, uv2, shading;
+    UvCrop c1, c2;
+    bool has1 = read_uv_crop(env, uv_crop_a, c1), has2 = read_uv_crop(env, uv_crop2_a, c2);
+    if (has1) uv = read_floats_exact(env, uv_out, uv_spec(c1.model).output_len());
+    if (has2) uv2 = read_floats_exact(env, uv_out2, uv_spec(c2.model).output_len());
+    if (uv.empty() && !uv2.empty()) { std::swap(uv, uv2); std::swap(c1, c2); }
+    if (!uv.empty()) { o.uv_out = uv.data(); o.uv_crop = c1; }
+    if (!uv2.empty()) { o.uv_out2 = uv2.data(); o.uv_crop2 = c2; }
+    for (const UvCrop* c : {&c1, &c2}) {
+        if (c->model != 1 || !shading.empty()) continue;
+        if ((c == &c1 && !has1) || (c == &c2 && !has2)) continue;
+        shading = read_floats_exact(env, uv_shading, uv_spec(1).input_len());
+        if (!shading.empty()) { o.uv_shading = shading.data(); o.uv_shading_crop = *c; }
     }
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
     o.auto_orient = auto_orient;
@@ -432,7 +466,10 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"needs_manual_crop\": " << json_strings(r.needs_manual_crop)
       << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
       << ", \"uv_agreement\": " << json_num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
-      << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false");
+      << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
+      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
+      << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
+      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
     f << ", \"ms\": {";
     for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << escape(r.ms[i].first) << "\": " << (long)r.ms[i].second;

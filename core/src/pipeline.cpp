@@ -1,6 +1,7 @@
 #include "pipeline.h"
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/photo.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -223,6 +224,135 @@ cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H
         if (r.area() > 0) m(r).setTo(255);
     }
     return m;
+}
+
+// Fingers / thumbs holding the page: on the unwarped page they are the non-paper areas (the page
+// finder leaves them out of the page) that reach the page border and are mostly skin coloured
+// (YCrCb skin box). They are filled with the paper colour around them (a smooth Telea fill at
+// 1/4 size, so a line crossing the edge fades instead of ending in a hard cut) and marked as
+// paper. Text under a finger is not invented: it is paper. Returns the share of the page filled.
+double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    cv::Mat hole = paper < 128;
+    int n_hole = cv::countNonZero(hole);
+    if (n_hole == 0 || n_hole > 0.25 * w * h) return 0;
+    cv::Mat bgr, ycc;
+    cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
+    cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
+    // skin: in the YCrCb skin box AND clearly redder / less blue than this page's own paper
+    // (beige or yellowed paper sits inside the box too)
+    cv::Mat paper_px = paper > 200;
+    if (cv::countNonZero(paper_px) < 0.2 * w * h) return 0;
+    cv::Scalar pc = cv::mean(ycc, paper_px);
+    cv::Mat skin;
+    cv::inRange(ycc, cv::Scalar(40, std::max(140.0, pc[1] + 7), 77), cv::Scalar(255, 180, std::min(125.0, pc[2] - 4)), skin);
+    // fingers are smooth: ink strokes (text, rules) inside a candidate mean it is page content
+    cv::Mat gray, edges;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    cv::Canny(gray, edges, 60, 150);
+    cv::Mat lab, st, cen;
+    int n = cv::connectedComponentsWithStats(hole, lab, st, cen, 8);
+    cv::Mat fill = cv::Mat::zeros(h, w, CV_8U);
+    const int border = std::max(4, w / 100);
+    for (int i = 1; i < n; ++i) {
+        int x = st.at<int>(i, 0), y = st.at<int>(i, 1), bw = st.at<int>(i, 2), bh = st.at<int>(i, 3), area = st.at<int>(i, 4);
+        bool at_border = x <= border || y <= border || x + bw >= w - border || y + bh >= h - border;
+        if (!at_border || area < 0.0005 * w * h) continue;
+        cv::Mat comp = lab(cv::Rect(x, y, bw, bh)) == i;
+        double skin_frac = (double)cv::countNonZero(skin(cv::Rect(x, y, bw, bh)) & comp) / area;
+        // a finger reaches into the page: it is not a thin sliver along the border
+        int reach = std::min(std::min(x + bw, w - x), std::min(y + bh, h - y));
+        double edge_frac = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & comp) / area;
+        if (skin_frac < 0.5 || reach < 2 * border || edge_frac > 0.03) continue;
+        fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
+    }
+    int n_fill = cv::countNonZero(fill);
+    if (n_fill == 0) return 0;
+    // the fringe of the finger (shadow, blurred edge) goes with it
+    cv::dilate(fill, fill, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
+    cv::Mat small, small_mask, filled;
+    cv::resize(bgr, small, cv::Size(w / 4, h / 4), 0, 0, cv::INTER_AREA);
+    cv::resize(fill, small_mask, small.size(), 0, 0, cv::INTER_NEAREST);
+    cv::inpaint(small, small_mask, filled, 5, cv::INPAINT_TELEA);
+    cv::resize(filled, filled, bgr.size(), 0, 0, cv::INTER_LINEAR);
+    cv::Mat soft;
+    cv::GaussianBlur(fill, soft, cv::Size(0, 0), 1.5);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* p = page_bgra.ptr<uint8_t>(y);
+        const uint8_t* f = filled.ptr<uint8_t>(y);
+        const uint8_t* a = soft.ptr<uint8_t>(y);
+        uint8_t* pa = paper.ptr<uint8_t>(y);
+        for (int x = 0; x < w; ++x) {
+            if (!a[x]) continue;
+            float t = a[x] / 255.f;
+            for (int k = 0; k < 3; ++k) p[4 * x + k] = (uint8_t)std::lround(p[4 * x + k] * (1 - t) + f[3 * x + k] * t);
+            pa[x] = std::max(pa[x], a[x]);
+        }
+    }
+    return (double)n_fill / (w * h);
+}
+
+// Text-row angle spread of a page (degrees, p90 - p10 of the rows' slopes): word blobs merged
+// along a row, the centroid track of each row fitted with a line; the page is also measured turned
+// 90 degrees (sideways text) and the orientation with more rows counts. rows: rows measured.
+// Scaled for a page about 1100 px wide (a half-size stage-1 page).
+double text_row_spread(const cv::Mat& page_bgr, int* rows_out) {
+    double best = -1;
+    int best_rows = -1;
+    for (int turn = 0; turn < 2; ++turn) {
+        cv::Mat img = page_bgr;
+        if (turn) cv::rotate(page_bgr, img, cv::ROTATE_90_CLOCKWISE);
+        cv::Mat g, bg, ink, lines, words;
+        cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
+        cv::dilate(g, bg, cv::Mat::ones(5, 5, CV_8U));
+        cv::medianBlur(bg, bg, 15);
+        cv::subtract(bg, g, ink);
+        ink = ink > 40;
+        cv::Mat lh, lv;
+        cv::morphologyEx(ink, lh, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(60, 1)));
+        cv::morphologyEx(ink, lv, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 60)));
+        cv::dilate(lh | lv, lines, cv::Mat::ones(3, 3, CV_8U));
+        ink.setTo(0, lines);
+        cv::morphologyEx(ink, words, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(13, 1)));
+        cv::morphologyEx(words, words, cv::MORPH_OPEN, cv::Mat::ones(3, 3, CV_8U));
+        cv::Mat lab, st, cen;
+        int n = cv::connectedComponentsWithStats(words, lab, st, cen, 8);
+        std::vector<double> ang;
+        for (int i = 1; i < n; ++i) {
+            int x = st.at<int>(i, 0), y = st.at<int>(i, 1), w = st.at<int>(i, 2), h = st.at<int>(i, 3);
+            if (w < 75 || h < 4 || h > 30 || w < 5 * h) continue;
+            std::vector<double> xs, cs;
+            for (int cx = 0; cx + 4 <= w; cx += 4) {
+                double sy = 0;
+                int m = 0;
+                for (int yy = 0; yy < h; ++yy)
+                    for (int xx = cx; xx < cx + 4; ++xx)
+                        if (lab.at<int>(y + yy, x + xx) == i && ink.at<uint8_t>(y + yy, x + xx)) { sy += yy; ++m; }
+                if (m < 3) continue;
+                xs.push_back(x + cx + 2);
+                cs.push_back(y + sy / m);
+            }
+            if (xs.size() < 12) continue;
+            double mx = 0, my = 0;
+            for (size_t k = 0; k < xs.size(); ++k) { mx += xs[k]; my += cs[k]; }
+            mx /= xs.size(); my /= xs.size();
+            double sxx = 0, sxy = 0;
+            for (size_t k = 0; k < xs.size(); ++k) { sxx += (xs[k] - mx) * (xs[k] - mx); sxy += (xs[k] - mx) * (cs[k] - my); }
+            if (sxx > 0) ang.push_back(std::atan(sxy / sxx) * 180.0 / CV_PI);
+        }
+        if ((int)ang.size() > best_rows) {
+            best_rows = (int)ang.size();
+            if (ang.size() >= 3) {
+                std::sort(ang.begin(), ang.end());
+                auto q = [&](double f) { return ang[(size_t)std::lround(f * (ang.size() - 1))]; };
+                best = q(0.9) - q(0.1);
+            } else {
+                best = -1;
+            }
+        }
+    }
+    if (rows_out) *rows_out = best_rows;
+    return best;
 }
 
 // local area change of the warp map's line stage, |det(I + dF) - 1| per grid cell (the outer 2
@@ -457,27 +587,55 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
             r.fell_back = true;
         }
     }
-    // UVDoc (app): its grid replaces the surface model / homography as stage 1 when its page outline
-    // agrees with the page finder (or with corners set by hand); the line stage still runs on top
+    // Flattening nets (app): a grid replaces the surface model / homography as stage 1 when its page
+    // outline agrees with the page finder (or with corners set by hand); with two nets, the one whose
+    // stage-1 page has the straighter text rows wins. The line stage still runs on top.
     if (opt.uv_out && !opt.perspective_only) {
-        UvGrid g = uv_grid(opt.uv_out, opt.uv_crop);
-        bool frame_ok = g.ok && g.turned == landscape;
-        double need = opt.uv_min_agreement;
-        if (!opt.corners_edited && pc.ok && !pc.det.paper.empty()) {
-            r.uv_agreement = uv_agreement(g, pc.det.paper, pc.scale);
-        } else {
-            r.uv_agreement = uv_agreement(g, corners, photo.size());
-            need = opt.uv_min_agreement_quad;
+        auto t_uv = Clock::now();
+        const bool use_mask = !opt.corners_edited && pc.ok && !pc.det.paper.empty();
+        const double need = use_mask ? opt.uv_min_agreement : opt.uv_min_agreement_quad;
+        struct Cand { UvGrid g; double agree = 0; int model = 0; };
+        std::vector<Cand> ok;
+        double best_agree = 0;
+        for (int k = 0; k < 2; ++k) {
+            const float* out = k == 0 ? opt.uv_out : opt.uv_out2;
+            if (!out) continue;
+            const UvCrop& crop = k == 0 ? opt.uv_crop : opt.uv_crop2;
+            Cand c;
+            c.g = uv_grid(out, crop);
+            c.model = crop.model;
+            c.agree = use_mask ? uv_agreement(c.g, pc.det.paper, pc.scale) : uv_agreement(c.g, corners, photo.size());
+            best_agree = std::max(best_agree, c.agree);
+            if (c.g.ok && c.g.turned == landscape && c.agree >= need) ok.push_back(std::move(c));
         }
-        if (frame_ok && r.uv_agreement >= need) {
+        r.uv_agreement = best_agree;
+        if (!ok.empty()) {
+            size_t pick = 0;
+            if (ok.size() == 2) {
+                // a half-size stage-1 page of each: text-row angle spread
+                for (size_t k = 0; k < 2; ++k) {
+                    Unroll Us = Uh;
+                    Us.mode = GeomMode::Neural;
+                    Us.uv = ok[k].g;
+                    Us.W = W / 2;
+                    Us.H = H / 2;
+                    int rows = 0;
+                    r.uv_spread[k] = text_row_spread(remap_unroll(photo, Us), &rows);
+                    if (rows < 5) r.uv_spread[k] = -1;
+                }
+                if (r.uv_spread[0] >= 0 && r.uv_spread[1] >= 0 && r.uv_spread[1] < r.uv_spread[0] - opt.uv_prefer_margin) pick = 1;
+            }
             U = Uh;
             U.mode = GeomMode::Neural;
-            U.uv = std::move(g);
+            U.uv = std::move(ok[pick].g);
+            r.uv_agreement = ok[pick].agree;
+            r.uv_model = ok[pick].model;
             r.mode = GeomMode::Neural;
             r.fell_back = false;
         } else {
             r.uv_rejected = true;
         }
+        r.ms.emplace_back("flattening net check", ms_since(t_uv));
     }
     t0 = Clock::now();
     report(opt, 20, "Unrolling the page");
@@ -497,7 +655,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         warp4 = identity_grid(W, H);
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
-        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore);
+        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows);
         r.lines = fitted_lines(r.warp, W, H, r.rot);
         // on a UVDoc page the line refinement only corrects what is left: a correction that
         // stretches or squeezes the page locally is a tracing failure (dense staves, broken table
@@ -520,6 +678,24 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");
     final_resample(photo, r, opt);
+    if (opt.uv_shading && opt.remove_shadows) {
+        // shadows: the page divided by the net's shading map, sampled through the same map
+        auto ts = Clock::now();
+        UvShading sh;
+        sh.data = opt.uv_shading;
+        sh.crop = opt.uv_shading_crop;
+        cv::Rect box = opt.uv_shading_crop.box & cv::Rect(0, 0, photo.cols, photo.rows);
+        cv::Scalar mean = cv::mean(photo(box));
+        sh.brightness = (mean[0] + mean[1] + mean[2]) / (3 * 255.0);
+        cv::Mat mx, my;
+        for (int y0 = 0; y0 < r.render_map.out_h; y0 += 64) {
+            int y1 = std::min(r.render_map.out_h, y0 + 64);
+            expand_rows(r.render_map, y0, y1, mx, my);
+            uv_apply_shading(r.page, y0, mx, my, sh);
+        }
+        r.shadows_removed = true;
+        r.ms.emplace_back("shadow removal", ms_since(ts));
+    }
     t0 = Clock::now();
     report(opt, 95, "Finishing");
     // paper mask: from this run's detection, or - when the corners were edited - from a fresh
@@ -531,6 +707,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         if (pd.ok && worst < 0.03 * diag) pc = pd;
     }
     if (pc.ok && !pc.det.paper.empty()) r.paper = paper_alpha(pc.det.paper, pc.scale, r.render_map);
+    if (opt.erase_fingers && !r.paper.empty()) r.fingers_erased = erase_fingers(r.page, r.paper);
     // before page: perspective only, same rotation and size
     cv::Mat src = to_bgra(photo);
     GridMap hb = at_render_size(compose(Uh, identity_grid(W, H), r.rot, true), opt);

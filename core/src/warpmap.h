@@ -45,8 +45,9 @@ struct WarpDebug {
 // src: 8-bit BGR. dbg (optional) receives the intermediates for the parity checks.
 // ignore (optional, app only): CV_8U of src's size; line samples and grid controls whose
 // straightened position falls on a non-zero pixel are left out of the fit (the user marked
-// those lines as wrong). Null: the reference behaviour.
-GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr);
+// those lines as wrong). Null: the reference behaviour. share_rows (app): pieces of one ruled
+// line share their ideal position (see share_ideals in warpmap.cpp); false: the reference.
+GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false);
 
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);

@@ -272,6 +272,8 @@ fun SettingsScreen(vm: ScanViewModel) {
     var autoRotate by remember { mutableStateOf(s.autoRotate) }
     var pageFinder by remember { mutableStateOf(s.pageFinderNet) }
     var uvDoc by remember { mutableStateOf(s.uvDoc) }
+    var flatNets by remember { mutableIntStateOf(s.flatNets) }
+    var neuralShadows by remember { mutableStateOf(s.neuralShadows) }
     var reviewCrops by remember { mutableStateOf(s.reviewCrops) }
     var bookRtl by remember { mutableStateOf(s.bookRightToLeft) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
@@ -294,7 +296,9 @@ fun SettingsScreen(vm: ScanViewModel) {
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Finding the page")
             SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
-            SwitchRow("Neural flattening (UVDoc)", "Off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
+            SwitchRow("Neural flattening", "UVDoc and SyntheticDoc nets; off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
+            if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
+            SwitchRow("Remove shadows", "SyntheticDoc shading map: hand and object shadows", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
             SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
             SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

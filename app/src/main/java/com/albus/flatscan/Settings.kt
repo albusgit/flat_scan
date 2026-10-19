@@ -8,8 +8,10 @@ import android.view.View
 object Features {
     /** The page-finder net (assets/models/pagefinder.onnx); off: the colour-threshold paper mask. */
     const val PAGE_FINDER_NET = true
-    /** UVDoc flattening (assets/models/uvdoc.onnx); off: the page outline's surface model. */
+    /** Flattening nets (assets/models/uvdoc.onnx, syntheticdoc.onnx); off: the page outline's surface model. */
     const val UVDOC = true
+    /** SyntheticDoc's shading map divides shadows out of the page. */
+    const val NEURAL_SHADOWS = true
 }
 
 /** User settings and remembered choices (SharedPreferences). */
@@ -50,10 +52,20 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("page_finder_net", Features.PAGE_FINDER_NET)
         set(v) = p.edit().putBoolean("page_finder_net", v).apply()
 
-    /** Feature flag: flatten with UVDoc (falls back to the outline's surface model when it disagrees). */
+    /** Feature flag: flatten with the nets (falls back to the outline's surface model when they disagree). */
     var uvDoc: Boolean
         get() = p.getBoolean("uvdoc", Features.UVDOC)
         set(v) = p.edit().putBoolean("uvdoc", v).apply()
+
+    /** Which flattening nets run: 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc only. */
+    var flatNets: Int
+        get() = p.getInt("flat_nets", 0).coerceIn(0, 2)
+        set(v) = p.edit().putInt("flat_nets", v.coerceIn(0, 2)).apply()
+
+    /** Remove shadows with SyntheticDoc's shading map. */
+    var neuralShadows: Boolean
+        get() = p.getBoolean("neural_shadows", Features.NEURAL_SHADOWS)
+        set(v) = p.edit().putBoolean("neural_shadows", v).apply()
 
     /** Show the crop screen for every page; otherwise only doubtful crops (quality gate) stop there. */
     var reviewCrops: Boolean
