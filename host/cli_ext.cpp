@@ -13,6 +13,9 @@
 #include "surface.h"
 #include "sparse.h"
 #include "warpmap.h"
+#include "pipeline.h"
+#include <sys/stat.h>
+#include <fstream>
 #include <chrono>
 
 using namespace fs;
@@ -115,7 +118,58 @@ static int cmd_warp(int argc, char** argv) {
     return 0;
 }
 
+static bool flag(int argc, char** argv, const char* f) {
+    for (int i = 0; i < argc; ++i) if (!std::strcmp(argv[i], f)) return true;
+    return false;
+}
+
+static void write_outputs(const PipelineResult& r, const std::string& dir, const char* img_name, bool photo) {
+    mkdir(dir.c_str(), 0755);
+    cv::Mat bgr;
+    cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);
+    cv::imwrite(dir + "/" + img_name, bgr);
+    save_grid(dir + "/warpmap.npz", r.final_map, {});
+    if (!r.stage1.empty()) cv::imwrite(dir + "/stage1.png", r.stage1);
+    std::ofstream f(dir + "/info.json");
+    f << "{\"mode\": \"" << (r.mode == GeomMode::Surface ? "surface" : "homography") << "\"";
+    if (photo) {
+        f << ", \"fell_back\": " << (r.fell_back ? "true" : "false") << ", \"fit_median_px\": " << r.fit_median_px
+          << ", \"fit_p90_px\": " << r.fit_p90_px << ", \"axis\": \"" << r.model.axis << "\", \"rot\": " << r.rot
+          << ", \"orient\": [" << r.orient_sh << ", " << r.orient_sv << ", " << r.orient_upright << "]";
+    }
+    f << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false") << ", \"ms\": {";
+    for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << r.ms[i].first << "\": " << (long)std::lround(r.ms[i].second);
+    f << "}}\n";
+}
+
+// photo PHOTO OUTDIR [--v8] [--cpu] [--orient-stage1]
+static int cmd_photo(int argc, char** argv) {
+    cv::Mat img = cv::imread(argv[2], cv::IMREAD_COLOR);
+    PipelineOptions o;
+    o.use_gpu = !flag(argc, argv, "--cpu");
+    o.orient_on_stage1 = flag(argc, argv, "--orient-stage1");
+    if (flag(argc, argv, "--v8")) o.surface_fallback_px = -1;   // force the homography path
+    PipelineResult r = run_photo(img, o);
+    if (!r.ok) { std::fprintf(stderr, "%s\n", r.error.c_str()); return 1; }
+    write_outputs(r, argv[3], "out.png", true);
+    std::printf("%s: mode %s rot %d gpu %d total %.0f ms\n", argv[2], r.mode == GeomMode::Surface ? "surface" : "homography", r.rot,
+                (int)r.gpu_resample, r.ms.back().second);
+    return 0;
+}
+
+static int cmd_scan(int argc, char** argv) {
+    cv::Mat img = cv::imread(argv[2], cv::IMREAD_COLOR);
+    PipelineOptions o;
+    o.use_gpu = !flag(argc, argv, "--cpu");
+    PipelineResult r = run_scan(img, o);
+    write_outputs(r, argv[3], "B_warpmap.png", false);
+    std::printf("%s: gpu %d total %.0f ms\n", argv[2], (int)r.gpu_resample, r.ms.back().second);
+    return 0;
+}
+
 int cli_ext(const std::string& cmd, int argc, char** argv) {
+    if (cmd == "photo" && argc >= 4) return cmd_photo(argc, argv);
+    if (cmd == "scan" && argc >= 4) return cmd_scan(argc, argv);
     if (cmd == "warp" && argc >= 4) return cmd_warp(argc, argv);
     if (cmd == "solvetest" && argc >= 4) return cmd_solvetest(argc, argv);
     if (cmd == "surface" && argc >= 3) return cmd_surface(argc, argv);

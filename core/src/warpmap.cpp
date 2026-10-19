@@ -225,72 +225,107 @@ void build_controls(const std::vector<DLine>& Hs, const std::vector<DLine>& Vs, 
 // ------------------------------------------------------------------ regulariser + solve
 const double LAM_TPS = 0.5, LAM_MEM = 0.01;
 
-// Lm^T Lm + 1e-9 I for warpmap.regularizer(gw, gh) (biharmonic + membrane), as triplets
-void add_regularizer(int gw, int gh, std::vector<int64_t>& keys, std::vector<double>& vals) {
-    int64_t n = (int64_t)gw * gh;
-    auto row = [&](const int* id, const double* w, int k) {
-        for (int a = 0; a < k; ++a)
-            for (int b = 0; b < k; ++b) { keys.push_back((int64_t)id[a] * n + id[b]); vals.push_back(w[a] * w[b]); }
-    };
-    auto I = [&](int iy, int ix) { return iy * gw + ix; };
+// The normal matrix has a fixed 13-point stencil (biharmonic + membrane + bilinear data
+// terms): offsets (dy, dx) with |dy| + |dx| <= 2, accumulated directly per node.
+const int NOFF = 13;
+const int OFF_DY[NOFF] = {-2, -1, -1, -1, 0, 0, 0, 0, 0, 1, 1, 1, 2};
+const int OFF_DX[NOFF] = {0, -1, 0, 1, -2, -1, 0, 1, 2, -1, 0, 1, 0};
+inline int off_index(int dy, int dx) {
+    static const int lut[5][5] = {{-1, -1, 0, -1, -1}, {-1, 1, 2, 3, -1}, {4, 5, 6, 7, 8}, {-1, 9, 10, 11, -1}, {-1, -1, 12, -1, -1}};
+    return lut[dy + 2][dx + 2];
+}
+
+struct Stencil {
+    int gw, gh;
+    std::vector<double> a;   // n x 13
+    Stencil(int w, int h) : gw(w), gh(h), a((size_t)w * h * NOFF, 0.0) {}
+    // add w_i * w_j for all node pairs of one row of a least-squares operator
+    void add_row(const int* iy, const int* ix, const double* w, int k) {
+        for (int p = 0; p < k; ++p)
+            for (int q = 0; q < k; ++q)
+                a[((size_t)iy[p] * gw + ix[p]) * NOFF + off_index(iy[q] - iy[p], ix[q] - ix[p])] += w[p] * w[q];
+    }
+    Csr to_csr() const {
+        Csr M;
+        int n = gw * gh;
+        M.n = n;
+        M.ptr.assign(n + 1, 0);
+        M.idx.reserve((size_t)n * NOFF);
+        M.val.reserve((size_t)n * NOFF);
+        for (int iy = 0; iy < gh; ++iy)
+            for (int ix = 0; ix < gw; ++ix) {
+                for (int o = 0; o < NOFF; ++o) {
+                    int y = iy + OFF_DY[o], x = ix + OFF_DX[o];
+                    if (y < 0 || y >= gh || x < 0 || x >= gw) continue;
+                    M.idx.push_back(y * gw + x);
+                    M.val.push_back(a[((size_t)iy * gw + ix) * NOFF + o]);
+                }
+                M.ptr[iy * gw + ix + 1] = (int)M.idx.size();
+            }
+        return M;
+    }
+};
+
+// Lm^T Lm + 1e-9 I for warpmap.regularizer(gw, gh): thin-plate (second differences in x, y
+// and the mixed term, weight LAM_TPS) + membrane (LAM_MEM)
+void add_regularizer(Stencil& S) {
+    int gw = S.gw, gh = S.gh;
     double s1 = std::sqrt(LAM_TPS), s2 = std::sqrt(2 * LAM_TPS), s3 = std::sqrt(LAM_MEM);
     for (int iy = 0; iy < gh; ++iy)
         for (int ix = 0; ix + 2 < gw; ++ix) {
-            int id[3] = {I(iy, ix + 2), I(iy, ix + 1), I(iy, ix)};
+            int yy[3] = {iy, iy, iy}, xx[3] = {ix + 2, ix + 1, ix};
             double w[3] = {1 * s1, -2 * s1, 1 * s1};
-            row(id, w, 3);
+            S.add_row(yy, xx, w, 3);
         }
     for (int iy = 0; iy + 2 < gh; ++iy)
         for (int ix = 0; ix < gw; ++ix) {
-            int id[3] = {I(iy + 2, ix), I(iy + 1, ix), I(iy, ix)};
+            int yy[3] = {iy + 2, iy + 1, iy}, xx[3] = {ix, ix, ix};
             double w[3] = {1 * s1, -2 * s1, 1 * s1};
-            row(id, w, 3);
+            S.add_row(yy, xx, w, 3);
         }
     for (int iy = 0; iy + 1 < gh; ++iy)
         for (int ix = 0; ix + 1 < gw; ++ix) {
-            int id[4] = {I(iy + 1, ix + 1), I(iy + 1, ix), I(iy, ix + 1), I(iy, ix)};
+            int yy[4] = {iy + 1, iy + 1, iy, iy}, xx[4] = {ix + 1, ix, ix + 1, ix};
             double w[4] = {1 * s2, -1 * s2, -1 * s2, 1 * s2};
-            row(id, w, 4);
+            S.add_row(yy, xx, w, 4);
         }
     for (int iy = 0; iy < gh; ++iy)
         for (int ix = 0; ix + 1 < gw; ++ix) {
-            int id[2] = {I(iy, ix + 1), I(iy, ix)};
+            int yy[2] = {iy, iy}, xx[2] = {ix + 1, ix};
             double w[2] = {1 * s3, -1 * s3};
-            row(id, w, 2);
+            S.add_row(yy, xx, w, 2);
         }
     for (int iy = 0; iy + 1 < gh; ++iy)
         for (int ix = 0; ix < gw; ++ix) {
-            int id[2] = {I(iy + 1, ix), I(iy, ix)};
+            int yy[2] = {iy + 1, iy}, xx[2] = {ix, ix};
             double w[2] = {1 * s3, -1 * s3};
-            row(id, w, 2);
+            S.add_row(yy, xx, w, 2);
         }
-    for (int64_t i = 0; i < n; ++i) { keys.push_back(i * n + i); vals.push_back(1e-9); }
+    for (size_t i = 0; i < (size_t)gw * gh; ++i) S.a[i * NOFF + 6] += 1e-9;
 }
 
 // warpmap.solve: regularised least squares on a G-px grid
 Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh,
                   int G, const Field* warm, int* iters) {
     int64_t n = (int64_t)gw * gh;
-    std::vector<int64_t> keys;
-    std::vector<double> vals;
-    keys.reserve(xy.size() * 16 + n * 30);
-    vals.reserve(keys.capacity());
-    add_regularizer(gw, gh, keys, vals);
+    Stencil S(gw, gh);
+    add_regularizer(S);
     std::vector<double> rhs(n, 0.0);
     for (size_t s = 0; s < xy.size(); ++s) {
         double gx = xy[s][0] / G, gy = xy[s][1] / G;
         long x0 = std::min(std::max((long)std::floor(gx), 0L), (long)gw - 2);
         long y0 = std::min(std::max((long)std::floor(gy), 0L), (long)gh - 2);
         double fx = std::min(std::max(gx - x0, 0.0), 1.0), fy = std::min(std::max(gy - y0, 0.0), 1.0);
-        int id[4] = {(int)(y0 * gw + x0), (int)(y0 * gw + x0 + 1), (int)((y0 + 1) * gw + x0), (int)((y0 + 1) * gw + x0 + 1)};
+        int yy[4] = {(int)y0, (int)y0, (int)y0 + 1, (int)y0 + 1}, xx[4] = {(int)x0, (int)x0 + 1, (int)x0, (int)x0 + 1};
         double w[4] = {(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy};
         double ws = weights ? (*weights)[s] : 1.0;
         for (int a = 0; a < 4; ++a) {
-            rhs[id[a]] += w[a] * (ws * values[s]);
-            for (int b = 0; b < 4; ++b) { keys.push_back((int64_t)id[a] * n + id[b]); vals.push_back(w[a] * ws * w[b]); }
+            int ia = yy[a] * gw + xx[a];
+            rhs[ia] += w[a] * (ws * values[s]);
+            for (int b = 0; b < 4; ++b) S.a[(size_t)ia * NOFF + off_index(yy[b] - yy[a], xx[b] - xx[a])] += w[a] * ws * w[b];
         }
     }
-    Csr M = csr_from_triplets((int)n, (int)n, keys, vals);
+    Csr M = S.to_csr();
     std::vector<double> x0;
     if (warm) x0 = warm->v;
     SolveStats st;
@@ -861,8 +896,11 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
     std::vector<std::array<double, 2>> cxy;
     Vec vx, vy;
     for (size_t i = 0; i < dp.size(); ++i) { cxy.push_back({dp[i].x, dp[i].y}); vx.push_back(sp[i].x - dp[i].x); vy.push_back(sp[i].y - dp[i].y); }
-    d.GX = solve_field(cxy, vx, nullptr, gw, gh, GG, nullptr, &d.cg_iters[0]);
-    d.GY = solve_field(cxy, vy, nullptr, gw, gh, GG, nullptr, &d.cg_iters[1]);
+    {   // the x and y fields are independent solves
+        std::thread tx([&] { d.GX = solve_field(cxy, vx, nullptr, gw, gh, GG, nullptr, &d.cg_iters[0]); });
+        d.GY = solve_field(cxy, vy, nullptr, gw, gh, GG, nullptr, &d.cg_iters[1]);
+        tx.join();
+    }
     d.ms.emplace_back("global", ms_since(t0));
     t0 = Clock::now();
     // A_img = remap(src, xx + GX(xx/32, yy/32), ...): exact bilinear at x/32 (no border taps needed)
@@ -925,13 +963,16 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg) {
         }
         Field warm_y, warm_x;
         if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
-        Field Fy = solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]);
-        xy.clear(); val.clear();
+        std::vector<std::array<double, 2>> xyv;
+        Vec valv;
         for (const auto& r : SS.v) {
             double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
-            xy.push_back({r[1], ys}); val.push_back(r[2]);
+            xyv.push_back({r[1], ys}); valv.push_back(r[2]);
         }
-        Field Fx = solve_field(xy, val, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
+        Field Fy, Fx;
+        std::thread ty([&] { Fy = solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]); });
+        Fx = solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
+        ty.join();
         if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
         Fy_prev = Fy; Fx_prev = Fx;
     }
