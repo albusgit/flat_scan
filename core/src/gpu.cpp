@@ -205,6 +205,18 @@ static GLuint tex_r32f(int w, int h, const float* data) {
     return t;
 }
 
+static GLuint tex_rgba32f(int w, int h, const float* data) {
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, w, h);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_FLOAT, data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    return t;
+}
+
 GLuint gpu_tex_rgba8ui(const cv::Mat& m) {
     CV_Assert(m.type() == CV_8UC4 && m.isContinuous());
     GLuint t;
@@ -351,24 +363,23 @@ void main() {
 precision highp float;
 precision highp int;
 uniform highp usampler2D uSrc;
-uniform highp sampler2D uIllum;
-uniform vec3 uWb;
+uniform highp sampler2D uPaper;   // RGBA32F quarter grid: paper colour per channel (PageParams::paper)
 uniform ivec2 uImg;
 float luma(vec3 v) { return 0.114 * v.r + 0.587 * v.g + 0.299 * v.b; }   // BGRA order
-float illumAt(int x, int y) {
-    ivec2 n = textureSize(uIllum, 0);
+vec3 paperAt(int x, int y) {
+    ivec2 n = textureSize(uPaper, 0);
     float fx = clamp((float(x) + 0.5) * 0.25 - 0.5, 0.0, float(n.x - 1));
     float fy = clamp((float(y) + 0.5) * 0.25 - 0.5, 0.0, float(n.y - 1));
     int x0 = int(fx), y0 = int(fy);
     int x1 = min(x0 + 1, n.x - 1), y1 = min(y0 + 1, n.y - 1);
     float a = fx - float(x0), b = fy - float(y0);
-    return (texelFetch(uIllum, ivec2(x0, y0), 0).r * (1.0 - a) + texelFetch(uIllum, ivec2(x1, y0), 0).r * a) * (1.0 - b) +
-           (texelFetch(uIllum, ivec2(x0, y1), 0).r * (1.0 - a) + texelFetch(uIllum, ivec2(x1, y1), 0).r * a) * b;
+    return (texelFetch(uPaper, ivec2(x0, y0), 0).rgb * (1.0 - a) + texelFetch(uPaper, ivec2(x1, y0), 0).rgb * a) * (1.0 - b) +
+           (texelFetch(uPaper, ivec2(x0, y1), 0).rgb * (1.0 - a) + texelFetch(uPaper, ivec2(x1, y1), 0).rgb * a) * b;
 }
 vec3 normalised(int x, int y) {
     vec3 q = vec3(texelFetch(uSrc, ivec2(x, y), 0).rgb);
-    float S = illumAt(x, y);
-    return vec3(q.r / max(S * uWb.r, 1.0), q.g / max(S * uWb.g, 1.0), q.b / max(S * uWb.b, 1.0));
+    vec3 P = paperAt(x, y);
+    return vec3(q.r / max(P.r, 1.0), q.g / max(P.g, 1.0), q.b / max(P.b, 1.0));
 }
 )"
 
@@ -410,6 +421,7 @@ uniform uint uSpeckMax;
 uniform uint uSpeckLight;
 uniform float uSpeckBg;
 uniform highp sampler2D uPic;
+uniform highp sampler2D uTint;   // light-colour weight (PageParams::tint)
 uniform float uWp;
 uniform float uWpTint;
 uniform float uGamma;
@@ -436,9 +448,19 @@ float picAt(int x, int y) {
     return (texelFetch(uPic, ivec2(x0, y0), 0).r * (1.0 - a) + texelFetch(uPic, ivec2(x1, y0), 0).r * a) * (1.0 - b) +
            (texelFetch(uPic, ivec2(x0, y1), 0).r * (1.0 - a) + texelFetch(uPic, ivec2(x1, y1), 0).r * a) * b;
 }
-float curve1(float v) {
-    if (uKind == 1) return min(v / uWp, 1.0);
-    return v >= uWp ? 1.0 : pow(v / uWp, uGamma);
+float tintAt(int x, int y) {
+    ivec2 n = textureSize(uTint, 0);
+    float fx = clamp((float(x) + 0.5) * 0.25 - 0.5, 0.0, float(n.x - 1));
+    float fy = clamp((float(y) + 0.5) * 0.25 - 0.5, 0.0, float(n.y - 1));
+    int x0 = int(fx), y0 = int(fy);
+    int x1 = min(x0 + 1, n.x - 1), y1 = min(y0 + 1, n.y - 1);
+    float a = fx - float(x0), b = fy - float(y0);
+    return (texelFetch(uTint, ivec2(x0, y0), 0).r * (1.0 - a) + texelFetch(uTint, ivec2(x1, y0), 0).r * a) * (1.0 - b) +
+           (texelFetch(uTint, ivec2(x0, y1), 0).r * (1.0 - a) + texelFetch(uTint, ivec2(x1, y1), 0).r * a) * b;
+}
+float curve1(float v, float wp) {
+    if (uKind == 1) return min(v / wp, 1.0);
+    return v >= wp ? 1.0 : pow(v / wp, uGamma);
 }
 void main() {
     int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
@@ -446,12 +468,14 @@ void main() {
     int y = uRow0 + r;
     vec3 q = vec3(texelFetch(uSrc, ivec2(x, y), 0).rgb);
     vec3 t;
+    float tint = 0.0;
     if (uKind == 0) {
         t = q * (1.0 / 255.0);
     } else {
         vec3 v = normalised(x, y);
         float l = luma(v);
         float b = max(bgvAt(x, y), 0.05), w = 0.0;
+        tint = tintAt(x, y);
         if (uKind == 3) {
             float wp = b < 0.97 ? uWpTint : uWp;
             float u = clamp((l / b - 0.5) / (wp - 0.5), 0.0, 1.0);
@@ -460,9 +484,10 @@ void main() {
             float ta = l >= uWp ? 1.0 : pow(l / uWp, 1.25);
             t = vec3(tr + (ta - tr) * w);
         } else {
-            t = vec3(curve1(v.r), curve1(v.g), curve1(v.b));
+            float wpe = uWp + (1.0 - uWp) * tint;   // light colours: no clipping band below white
+            t = vec3(curve1(v.r, wpe), curve1(v.g, wpe), curve1(v.b, wpe));
         }
-        if (uSpecks != 0 && l < 0.75 && b >= uSpeckBg && w < 0.5) {
+        if (uSpecks != 0 && l < 0.75 && b >= uSpeckBg && w < 0.5 && tint < 0.5) {
             ivec2 nq = textureSize(uCnt, 0);
             int bi = min(y / 4, nq.y - 1), bj = min(x / 4, nq.x - 1);
             uint n = 0u;
@@ -482,6 +507,7 @@ void main() {
         float ch = max(t.r, max(t.g, t.b)) - min(t.r, min(t.g, t.b));   // near-neutral only
         float f = clamp((ch - 0.06) / (0.15 - 0.06), 0.0, 1.0);
         w = w * (1.0 - f * f * (3.0 - 2.0 * f));
+        w = w * (1.0 - tint);   // nor on light colours
         t = t + (vec3(1.0) - t) * w;
     }
     if (uGray != 0) t = vec3(luma(t));
@@ -551,25 +577,27 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     if (!available()) return false;
     Curve c = filter_curve(f, p.sigma);
     if (c.kind == 0 && adj.identity()) return false;
+    if (p.paper.type() != CV_32FC4 || p.tint.type() != CV_32F || p.paper.size() != p.tint.size()) return false;
     AdjustK ak = adjust_constants(adj, c.specks);
     std::lock_guard<std::mutex> lk(mu_);
     if (img.cols > max_tex_ || img.rows > max_tex_ || img.cols != p.page_w || img.rows != p.page_h) return false;
     if (!make_current()) return false;
     cv::Mat s = img.isContinuous() ? img : img.clone();
-    cv::Mat ill = p.illum.isContinuous() ? p.illum : p.illum.clone();
+    cv::Mat ppr = p.paper.isContinuous() ? p.paper : p.paper.clone();
     cv::Mat bgv = p.bgv.isContinuous() ? p.bgv : p.bgv.clone();
     cv::Mat pic = p.pic.isContinuous() ? p.pic : p.pic.clone();
+    cv::Mat tnt = p.tint.isContinuous() ? p.tint : p.tint.clone();
     int qw = std::max(1, img.cols / 4), qh = std::max(1, img.rows / 4);
     GLuint tsrc = gpu_tex_rgba8ui(s);
-    GLuint till = tex_r32f(ill.cols, ill.rows, ill.ptr<float>());
+    GLuint tppr = tex_rgba32f(ppr.cols, ppr.rows, ppr.ptr<float>());
     GLuint tbgv = tex_r32f(bgv.cols, bgv.rows, bgv.ptr<float>());
     GLuint tpic = tex_r32f(pic.cols, pic.rows, pic.ptr<float>());
+    GLuint ttnt = tex_r32f(tnt.cols, tnt.rows, tnt.ptr<float>());
     GLuint tcnt = tex_storage(GL_R32UI, qw, qh);
     for (GLuint prog : {prog_count_, prog_tone_}) {
         glUseProgram(prog);
         bind_tex(prog, 0, tsrc, "uSrc");
-        bind_tex(prog, 1, till, "uIllum");
-        glUniform3f(glGetUniformLocation(prog, "uWb"), p.wb[0], p.wb[1], p.wb[2]);
+        bind_tex(prog, 1, tppr, "uPaper");
         set_i2(prog, "uImg", img.cols, img.rows);
     }
     if (c.specks) {
@@ -583,6 +611,7 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     bind_tex(prog_tone_, 2, tcnt, "uCnt");
     bind_tex(prog_tone_, 3, tbgv, "uBgv");
     bind_tex(prog_tone_, 4, tpic, "uPic");
+    bind_tex(prog_tone_, 5, ttnt, "uTint");
     set_i(prog_tone_, "uKind", c.kind);
     glUniform1f(glGetUniformLocation(prog_tone_, "uWp"), c.wp);
     glUniform1f(glGetUniformLocation(prog_tone_, "uGamma"), c.gamma);
@@ -601,8 +630,8 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     glUniform1f(glGetUniformLocation(prog_tone_, "uSpeckBg"), c.speck_bg);
     glUniform1f(glGetUniformLocation(prog_tone_, "uStrength"), strength);
     bool ok = run_banded(prog_tone_, img.cols, img.rows, out);
-    GLuint ts[5] = {tsrc, till, tbgv, tcnt, tpic};
-    glDeleteTextures(5, ts);
+    GLuint ts[6] = {tsrc, tppr, tbgv, tcnt, tpic, ttnt};
+    glDeleteTextures(6, ts);
     glFinish();
     release();
     return ok;

@@ -22,8 +22,13 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 // images are BGRA (OpenCV order): channel 0 is blue
 inline float luma(float b, float g, float r) { return 0.114f * b + 0.587f * g + 0.299f * r; }
 
-// pull-push fill of values where mask > 0
-cv::Mat fill_masked(const cv::Mat& val, const cv::Mat& mask) {
+inline float smoothstep(float e0, float e1, float x) {
+    float t = std::min(std::max((x - e0) / (e1 - e0), 0.f), 1.f);
+    return t * t * (3.f - 2.f * t);
+}
+
+// pull-push fill of values where mask > 0 (fallback: the value where the coarsest level has too few)
+cv::Mat fill_masked(const cv::Mat& val, const cv::Mat& mask, float fallback0 = 200.f) {
     std::vector<cv::Mat> V{val.mul(mask)}, W{mask.clone()};
     while (V.back().cols > 2 && V.back().rows > 2) {
         cv::Mat v2, w2;
@@ -39,7 +44,7 @@ cv::Mat fill_masked(const cv::Mat& val, const cv::Mat& mask) {
         for (int i = 0; i < e.rows; ++i)
             for (int j = 0; j < e.cols; ++j) {
                 float w = W[k].at<float>(i, j);
-                float fallback = up.empty() ? 200.f : up.at<float>(i, j);
+                float fallback = up.empty() ? fallback0 : up.at<float>(i, j);
                 float a = std::min(1.f, w * 4.f);   // blend towards the coarser estimate where coverage is thin
                 e.at<float>(i, j) = w > 0 ? a * (V[k].at<float>(i, j) / w) + (1 - a) * fallback : fallback;
             }
@@ -61,11 +66,17 @@ cv::Mat fill_masked(const cv::Mat& val, const cv::Mat& mask) {
 //     sparse, photos and halftones are not).
 // Everything else is left to the interpolation from the paper around it.
 const float kIslandLevel = 0.85f, kIslandFlat = 0.7f;
+const int kIslandBridge = 11;
 
 void drop_dark_islands(const cv::Mat& page, const cv::Mat& lum, cv::Mat& mask) {
-    cv::Mat m8, lab, stats, cen;
+    // pieces of paper split only by a thin seam that is not a paper sample (the colour-edge
+    // ring of paper_mask along a crease or a shadow edge, ~2 kEdgeR px) are one piece: the
+    // components are taken on the mask dilated by kIslandBridge
+    cv::Mat m8, md, lab, stats, cen;
     mask.convertTo(m8, CV_8U);
-    int n = cv::connectedComponentsWithStats(m8, lab, stats, cen, 8, CV_32S);
+    cv::dilate(m8, md, cv::Mat::ones(kIslandBridge, kIslandBridge, CV_8U));
+    int n = cv::connectedComponentsWithStats(md, lab, stats, cen, 8, CV_32S);
+    lab.setTo(0, m8 == 0);
     if (n <= 2) return;
     int main_c = 1;
     for (int k = 2; k < n; ++k)
@@ -103,6 +114,188 @@ void drop_dark_islands(const cv::Mat& page, const cv::Mat& lum, cv::Mat& mask) {
     for (int i = 0; i < mask.rows; ++i)
         for (int j = 0; j < mask.cols; ++j)
             if (!keep[lab.at<int>(i, j)]) mask.at<float>(i, j) = 0.f;
+}
+
+// Colour of the (ink-free) background relative to the paper, independent of the lighting: the
+// chromaticity bg / luma(bg), divided by the paper's chromaticity ref, scaled to a fixed light
+// level (L ~ 94) and converted to Lab. A, B: its a, b; paper is (0, 0) whatever its own tint.
+void rel_ab(const cv::Mat& bg4, const cv::Mat& lum, const float* ref, cv::Mat& A, cv::Mat& B) {
+    cv::Mat f(bg4.size(), CV_32FC3), lab;
+    for (int i = 0; i < bg4.rows; ++i)
+        for (int j = 0; j < bg4.cols; ++j) {
+            const uint8_t* q = bg4.ptr<uint8_t>(i) + 4 * j;
+            float l = std::max(lum.at<float>(i, j), 1.f);
+            cv::Vec3f& o = f.at<cv::Vec3f>(i, j);
+            for (int c = 0; c < 3; ++c) o[c] = std::min(1.f, 0.85f * (float)q[c] / (l * ref[c]));
+        }
+    cv::cvtColor(f, lab, cv::COLOR_BGR2Lab);
+    std::vector<cv::Mat> ch;
+    cv::split(lab, ch);
+    A = ch[1];
+    B = ch[2];
+}
+
+// Paper samples, by colour. The old test (chroma max - min < 24 levels, absolute) took every
+// bright, smooth area of low chroma for paper: light yellow / blue / pink boxes, pale photos
+// (whose own brightness then became the illumination, so they were flattened to white), and
+// on a page under warm light it rejected the paper itself. Paper is near-neutral or uniformly
+// tinted; a highlighter or a pastel box is a distinct colour relative to the paper around it:
+//  1. the paper colour is the most common colour of the bright candidates (a 2-D histogram of
+//     a, b relative to grey, votes weighted by brightness^4: paper is the brightest surface);
+//  2. seeds: candidates within kSeedC (dE in a, b) of it;
+//  3. breadth-first growth from the seeds over 4-neighbour candidates. Every grown sample
+//     carries the paper colour of its path (a running average, weight kPathAlpha); a
+//     neighbour joins if its colour is within kStepC of it and within kMaxC of the paper
+//     colour, and it is not on a colour edge (a, b change > kEdgeC across +-kEdgeR px). A
+//     colour cast that drifts slowly across the page (mixed lighting) is followed; the edge
+//     of a pastel box, a highlighted line or a pale photo is not crossed;
+//  4. pieces not connected to the main paper: see below.
+// A, B: background colour relative to the paper (rel_ab). Returns the mask (CV_32F 0 / 1).
+const float kSeedC = 3.f, kStepC = 2.5f, kPathAlpha = 0.1f, kMaxC = 40.f, kEdgeC = 4.f, kLocalC = 5.f, kRefSigma = 8.f;
+const float kNoiseEdge = 2.5f, kNoiseStep = 1.5f, kNoiseTint = 2.f;   // thresholds >= these x colour noise
+const int kEdgeR = 3;
+
+cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, cv::Mat& A, cv::Mat& B, float& noise) {
+    const float one[3] = {1.f, 1.f, 1.f};
+    rel_ab(bg4, lum, one, A, B);
+    float lmax = 1.f;
+    for (int i = 0; i < bg4.rows; ++i)
+        for (int j = 0; j < bg4.cols; ++j)
+            if (cand.at<uint8_t>(i, j)) lmax = std::max(lmax, lum.at<float>(i, j));
+    const int NB = 80;   // a, b in [-40, 40), 1 unit bins
+    cv::Mat hist = cv::Mat::zeros(NB, NB, CV_32F);
+    for (int i = 0; i < bg4.rows; ++i)
+        for (int j = 0; j < bg4.cols; ++j) {
+            if (!cand.at<uint8_t>(i, j)) continue;
+            int ia = (int)std::floor(A.at<float>(i, j)) + NB / 2, ib = (int)std::floor(B.at<float>(i, j)) + NB / 2;
+            if (ia < 0 || ib < 0 || ia >= NB || ib >= NB) continue;
+            float r = lum.at<float>(i, j) / lmax;
+            hist.at<float>(ib, ia) += r * r * r * r;
+        }
+    cv::GaussianBlur(hist, hist, cv::Size(0, 0), 2.5);
+    cv::Point mx;
+    cv::minMaxLoc(hist, nullptr, nullptr, nullptr, &mx);
+    float a0 = (float)(mx.x - NB / 2) + 0.5f, b0 = (float)(mx.y - NB / 2) + 0.5f;
+    // paper chromaticity: median of the candidates near the mode
+    float ref[3] = {1.f, 1.f, 1.f};
+    {
+        std::vector<float> r[3];
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j) {
+                if (!cand.at<uint8_t>(i, j) || std::hypot(A.at<float>(i, j) - a0, B.at<float>(i, j) - b0) >= 4.f) continue;
+                const uint8_t* q = bg4.ptr<uint8_t>(i) + 4 * j;
+                float l = std::max(lum.at<float>(i, j), 1.f);
+                for (int c = 0; c < 3; ++c) r[c].push_back(q[c] / l);
+            }
+        if (!r[0].empty())
+            for (int c = 0; c < 3; ++c) {
+                std::nth_element(r[c].begin(), r[c].begin() + r[c].size() / 2, r[c].end());
+                ref[c] = std::min(1.5f, std::max(0.6f, r[c][r[c].size() / 2]));
+            }
+    }
+    rel_ab(bg4, lum, ref, A, B);
+    // colour noise of the background (texture of magazine paper, JPEG chroma blocks, sensor
+    // noise in the dark): 90th percentile of the a, b difference between candidates 2 px
+    // apart. The colour thresholds grow with it, so noisy paper is not split into pieces.
+    {
+        std::vector<float> dn;
+        for (int i = 0; i < bg4.rows; i += 2)
+            for (int j = 0; j + 2 < bg4.cols; j += 2)
+                if (cand.at<uint8_t>(i, j) && cand.at<uint8_t>(i, j + 2))
+                    dn.push_back(std::hypot(A.at<float>(i, j + 2) - A.at<float>(i, j), B.at<float>(i, j + 2) - B.at<float>(i, j)));
+        noise = 0.f;
+        if (dn.size() > 100) {
+            std::nth_element(dn.begin(), dn.begin() + dn.size() * 9 / 10, dn.end());
+            noise = dn[dn.size() * 9 / 10];
+        }
+    }
+    const float edge_c = std::max(kEdgeC, kNoiseEdge * noise), step_c = std::max(kStepC, kNoiseStep * noise);
+    // colour edges: the a, b difference across +-kEdgeR px (4 directions, lightly smoothed
+    // first) above edge_c. A ring of them surrounds every coloured area, corners included.
+    cv::Mat edge(bg4.size(), CV_8U);
+    {
+        cv::Mat As, Bs;
+        cv::GaussianBlur(A, As, cv::Size(0, 0), 1.5);
+        cv::GaussianBlur(B, Bs, cv::Size(0, 0), 1.5);
+        const int ex[4] = {kEdgeR, 0, kEdgeR, kEdgeR}, ey[4] = {0, kEdgeR, kEdgeR, -kEdgeR};
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j) {
+                float g = 0.f;
+                for (int k = 0; k < 4; ++k) {
+                    int i0 = std::min(std::max(i - ey[k], 0), bg4.rows - 1), j0 = std::min(std::max(j - ex[k], 0), bg4.cols - 1);
+                    int i1 = std::min(std::max(i + ey[k], 0), bg4.rows - 1), j1 = std::min(std::max(j + ex[k], 0), bg4.cols - 1);
+                    g = std::max(g, std::hypot(As.at<float>(i1, j1) - As.at<float>(i0, j0), Bs.at<float>(i1, j1) - Bs.at<float>(i0, j0)));
+                }
+                edge.at<uint8_t>(i, j) = g > edge_c ? 1 : 0;
+            }
+    }
+    // seeds, then breadth-first growth over candidates that are not colour edges; every grown
+    // sample carries the paper colour of its path (R, a running average), and a neighbour
+    // joins if its colour is within kStepC of that
+    cv::Mat grown = cv::Mat::zeros(bg4.size(), CV_8U), RA(bg4.size(), CV_32F), RB(bg4.size(), CV_32F);
+    std::vector<cv::Point> queue;
+    for (int i = 0; i < bg4.rows; ++i)
+        for (int j = 0; j < bg4.cols; ++j)
+            if (cand.at<uint8_t>(i, j) && std::hypot(A.at<float>(i, j), B.at<float>(i, j)) < kSeedC) {
+                grown.at<uint8_t>(i, j) = 1;
+                RA.at<float>(i, j) = A.at<float>(i, j);
+                RB.at<float>(i, j) = B.at<float>(i, j);
+                queue.emplace_back(j, i);
+            }
+    const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
+    for (size_t h = 0; h < queue.size(); ++h) {
+        cv::Point p = queue[h];
+        float ra = RA.at<float>(p), rb = RB.at<float>(p);
+        for (int k = 0; k < 4; ++k) {
+            cv::Point q(p.x + dx[k], p.y + dy[k]);
+            if (q.x < 0 || q.y < 0 || q.x >= bg4.cols || q.y >= bg4.rows) continue;
+            if (grown.at<uint8_t>(q) || !cand.at<uint8_t>(q) || edge.at<uint8_t>(q)) continue;
+            float aq = A.at<float>(q), bq = B.at<float>(q);
+            if (std::hypot(aq - ra, bq - rb) < step_c && std::hypot(aq, bq) < kMaxC) {
+                grown.at<uint8_t>(q) = 1;
+                RA.at<float>(q) = ra + kPathAlpha * (aq - ra);
+                RB.at<float>(q) = rb + kPathAlpha * (bq - rb);
+                queue.push_back(q);
+            }
+        }
+    }
+    // 4. pieces of the grown area that are not connected to the main paper (the largest piece)
+    // are kept only if their colour (median a, b) is within kLocalC of the main paper's colour
+    // filled in at their place. Under a colour cast, a pastel area can match the global paper
+    // colour somewhere (a blue box under warm light) and seed itself; next to the paper
+    // around it, it is still a distinct colour. Paper cut off by a picture or a band is kept.
+    cv::Mat lab, stats, cen;
+    int n = cv::connectedComponentsWithStats(grown, lab, stats, cen, 8, CV_32S);
+    if (n > 2) {
+        int main_c = 1;
+        for (int k = 2; k < n; ++k)
+            if (stats.at<int>(k, cv::CC_STAT_AREA) > stats.at<int>(main_c, cv::CC_STAT_AREA)) main_c = k;
+        cv::Mat mmain(bg4.size(), CV_32F);
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j) mmain.at<float>(i, j) = lab.at<int>(i, j) == main_c ? 1.f : 0.f;
+        cv::Mat Ar = fill_masked(A, mmain, 0.f), Br = fill_masked(B, mmain, 0.f);
+        cv::GaussianBlur(Ar, Ar, cv::Size(0, 0), kRefSigma);
+        cv::GaussianBlur(Br, Br, cv::Size(0, 0), kRefSigma);
+        std::vector<std::vector<float>> d(n);
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j) {
+                int k = lab.at<int>(i, j);
+                if (k > 0 && k != main_c)
+                    d[k].push_back(std::hypot(A.at<float>(i, j) - Ar.at<float>(i, j), B.at<float>(i, j) - Br.at<float>(i, j)));
+            }
+        std::vector<char> keep(n, 1);
+        for (int k = 1; k < n; ++k) {
+            if (k == main_c || d[k].empty()) continue;
+            std::nth_element(d[k].begin(), d[k].begin() + d[k].size() / 2, d[k].end());
+            keep[k] = d[k][d[k].size() / 2] < kLocalC;
+        }
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j)
+                if (!keep[lab.at<int>(i, j)]) grown.at<uint8_t>(i, j) = 0;
+    }
+    cv::Mat mask;
+    grown.convertTo(mask, CV_32F);
+    return mask;
 }
 
 }  // namespace
@@ -169,18 +362,32 @@ static inline float illum_at(const cv::Mat& I, float px, float py) {
            (I.at<float>(y1, x0) * (1.f - a) + I.at<float>(y1, x1) * a) * b;
 }
 
-static inline void normalise(const uint8_t* q, float S, const float* wb, float* v) {
-    for (int c = 0; c < 3; ++c) v[c] = (float)q[c] / std::max(S * wb[c], 1.f);
+// paper colour per channel at a page pixel (PageParams::paper, bilinear like illum_at)
+static inline void paper_at(const cv::Mat& P, float px, float py, float* o) {
+    float fx = (px + 0.5f) * 0.25f - 0.5f, fy = (py + 0.5f) * 0.25f - 0.5f;
+    fx = std::min(std::max(fx, 0.f), (float)(P.cols - 1));
+    fy = std::min(std::max(fy, 0.f), (float)(P.rows - 1));
+    int x0 = (int)fx, y0 = (int)fy;
+    int x1 = std::min(x0 + 1, P.cols - 1), y1 = std::min(y0 + 1, P.rows - 1);
+    float a = fx - (float)x0, b = fy - (float)y0;
+    const cv::Vec4f &p00 = P.at<cv::Vec4f>(y0, x0), &p01 = P.at<cv::Vec4f>(y0, x1), &p10 = P.at<cv::Vec4f>(y1, x0), &p11 = P.at<cv::Vec4f>(y1, x1);
+    for (int c = 0; c < 3; ++c) o[c] = (p00[c] * (1.f - a) + p01[c] * a) * (1.f - b) + (p10[c] * (1.f - a) + p11[c] * a) * b;
+}
+
+static inline void normalise(const uint8_t* q, const float* P, float* v) {
+    for (int c = 0; c < 3; ++c) v[c] = (float)q[c] / std::max(P[c], 1.f);
 }
 
 static const float kInk = 0.55f;   // normalised luminance below which a pixel counts as ink
 static const float kSpeckLight = 0.75f;   // speck removal: pixels below this are the speck or its halo
 static const float kBgChroma0 = 0.06f, kBgChroma1 = 0.15f;   // background cleanup: chroma max - min of t, fade-out
 static const float kPicGamma = 1.25f;   // B&W tone curve inside pictures (= Auto color / Grayscale)
+static const float kTint0 = 3.5f, kTint1 = 6.5f;   // light-colour weight: a, b distance from the local paper colour
 
-static inline float curve1(const Curve& c, float v) {
-    if (c.kind == 1) return std::min(v / c.wp, 1.f);
-    return v >= c.wp ? 1.f : std::pow(v / c.wp, c.gamma);
+// wp: the filter's white point, raised towards 1 on light colours (tint)
+static inline float curve1(const Curve& c, float v, float wp) {
+    if (c.kind == 1) return std::min(v / wp, 1.f);
+    return v >= wp ? 1.f : std::pow(v / wp, c.gamma);
 }
 
 PageParams page_params(const cv::Mat& page, bool use_gpu) {
@@ -190,24 +397,25 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
     cv::Mat bg4;
     p.gpu_background = use_gpu && Gpu::instance().background_quarter(page, bg4);
     if (!p.gpu_background) bg4 = background_quarter_cpu(page);
-    cv::Mat lum(bg4.size(), CV_32F), chroma(bg4.size(), CV_32F);
+    cv::Mat lum(bg4.size(), CV_32F);
     for (int i = 0; i < bg4.rows; ++i)
         for (int j = 0; j < bg4.cols; ++j) {
             const uint8_t* q = bg4.ptr<uint8_t>(i) + 4 * j;
             lum.at<float>(i, j) = luma(q[0], q[1], q[2]);
-            chroma.at<float>(i, j) = (float)(std::max({q[0], q[1], q[2]}) - std::min({q[0], q[1], q[2]}));
         }
     cv::Mat locmax;
     cv::dilate(lum, locmax, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(31, 31)));
-    cv::Mat mask(bg4.size(), CV_32F);
-    int npaper = 0;
+    // bright candidates (near the local brightness maximum); which of them are paper is decided
+    // by their colour relative to the paper's own colour (paper_mask)
+    cv::Mat cand(bg4.size(), CV_8U), A, B;
     for (int i = 0; i < bg4.rows; ++i)
         for (int j = 0; j < bg4.cols; ++j) {
             float l = lum.at<float>(i, j);
-            bool m = chroma.at<float>(i, j) < 24.f && l >= 0.88f * locmax.at<float>(i, j) && l > 40.f;
-            mask.at<float>(i, j) = m ? 1.f : 0.f;
-            npaper += m;
+            cand.at<uint8_t>(i, j) = l >= 0.88f * locmax.at<float>(i, j) && l > 40.f ? 1 : 0;
         }
+    float cnoise = 0.f;
+    cv::Mat mask = paper_mask(bg4, lum, cand, A, B, cnoise);
+    int npaper = cv::countNonZero(mask);
     if (npaper < (int)(0.01 * bg4.total()))
         for (int i = 0; i < bg4.rows; ++i)
             for (int j = 0; j < bg4.cols; ++j) mask.at<float>(i, j) = lum.at<float>(i, j) >= 0.9f * locmax.at<float>(i, j);
@@ -225,6 +433,33 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
             p.wb[c] = std::min(1.5f, std::max(0.6f, r[r.size() / 2]));
         }
     }
+    // paper colour per channel, P = S x local white balance: the chromaticity of the paper
+    // samples, filled in and smoothed (kRefSigma) like the paper colour reference of the
+    // mask. A colour cast that changes across the page (a lamp on one side, daylight on the
+    // other) is removed everywhere, not only on average; coloured areas are not paper samples
+    // and get the white balance of the paper around them.
+    p.paper.create(bg4.size(), CV_32FC4);
+    {
+        cv::Mat r[3];
+        for (int c = 0; c < 3; ++c) {
+            r[c].create(bg4.size(), CV_32F);
+            for (int i = 0; i < bg4.rows; ++i)
+                for (int j = 0; j < bg4.cols; ++j) r[c].at<float>(i, j) = bg4.ptr<uint8_t>(i)[4 * j + c] / std::max(1.f, lum.at<float>(i, j));
+            r[c] = fill_masked(r[c], mask, p.wb[c]);
+            cv::GaussianBlur(r[c], r[c], cv::Size(0, 0), kRefSigma);
+        }
+        // far from any paper sample the filled-in colour is a guess (the light may change
+        // colour across a shadow edge); there the global white balance is used
+        cv::Mat dens;
+        cv::GaussianBlur(mask, dens, cv::Size(0, 0), kRefSigma);
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j) {
+                float S = p.illum.at<float>(i, j), wl = smoothstep(0.05f, 0.3f, dens.at<float>(i, j));
+                cv::Vec4f& P = p.paper.at<cv::Vec4f>(i, j);
+                for (int c = 0; c < 3; ++c) P[c] = S * std::min(1.5f, std::max(0.6f, p.wb[c] + (r[c].at<float>(i, j) - p.wb[c]) * wl));
+                P[3] = 0.f;
+            }
+    }
     // paper noise: MAD of normalised luminance on paper pixels away from ink
     {
         std::vector<float> v;
@@ -232,8 +467,9 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
             for (int x = 1; x < page.cols; x += 3) {
                 int i = std::min(y / 4, mask.rows - 1), j = std::min(x / 4, mask.cols - 1);
                 if (mask.at<float>(i, j) <= 0) continue;
-                float vv[3];
-                normalise(page.ptr<uint8_t>(y) + 4 * x, illum_at(p.illum, (float)x, (float)y), p.wb, vv);
+                float vv[3], P[3];
+                paper_at(p.paper, (float)x, (float)y, P);
+                normalise(page.ptr<uint8_t>(y) + 4 * x, P, vv);
                 float l = luma(vv[0], vv[1], vv[2]);
                 if (l > 0.8f) v.push_back(l);   // ink excluded
             }
@@ -250,8 +486,8 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
     for (int i = 0; i < bg4.rows; ++i)
         for (int j = 0; j < bg4.cols; ++j) {
             const uint8_t* q = bg4.ptr<uint8_t>(i) + 4 * j;
-            float S = p.illum.at<float>(i, j), vv[3];
-            normalise(q, S, p.wb, vv);
+            float vv[3];
+            normalise(q, &p.paper.at<cv::Vec4f>(i, j)[0], vv);
             p.bgv.at<float>(i, j) = luma(vv[0], vv[1], vv[2]);
         }
     // picture weight (B&W), quarter grid. B&W thresholds every pixel against its local
@@ -263,20 +499,34 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
     // no ink; coloured text on paper has a paper background); pale tints and shadows on paper
     // that the illumination left over stay thresholded (white).
     {
-        auto smooth = [](float e0, float e1, float x) {
-            float t = std::min(std::max((x - e0) / (e1 - e0), 0.f), 1.f);
-            return t * t * (3.f - 2.f * t);
-        };
         cv::Mat pic(bg4.size(), CV_32F);
         for (int i = 0; i < bg4.rows; ++i)
             for (int j = 0; j < bg4.cols; ++j) {
                 float vv[3];
-                normalise(bg4.ptr<uint8_t>(i) + 4 * j, p.illum.at<float>(i, j), p.wb, vv);
+                normalise(bg4.ptr<uint8_t>(i) + 4 * j, &p.paper.at<cv::Vec4f>(i, j)[0], vv);
                 float b = p.bgv.at<float>(i, j);
                 float ch = std::max({vv[0], vv[1], vv[2]}) - std::min({vv[0], vv[1], vv[2]});
-                pic.at<float>(i, j) = std::max(smooth(0.45f, 0.3f, b), smooth(0.12f, 0.25f, ch) * smooth(0.85f, 0.65f, b));
+                pic.at<float>(i, j) = std::max(smoothstep(0.45f, 0.3f, b), smoothstep(0.12f, 0.25f, ch) * smoothstep(0.85f, 0.65f, b));
             }
         cv::blur(pic, p.pic, cv::Size(3, 3), cv::Point(-1, -1), cv::BORDER_REPLICATE);
+    }
+    // light-colour weight (tint), quarter grid: the local background is a distinct colour
+    // relative to the paper around it (a, b distance from the paper colour filled in from the
+    // paper samples: kTint0 -> kTint1) and light (bgv 0.7 -> 0.85). There the tone curves do not
+    // clip the paper-noise band to white, background cleanup does not whiten and specks are
+    // not removed: a light yellow, blue or pink area or a pale photo keeps its colour.
+    {
+        cv::Mat Af = fill_masked(A, mask, 0.f), Bf = fill_masked(B, mask, 0.f);
+        cv::GaussianBlur(Af, Af, cv::Size(0, 0), kRefSigma);
+        cv::GaussianBlur(Bf, Bf, cv::Size(0, 0), kRefSigma);
+        cv::Mat tint(bg4.size(), CV_32F);
+        const float tint0 = std::max(kTint0, kNoiseTint * cnoise);   // noisy paper: a larger distance
+        for (int i = 0; i < bg4.rows; ++i)
+            for (int j = 0; j < bg4.cols; ++j) {
+                float d = std::hypot(A.at<float>(i, j) - Af.at<float>(i, j), B.at<float>(i, j) - Bf.at<float>(i, j));
+                tint.at<float>(i, j) = smoothstep(tint0, tint0 + (kTint1 - kTint0), d) * smoothstep(0.7f, 0.85f, p.bgv.at<float>(i, j));
+            }
+        cv::blur(tint, p.tint, cv::Size(3, 3), cv::Point(-1, -1), cv::BORDER_REPLICATE);
     }
     p.ms = ms_since(t0);
     return p;
@@ -315,9 +565,10 @@ cv::Mat apply_paper(const cv::Mat& page, const cv::Mat& paper0, const PageParams
         const uint8_t* a = paper.ptr<uint8_t>(y);
         for (int x = 0; x < out.cols; ++x) {
             if (a[x] == 255) continue;
-            float al = a[x] / 255.f, S = illum_at(p.illum, (float)x, (float)y);
+            float al = a[x] / 255.f, P[3];
+            paper_at(p.paper, (float)x, (float)y, P);
             for (int c = 0; c < 3; ++c) {
-                float pc = std::min(255.f, S * p.wb[c] * 1.01f);   // clean paper (slightly above, so filters clip it)
+                float pc = std::min(255.f, P[c] * 1.01f);   // clean paper (slightly above, so filters clip it)
                 o[4 * x + c] = (uint8_t)std::lrint(o[4 * x + c] * al + pc * (1.f - al));
             }
         }
@@ -336,8 +587,9 @@ static cv::Mat ink_counts(const cv::Mat& img, const PageParams& p) {
                 for (int c = 0; c < 4; ++c) {
                     int y = 4 * i + r, x = 4 * j + c;
                     if (y >= img.rows || x >= img.cols) continue;
-                    float v[3];
-                    normalise(img.ptr<uint8_t>(y) + 4 * x, illum_at(p.illum, (float)x, (float)y), p.wb, v);
+                    float v[3], P[3];
+                    paper_at(p.paper, (float)x, (float)y, P);
+                    normalise(img.ptr<uint8_t>(y) + 4 * x, P, v);
                     float l = luma(v[0], v[1], v[2]);
                     n += (l < kInk ? 1 : 0) + (l < kSpeckLight ? 65536 : 0);
                 }
@@ -373,7 +625,7 @@ AdjustK adjust_constants(const Adjust& a0, bool specks) {
     return k;
 }
 
-static inline void adjust_px(const AdjustK& k, float* t) {
+static inline void adjust_px(const AdjustK& k, float* t, float tint) {
     if (k.levels)
         for (int c = 0; c < 3; ++c) {
             float u = std::min(std::max((t[c] - k.black) * k.inv_range, 0.f), 1.f);
@@ -388,6 +640,9 @@ static inline void adjust_px(const AdjustK& k, float* t) {
         float ch = std::max({t[0], t[1], t[2]}) - std::min({t[0], t[1], t[2]});
         float f = std::min(std::max((ch - kBgChroma0) / (kBgChroma1 - kBgChroma0), 0.f), 1.f);
         w = w * (1.f - f * f * (3.f - 2.f * f));
+        // nor where the local background is a light colour (tint): a pale pastel area has a
+        // per-pixel chroma near the noise level, but it is not a grey artefact on paper
+        w = w * (1.f - tint);
         for (int c = 0; c < 3; ++c) t[c] = t[c] + (1.f - t[c]) * w;
     }
 }
@@ -403,15 +658,17 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, c
     for (int y = 0; y < img.rows; ++y)
         for (int x = 0; x < img.cols; ++x) {
             const uint8_t* q = img.ptr<uint8_t>(y) + 4 * x;
-            float t[3];
+            float t[3], tint = 0.f;
             if (c.kind == 0) {
                 for (int k = 0; k < 3; ++k) t[k] = (float)q[k] * (1.f / 255.f);
             } else {
                 float px = full ? (float)x : (x + 0.5f) * sx - 0.5f, py = full ? (float)y : (y + 0.5f) * sy - 0.5f;
-                float v[3];
-                normalise(q, illum_at(p.illum, px, py), p.wb, v);
+                float v[3], P[3];
+                paper_at(p.paper, px, py, P);
+                normalise(q, P, v);
                 float l = luma(v[0], v[1], v[2]);
                 float b = std::max(illum_at(p.bgv, px, py), 0.05f), w = 0.f;
+                tint = illum_at(p.tint, px, py);
                 if (c.kind == 3) {
                     float r = l / b;
                     float wp = b < 0.97f ? c.wp_tint : c.wp;
@@ -423,13 +680,16 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, c
                     float ta = l >= c.wp ? 1.f : std::pow(l / c.wp, kPicGamma);
                     t[0] = t[1] = t[2] = tr + (ta - tr) * w;
                 } else {
-                    for (int k = 0; k < 3; ++k) t[k] = curve1(c, v[k]);
+                    // light colours: no clipping band below white, so their lighter channels are
+                    // not flattened to 1 along with the paper noise
+                    float wpe = c.wp + (1.f - c.wp) * tint;
+                    for (int k = 0; k < 3; ++k) t[k] = curve1(c, v[k], wpe);
                 }
                 // a speck (a few ink pixels with little else around them: a light stroke such as
                 // coloured text has many pixels below kSpeckLight) becomes the white of the paper
                 // around it, only where that background renders white (not in pictures, colour
                 // areas or tinted cells)
-                if (!cnt.empty() && l < kSpeckLight && b >= c.speck_bg && w < 0.5f) {
+                if (!cnt.empty() && l < kSpeckLight && b >= c.speck_bg && w < 0.5f && tint < 0.5f) {
                     int bi = std::min(y / 4, cnt.rows - 1), bj = std::min(x / 4, cnt.cols - 1), n = 0;
                     for (int di = -4; di <= 4; ++di)
                         for (int dj = -4; dj <= 4; ++dj) {
@@ -440,7 +700,7 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, c
                     if (ink >= 1 && ink <= ak.speck_max && light <= ak.speck_light) t[0] = t[1] = t[2] = 1.f;
                 }
             }
-            adjust_px(ak, t);
+            adjust_px(ak, t, tint);
             if (c.gray) t[0] = t[1] = t[2] = luma(t[0], t[1], t[2]);
             uint8_t* o = out.ptr<uint8_t>(y) + 4 * x;
             for (int k = 0; k < 3; ++k) {

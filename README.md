@@ -91,6 +91,27 @@ The filters lost colour and punched white holes into pictures. The root causes a
 
 Contact sheets and per-page measurements were made on the 34 pages and on synthetic pages: holes inside pictures at Auto 100% went from 18% to ≤ 0.5%, colour inside pictures is kept (chroma ratio about 1.0), and text marks lost at Auto 70% went from 44 to 4. The GLSL changes compile (glslc) but the GPU path was not run.
 
+### Filters: light colours kept
+
+Light colours (highlighter, pastel boxes and backgrounds, pale photos) were turned white. Root causes and fixes (`core/src/cleanup.cpp`, `solid.cpp`, `gpu.cpp`):
+- the paper test was "chroma < 24 levels" (absolute), so a bright, smooth light-colour area counted as paper. Its own brightness became the illumination and it was flattened to white. Under warm light the same test rejected the paper itself. Paper is now found by colour relative to the paper's own colour (`paper_mask`): seeds near the most common bright colour, grown over slow colour drift but not across colour edges, and separate pieces are kept only if they match the paper around them. Thresholds scale with the colour noise of the page;
+- the white point clipped the paper-noise band (`wp`..1) to white in every channel, which halved the chroma of pale colours. On light-colour areas (`tint` weight) the white point is now 1;
+- background cleanup and speck removal also skip light-colour areas;
+- white balance is now local (`PageParams::paper`), so mixed lighting leaves no tinted paper. Far from paper samples the global white balance is used;
+- Solid colors assumed white paper on pages without light low-chroma cells. Below strength 100% the light colour areas then merged with the slightly darker paper into one greyish rectangle.
+
+Synthetic pages (pastel boxes L 85-95 / C 8-30, highlighter, light-blue and pink text, pale photos; neutral, warm, dim and mixed lighting) at Auto 100%:
+- worst chroma ratio: 0.00 before, 1.01 after;
+- worst region turned white: 100% before, 0% after;
+- paper pixels ≥ 250: 75% before, 99.6% after.
+
+At Auto 70% with background cleanup 100%, the worst chroma ratio went from 0.11 to 0.88. Text darkness is unchanged. On the 34 real pages at Auto 100%, white paper went from 60% to 73.5% of the page. Remaining:
+- neutral light-grey boxes are still taken for paper;
+- the levels white point is applied as before;
+- one real page with glare and a blue shadow (`docres__190_in`) keeps a light grey band along the shadow edge.
+
+The GLSL compiles (glslc), but the GPU path was not run.
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.
