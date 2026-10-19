@@ -295,6 +295,7 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
         out = solid_colors(out, protect, &ss);
         s.solid_regions = ss.regions;
         s.solid_clusters = ss.clusters;
+        s.solid = ss;
         if (f == Filter::Grayscale)
             for (int y = 0; y < out.rows; ++y)
                 for (int x = 0; x < out.cols; ++x) {

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "nputil.h"
@@ -181,6 +183,7 @@ struct Region {
     cv::Rect box;
     cv::Vec3f bgr, lab;        // measured background colour (median, ink excluded)
     int area = 0, core = 0;
+    float noise = 0;           // 10-90% luminance spread of the raw cell texture
     bool fill = false, white = false;
     int cluster = -1;
 };
@@ -192,21 +195,62 @@ double median_of(std::vector<float>& v) {
 }
 
 // median colour and luminance spread of the pixels where `use` is set inside box
-bool measure(const cv::Mat& bgr, const cv::Mat& use, const cv::Rect& box, cv::Vec3f& col, float& spread, int& n) {
-    std::vector<float> ch[3], L;
-    for (int y = box.y; y < box.y + box.height; ++y)
-        for (int x = box.x; x < box.x + box.width; ++x) {
-            if (!use.at<uint8_t>(y, x)) continue;
-            const uint8_t* p = bgr.ptr<uint8_t>(y) + 3 * x;
-            for (int c = 0; c < 3; ++c) ch[c].push_back(p[c]);
-            L.push_back(lum8(p));
+// Median colour and luminance spread of a cell, measured only well away from its ink: a first
+// median over the candidate pixels, then everything clearly darker than that (ink, relative to
+// the cell's own colour) is dilated by 3 px and excluded, and the median is taken again.
+// `bgr` is the lightly smoothed page (no halftone texture), `raw` the page itself.
+// spread: 10-90% luminance range (smooth unevenness counts); detail: the same range of the
+// high-pass L - blur(L) (pictures, logos and halftone images have detail, uneven print does not).
+bool measure(const cv::Mat& bgr, const cv::Mat& use0, const cv::Rect& box, cv::Vec3f& col, float& spread, int& n,
+             const cv::Mat* raw = nullptr, float* raw_spread = nullptr, float* detail = nullptr) {
+    cv::Mat use = use0(box).clone(), L(box.size(), CV_32F);
+    std::vector<float> l0;
+    for (int y = 0; y < box.height; ++y)
+        for (int x = 0; x < box.width; ++x) {
+            float v = lum8(bgr.ptr<uint8_t>(box.y + y) + 3 * (box.x + x));
+            L.at<float>(y, x) = v;
+            if (use.at<uint8_t>(y, x)) l0.push_back(v);
         }
-    n = (int)L.size();
+    if (l0.size() < 30) return false;
+    float m0 = (float)median_of(l0);
+    cv::Mat inkm = (L < m0 - 14.f), inkd;
+    cv::dilate(inkm, inkd, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+    use.setTo(0, inkd);
+    std::vector<float> ch[3], Ls;
+    for (int y = 0; y < box.height; ++y)
+        for (int x = 0; x < box.width; ++x) {
+            if (!use.at<uint8_t>(y, x)) continue;
+            const uint8_t* p = bgr.ptr<uint8_t>(box.y + y) + 3 * (box.x + x);
+            for (int c = 0; c < 3; ++c) ch[c].push_back(p[c]);
+            Ls.push_back(L.at<float>(y, x));
+        }
+    n = (int)Ls.size();
     if (n < 30) return false;
     for (int c = 0; c < 3; ++c) col[c] = (float)median_of(ch[c]);
-    // robust spread: 90th - 10th percentile of luminance
-    std::sort(L.begin(), L.end());
-    spread = L[(size_t)(0.9 * (n - 1))] - L[(size_t)(0.1 * (n - 1))];
+    std::sort(Ls.begin(), Ls.end());
+    spread = Ls[(size_t)(0.9 * (n - 1))] - Ls[(size_t)(0.1 * (n - 1))];
+    if (detail) {
+        // blur only over the measured pixels (normalised convolution), so ink does not leak in
+        cv::Mat m, Lm, bl, bm;
+        use.convertTo(m, CV_32F, 1 / 255.0);
+        Lm = L.mul(m);
+        cv::GaussianBlur(Lm, bl, cv::Size(0, 0), 6.0);
+        cv::GaussianBlur(m, bm, cv::Size(0, 0), 6.0);
+        std::vector<float> hp;
+        for (int y = 0; y < box.height; ++y)
+            for (int x = 0; x < box.width; ++x)
+                if (use.at<uint8_t>(y, x) && bm.at<float>(y, x) > 0.2f) hp.push_back(L.at<float>(y, x) - bl.at<float>(y, x) / bm.at<float>(y, x));
+        std::sort(hp.begin(), hp.end());
+        *detail = hp.size() < 30 ? 0.f : hp[(size_t)(0.9 * (hp.size() - 1))] - hp[(size_t)(0.1 * (hp.size() - 1))];
+    }
+    if (raw && raw_spread) {   // texture of the unsmoothed pixels: the unmixing noise floor
+        std::vector<float> R;
+        for (int y = 0; y < box.height; ++y)
+            for (int x = 0; x < box.width; ++x)
+                if (use.at<uint8_t>(y, x)) R.push_back(lum8(raw->ptr<uint8_t>(box.y + y) + 3 * (box.x + x)));
+        std::sort(R.begin(), R.end());
+        *raw_spread = R[(size_t)(0.9 * (R.size() - 1))] - R[(size_t)(0.1 * (R.size() - 1))];
+    }
     return true;
 }
 
@@ -221,6 +265,8 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
     cv::dilate(g, bg, cv::Mat::ones(9, 9, CV_8U));
     cv::medianBlur(bg, bg, 41);
     cv::subtract(bg, g, diff, cv::noArray(), CV_16S);
+    cv::Mat bgr_s;
+    cv::GaussianBlur(bgr, bgr_s, cv::Size(0, 0), 1.5);   // colour / spread measured without halftone texture
     // ---- grid lines (clean.py): segments, short segments, inferred borders, wobbly ends, snap
     cv::Mat ink = diff > 45;
     Lines H = clean_segments(ink, true), V = clean_segments(ink, false);
@@ -242,9 +288,9 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
     cv::Mat prot = cv::Mat::zeros(h, w, CV_8U);
     for (const auto& r : protect)
         cv::rectangle(prot, cv::Point((int)(r.x0 * w), (int)(r.y0 * h)), cv::Point((int)(r.x1 * w), (int)(r.y1 * h)), cv::Scalar(255), cv::FILLED);
-    // (d) colour measurement only well away from ink and lines: any visible mark, dilated 3 px
+    // (d) colour measurement only well away from lines (here) and ink (per cell, in measure())
     cv::Mat away;
-    cv::dilate((diff > 16) | lines, away, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+    cv::dilate(lines, away, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
     away = (away == 0) & (prot == 0);
     cv::Mat lab, stats, cen;
     int n = cv::connectedComponentsWithStats(lines == 0, lab, stats, cen, 4);
@@ -264,21 +310,44 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
         Region rg{i, R, {}, {}, ar};
         float spread = 0;
         S.regions++;
-        if (pin > 0.3 * ar || !measure(bgr, use, R, rg.bgr, spread, rg.core)) { S.skipped++; continue; }
+        float detail = 0;
+        if (pin > 0.3 * ar || !measure(bgr_s, use, R, rg.bgr, spread, rg.core, &bgr, &rg.noise, &detail)) { S.skipped++; continue; }
         // (f) pictures, gradients, logos: too much colour variation once ink is removed
-        if (spread > 14.f) { S.skipped_varied++; continue; }
         rg.lab = lab_of(rg.bgr);
+        if (getenv("FS_SOLID_DEBUG"))
+            std::fprintf(stderr, "region %d box %d,%d %dx%d area %d core %d  L %.1f a %.1f b %.1f C %.1f spread %.1f detail %.1f noise %.1f\n", i, x, y, ww,
+                         hh, ar, rg.core, rg.lab[0], rg.lab[1], rg.lab[2], chroma(rg.lab), spread, detail, rg.noise);
+        // (f) pictures / logos (local detail) and designed gradients (large smooth range) stay as they are
+        if (detail > 18.f || spread > 45.f) { S.skipped_varied++; continue; }
         reg_of_label[i] = (int)regs.size();
         regs.push_back(rg);
     }
-    // paper lightness: the low-chroma regions near the top of the lightness range
-    std::vector<float> Lp;
-    for (auto& r : regs)
-        if (chroma(r.lab) < 6 && r.lab[0] > 80) Lp.push_back(r.lab[0]);
-    float Lpaper = Lp.empty() ? 100.f : (float)percentile(Vec(Lp.begin(), Lp.end()), 75);
-    // (c) fill only colours that clearly differ from paper; the rest becomes pure white
+    // paper colour: the low-chroma cells near the top of the lightness range (after Auto color
+    // this is pure white; with Original it is the page's own paper)
+    cv::Vec3d paper(100, 0, 0);
+    {
+        // area-weighted 75th percentile of L, and median a, b, over the low-chroma light cells:
+        // the paper itself, not pulled down by grey cells
+        std::vector<std::pair<float, double>> Ls, as, bs;
+        double wsum = 0;
+        for (auto& r : regs)
+            if (chroma(r.lab) < 3 && r.lab[0] > 85) {
+                Ls.push_back({r.lab[0], (double)r.area}); as.push_back({r.lab[1], (double)r.area}); bs.push_back({r.lab[2], (double)r.area});
+                wsum += r.area;
+            }
+        auto wq = [&](std::vector<std::pair<float, double>> v, double q) {
+            std::sort(v.begin(), v.end());
+            double acc = 0;
+            for (auto& e : v) { acc += e.second; if (acc >= q * wsum) return (double)e.first; }
+            return (double)v.back().first;
+        };
+        if (wsum > 0) paper = cv::Vec3d(wq(Ls, 0.75), wq(as, 0.5), wq(bs, 0.5));
+    }
+    auto dE_paper = [&](const cv::Vec3f& lab) { return cv::norm(cv::Vec3d(lab) - paper); };
+    // (c) candidates differ from paper at all; the fill / white decision is taken per colour
+    // cluster below, so cells of one colour are never split between filled and white
     for (auto& r : regs) {
-        r.fill = chroma(r.lab) > 10.f || r.lab[0] < Lpaper - 8.f;
+        r.fill = dE_paper(r.lab) >= 3.0;
         r.white = !r.fill;
     }
     // (e) coloured areas not enclosed by lines: large uniform coloured blobs at 1/4 resolution
@@ -299,7 +368,7 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
         for (int y = 0; y < ql.rows; ++y)
             for (int x = 0; x < ql.cols; ++x) {
                 cv::Vec3f c = ql.at<cv::Vec3f>(y, x);
-                bool coloured = (chroma(c) > 12.f || c[0] < Lpaper - 12.f) && c[0] > 35.f;
+                bool coloured = cv::norm(cv::Vec3d(c) - paper) >= 8.0 && c[0] > 35.f;
                 col.at<uint8_t>(y, x) = coloured && takenq.at<uint8_t>(y, x) < 64 ? 255 : 0;
             }
         cv::morphologyEx(col, col, cv::MORPH_OPEN, cv::Mat::ones(4, 4, CV_8U));
@@ -323,10 +392,10 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
             cv::Mat use = cv::Mat::zeros(h, w, CV_8U);
             use(R).setTo(255, away(R) & (taken(R) == 0));
             Region rg{-1, R, {}, {}, R.area()};
-            float spread = 0;
-            if (!measure(bgr, use, R, rg.bgr, spread, rg.core) || spread > 14.f) continue;
+            float spread = 0, detail = 0;
+            if (!measure(bgr_s, use, R, rg.bgr, spread, rg.core, &bgr, &rg.noise, &detail) || detail > 18.f || spread > 45.f) continue;
             rg.lab = lab_of(rg.bgr);
-            if (!(chroma(rg.lab) > 10.f || rg.lab[0] < Lpaper - 8.f)) continue;
+            if (dE_paper(rg.lab) < 5.0) continue;
             rg.fill = true;
             regs.push_back(rg);
             S.blobs++;
@@ -353,9 +422,19 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
         cl.erase(cl.begin() + bb);
     }
     std::vector<cv::Vec3f> fillc(regs.size(), cv::Vec3f(255, 255, 255));
-    for (size_t c = 0; c < cl.size(); ++c)
-        for (int k : cl[c].mem) { regs[k].cluster = (int)c; fillc[k] = bgr_of(cv::Vec3f(cl[c].lab)); }
-    S.clusters = (int)cl.size();
+    int ncl = 0;
+    for (size_t c = 0; c < cl.size(); ++c) {
+        // a cluster is filled only if it clearly differs from paper (dE >= 5); else pure white
+        bool coloured = cv::norm(cl[c].lab - paper) >= 5.0 &&
+                        !(cl[c].lab[0] >= paper[0] - 1.0 && std::hypot(cl[c].lab[1], cl[c].lab[2]) < 5.0);   // whiter than paper
+        ncl += coloured;
+        for (int k : cl[c].mem) {
+            regs[k].cluster = (int)c;
+            if (coloured) fillc[k] = bgr_of(cv::Vec3f(cl[c].lab));
+            else { regs[k].fill = false; regs[k].white = true; }
+        }
+    }
+    S.clusters = ncl;
     // ---- fill map: region index per pixel, propagated into the line-centre pixels (h)
     cv::Mat owner(h, w, CV_32F, cv::Scalar(0));     // region index + 1
     for (size_t k = 0; k < regs.size(); ++k) {
@@ -396,8 +475,10 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
                     if (lq < li) { li = lq; I = Q; }
                 }
             }
+            // below the cell's own texture level a pixel is background (flattened to the fill)
+            float f0 = std::max(6.f, 0.6f * r.noise);
             float t = 0.f;
-            if (lb - li >= 12.f && lb - lp >= 6.f) t = std::min(1.f, std::max(0.f, (lb - lp) / (lb - li)));
+            if (lb - li >= f0 + 12.f && lb - lp > f0) t = std::min(1.f, std::max(0.f, (lb - lp - f0) / (lb - li - f0)));
             uint8_t* o = out.ptr<uint8_t>(y) + 4 * x;
             for (int c = 0; c < 3; ++c) o[c] = (uint8_t)std::lrint(t * I[c] + (1.f - t) * F[c]);
         }

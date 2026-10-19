@@ -68,6 +68,7 @@ struct RenderStats {
     bool gpu_filter = false;
     double ms_filter = 0, ms_solid = 0;
     int solid_regions = 0, solid_clusters = 0;
+    SolidStats solid;
 };
 
 // Paper fill, filter (GPU or CPU), then Solid colors (not with Black & white).

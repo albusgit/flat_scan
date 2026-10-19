@@ -4,13 +4,17 @@
 //     inferred borders, wobbly ends, snap), after closing collinear gaps of up to ~15 px
 //  b. all cell colours of the page are clustered in Lab (merge while dE76 < 7, area weighted)
 //     and every cell gets its cluster's colour, so same-colour cells match exactly
-//  c. a cell is filled only if it clearly differs from paper (chroma > 10 or L more than 8
-//     below paper); otherwise it becomes pure white
+//  c. a cell is filled only if its colour cluster clearly differs from the page's paper colour
+//     (dE76 >= 5 from the low-chroma, light cells); otherwise it becomes pure white. Decided per
+//     cluster, so one colour is never split. (A fixed "chroma > 10" cut loses the light blue and
+//     lavender cells of scan p3, chroma 3-7 but clearly tinted; a cast on a white cell after
+//     Auto color stays below dE 5.)
 //  d. the colour is measured only on pixels > 3 px away from any ink or line; ink is re-mixed
 //     with its own coverage (unmixing against the old background), so no halos remain
 //  e. large uniform coloured areas not enclosed by lines are found as blobs at 1/4
 //     resolution; their rectangle edges snap to grid lines within 30 px
-//  f. regions with a large colour spread after removing ink (pictures, gradients, logos) and
+//  f. regions with local detail after removing ink (pictures, logos: high-pass 10-90% range
+//     > 18 levels) or a large smooth range (designed gradients: > 45 levels), and
 //     regions mostly inside a protected rectangle are left untouched
 //  g. ink is never recoloured: its colour is the darkest nearby pixel's own colour
 //  h. the fill reaches the line centres (line pixels take the nearest cell's fill as background)

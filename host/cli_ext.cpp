@@ -223,9 +223,9 @@ static int cmd_render(int argc, char** argv) {
         cv::Mat o3;
         cv::cvtColor(og, o3, cv::COLOR_BGRA2BGR);
         cv::imwrite(dir + "/f" + std::to_string(k) + (solid ? "_solid" : "") + ".png", o3);
-        std::printf("%s{\"filter\": \"%s\", \"gpu\": %d, \"gpu_ms\": %.0f, \"cpu_ms\": %.0f, \"solid_ms\": %.0f, \"gpu_vs_cpu_max\": %.0f, \"values_gt1\": %d, \"regions\": %d, \"clusters\": %d}",
+        std::printf("%s{\"filter\": \"%s\", \"gpu\": %d, \"gpu_ms\": %.0f, \"cpu_ms\": %.0f, \"solid_ms\": %.0f, \"gpu_vs_cpu_max\": %.0f, \"values_gt1\": %d, \"regions\": %d, \"clusters\": %d, \"filled\": %d, \"white\": %d, \"skipped\": %d, \"varied\": %d, \"blobs\": %d}",
                     first ? "" : ", ", filter_name(f), (int)sg.gpu_filter, sg.ms_filter, sc.ms_filter, sg.ms_solid, mx,
-                    cv::countNonZero(d.reshape(1) > 1), sg.solid_regions, sg.solid_clusters);
+                    cv::countNonZero(d.reshape(1) > 1), sg.solid_regions, sg.solid_clusters, sg.solid.filled, sg.solid.white, sg.solid.skipped, sg.solid.skipped_varied, sg.solid.blobs);
         first = false;
     }
     std::printf("]}\n");
