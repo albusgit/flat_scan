@@ -210,6 +210,21 @@ The refinement trusted every traced "line" to be straight on the paper, and bent
 
 The thumb's hole now often takes in the background strip beside it (skin share 0.499 on the receipt), so the skin share needed is 35 % (was 50 %). Every other candidate on the 35 photos that reaches 35 % is rejected by the reach or ink tests, or is background at a page corner.
 
+## Round 7: small form boxes and colour-area boundaries as lines
+
+Both in `warpmap.cpp`, app path, neural pages only.
+
+- **Box corners** (`corner_pairs`): the receipt's discount column is a stack of small open boxes ("┌", ~85 × 65 px). Neither side reaches a found rule, so they were never traced and their tops, tilted by the fold, stayed tilted. A horizontal and a vertical stroke ≥ 45 px each, ≤ 9 px thick, whose ends meet within 10 px form a corner, and both are traced. The horizontal stroke must continue a found rule of its row across a gap < 80 px; without that test, bold poster letters ("B", "4") and product label outlines on the flyer counted as corners. The pieces are found unjoined (a box top 20 px from the next column's rule is its own piece) and stay separate lines; `share_ideals` still gives them their row's height. All 8 tilted box tops are straight now.
+- **Colour-area boundaries** (`colour_edges`): the darkness map sees only dark ink, so on a page of colour blocks a cell boundary the net left wavy had no constraint (the flyer `dewarpnet__14_2`: the boundary beside the OGX bottle bowed by 19 px over 400 px, in an S). The page is grey-closed 9 × 9 (text and rules go, colour areas stay), and each pixel's step is 2.5 × the Lab distance between the 8-px means on either side. Steps > 30 make segments as ink does. Each piece is traced with its own threshold, and the pieces chain into one boundary when they continue each other. Rules for a chain:
+  - within 2° of the axis (content tilted on the paper is no warp);
+  - straight like a rule, except that a chain over 500 px may bow by min(4 % of its length, 25 px). That long a step is a cell or column boundary, and its wave is what the net left.
+  - Samples where the darkness map already found the same boundary as a line are left out, because two traces of one edge a few px apart tear the page between them.
+  - The outer 25 px are skipped (the paper's own edge).
+
+  The flyer's boundary now varies by 3 px (was 19), and the shampoo can's right side on the crease is straight. A small jog remains on the can's left side at the fold.
+- **35 photos** vs round 6 (same binary otherwise, geometry only): text-row spread mean 1.26° / p90 2.57° unchanged; table-line p90 dev. p90 17.6 → 16.0 px. Receipt table lines 7.0 → 1.0 px; `docscanner__27_2` 18.0 → 0.0 px. Edges fired on 14 pages, no page newly rejected by the distortion guard.
+- Desktop CLI: `FS_NO_EDGES=1` turns the colour edges off; `FS_MAX_DIST=x` overrides the distortion guard; `FS_DUMP=P` also writes `P_det.png`, the line stage's |det J − 1| per 8-px cell (× 1000).
+
 ### Filters: light colours kept
 
 Light colours (highlighter, pastel boxes and backgrounds, pale photos) were turned white. Root causes and fixes (`core/src/cleanup.cpp`, `solid.cpp`, `gpu.cpp`):

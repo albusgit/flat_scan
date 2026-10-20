@@ -700,7 +700,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------ pages
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
-            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=6"
+            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7"
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no

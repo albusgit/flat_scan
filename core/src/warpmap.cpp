@@ -415,10 +415,10 @@ Field grid_to_grid(const Field& F, int g_to, int gw, int gh) {
 }
 
 // ------------------------------------------------------------------ clean.py line segments
-Lines segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150) {
+Lines segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150, bool merge = true, int close = 31) {
     cv::Mat m0, m;
     cv::morphologyEx(ink, m0, cv::MORPH_OPEN, hz ? rect(klen, 1) : rect(1, klen));
-    cv::morphologyEx(m0, m, cv::MORPH_CLOSE, hz ? rect(31, 1) : rect(1, 31));
+    cv::morphologyEx(m0, m, cv::MORPH_CLOSE, hz ? rect(close, 1) : rect(1, close));
     cv::Mat lab, st, cen;
     int n = cv::connectedComponentsWithStats(m, lab, st, cen, 8);
     Lines segs;
@@ -444,6 +444,7 @@ Lines segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150) {
         else segs.push_back({pos, (double)y, (double)(y + h - 1), median(cc), (double)L});
     }
     std::stable_sort(segs.begin(), segs.end(), [](const Line& a, const Line& b) { return a[0] < b[0]; });
+    if (!merge) return segs;
     Lines out;
     for (const auto& s : segs) {
         bool done = false;
@@ -483,6 +484,44 @@ Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const 
         if (touches(s, perp, 7) || (one_end && s[4] >= 45 && touches(s, perp, 7, 1))) add.push_back(s);
     }
     return add;
+}
+
+// app: small open boxes ("┌", a form's discount column) have no side that reaches a found rule, so
+// neither short pass takes them, and a box top tilted by a local curl stayed tilted. A horizontal and
+// a vertical stroke of >= 45 px each whose ends meet within 10 px form a corner; both count. Horizontal
+// ink is widened by 2 px here (a 3-px rule leaning 5 deg breaks into ~35-px runs). Strokes at most
+// 9 px thick, widening included: a poster's bold letters ("B", "4") have such corners, printed
+// rules are thin. And the horizontal one must continue a found rule of its row across a gap < 80 px
+// (the boxes sit in a form's rows; a product's label outline on a flyer does not).
+void corner_pairs(const cv::Mat& ink_h, const cv::Mat& ink_v, const Lines& H, const Lines& V, const Lines& Hs, const Lines& Vs,
+                  Lines& Hc, Lines& Vc) {
+    cv::Mat ih;
+    cv::dilate(ink_h, ih, rect(1, 5));
+    Lines hs = segments(ih, true, 25, 45, false, 7), vs = segments(ink_v, false, 25, 45, false, 7);   // unjoined: a box top 20 px from a column's rule is its own piece
+    auto known = [](const Line& s, const Lines& A, const Lines& B) {
+        for (const Lines* L : {&A, &B})
+            for (const auto& o : *L)
+                if (std::fabs(o[0] - s[0]) < 12 && s[1] <= o[2] + 10 && s[2] >= o[1] - 10) return true;
+        return false;
+    };
+    std::vector<char> uh(hs.size(), 0), uv(vs.size(), 0);
+    for (size_t i = 0; i < hs.size(); ++i) {
+        if (hs[i][4] > 300 || hs[i][3] > 9 || known(hs[i], H, Hs)) continue;
+        bool row = false;   // continues a table rule of its row (a box top in a form's column)
+        for (const Lines* L : {&H, &Hs})
+            for (const auto& o : *L)
+                row |= std::fabs(o[0] - hs[i][0]) <= 8 && std::max(o[1], hs[i][1]) - std::min(o[2], hs[i][2]) < 80;
+        if (!row) continue;
+        for (size_t j = 0; j < vs.size(); ++j) {
+            if (vs[j][4] > 300 || vs[j][3] > 9 || known(vs[j], V, Vs)) continue;
+            const Line &h = hs[i], &v = vs[j];
+            bool xe = std::fabs(v[0] - h[1]) < 10 || std::fabs(v[0] - h[2]) < 10;
+            bool ye = std::fabs(h[0] - v[1]) < 10 || std::fabs(h[0] - v[2]) < 10;
+            if (xe && ye) uh[i] = uv[j] = 1;
+        }
+    }
+    for (size_t i = 0; i < hs.size(); ++i) if (uh[i]) Hc.push_back(hs[i]);
+    for (size_t j = 0; j < vs.size(); ++j) if (uv[j]) Vc.push_back(vs[j]);
 }
 
 Lines merge_gap(Lines L, double tol = 8, double maxgap = 60) {
@@ -726,10 +765,16 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
     Lines Hs = short_segments(ink_h, true, H, HV, faint);
+    Lines Hc, Vc;
+    if (faint) corner_pairs(ink_h, ink_v, H, V, Hs, Vs, Hc, Vc);
     Lines h2 = H; h2.insert(h2.end(), Hs.begin(), Hs.end());
     Lines v2 = V; v2.insert(v2.end(), Vs.begin(), Vs.end());
     H = merge_gap(h2);
     V = merge_gap(v2);
+    // corner pieces stay their own lines: merged with a column's rule beside them, the one trace
+    // follows the rule and drops the tilted piece (share_ideals still gives them one height)
+    H.insert(H.end(), Hc.begin(), Hc.end());
+    V.insert(V.end(), Vc.begin(), Vc.end());
     auto clip = [faint](Lines& A, const Lines& B, double tol) {
         for (auto& L : A) {
             bool any = false;
@@ -1102,6 +1147,148 @@ std::vector<std::array<double, 3>> text_margins(const cv::Mat& Dm, const Lines& 
     return out;
 }
 
+// App, neural pages: long straight boundaries between colour areas (a flyer's cells, a can's side)
+// as lines. The darkness map sees only dark ink, so on a page of colour blocks a cell boundary the
+// net left wavy had no constraint at all. The page is closed (grey 9x9, per channel: text and rules
+// go, colour areas stay), and the step across each pixel is the Lab distance of the 8-px means on
+// either side (x 2.5; a photo's soft edge is ~10 px wide). Steps above 30 make segments as ink does (long
+// pass only, widened 2 px across for gentle waves); a segment beside a found rule is left out, as
+// are the outer 25 px (the paper's own edge). Each is traced like a rule, with the line's own
+// threshold. A trace must be near the axis (chord within 2 deg: content tilted on the paper - a
+// leaning bottle - is no residual warp) and straight like a rule (3 px + 1 % of its length), except
+// that one over 500 px may bow by 4 % of its length: that long a step is a cell or column boundary,
+// and its wave is what the net left.
+void colour_edges(const cv::Mat& img, const Lines& H, const Lines& V, std::vector<std::array<double, 3>>& eh,
+                  std::vector<std::array<double, 3>>& ev, Lines& EH, Lines& EV, int& nbowed) {
+    const int h = img.rows, w = img.cols, border = 25;
+    cv::Mat cl, lab;
+    cv::morphologyEx(img, cl, cv::MORPH_CLOSE, cv::Mat::ones(9, 9, CV_8U));
+    cv::cvtColor(cl, lab, cv::COLOR_BGR2Lab);
+    lab.convertTo(lab, CV_32FC3);
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool hz = pass == 0;   // horizontal edges: steps along y
+        cv::Mat B;
+        cv::blur(lab, B, hz ? cv::Size(5, 8) : cv::Size(8, 5));
+        cv::Mat S(h, w, CV_32F, cv::Scalar(0));
+        for (int y = border; y < h - border; ++y)
+            for (int x = border; x < w - border; ++x) {
+                const cv::Vec3f &q1 = hz ? B.at<cv::Vec3f>(y + 5, x) : B.at<cv::Vec3f>(y, x + 5),
+                                &q0 = hz ? B.at<cv::Vec3f>(y - 5, x) : B.at<cv::Vec3f>(y, x - 5);
+                cv::Vec3f d = q1 - q0;
+                S.at<float>(y, x) = std::min(255.f, 2.5f * std::sqrt(d.dot(d)));
+            }
+        cv::Mat mask = S > 30.f;
+        cv::dilate(mask, mask, hz ? rect(1, 5) : rect(5, 1));
+        // pieces unjoined: a column boundary is a step only where the cells on either side differ,
+        // and one trace from the middle of the whole column stops at the first such gap
+        Lines segs = segments(mask, hz, 100, 150, false, 7);
+        const Lines& ink = hz ? H : V;
+        Lines keep;
+        for (const auto& s : segs) {
+            bool dup = false;
+            for (const auto& o : ink)
+                dup |= std::fabs(o[0] - s[0]) < 15 && std::min(o[2], s[2]) - std::max(o[1], s[1]) > 0.5 * (s[2] - s[1]);
+            if (!dup) keep.push_back(s);
+        }
+        DView D{S.ptr<float>(), S.rows, S.cols};
+        const long n_a = hz ? w : h, n_c = hz ? h : w;
+        struct Piece { Vec t, c; double t0, t1, c0, c1, med, wd; };
+        std::vector<Piece> pieces;
+        for (size_t li = 0; li < keep.size(); ++li) {
+            const Line& L = keep[li];
+            double p = L[0], a = L[1], b = L[2];
+            Vec pk;
+            for (long k = std::max(0L, pyint(a)); k <= std::min(n_a - 1, pyint(b)); k += 4) {
+                float m = 0;
+                for (long q = std::max(0L, pyint(p) - 3); q <= std::min(n_c - 1, pyint(p) + 3); ++q)
+                    m = std::max(m, hz ? D.at((int)q, (int)k) : D.at((int)k, (int)q));
+                pk.push_back(m);
+            }
+            double thr = pk.empty() ? 60 : std::min(60.0, std::max(25.0, 0.75 * median(pk)));
+            std::vector<long> t;
+            Vec c, wd;
+            trace_w2(D, p, std::max(0.0, a - 40), std::min((double)n_a - 1, b + 40), hz, t, c, wd, 25, nullptr, 16, thr);   // a step's response is ~16 px wide however thin the mask
+            std::vector<char> ok = chain_trace(t, c, wd, nullptr);
+            Vec tv, cv;
+            for (size_t i = 0; i < t.size(); ++i)
+                if (ok[i]) { tv.push_back((double)t[i]); cv.push_back(c[i]); }
+            if (tv.size() < 20) continue;
+            Vec mf = median_filter1d_nearest(cv, 31);
+            // where the darkness map found the same boundary as a line, that line has it: two traces
+            // of one edge a few px apart tear the page between them
+            auto inked = [&](double tq, double cq) {
+                for (const auto& o : ink)
+                    if (std::fabs(o[0] - cq) < 15 && o[1] - 20 <= tq && tq <= o[2] + 20) return true;
+                return false;
+            };
+            Piece P;
+            for (size_t i = 0; i < tv.size(); ++i)
+                if (std::fabs(cv[i] - mf[i]) < 1.5 && !inked(tv[i], cv[i])) { P.t.push_back(tv[i]); P.c.push_back(cv[i]); }
+            if (P.t.size() < 20 || P.t.back() - P.t.front() < 60) continue;
+            P.t0 = P.t.front(); P.t1 = P.t.back(); P.c0 = P.c.front(); P.c1 = P.c.back();
+            P.med = median(P.c); P.wd = L[3];
+            pieces.push_back(std::move(P));
+        }
+        // a boundary's pieces (where the cells on either side differ) chain into one line when they
+        // continue each other: medians within 20 px, a gap < 100 px, facing ends within 12 px + 10 %
+        // of the gap. The tests apply to the chain - a piece through the wave alone leans or bows.
+        const size_t np_ = pieces.size();
+        std::vector<size_t> parent(np_);
+        for (size_t i = 0; i < np_; ++i) parent[i] = i;
+        std::function<size_t(size_t)> find = [&](size_t i) { return parent[i] == i ? i : parent[i] = find(parent[i]); };
+        for (size_t i = 0; i < np_; ++i)
+            for (size_t j = i + 1; j < np_; ++j) {
+                const Piece &A = pieces[i], &Bq = pieces[j];
+                if (std::fabs(A.med - Bq.med) > 20) continue;
+                const Piece &lo = A.t0 <= Bq.t0 ? A : Bq, &hi = A.t0 <= Bq.t0 ? Bq : A;
+                double gap = hi.t0 - lo.t1;
+                bool link;
+                if (gap < 0) {   // overlapping: within 6 px of each other where both run
+                    double s = 0;
+                    int m = 0;
+                    for (size_t k = 0; k < hi.t.size() && hi.t[k] <= lo.t1; k += 4) { s += std::fabs(hi.c[k] - interp(hi.t[k], lo.t, lo.c)); ++m; }
+                    link = m > 0 && s / m <= 6;
+                } else {
+                    link = gap < 100 && std::fabs(hi.c0 - lo.c1) <= 12 + 0.1 * gap;
+                }
+                if (link) parent[find(i)] = find(j);
+            }
+        std::map<size_t, std::vector<size_t>> chains;
+        for (size_t i = 0; i < np_; ++i) chains[find(i)].push_back(i);
+        for (const auto& kv : chains) {
+            std::vector<std::pair<double, double>> s;
+            double wd = 0;
+            for (size_t i : kv.second) {
+                for (size_t k = 0; k < pieces[i].t.size(); ++k) s.push_back({pieces[i].t[k], pieces[i].c[k]});
+                wd = std::max(wd, pieces[i].wd);
+            }
+            std::sort(s.begin(), s.end());
+            Vec tv2, cv2;
+            for (const auto& q : s) { tv2.push_back(q.first); cv2.push_back(q.second); }
+            const double len = tv2.back() - tv2.front();
+            if (tv2.size() < 40 || len < 150) continue;
+            Vec pf = polyfit(tv2, cv2, 1), dev;
+            for (size_t i = 0; i < tv2.size(); ++i) dev.push_back(std::fabs(cv2[i] - polyval(pf, tv2[i])));
+            std::sort(dev.begin(), dev.end());
+            const double p95 = dev[(size_t)(0.95 * (dev.size() - 1))];
+            const double lim = len > 500 ? std::min(25.0, 3 + 0.04 * len) : 3 + 0.01 * len;
+            if (std::fabs(pf[0]) > 0.035 || p95 > lim) { ++nbowed; continue; }
+            const double ideal = median(cv2);
+            auto& out = hz ? eh : ev;
+            size_t i = 0;
+            while (i < tv2.size()) {   // 4-px bins
+                long bin = (long)np_floordiv(tv2[i], BIN);
+                size_t j = i;
+                double st = 0, sc = 0;
+                while (j < tv2.size() && (long)np_floordiv(tv2[j], BIN) == bin) { st += tv2[j]; sc += cv2[j]; ++j; }
+                out.push_back({st / (double)(j - i), ideal, sc / (double)(j - i) - ideal});
+                i = j;
+            }
+            (hz ? EH : EV).push_back({ideal, tv2.front(), tv2.back(), wd, len});
+        }
+    }
+}
+
 Field zero_field(int gw, int gh, int g) {
     Field f;
     f.gw = gw; f.gh = gh; f.g = g;
@@ -1124,7 +1311,7 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust) {
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1249,6 +1436,15 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
         drop(d.M, false);
     }
+    if (edges && share_rows) {
+        Lines eh, ev;
+        colour_edges(d.A_img, d.H, d.V, d.EH, d.EV, eh, ev, d.n_edge_bowed);
+        d.n_edges_h = (int)eh.size();
+        d.E_lines = eh;
+        d.E_lines.insert(d.E_lines.end(), ev.begin(), ev.end());
+        drop(d.EH, true);
+        drop(d.EV, false);
+    }
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
@@ -1278,11 +1474,16 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
             double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
             xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);   // TEXT_W = 1
         }
+        for (const auto& r : d.EH) {
+            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
+        }
         Field warm_y, warm_x;
         if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
         std::vector<std::array<double, 2>> xyv;
         Vec valv;
-        for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M})
+        for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
+                                                              (const std::vector<std::array<double, 3>>*)&d.EV})
             for (const auto& r : *src) {
                 double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
                 xyv.push_back({r[1], ys}); valv.push_back(r[2]);

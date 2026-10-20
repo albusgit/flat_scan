@@ -79,6 +79,8 @@ int main(int argc, char** argv) {
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
     o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
     o.robust_solve = std::getenv("FS_NO_ROBUST") == nullptr;
+    o.colour_edges = std::getenv("FS_NO_EDGES") == nullptr;
+    if (const char* md = std::getenv("FS_MAX_DIST")) o.max_line_distortion = std::atof(md), o.max_line_distortion_frac = 1;
     if (std::getenv("FS_NO_SOFTEN")) o.max_local_rescale = 0;
     if (const char* st = std::getenv("FS_SOFTEN_THR")) o.max_local_rescale = std::atof(st);
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
@@ -200,7 +202,7 @@ int main(int argc, char** argv) {
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;
@@ -258,6 +260,19 @@ int main(int argc, char** argv) {
             t << "V " << L[0] << " " << L[1] << " " << L[2] << " " << L[3] << " " << L[4] << "\n";
         }
         cv::imwrite(p + "_segs.jpg", v, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // PREFIX_det.png: |det J - 1| of the line stage per 8-px cell (x 1000, 0.2 = 200), stage-1 size / 8
+        const fs::Field &Fx = r.warp.Fx, &Fy = r.warp.Fy;
+        if (Fx.gw > 3 && Fx.gh > 3) {
+            cv::Mat dm(Fx.gh, Fx.gw, CV_8U, cv::Scalar(0));
+            for (int i = 0; i + 1 < Fx.gh; ++i)
+                for (int j = 0; j + 1 < Fx.gw; ++j) {
+                    auto V = [&](const fs::Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
+                    double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
+                    double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
+                    dm.at<uint8_t>(i, j) = (uint8_t)std::min(255.0, 1000 * std::fabs((1 + xx) * (1 + yy) - xy * yx - 1));
+                }
+            cv::imwrite(p + "_det.png", dm);
+        }
     }
     if (r.ok && std::string(argv[2]) != "-") {
         cv::Mat bgr;

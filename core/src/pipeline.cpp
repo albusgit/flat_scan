@@ -456,6 +456,11 @@ std::vector<std::array<float, 5>> fitted_lines(const WarpDebug& d, int W, int H,
     };
     for (const auto& L : d.H) add(0, L[1], L[0], L[2], L[0]);
     for (const auto& L : d.V) add(0, L[0], L[1], L[0], L[2]);
+    for (size_t i = 0; i < d.E_lines.size(); ++i) {   // colour-area boundaries, drawn as grid lines
+        const auto& L = d.E_lines[i];
+        if ((int)i < d.n_edges_h) add(2, L[1], L[0], L[2], L[0]);
+        else add(2, L[0], L[1], L[0], L[2]);
+    }
     // text rows: consecutive samples of one row share its ideal position
     for (size_t i = 0; i < d.T.size();) {
         size_t j = i;
@@ -754,7 +759,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
         warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows, opt.faint_lines,
-                           opt.robust_solve);
+                           opt.robust_solve, opt.colour_edges);
         r.lines = fitted_lines(r.warp, W, H, r.rot);
         // on a UVDoc page the line refinement only corrects what is left: a correction that
         // stretches or squeezes the page locally is a tracing failure (dense staves, broken table
