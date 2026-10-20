@@ -262,7 +262,17 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
         double skin_frac = (double)cv::countNonZero(skin(cv::Rect(x, y, bw, bh)) & comp) / area;
         // a finger reaches into the page: it is not a thin sliver along the border
         int reach = std::min(std::min(x + bw, w - x), std::min(y + bh, h - y));
-        double edge_frac = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & comp) / area;
+        // ink inside the candidate, its own outline (finger edge, nail, the page rule beside it) left out
+        cv::Mat inner;
+        cv::erode(comp, inner, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
+        int n_inner = cv::countNonZero(inner);
+        double edge_frac = n_inner > 0.2 * area ? (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & inner) / n_inner : 1.0;
+        if (std::getenv("FS_DEBUG_FINGERS")) {
+            cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
+            double whole = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & comp) / area;
+            std::fprintf(stderr, "finger cand %d,%d %dx%d area %d skin %.3f reach %d edge %.4f whole %.4f dY %.1f dCr %.1f dCb %.1f\n", x, y, bw, bh, area,
+                         skin_frac, reach, edge_frac, whole, cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2]);
+        }
         if (skin_frac < 0.5 || reach < 2 * border || edge_frac > 0.03) continue;
         fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
     }
@@ -637,7 +647,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         warp4 = identity_grid(W, H);
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
-        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows);
+        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows, opt.faint_lines);
         r.lines = fitted_lines(r.warp, W, H, r.rot);
         // on a UVDoc page the line refinement only corrects what is left: a correction that
         // stretches or squeezes the page locally is a tracing failure (dense staves, broken table
@@ -645,7 +655,22 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         if (r.mode == GeomMode::Neural) {
             double frac = 0, p99 = local_distortion(r.warp, &frac);
             r.line_distortion = p99;
-            if (p99 > opt.max_line_distortion || frac > opt.max_line_distortion_frac) {
+            bool bad = p99 > opt.max_line_distortion || frac > opt.max_line_distortion_frac;
+            if (bad && opt.faint_lines) {
+                // the faint rules may be what overstretches it (picture edges, a rule traced into
+                // text): the reference lines alone
+                WarpDebug w2;
+                GridMap m2 = unwarp_map(stage1, &w2, ignore.empty() ? nullptr : &ignore, opt.share_rows, false);
+                double f2 = 0, q2 = local_distortion(w2, &f2);
+                if (q2 <= opt.max_line_distortion && f2 <= opt.max_line_distortion_frac) {
+                    warp4 = std::move(m2);
+                    r.warp = std::move(w2);
+                    r.lines = fitted_lines(r.warp, W, H, r.rot);
+                    r.line_distortion = q2;
+                    bad = false;
+                }
+            }
+            if (bad) {
                 warp4 = identity_grid(W, H);
                 r.lines_rejected = true;
             }

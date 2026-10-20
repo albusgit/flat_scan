@@ -74,6 +74,7 @@ struct PipelineOptions {
     double uv_min_agreement_quad = 0.85;   // ... vs the corners when they were set by hand (no mask)
     bool line_stage = true;           // the warp map (line refinement) on top of stage 1
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
+    bool faint_lines = true;          // also find and trace printed rules too pale for the darkness-45 threshold (warpmap faint_rules)
     bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
     double max_line_distortion = 0.2;        // UVDoc pages: line refinement kept only below these
     double max_line_distortion_frac = 0.01;  // (local area change p99, share of cells above 0.2)

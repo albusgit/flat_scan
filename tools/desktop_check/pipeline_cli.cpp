@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <string>
 
@@ -76,6 +77,7 @@ int main(int argc, char** argv) {
     o.perspective_only = std::getenv("FS_PERSPECTIVE_ONLY") != nullptr;
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
+    o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
     if (const char* ig = std::getenv("FS_IGNORE")) {
@@ -187,6 +189,23 @@ int main(int argc, char** argv) {
         f << "}";
     }
     std::printf("%s\n", f.str().c_str());
+    // FS_DUMP=PREFIX: the stage-1 page (PREFIX_stage1.png) and the line tracer's segments on it
+    // (PREFIX_segs.jpg: red horizontal, blue vertical; PREFIX_segs.txt: kind pos start end width length)
+    if (const char* dp = std::getenv("FS_DUMP"); dp && r.ok && !r.stage1.empty()) {
+        std::string p = dp;
+        cv::imwrite(p + "_stage1.png", r.stage1);
+        cv::Mat v = r.stage1.clone();
+        std::ofstream t(p + "_segs.txt");
+        for (const auto& L : r.warp.H) {
+            cv::line(v, cv::Point((int)L[1], (int)L[0]), cv::Point((int)L[2], (int)L[0]), {0, 0, 255}, 2);
+            t << "H " << L[0] << " " << L[1] << " " << L[2] << " " << L[3] << " " << L[4] << "\n";
+        }
+        for (const auto& L : r.warp.V) {
+            cv::line(v, cv::Point((int)L[0], (int)L[1]), cv::Point((int)L[0], (int)L[2]), {255, 0, 0}, 2);
+            t << "V " << L[0] << " " << L[1] << " " << L[2] << " " << L[3] << " " << L[4] << "\n";
+        }
+        cv::imwrite(p + "_segs.jpg", v, {cv::IMWRITE_JPEG_QUALITY, 85});
+    }
     if (r.ok && std::string(argv[2]) != "-") {
         cv::Mat bgr;
         cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);

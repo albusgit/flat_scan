@@ -145,7 +145,50 @@ std::vector<DLine> merge_lines(std::vector<std::pair<std::vector<double>, std::v
     return lines;
 }
 
-void dewarp_detect(const cv::Mat& img, std::vector<DLine>& Hs, std::vector<DLine>& Vs) {
+// App only (faint_lines): long, thin, isolated runs of faint ink along one axis - printed rules too
+// light for the darkness-45 threshold (pale grey form rules, blurry low-resolution photos blown up
+// to page size, where a rule's darkness is 40 - 55). At a low threshold text rows merge into long
+// runs too; those are thick, or have ink on both sides of the run, and are left out. A rule needs
+// paper on at least one side (text may sit on it). Df: darkness (float, background - gray).
+cv::Mat faint_rules(const cv::Mat& Df, bool hz, int klen, double lo = 25, double maxw = 7) {
+    cv::Mat ink = Df > lo, m;
+    cv::morphologyEx(ink, m, cv::MORPH_OPEN, hz ? rect(klen, 1) : rect(1, klen));
+    cv::Mat lab, st, cen;
+    int n = cv::connectedComponentsWithStats(m, lab, st, cen, 8);
+    cv::Mat out = cv::Mat::zeros(m.size(), CV_8U);
+    auto Dat = [&](int along, double across) {
+        int a = (int)std::lround(across);
+        int r = hz ? a : along, c = hz ? along : a;
+        if (r < 0 || c < 0 || r >= Df.rows || c >= Df.cols) return 0.f;
+        return Df.at<float>(r, c);
+    };
+    for (int i = 1; i < n; ++i) {
+        int x = st.at<int>(i, 0), y = st.at<int>(i, 1), w = st.at<int>(i, 2), h = st.at<int>(i, 3);
+        int L = hz ? w : h, X = hz ? h : w;
+        if (L < klen) continue;
+        Vec widths, centre, side;
+        for (int k = 0; k < L; ++k) {
+            long cnt = 0, s = 0;
+            for (int q = 0; q < X; ++q) {
+                int r = hz ? y + q : y + k, c = hz ? x + k : x + q;
+                if (lab.at<int>(r, c) == i) { ++cnt; s += q; }
+            }
+            if (cnt == 0) continue;
+            double ctr = (double)s / cnt + (hz ? y : x), off = cnt / 2.0 + 4;
+            int along = hz ? x + k : y + k;
+            widths.push_back((double)cnt);
+            centre.push_back(Dat(along, ctr));
+            side.push_back(std::min(Dat(along, ctr - off), Dat(along, ctr + off)));
+        }
+        if (widths.empty() || median(widths) > maxw || median(side) >= 0.4 * median(centre)) continue;
+        cv::Mat roi = out(cv::Rect(x, y, w, h));
+        cv::Mat sel = lab(cv::Rect(x, y, w, h)) == i;
+        roi.setTo(255, sel);
+    }
+    return out;
+}
+
+void dewarp_detect(const cv::Mat& img, std::vector<DLine>& Hs, std::vector<DLine>& Vs, bool faint = false) {
     cv::Mat g, bg;
     cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
     cv::dilate(g, bg, cv::Mat::ones(9, 9, CV_8U));
@@ -155,8 +198,14 @@ void dewarp_detect(const cv::Mat& img, std::vector<DLine>& Hs, std::vector<DLine
         for (int x = 0; x < g.cols; ++x) ink.at<uint8_t>(y, x) = ((int)bg.at<uint8_t>(y, x) - (int)g.at<uint8_t>(y, x)) > 45 ? 255 : 0;
     cv::Mat hm, vm;
     cv::morphologyEx(ink, hm, cv::MORPH_OPEN, rect(120, 1));
-    cv::morphologyEx(hm, hm, cv::MORPH_CLOSE, rect(25, 3));
     cv::morphologyEx(ink, vm, cv::MORPH_OPEN, rect(1, 120));
+    if (faint) {
+        cv::Mat Df;
+        cv::subtract(bg, g, Df, cv::noArray(), CV_32F);
+        hm |= faint_rules(Df, true, 120);
+        vm |= faint_rules(Df, false, 120);
+    }
+    cv::morphologyEx(hm, hm, cv::MORPH_CLOSE, rect(25, 3));
     cv::morphologyEx(vm, vm, cv::MORPH_CLOSE, rect(3, 25));
     Hs = merge_lines(comp_samples(hm, true, 250));
     Vs = merge_lines(comp_samples(vm, false, 250));
@@ -649,14 +698,19 @@ cv::Mat darkness_fast(const cv::Mat& img) {
     return D;
 }
 
-void get_lines(const cv::Mat& D, Lines& H, Lines& V) {
+void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     cv::Mat ink = D > 45.f;   // 0 / 255
-    H = segments(ink, true);
-    V = segments(ink, false);
-    Lines Vs = short_segments(ink, false, V, H);
+    cv::Mat ink_h = ink, ink_v = ink;
+    if (faint) {   // app: faint printed rules too (faint_rules)
+        ink_h = ink | faint_rules(D, true, 100);
+        ink_v = ink | faint_rules(D, false, 100);
+    }
+    H = segments(ink_h, true);
+    V = segments(ink_v, false);
+    Lines Vs = short_segments(ink_v, false, V, H);
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
-    Lines Hs = short_segments(ink, true, H, HV);
+    Lines Hs = short_segments(ink_h, true, H, HV);
     Lines h2 = H; h2.insert(h2.end(), Hs.begin(), Hs.end());
     Lines v2 = V; v2.insert(v2.end(), Vs.begin(), Vs.end());
     H = merge_gap(h2);
@@ -733,7 +787,7 @@ void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
 }
 
 Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* prior_dx, const Field* prior_dy, int threads,
-                bool share_rows = false) {
+                bool share_rows = false, bool faint = false) {
     Samples out;
     for (int pass = 0; pass < 2; ++pass) {
         bool hz = pass == 0;
@@ -760,7 +814,21 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 prior = &prior_v;
             }
             long maxrun = pyround(std::max(7.0, 1.5 * th));
-            trace_w2(D, p, a2, b2, hz, t, c, wd, maxrun, prior);
+            // faint (app): the tracing threshold from the line's own darkness (0.75 x its median
+            // peak across +-3 px, 25 .. 60), so a pale rule is followed; dark rules keep 60
+            double thr = 60;
+            if (faint) {
+                Vec pk;
+                long n_c = hz ? D.rows : D.cols, n_a = hz ? D.cols : D.rows;
+                for (long k = std::max(0L, pyint(a)); k <= std::min(n_a - 1, pyint(b)); k += 4) {
+                    float m = 0;
+                    for (long q = std::max(0L, pyint(p) - 3); q <= std::min(n_c - 1, pyint(p) + 3); ++q)
+                        m = std::max(m, hz ? D.at((int)q, (int)k) : D.at((int)k, (int)q));
+                    pk.push_back(m);
+                }
+                if (!pk.empty()) thr = std::min(60.0, std::max(25.0, 0.75 * median(pk)));
+            }
+            trace_w2(D, p, a2, b2, hz, t, c, wd, maxrun, prior, 16, thr);
             std::vector<char> ok = chain_trace(t, c, wd, prior);
             size_t n = t.size();
             auto count = [&] { size_t s = 0; for (char q : ok) s += q; return s; };
@@ -921,7 +989,7 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows) {
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -947,7 +1015,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     std::vector<DLine> Hs, Vs;
     std::vector<cv::Point2d> sp, dp;
     try {
-        dewarp_detect(src, Hs, Vs);
+        dewarp_detect(src, Hs, Vs, faint);
         build_controls(Hs, Vs, sp, dp);
     } catch (const std::exception&) {
         sp.clear(); dp.clear();
@@ -1029,7 +1097,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     d.ms.emplace_back("global_remap+darkness", ms_since(t0));
     t0 = Clock::now();
     // ---- local stage (local_field)
-    get_lines(d.D, d.H, d.V);
+    get_lines(d.D, d.H, d.V, faint);
     const int GC = 16, GF = 8;
     if (d.H.empty() || d.V.empty()) {
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
@@ -1040,7 +1108,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         return compose_maps(d, w, h);
     }
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
-    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows);
+    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
     drop(d.S1.h, true);
     drop(d.S1.v, false);
@@ -1054,7 +1122,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         const Samples& S = it == 0 ? d.S1 : d.S2;
         if (it == 1) {
             auto tc = Clock::now();
-            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows);
+            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint);
             drop(d.S2.h, true);
             drop(d.S2.v, false);
             d.ms.emplace_back("trace pass2", ms_since(tc));

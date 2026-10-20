@@ -47,11 +47,14 @@ struct WarpDebug {
 // straightened position falls on a non-zero pixel are left out of the fit (the user marked
 // those lines as wrong). Null: the reference behaviour. share_rows (app): pieces of one ruled
 // line share their ideal position (see share_ideals in warpmap.cpp); false: the reference.
-GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false);
+// faint (app): printed rules too pale for the reference's darkness threshold are found and traced
+// too (thin, isolated runs at darkness > 25; per-line tracing threshold); false: the reference.
+GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false,
+                   bool faint = false);
 
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);
-void get_lines(const cv::Mat& D, Lines& H, Lines& V);
+void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint = false);
 // clean.segments / clean.short_segments (morphological axis-aligned line segments)
 Lines clean_segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150);
 Lines clean_short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp);
