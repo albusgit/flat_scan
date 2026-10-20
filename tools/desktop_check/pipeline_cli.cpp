@@ -80,6 +80,27 @@ int main(int argc, char** argv) {
     o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
+    // FS_SHADE_NET=MODEL.onnx: the shadow net, run by tools/shadow_net/run_onnx.py with FS_PYTHON
+    // (raw float32 files next to OUT); FS_SHADE_AFTER: after SyntheticDoc's map; FS_SHADE_LS: long side
+    if (const char* sm = std::getenv("FS_SHADE_NET")) {
+        std::string model = sm, py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
+        std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
+        std::string fin = base + ".shin.f32", fout = base + ".shout.f32";
+        std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
+        o.shade_net = [=](std::vector<float>& io, int w, int h) {
+            { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
+            std::string cmd = "\"\"" + py + "\" -I \"" + script + "\" \"" + model + "\" \"" + fin + "\" \"" + fout + "\" " +
+                              std::to_string(w) + " " + std::to_string(h) + "\"";
+            if (std::system(cmd.c_str()) != 0) return false;
+            std::ifstream f(fout, std::ios::binary);
+            f.read((char*)io.data(), io.size() * 4);
+            bool ok = (size_t)f.gcount() == io.size() * 4;
+            std::remove(fin.c_str()); std::remove(fout.c_str());
+            return ok;
+        };
+        o.shade_after_uv = std::getenv("FS_SHADE_AFTER") != nullptr;
+        if (const char* ls = std::getenv("FS_SHADE_LS")) o.shade_long_side = std::atoi(ls);
+    }
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
         size_t p = 0;
@@ -147,7 +168,7 @@ int main(int argc, char** argv) {
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "]}";
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << "}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;

@@ -7,6 +7,8 @@
 #include <functional>
 #include <map>
 #include <numeric>
+#include <atomic>
+#include <cstdlib>
 #include <thread>
 
 #include "nprng.h"
@@ -458,23 +460,25 @@ Lines segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150) {
     return out;
 }
 
-bool touches(const Line& seg, const Lines& perp, double tol) {
+bool touches(const Line& seg, const Lines& perp, double tol, int need = 2) {
     int ok = 0;
     for (double end : {seg[1], seg[2]})
         for (const auto& p : perp)
             if (std::fabs(p[0] - end) < tol && p[1] - tol <= seg[0] && seg[0] <= p[2] + tol) { ++ok; break; }
-    return ok == 2;
+    return ok >= need;
 }
 
-Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp) {
+// one_end (app): a segment of >= 45 px touching a perpendicular line at one end also counts - box
+// sides whose other edge is printed too faintly to be found (text strokes are shorter)
+Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp, bool one_end = false) {
     Lines segs = segments(ink, hz, 35, 35), add;
     for (const auto& s : segs) {
-        if (s[4] >= 150) continue;
+        if (s[4] >= 150 && !one_end) continue;   // the long pass has it (unless it leans: app)
         bool dup = false;
         for (const auto& o : long_segs)
             if (std::fabs(o[0] - s[0]) < 12 && s[1] <= o[2] + 10 && s[2] >= o[1] - 10) { dup = true; break; }
         if (dup) continue;
-        if (touches(s, perp, 7)) add.push_back(s);
+        if (touches(s, perp, 7) || (one_end && s[4] >= 45 && touches(s, perp, 7, 1))) add.push_back(s);
     }
     return add;
 }
@@ -704,18 +708,24 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     if (faint) {   // app: faint printed rules too (faint_rules)
         ink_h = ink | faint_rules(D, true, 100);
         ink_v = ink | faint_rules(D, false, 100);
+        // ... and leaning vertical ones: a 3-px rule leaning 5 deg leaves a 1-px column after
+        // ~30 px, so the short box sides where a page curls (the receipt's totals boxes) were never
+        // seen. Widened by 2 px across the line, rules up to ~7 deg give long runs; the tracer then
+        // follows the line itself (the widening is symmetric, so positions are unchanged). Not
+        // for horizontal rules: there it joins the letters of a text row into false rules.
+        cv::dilate(ink_v, ink_v, rect(5, 1));
     }
     H = segments(ink_h, true);
     V = segments(ink_v, false);
-    Lines Vs = short_segments(ink_v, false, V, H);
+    Lines Vs = short_segments(ink_v, false, V, H, faint);
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
-    Lines Hs = short_segments(ink_h, true, H, HV);
+    Lines Hs = short_segments(ink_h, true, H, HV, faint);
     Lines h2 = H; h2.insert(h2.end(), Hs.begin(), Hs.end());
     Lines v2 = V; v2.insert(v2.end(), Vs.begin(), Vs.end());
     H = merge_gap(h2);
     V = merge_gap(v2);
-    auto clip = [](Lines& A, const Lines& B, double tol) {
+    auto clip = [faint](Lines& A, const Lines& B, double tol) {
         for (auto& L : A) {
             bool any = false;
             double mn = 1e300, mx = -1e300;
@@ -723,8 +733,11 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
             for (const auto& P : B)
                 if (P[1] - 15 <= L[0] && L[0] <= P[2] + 15 && P[4] > 80) { mn = std::min(mn, P[0]); mx = std::max(mx, P[0]); ++cnt; any = true; }
             if (any && cnt >= 2) {
-                L[1] = std::max(L[1], mn - tol);
-                L[2] = std::min(L[2], mx + tol);
+                double a = std::max(L[1], mn - tol), b = std::min(L[2], mx + tol);
+                // app: a box side whose far edge is too faint to be found keeps its length
+                if (faint && b - a < 0.5 * (L[2] - L[1])) continue;
+                L[1] = a;
+                L[2] = b;
                 L[4] = L[2] - L[1];
             }
         }
@@ -763,18 +776,28 @@ void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
     std::vector<size_t> parent(n);
     for (size_t i = 0; i < n; ++i) parent[i] = i;
     std::function<size_t(size_t)> find = [&](size_t i) { return parent[i] == i ? i : parent[i] = find(parent[i]); };
-    std::vector<double> ideal(n, 0), t0(n, 0), t1(n, 0);
+    std::vector<double> ideal(n, 0), t0(n, 0), t1(n, 0), c0(n, 0), c1(n, 0);   // c0 / c1: traced position at t0 / t1
     for (size_t i = 0; i < n; ++i) {
         if (per[i].empty()) continue;
         ideal[i] = per[i][0][1];
         t0[i] = 1e300; t1[i] = -1e300;
-        for (const auto& r : per[i]) { t0[i] = std::min(t0[i], r[0]); t1[i] = std::max(t1[i], r[0]); }
+        for (const auto& r : per[i]) {
+            if (r[0] < t0[i]) { t0[i] = r[0]; c0[i] = r[1] + r[2]; }
+            if (r[0] > t1[i]) { t1[i] = r[0]; c1[i] = r[1] + r[2]; }
+        }
     }
     for (size_t i = 0; i < n; ++i)
         for (size_t j = i + 1; j < n; ++j) {
-            if (per[i].empty() || per[j].empty() || std::fabs(ideal[i] - ideal[j]) > 6) continue;
+            if (per[i].empty() || per[j].empty()) continue;
             double gap = std::max(t0[i], t0[j]) - std::min(t1[i], t1[j]);
-            if (gap < 80) parent[find(i)] = find(j);
+            if (std::fabs(ideal[i] - ideal[j]) <= 6 && gap < 80) { parent[find(i)] = find(j); continue; }
+            // pieces that physically continue each other (their traces meet within 5 px across a
+            // gap < 40 px) are one line even when a curl moved one piece's ideal (box sides
+            // stacked down a curled page edge)
+            if (std::fabs(ideal[i] - ideal[j]) <= 20 && gap < 40 && gap > -10) {
+                double meet = t1[i] <= t0[j] + 10 ? std::fabs(c1[i] - c0[j]) : std::fabs(c1[j] - c0[i]);
+                if (meet <= 5) parent[find(i)] = find(j);
+            }
         }
     std::vector<double> sum(n, 0), cnt(n, 0);
     for (size_t i = 0; i < n; ++i)
@@ -798,6 +821,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         double lo = 1e300, hi = -1e300;
         for (const auto& L : lines) { lo = std::min(lo, L[1]); hi = std::max(hi, L[2]); }
         std::vector<std::vector<std::array<double, 3>>> per(lines.size());
+        std::atomic<int> bowed{0};
         auto one = [&](size_t li) {
             const Line& L = lines[li];
             double p = L[0], a = L[1], b = L[2], th = L[3];
@@ -858,6 +882,17 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
             Vec tv, cv;
             for (size_t i = 0; i < n; ++i)
                 if (ok[i]) { tv.push_back((double)t[i]); cv.push_back(c[i]); }
+            // share_rows (app, neural pages): the stage-1 page is already flat, so its ruled lines
+            // are nearly straight; a trace that bows (p95 distance from its straight fit above
+            // 3 px + 1% of its length) is a curve - an ellipse's top, a stamp, a rule traced into
+            // text - and straightening it would bend everything around it
+            if (share_rows && tv.size() >= 8) {
+                Vec pf = polyfit(tv, cv, 1);
+                Vec dev;
+                for (size_t i = 0; i < tv.size(); ++i) dev.push_back(std::fabs(cv[i] - polyval(pf, tv[i])));
+                std::sort(dev.begin(), dev.end());
+                if (dev[(size_t)(0.95 * (dev.size() - 1))] > 3 + 0.01 * (tv.back() - tv.front())) { ++bowed; return; }
+            }
             // 4-px bins of consecutive samples
             Vec tt, cc;
             {
@@ -902,6 +937,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
             ts.emplace_back([&, k] { for (size_t li = k; li < lines.size(); li += nt) one(li); });
         for (auto& q : ts) q.join();
         if (share_rows) share_ideals(per);
+        out.n_bowed += bowed;
         for (auto& r : per) rows_out.insert(rows_out.end(), r.begin(), r.end());
     }
     return out;
@@ -965,6 +1001,100 @@ std::vector<std::array<double, 3>> text_rows(const cv::Mat& Dm, const Lines& H, 
         ++nrows;
     }
     return rows;
+}
+
+// App: the aligned edges of text columns as vertical lines. A justified (or left / right aligned)
+// column's edge is straight on the page, and on a magazine page without vertical rules it is the
+// only vertical cue (a bowed column edge was left as it was). Text-line blobs as in text_rows; their
+// left (and right) ends are chained down the page - each step at most 6 px across, at most ~3.5
+// median line heights down, so an indented first line or a short last line is skipped - and a chain of
+// >= 8 lines over >= 250 px whose ends sit within 2 px (rms) of a smooth curve (a polynomial of
+// degree 2 / 3 / 4 for chains under 500 / 900 / over 900 px - a page's bow is no parabola; ragged
+// edges fail) gives samples (along y, ideal x, disp) every 6 px, like a traced vertical rule.
+std::vector<std::array<double, 3>> text_margins(const cv::Mat& Dm, const Lines& H, const Lines& V, int& nchains, double step = 6) {
+    int h = Dm.rows, w = Dm.cols;
+    cv::Mat ink = (Dm > 70.f) / 255;
+    cv::Mat lines = cv::Mat::zeros(h, w, CV_8U);
+    auto fill = [&](long r0, long r1, long c0, long c1) {
+        r0 = std::max(0L, r0); c0 = std::max(0L, c0);
+        r1 = std::min((long)h, r1); c1 = std::min((long)w, c1);
+        if (r1 > r0 && c1 > c0) lines(cv::Range((int)r0, (int)r1), cv::Range((int)c0, (int)c1)).setTo(1);
+    };
+    for (const auto& L : H) fill(pyint(std::max(0.0, L[0] - L[3] / 2 - 4)), pyint(L[0] + L[3] / 2 + 5), pyint(L[1]), pyint(L[2]) + 1);
+    for (const auto& L : V) fill(pyint(L[1]), pyint(L[2]) + 1, pyint(std::max(0.0, L[0] - L[3] / 2 - 4)), pyint(L[0] + L[3] / 2 + 5));
+    ink.setTo(0, lines > 0);
+    cv::Mat words;
+    cv::morphologyEx(ink, words, cv::MORPH_CLOSE, rect(31, 1));
+    cv::morphologyEx(words, words, cv::MORPH_OPEN, cv::Mat::ones(3, 3, CV_8U));
+    words.setTo(0, lines > 0);
+    cv::Mat lab, st, cen;
+    int n = cv::connectedComponentsWithStats(words, lab, st, cen, 8);
+    struct Blob { double x0, x1, y, hh; };
+    std::vector<Blob> B;
+    for (int i = 1; i < n; ++i) {
+        int x = st.at<int>(i, 0), y = st.at<int>(i, 1), ww = st.at<int>(i, 2), hh = st.at<int>(i, 3);
+        if (ww < 140 || !(10 <= hh && hh <= 55) || ww < 5 * hh) continue;
+        B.push_back({(double)x, (double)(x + ww - 1), cen.at<double>(i, 1), (double)hh});
+    }
+    std::sort(B.begin(), B.end(), [](const Blob& a, const Blob& b) { return a.y < b.y; });
+    Vec hs;
+    for (const auto& b : B) hs.push_back(b.hh);
+    const double hh_med = hs.empty() ? 20 : median(hs);   // line height (a short last line's blob is lower)
+    std::vector<std::array<double, 3>> out;
+    nchains = 0;
+    for (int side = 0; side < 2; ++side) {
+        auto e = [&](size_t k) { return side == 0 ? B[k].x0 : B[k].x1; };
+        std::vector<char> used(B.size(), 0);
+        for (size_t s0 = 0; s0 < B.size(); ++s0) {
+            if (used[s0]) continue;
+            std::vector<size_t> ch{s0};
+            size_t last = s0;
+            for (size_t k = s0 + 1; k < B.size(); ++k) {
+                if (B[k].y - B[last].y > 3.5 * hh_med + 4) break;
+                if (used[k] || B[k].y <= B[last].y + 0.5 * hh_med) continue;
+                if (std::fabs(e(k) - e(last)) <= 6) { ch.push_back(k); last = k; }
+            }
+            if (ch.size() < 8 || B[ch.back()].y - B[ch.front()].y < 250) continue;
+            Vec ys, xs;
+            for (size_t k : ch) { ys.push_back(B[k].y); xs.push_back(e(k)); }
+            const double y_mid = 0.5 * (ys.front() + ys.back()), y_sc = std::max(1.0, 0.5 * (ys.back() - ys.front()));
+            const double span = ys.back() - ys.front();
+            const int deg = span > 900 ? 4 : span > 500 ? 3 : 2;
+            auto U = [&](double y) { return (y - y_mid) / y_sc; };   // fit in [-1, 1]
+            std::vector<char> keep(ys.size(), 1);
+            Vec p;
+            double rms = 0;
+            for (int it = 0; it < 3; ++it) {
+                Vec ky, kx;
+                for (size_t k = 0; k < ys.size(); ++k)
+                    if (keep[k]) { ky.push_back(U(ys[k])); kx.push_back(xs[k]); }
+                if ((int)ky.size() < std::max(8, 3 * (deg + 1))) { p.clear(); break; }
+                p = polyfit(ky, kx, deg);
+                double ss = 0; int m = 0;
+                for (size_t k = 0; k < ys.size(); ++k) {
+                    double r = std::fabs(polyval(p, U(ys[k])) - xs[k]);
+                    keep[k] = r <= 4;
+                    if (keep[k]) { ss += r * r; ++m; }
+                }
+                rms = m ? std::sqrt(ss / m) : 1e9;
+            }
+            if (p.empty() || rms > 2) continue;
+            Vec ky;
+            for (size_t k = 0; k < ys.size(); ++k)
+                if (keep[k]) ky.push_back(ys[k]);
+            if (ky.size() < 8 || ky.back() - ky.front() < 250) continue;
+            for (size_t k : ch) used[k] = 1;
+            long nt = (long)std::ceil((ky.back() + 1 - ky.front()) / step);
+            Vec tt(nt), xc(nt);
+            for (long k = 0; k < nt; ++k) { tt[k] = ky.front() + k * step; xc[k] = polyval(p, U(tt[k])); }
+            double ideal = np_mean(xc), mxd = 0;
+            for (double v : xc) mxd = std::max(mxd, std::fabs(v - ideal));
+            if (mxd > 40) continue;
+            for (long k = 0; k < nt; ++k) out.push_back({tt[k], ideal, xc[k] - ideal});
+            ++nchains;
+        }
+    }
+    return out;
 }
 
 Field zero_field(int gw, int gh, int g) {
@@ -1110,6 +1240,10 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
     d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
+    if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
+        d.M = text_margins(d.D, d.H, d.V, d.n_margins);
+        drop(d.M, false);
+    }
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
@@ -1143,10 +1277,11 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
         std::vector<std::array<double, 2>> xyv;
         Vec valv;
-        for (const auto& r : SS.v) {
-            double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
-            xyv.push_back({r[1], ys}); valv.push_back(r[2]);
-        }
+        for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M})
+            for (const auto& r : *src) {
+                double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
+                xyv.push_back({r[1], ys}); valv.push_back(r[2]);
+            }
         Field Fy, Fx;
         // every sample of one direction ignored: nothing to straighten that way
         std::thread ty([&] {

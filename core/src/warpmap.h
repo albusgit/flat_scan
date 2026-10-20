@@ -25,6 +25,7 @@ struct Field {
 
 struct Samples {      // collect(): rows (along, ideal, disp)
     std::vector<std::array<double, 3>> h, v;
+    int n_bowed = 0;  // traces left out as curves (share_rows)
 };
 
 struct WarpDebug {
@@ -32,6 +33,8 @@ struct WarpDebug {
     Lines H, V;
     Samples S1, S2;
     std::vector<std::array<double, 3>> T;
+    std::vector<std::array<double, 3>> M;          // app: aligned text-column edges (along y, ideal x, disp)
+    int n_margins = 0;
     std::vector<std::array<double, 4>> G_lines;   // global-stage grid lines: [horizontal (1/0), straightened
                                                   // position, start, end] (stage-1 frame)
     int n_ignored = 0;                            // samples dropped by the ignore mask
