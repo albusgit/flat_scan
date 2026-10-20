@@ -7,6 +7,11 @@ fun interface ProgressListener {
     fun onProgress(percent: Int, stage: String)
 }
 
+/** The shadow net ([ShadeNet]): planar BGR [0, 1], 3 x height x width in, the shading map (same layout) out, or null. */
+fun interface ShadeNetRunner {
+    fun shade(input: FloatArray, width: Int, height: Int): FloatArray?
+}
+
 /** Filters of the filter strip; [id] is the native enum value (core/src/cleanup.h Filter). */
 enum class FilterKind(val id: Int, val label: String) {
     Original(0, "Original"),
@@ -67,14 +72,15 @@ object NativeLib {
      * ignore: areas whose lines the warp map must not use, page fractions [x0, y0, x1, y1, ...].
      * uvOut / uvCrop, uvOut2 / uvCrop2: flattening-net grids ([FlatNet.run]) for those crops of this
      * photo (the first is preferred; the straighter stage-1 page wins), or null. uvShading:
-     * SyntheticDoc's shading map for its crop (shadow removal), or null.
+     * SyntheticDoc's shading map for its crop (shadow removal), or null. shadeNet: the shadow net, run
+     * on the flattened page after SyntheticDoc's map, or null.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
         uvOut: FloatArray?, uvCrop: IntArray?, uvOut2: FloatArray?, uvCrop2: IntArray?, uvShading: FloatArray?,
-        listener: ProgressListener?,
+        shadeNet: ShadeNetRunner?, listener: ProgressListener?,
     ): Long
 
     /**

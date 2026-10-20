@@ -35,6 +35,7 @@ struct WarpDebug {
     std::vector<std::array<double, 3>> T;
     std::vector<std::array<double, 3>> M;          // app: aligned text-column edges (along y, ideal x, disp)
     int n_margins = 0;
+    int n_downweighted = 0;                        // robust solve: samples left at < half weight (last pass)
     std::vector<std::array<double, 4>> G_lines;   // global-stage grid lines: [horizontal (1/0), straightened
                                                   // position, start, end] (stage-1 frame)
     int n_ignored = 0;                            // samples dropped by the ignore mask
@@ -52,8 +53,10 @@ struct WarpDebug {
 // line share their ideal position (see share_ideals in warpmap.cpp); false: the reference.
 // faint (app): printed rules too pale for the reference's darkness threshold are found and traced
 // too (thin, isolated runs at darkness > 25; per-line tracing threshold); false: the reference.
+// robust (app): IRLS - samples the solved field does not follow are down-weighted and the fields
+// solved again, so one wrong line cannot bend the area around it.
 GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false,
-                   bool faint = false);
+                   bool faint = false, bool robust = false);
 
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);

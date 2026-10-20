@@ -296,9 +296,9 @@ fun SettingsScreen(vm: ScanViewModel) {
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Finding the page")
             SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
-            SwitchRow("Neural flattening", "UVDoc and SyntheticDoc nets; off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
-            if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
-            SwitchRow("Remove shadows", "SyntheticDoc shading map: hand and object shadows", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
+            SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
+            if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc high-res only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
+            SwitchRow("Remove shadows", "Shadow net: hand, object and leaf shadows; colours kept", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
             SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
             SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

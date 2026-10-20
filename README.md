@@ -123,14 +123,15 @@ Research notes (model survey with licences, verified vs inferred) are in `C:\Use
 | Model | Paper | Licence | File | Input → output |
 |---|---|---|---|---|
 | UVDoc | Verhoeven et al., SIGGRAPH Asia 2023 | MIT (code and weights in the repo) | `uvdoc.onnx`, 15.8 MB | 488×712 RGB → 45×31 backward grid |
-| SyntheticDoc | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages) | code MIT; **the weights file states no licence**, so confirm with the authors before a release | `syntheticdoc.onnx`, 17 MB | 512×720 RGB → 31×45 grid + 3×720×512 shading map |
+| SyntheticDoc high-res | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages, 2× input) | code MIT; **the weights file states no licence**, so confirm with the authors before a release | `syntheticdoc_hr.onnx`, 17 MB | 1024×1440 RGB → 121×177 grid (its shading map is not used) |
+| ShadeNet (ours) | trained here, `tools/shadow_net/` | ours | `shadenet.onnx`, 1 MB | flattened page at 512 px → its shading map |
 
 **Pipeline** (`core/src/uvdoc.{h,cpp}`, `run_photo`):
 1. The page finder gives the corners. Each net sees the corner box plus a 6% margin, turned upright if the page is landscape (both nets were trained on portrait pages). On a book spread the other page is painted out.
 2. A grid is used only if its page outline agrees with the page finder's mask (IoU ≥ 0.90, or ≥ 0.85 against hand-set corners). Otherwise the outline's surface model is used, as before.
-3. With both nets, a half-size stage-1 page from each is scored by text-row angle spread. SyntheticDoc wins only if it is straighter by more than 0.3°; UVDoc is the safer default and has the better tail.
+3. With both nets, a half-size stage-1 page from each is scored by text-row angle spread. SyntheticDoc high-res wins only if it is straighter by more than 0.3°; UVDoc is the safer default. The high-res grid must agree with the page finder at IoU ≥ 0.93 (its fine outline matches a right page at ≥ 0.957 on the 35 photos; a wrong crop passed 0.90 at 0.914).
 4. The line refinement runs on top. Pieces of one ruled line now share one target height (RDGR's "same row" constraint; fixes the steps at table cells). The refinement is dropped when it would stretch the page locally (|det J − 1| p99 > 0.2 or more than 1% of cells above 0.2): dense staves and broken rules.
-5. **Shadows:** the page is divided by SyntheticDoc's shading map, sampled through the same backward map. Unlike the reference inference, which weakens the map on bright photos (k = min(1, 0.4 / brightness)), the whole map is used (`shadow_full_strength`): hand and leaf shadows come out lighter, and nothing else changed visibly on the 35 photos.
+5. **Shadows:** the flattened page is divided by ShadeNet's shading map (round 6, below). SyntheticDoc's own shading maps are no longer used: they bleach colour (projector slide saturation 0.42, cookbook pages 0.40 with the high-res map).
 6. **Fingers:** non-paper areas that reach into the page from its border and are skin-coloured, smooth and redder than this page's paper are filled with the surrounding paper (Telea fill at ¼ size, soft edge). Text under a finger is never invented.
 
 **Measured on the 35 real photos** (34 round-4 photos + the hand-held receipt; desktop build of the same core, `tools/uvdoc_check.py`; text-row angle spread in degrees, lower is straighter):
@@ -154,7 +155,60 @@ Research notes (model survey with licences, verified vs inferred) are in `C:\Use
   - It would also add about 0.3–0.5 s per page and ~300 MB of peak memory.
   - Details and contact sheets: `C:\Users\User\Desktop\model_zoo\shadow_eval\`.
 - **DocShadow** (MIT, 120 MB): barely removes shadows and leaves the paper beige. **DocTr / DocGeoNet / DocScanner**: non-commercial licences. **DocMamba, RDGR**: no code released; RDGR's "same row" idea is used in the line refinement.
-- **Next step:** train a small illumination net on synthetic hard shadows with coloured content, so shadows are separated from colour blocks by training rather than by thresholds.
+- The small illumination net trained on synthetic hard shadows over coloured content is now shipped: ShadeNet, round 6.
+
+### Faint printed rules (the hand-held receipt's fold)
+
+The receipt's fold stayed sheared ("כ.א צמיגי עמוס" box): of its vertical table rules only 1 was found. They are pale grey print in a blurry 900×1600 photo blown up 2.7× to page size, and reach darkness 40–55 against the local paper. The tracer needs 45 to find a rule and 60 to follow one. The horizontal rules just made it, so the vertical shear from the fold was never measured.
+- `faint_lines` (app; `PipelineOptions::faint_lines`, `unwarp_map(..., faint)`): long runs at darkness > 25 join the detection in both stages, if they are thin (median width ≤ 7 px) and isolated (paper on at least one side; text rows, which merge into runs at a low threshold, are thick or inked on both sides). Each line is traced at 0.75 × its own darkness (25..60, so dark rules keep 60).
+- If the refinement then fails the distortion guard, it is retried with the reference lines alone.
+- Receipt: vertical rules 1 → 6, table-line p90 8.8 → 5.3 px. 35 photos: text-row spread median 0.82 → 0.75°, mean 1.60 → 1.52°; table-line p90 median 9.7 → 5.6 px. The projector screen (5.5 → 3.6°) and `doctr__25` (0.99 → 0.38°) improve most; no page got visibly worse.
+- (Corrected in round 6: "כ.א צמיגי עמוס" is printed straight. It looked slanted because the refinement took the ellipse's arcs for ruled lines and bent the area around them; see below.)
+- Finger erase measured ink over the whole candidate, so the finger's own outline and the rule beside it counted; on the new geometry the receipt's thumb crossed the 0.03 limit. Ink is now measured inside the candidate, eroded by the border width.
+
+## Round 6: shadow net, high-res flattening, line refinement that does not over-constrain
+
+### ShadeNet: a shadow model trained on synthetic data (`tools/shadow_net/`)
+
+- **Model:** a 0.5M-parameter U-Net (encoder to 1/32 with dilated context and a global-mean branch, decoder to 1/2, light full-resolution head). Input: the flattened page at 512 px (portrait; landscape pages turned), BGR in [0, 1]. Output: the page's shading map; the page is divided by it, brightening only, by at most 1 / 0.3. 1 MB fp16 ONNX; 135–160 ms on the emulator.
+- **Data** (`synth.py`, generated on the fly): 4,800 flat pages from the round-4 page generator, plus colour content a shadow model must keep: pastel cells, highlighter, saturated / grey / near-black blocks, circles and blobs (also cut by the page edge), gradients, photos, stamps. Shading: light falloff, curl and gutter bands, and cast shadows (hands, heads, phones, straight edges, foliage) with a penumbra that widens along the edge, shadow factor ≥ 0.25. Then colour cast, exposure, blur and noise. The target is the shading divided by its lit level, so lit paper keeps its colour and the filters set white as before.
+- **Training:** RTX 5060, about 2 h; L1 of log-shading + 0.5 × L1 of its gradient. Workers are numpy-only and compositing runs on the GPU (3× faster than CPU workers).
+- **Synthetic test** (150 held-out pages; error of the predicted map, per-image scale aligned; content = colour or ink wrongly treated as shading, shadow = shadow left):
+
+| | content error | shadow error |
+|---|---|---|
+| GCDRNet GC-Net | 0.155 | 0.119 |
+| **ShadeNet** | **0.046** | **0.053** |
+
+- **Real photos** (35, metrics from `model_zoo/shadow_eval`): with the map from the old standard SyntheticDoc model, ShadeNet after it gave the best numbers (median shadow/lit ratio 0.99 vs 0.94; edge residual 0.018 vs 0.033). The high-res model's map bleaches colour badly, so the app uses ShadeNet alone: median shadow ratio 0.92, saturation kept on every page. The dark circle on `docscanner__42_2` stays dark (an earlier checkpoint turned it into a blob; content shapes and a darkness cap fixed it).
+- Weak spot: dense, very dark leaf shadows (`docres__for_deshadowing`) are only partly removed.
+
+### SyntheticDoc high-res replaces the standard SyntheticDoc model
+
+Its grid is 177×121 instead of 45×31 (one cell ≈ 13 px of the page instead of ≈ 50 px), so creases and tight folds are representable: on the creased flyer (`dewarpnet__14_2`) the shampoo bottle on the crease is symmetric again. Geometry only, 35 photos, the same pages:
+
+| Stage 1 | text-row spread mean / p90 (deg) | table-line p90 dev. p90 (px) |
+|---|---|---|
+| UVDoc + standard SyntheticDoc (round 5) | 1.78 / 3.91 | 27.6 |
+| **UVDoc preferred, high-res when clearly straighter** | **1.56 / 2.69** | **13.3** |
+| High-res preferred | 1.75 / 3.96 | 13.3 |
+
+Same model family and size (17 MB). Emulator: the pipeline takes 3.0 s, and the whole page about 13 s including the three nets on the emulator's x86 CPU; not measured on a phone.
+
+### Line refinement: no more bent text
+
+The refinement trusted every traced "line" to be straight on the paper, and bent the page to make it so. Fixes, app path only (`warpmap.cpp`):
+- **Curves are not rules.** On a neural page, a trace whose p95 distance from its straight fit exceeds 3 px + 1 % of its length is dropped. This fixed the receipt's ellipse, which had been squashed into a rounded rectangle, along with the bent "כ.א צמיגי עמוס" text.
+- **Leaning box sides** (the totals boxes by the thumb): vertical ink is widened by 2 px before the run search; a ≥ 45 px side touching one rule counts; a side whose far edge is too faint is not clipped. Pieces whose traces meet within 5 px across a < 40 px gap share one target, even when a curl moved one piece by up to 20 px.
+- **Text-column edges** (`text_margins`): aligned left / right ends of text rows, chained down the page and fitted by a degree 2–4 curve within 2 px, are vertical constraints. This fixed the bowed column on the Fortune page (`docres__190_in`).
+- **Robust solve** (IRLS): a whole line whose median residual disagrees with the solved field is down-weighted (Cauchy, 3 px) and the field solved again.
+- **No spill-over:** a trace may run at most 40 px past a free end (a chart's dotted gridline had walked into the text beside it), and faint rules must be ≥ 2 px wide.
+- **Bump guard** (`soften_bumps`): on neural pages a correction that rescales a spot by more than 35 % is faded out there.
+- **Zoomed second net pass** (the page cut into overlapping halves or quarters, each run through the net as its own page): built and evaluated, **off**. The parts' grids disagree by a few pixels and the blend shears the overlap band (the receipt's table).
+
+### Finger erase
+
+The thumb's hole now often takes in the background strip beside it (skin share 0.499 on the receipt), so the skin share needed is 35 % (was 50 %). Every other candidate on the 35 photos that reaches 35 % is rejected by the reach or ink tests, or is background at a page corner.
 
 ### Filters: light colours kept
 

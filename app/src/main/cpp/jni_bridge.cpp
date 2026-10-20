@@ -242,7 +242,7 @@ bool read_uv_crop(JNIEnv* env, jintArray a, UvCrop& c) {
     if (v[2] <= 0 || v[3] <= 0) return false;
     c.box = cv::Rect(v[0], v[1], v[2], v[3]);
     c.turned = v[4] != 0;
-    c.model = v[5] == 1 ? 1 : 0;
+    c.model = v[5] >= 0 && v[5] <= 2 ? v[5] : 0;   // 0 UVDoc, 1 SyntheticDoc, 2 SyntheticDoc high-res
     return true;
 }
 
@@ -391,7 +391,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jfloatArray uv_out, jintArray uv_crop_a, jfloatArray uv_out2,
-                                                                  jintArray uv_crop2_a, jfloatArray uv_shading, jobject listener) {
+                                                                  jintArray uv_crop2_a, jfloatArray uv_shading, jobject shade_net,
+                                                                  jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -434,6 +435,28 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.auto_orient = auto_orient;
     o.render_w = render_w;
     o.use_gpu = use_gpu;
+    // the shadow net: ShadeNetRunner.shade(float[], int, int) -> float[] on this thread
+    jmethodID shade_mid = nullptr;
+    if (shade_net) {
+        jclass sc = env->GetObjectClass(shade_net);
+        shade_mid = env->GetMethodID(sc, "shade", "([FII)[F");
+        env->DeleteLocalRef(sc);
+    }
+    if (shade_mid) {
+        o.shade_after_uv = true;
+        o.shade_net = [&](std::vector<float>& io, int w, int h) {
+            jfloatArray in = env->NewFloatArray((jsize)io.size());
+            if (!in) return false;
+            env->SetFloatArrayRegion(in, 0, (jsize)io.size(), io.data());
+            auto out = (jfloatArray)env->CallObjectMethod(shade_net, shade_mid, in, (jint)w, (jint)h);
+            env->DeleteLocalRef(in);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+            bool ok = out && env->GetArrayLength(out) == (jsize)io.size();
+            if (ok) env->GetFloatArrayRegion(out, 0, (jsize)io.size(), io.data());
+            if (out) env->DeleteLocalRef(out);
+            return ok;
+        };
+    }
     Progress progress(env, listener);
     o.progress = [&](int pct, const char* stage) { progress(pct, stage); };
     try {
@@ -472,7 +495,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
-      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false");
+      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
     f << ", \"ms\": {";
     for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << escape(r.ms[i].first) << "\": " << (long)r.ms[i].second;

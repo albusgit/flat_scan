@@ -78,8 +78,39 @@ int main(int argc, char** argv) {
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
     o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
+    o.robust_solve = std::getenv("FS_NO_ROBUST") == nullptr;
+    if (std::getenv("FS_NO_SOFTEN")) o.max_local_rescale = 0;
+    if (const char* st = std::getenv("FS_SOFTEN_THR")) o.max_local_rescale = std::atof(st);
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
+    // FS_ZOOM=1: the zoomed second flattening pass (uv_zoom), the repo's ONNX models run by
+    // tools/shadow_net/run_onnx.py with FS_PYTHON
+    if (std::getenv("FS_ZOOM")) {
+        std::string py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
+        std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
+        std::string repo = FS_REPO_DIR;
+        o.zoom_pass = true;
+        o.uv_net = [=](int model, std::vector<float>& io) {
+            const UvSpec& sp = uv_spec(model);
+            std::string fin = base + ".zin.f32", fout = base + ".zout.f32";
+            std::string onnx = repo + (model == 1 ? "/app/src/main/assets/models/syntheticdoc.onnx" : "/app/src/main/assets/models/uvdoc.onnx");
+            { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
+            std::string cmd = "\"\"" + py + "\" -I \"" + repo + "/tools/shadow_net/run_onnx.py\" \"" + onnx + "\" \"" + fin + "\" \"" + fout + "\" " +
+                              std::to_string(sp.in_w) + " " + std::to_string(sp.in_h) + "\"";
+            if (std::system(cmd.c_str()) != 0) return false;
+            io.assign((size_t)sp.output_len(), 0.f);
+            std::ifstream f(fout, std::ios::binary);
+            f.read((char*)io.data(), io.size() * 4);
+            bool ok = (size_t)f.gcount() == io.size() * 4;
+            std::remove(fin.c_str()); std::remove(fout.c_str());
+            return ok;
+        };
+        if (const char* zw = std::getenv("FS_ZOOM_WORSE")) o.zoom_max_worse = std::atof(zw);
+        if (const char* zm = std::getenv("FS_ZOOM_MODEL")) o.zoom_model = std::atoi(zm);
+        if (const char* zs = std::getenv("FS_ZOOM_SPLIT")) { o.zoom_nu = zs[0] - '0'; o.zoom_nv = zs[1] - '0'; }   // e.g. 22, 12
+    } else {
+        o.zoom_pass = false;
+    }
     // FS_SHADE_NET=MODEL.onnx: the shadow net, run by tools/shadow_net/run_onnx.py with FS_PYTHON
     // (raw float32 files next to OUT); FS_SHADE_AFTER: after SyntheticDoc's map; FS_SHADE_LS: long side
     if (const char* sm = std::getenv("FS_SHADE_NET")) {
@@ -141,7 +172,8 @@ int main(int argc, char** argv) {
             z2 = read_npz(o2);
             const NpyArray& a2 = z2.at("out");
             uv2.assign(a2.as<float>(), a2.as<float>() + a2.count());
-            o.uv_crop2 = uv_crop(img.size(), pc.pts, 1 - o.uv_crop.model);
+            const char* um2 = std::getenv("FS_UVMODEL2");   // the second net's model (default: the other of 0 / 1)
+            o.uv_crop2 = uv_crop(img.size(), pc.pts, um2 ? std::atoi(um2) : 1 - o.uv_crop.model);
             if (uv2.size() == (size_t)uv_spec(o.uv_crop2.model).output_len()) o.uv_out2 = uv2.data();
         }
         // the shading map of whichever net has one (SyntheticDoc)
@@ -168,7 +200,7 @@ int main(int argc, char** argv) {
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << "}";
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;

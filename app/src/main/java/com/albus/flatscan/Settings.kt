@@ -8,9 +8,9 @@ import android.view.View
 object Features {
     /** The page-finder net (assets/models/pagefinder.onnx); off: the colour-threshold paper mask. */
     const val PAGE_FINDER_NET = true
-    /** Flattening nets (assets/models/uvdoc.onnx, syntheticdoc.onnx); off: the page outline's surface model. */
+    /** Flattening nets (assets/models/uvdoc.onnx, syntheticdoc_hr.onnx); off: the page outline's surface model. */
     const val UVDOC = true
-    /** SyntheticDoc's shading map divides shadows out of the page. */
+    /** The shadow net (assets/models/shadenet.onnx) divides shadows out of the page. */
     const val NEURAL_SHADOWS = true
 }
 
@@ -57,12 +57,12 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("uvdoc", Features.UVDOC)
         set(v) = p.edit().putBoolean("uvdoc", v).apply()
 
-    /** Which flattening nets run: 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc only. */
+    /** Which flattening nets run: 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc high-res only. */
     var flatNets: Int
         get() = p.getInt("flat_nets", 0).coerceIn(0, 2)
         set(v) = p.edit().putInt("flat_nets", v.coerceIn(0, 2)).apply()
 
-    /** Remove shadows with SyntheticDoc's shading map. */
+    /** Remove shadows with the shadow net. */
     var neuralShadows: Boolean
         get() = p.getBoolean("neural_shadows", Features.NEURAL_SHADOWS)
         set(v) = p.edit().putBoolean("neural_shadows", v).apply()

@@ -167,4 +167,123 @@ double uv_agreement(const UvGrid& g, const std::array<cv::Point2d, 4>& quad, cv:
     return iou_with(g.outline(), m, k);
 }
 
+namespace {
+
+// IoU of two polygons, rasterised at <= 800 px
+double poly_iou(const std::vector<cv::Point2f>& a, const std::vector<cv::Point2f>& b) {
+    cv::Rect2f r = cv::boundingRect(a) | cv::boundingRect(b);
+    double s = 800.0 / std::max(1.f, std::max(r.width, r.height));
+    cv::Size sz((int)std::ceil(r.width * s) + 2, (int)std::ceil(r.height * s) + 2);
+    auto raster = [&](const std::vector<cv::Point2f>& p) {
+        std::vector<cv::Point> q;
+        for (const auto& v : p) q.emplace_back((int)std::lround((v.x - r.x) * s) + 1, (int)std::lround((v.y - r.y) * s) + 1);
+        cv::Mat m = cv::Mat::zeros(sz, CV_8U);
+        cv::fillPoly(m, std::vector<std::vector<cv::Point>>{q}, cv::Scalar(255));
+        return m;
+    };
+    cv::Mat A = raster(a), B = raster(b);
+    double inter = cv::countNonZero(A & B), uni = cv::countNonZero(A | B);
+    return uni > 0 ? inter / uni : 0;
+}
+
+// bilinear point of a grid at fractional index (gx, gy)
+cv::Point2d grid_pt(const UvGrid& g, double gx, double gy) {
+    gx = std::min(std::max(gx, 0.0), (double)(g.gw - 1));
+    gy = std::min(std::max(gy, 0.0), (double)(g.gh - 1));
+    int x0 = std::min((int)gx, g.gw - 2), y0 = std::min((int)gy, g.gh - 2);
+    double a = gx - x0, b = gy - y0;
+    const cv::Point2d& p00 = g.pts[(size_t)y0 * g.gw + x0];
+    const cv::Point2d& p01 = g.pts[(size_t)y0 * g.gw + x0 + 1];
+    const cv::Point2d& p10 = g.pts[(size_t)(y0 + 1) * g.gw + x0];
+    const cv::Point2d& p11 = g.pts[(size_t)(y0 + 1) * g.gw + x0 + 1];
+    return p00 * ((1 - a) * (1 - b)) + p01 * (a * (1 - b)) + p10 * ((1 - a) * b) + p11 * (a * b);
+}
+
+double smooth01(double t) {
+    t = std::min(1.0, std::max(0.0, t));
+    return t * t * (3 - 2 * t);
+}
+
+}  // namespace
+
+UvGrid uv_zoom(const cv::Mat& photo, const UvGrid& g, int model, const UvNetFn& net, int* n_used, int nu, int nv) {
+    if (n_used) *n_used = 0;
+    if (!g.ok || g.gw < 8 || g.gh < 8 || !net) return g;
+    const UvSpec& sp = uv_spec(model);
+    // nu x nv parts in the page frame [0, 1]^2 (u across, v down, as the net saw the page), cut
+    // evenly with an overlap of 0.1 on each side of a cut
+    const double ov = 0.1;
+    struct Q { double u0, u1, v0, v1; UvGrid g; bool ok = false; };
+    std::vector<Q> qs;
+    for (int qi = 0; qi < nv; ++qi)
+        for (int qj = 0; qj < nu; ++qj)
+            qs.push_back({qj ? (double)qj / nu - ov : 0.0, qj + 1 < nu ? (double)(qj + 1) / nu + ov : 1.0,
+                          qi ? (double)qi / nv - ov : 0.0, qi + 1 < nv ? (double)(qi + 1) / nv + ov : 1.0, UvGrid(), false});
+    int used = 0;
+    for (auto& q : qs) {
+        // the quarter's outline in the photo, along the first grid
+        std::vector<cv::Point2f> poly;
+        const int n = 24;
+        auto P = [&](double u, double v) {
+            cv::Point2d p = grid_pt(g, u * (g.gw - 1), v * (g.gh - 1));
+            poly.emplace_back((float)p.x, (float)p.y);
+        };
+        for (int k = 0; k < n; ++k) P(q.u0 + (q.u1 - q.u0) * k / n, q.v0);
+        for (int k = 0; k < n; ++k) P(q.u1, q.v0 + (q.v1 - q.v0) * k / n);
+        for (int k = 0; k < n; ++k) P(q.u1 - (q.u1 - q.u0) * k / n, q.v1);
+        for (int k = 0; k < n; ++k) P(q.u0, q.v1 - (q.v1 - q.v0) * k / n);
+        cv::Rect2f bb = cv::boundingRect(poly);
+        double m = 0.06 * std::max(bb.width, bb.height);
+        int bx0 = std::max(0, (int)std::floor(bb.x - m)), by0 = std::max(0, (int)std::floor(bb.y - m));
+        int bx1 = std::min(photo.cols, (int)std::ceil(bb.x + bb.width + m) + 1), by1 = std::min(photo.rows, (int)std::ceil(bb.y + bb.height + m) + 1);
+        if (bx1 - bx0 < 16 || by1 - by0 < 16) continue;
+        UvCrop crop;
+        crop.box = cv::Rect(bx0, by0, bx1 - bx0, by1 - by0);
+        crop.turned = g.turned;   // the same frame as the first pass
+        crop.model = model;
+        cv::Mat hide(photo.size(), CV_8U, cv::Scalar(255));
+        std::vector<cv::Point> ip;
+        for (const auto& p : poly) ip.emplace_back((int)std::lround(p.x), (int)std::lround(p.y));
+        cv::fillPoly(hide, std::vector<std::vector<cv::Point>>{ip}, cv::Scalar(0));
+        std::vector<float> io = uv_input(photo, crop, hide);
+        if (!net(model, io) || (int)io.size() != sp.output_len()) continue;
+        q.g = uv_grid(io.data(), crop);
+        if (!q.g.ok || poly_iou(q.g.outline(), poly) < 0.9) continue;
+        q.ok = true;
+        ++used;
+    }
+    if (n_used) *n_used = used;
+    if (used == 0) return g;
+    UvGrid f;
+    f.ok = true;
+    f.turned = g.turned;
+    f.gw = 2 * g.gw - 1;
+    f.gh = 2 * g.gh - 1;
+    f.pts.resize((size_t)f.gw * f.gh);
+    // weight of a quarter at (u, v): 1 inside, fading to 0 across the overlap towards a cut edge
+    auto ramp = [&](double x, double a0, double a1, bool cut0, bool cut1) {
+        double w = 1;
+        if (cut0) w *= smooth01((x - a0) / (2 * ov));
+        if (cut1) w *= smooth01((a1 - x) / (2 * ov));
+        return w;
+    };
+    for (int i = 0; i < f.gh; ++i)
+        for (int j = 0; j < f.gw; ++j) {
+            double u = (double)j / (f.gw - 1), v = (double)i / (f.gh - 1);
+            cv::Point2d sum(0, 0);
+            double ws = 0;
+            for (const auto& q : qs) {
+                if (u < q.u0 - 1e-9 || u > q.u1 + 1e-9 || v < q.v0 - 1e-9 || v > q.v1 + 1e-9) continue;
+                double w = ramp(u, q.u0, q.u1, q.u0 > 0, q.u1 < 1) * ramp(v, q.v0, q.v1, q.v0 > 0, q.v1 < 1);
+                if (w <= 0) continue;
+                cv::Point2d p = q.ok ? grid_pt(q.g, (u - q.u0) / (q.u1 - q.u0) * (q.g.gw - 1), (v - q.v0) / (q.v1 - q.v0) * (q.g.gh - 1))
+                                     : grid_pt(g, u * (g.gw - 1), v * (g.gh - 1));
+                sum += p * w;
+                ws += w;
+            }
+            f.pts[(size_t)i * f.gw + j] = ws > 0 ? sum / ws : grid_pt(g, u * (g.gw - 1), v * (g.gh - 1));
+        }
+    return f;
+}
+
 }  // namespace fs

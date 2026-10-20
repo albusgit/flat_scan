@@ -226,6 +226,47 @@ cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H
     return m;
 }
 
+// The shadow net on the flattened page (PipelineOptions::shade_net): the page at long_side,
+// portrait (landscape pages turned for the net and back), its shading map bilinearly back at page
+// size, the page divided by it: brighten only, by at most 1 / 0.3 (cast shadows on paper keep
+// >= ~0.45 of the light; anything darker is ink, which a misread map must not blow out).
+bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side) {
+    if (page_bgra.empty() || !fn) return false;
+    cv::Mat bgr;
+    cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
+    const bool turned = bgr.cols > bgr.rows;
+    if (turned) cv::rotate(bgr, bgr, cv::ROTATE_90_CLOCKWISE);
+    double s = (double)long_side / std::max(bgr.cols, bgr.rows);
+    int nw = std::max(32, (int)std::lround(bgr.cols * s / 32) * 32), nh = std::max(32, (int)std::lround(bgr.rows * s / 32) * 32);
+    cv::Mat small;
+    cv::resize(bgr, small, cv::Size(nw, nh), 0, 0, cv::INTER_AREA);
+    const size_t plane = (size_t)nw * nh;
+    std::vector<float> buf(3 * plane);
+    for (int y = 0; y < nh; ++y) {
+        const cv::Vec3b* p = small.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < nw; ++x)
+            for (int c = 0; c < 3; ++c) buf[c * plane + (size_t)y * nw + x] = p[x][c] * (1.f / 255);
+    }
+    if (!fn(buf, nw, nh) || buf.size() != 3 * plane) return false;
+    cv::Mat S(nh, nw, CV_32FC3);
+    for (int y = 0; y < nh; ++y) {
+        cv::Vec3f* q = S.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < nw; ++x)
+            for (int c = 0; c < 3; ++c) q[x][c] = std::min(1.f, std::max(0.3f, buf[c * plane + (size_t)y * nw + x]));
+    }
+    if (turned) cv::rotate(S, S, cv::ROTATE_90_COUNTERCLOCKWISE);
+    cv::resize(S, S, page_bgra.size(), 0, 0, cv::INTER_LINEAR);
+    cv::parallel_for_(cv::Range(0, page_bgra.rows), [&](const cv::Range& R) {
+        for (int y = R.start; y < R.end; ++y) {
+            cv::Vec4b* p = page_bgra.ptr<cv::Vec4b>(y);
+            const cv::Vec3f* q = S.ptr<cv::Vec3f>(y);
+            for (int x = 0; x < page_bgra.cols; ++x)
+                for (int c = 0; c < 3; ++c) p[x][c] = cv::saturate_cast<uint8_t>(p[x][c] / q[x][c]);
+        }
+    });
+    return true;
+}
+
 // Fingers / thumbs holding the page: on the unwarped page they are the non-paper areas (the page
 // finder leaves them out of the page) that reach the page border and are mostly skin coloured
 // (YCrCb skin box). They are filled with the paper colour around them (a smooth Telea fill at
@@ -273,7 +314,8 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
             std::fprintf(stderr, "finger cand %d,%d %dx%d area %d skin %.3f reach %d edge %.4f whole %.4f dY %.1f dCr %.1f dCb %.1f\n", x, y, bw, bh, area,
                          skin_frac, reach, edge_frac, whole, cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2]);
         }
-        if (skin_frac < 0.5 || reach < 2 * border || edge_frac > 0.03) continue;
+        // skin >= 35%: the hole often takes in the background strip beside the finger too (receipt: 0.499)
+        if (skin_frac < 0.35 || reach < 2 * border || edge_frac > 0.03) continue;
         fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
     }
     int n_fill = cv::countNonZero(fill);
@@ -367,6 +409,40 @@ double local_distortion(const WarpDebug& d, double* frac) {
     size_t k = (size_t)(0.99 * (v.size() - 1));
     std::nth_element(v.begin(), v.begin() + k, v.end());
     return v[k];
+}
+
+// Neural pages: the stage-1 page is already flat, so a line correction that locally rescales it by
+// more than thr (|det J - 1| of a 4-px cell) is a wrong constraint's doing (a mis-traced line pulling
+// the text beside it), never real flattening. The correction is faded out around such cells
+// (widened by ~24 px, feathered over ~16 px); the rest of the page keeps it. g: the warp map on the
+// 4-px grid (absolute stage-1 px). Returns the share of grid nodes touched.
+double soften_bumps(GridMap& g, double thr) {
+    const int gw = g.gw, gh = g.gh;
+    const double s = g.stride;
+    if (gw < 3 || gh < 3) return 0;
+    cv::Mat bad = cv::Mat::zeros(gh, gw, CV_8U);
+    int n_bad = 0;
+    for (int i = 0; i + 1 < gh; ++i)
+        for (int j = 0; j + 1 < gw; ++j) {
+            double xj = (g.X(i, j + 1) - g.X(i, j)) / s, xi = (g.X(i + 1, j) - g.X(i, j)) / s;
+            double yj = (g.Y(i, j + 1) - g.Y(i, j)) / s, yi = (g.Y(i + 1, j) - g.Y(i, j)) / s;
+            if (std::fabs(xj * yi - xi * yj - 1) > thr) { bad.at<uint8_t>(i, j) = 255; ++n_bad; }
+        }
+    if (n_bad == 0) return 0;
+    cv::dilate(bad, bad, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(13, 13)));
+    cv::Mat m;
+    bad.convertTo(m, CV_32F, 1.0 / 255);
+    cv::GaussianBlur(m, m, cv::Size(0, 0), 4);
+    int touched = 0;
+    for (int i = 0; i < gh; ++i)
+        for (int j = 0; j < gw; ++j) {
+            double keep = 1 - std::min(1.0, 2.0 * m.at<float>(i, j));
+            if (keep >= 1) continue;
+            ++touched;
+            g.X(i, j) = (float)(s * j + keep * (g.X(i, j) - s * j));
+            g.Y(i, j) = (float)(s * i + keep * (g.Y(i, j) - s * i));
+        }
+    return (double)touched / ((double)gw * gh);
 }
 
 // the lines the warp map used, as output-page fractions (PipelineResult::lines)
@@ -598,7 +674,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
             c.model = crop.model;
             c.agree = use_mask ? uv_agreement(c.g, pc.det.paper, pc.scale) : uv_agreement(c.g, corners, photo.size());
             best_agree = std::max(best_agree, c.agree);
-            if (c.g.ok && c.g.turned == landscape && c.agree >= need) ok.push_back(std::move(c));
+            if (c.g.ok && c.g.turned == landscape && c.agree >= (c.model == 2 && use_mask ? opt.uv_min_agreement_hr : need)) ok.push_back(std::move(c));
         }
         r.uv_agreement = best_agree;
         if (!ok.empty()) {
@@ -624,6 +700,36 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
             r.uv_model = ok[pick].model;
             r.mode = GeomMode::Neural;
             r.fell_back = false;
+            // the zoomed second pass (uv_zoom): kept when its outline still agrees with the page and
+            // its half-size stage-1 page has text rows no less straight (within zoom_max_worse)
+            if (opt.zoom_pass && opt.uv_net) {
+                auto tz = Clock::now();
+                report(opt, 14, "Flattening: zoomed pass");
+                int used = 0;
+                UvGrid fine = uv_zoom(photo, U.uv, opt.zoom_model >= 0 ? opt.zoom_model : r.uv_model, opt.uv_net, &used, opt.zoom_nu, opt.zoom_nv);
+                r.uv_zoom_quarters = used;
+                if (used > 0) {
+                    double agree = use_mask ? uv_agreement(fine, pc.det.paper, pc.scale) : uv_agreement(fine, corners, photo.size());
+                    auto spread = [&](const UvGrid& gg) {
+                        Unroll Us = Uh;
+                        Us.mode = GeomMode::Neural;
+                        Us.uv = gg;
+                        Us.W = W / 2;
+                        Us.H = H / 2;
+                        int rows = 0;
+                        double s = text_row_spread(remap_unroll(photo, Us), &rows);
+                        return rows < 5 ? -1.0 : s;
+                    };
+                    r.uv_zoom_spread[0] = spread(U.uv);
+                    r.uv_zoom_spread[1] = spread(fine);
+                    if (agree >= need && r.uv_zoom_spread[0] >= 0 && r.uv_zoom_spread[1] >= 0 &&
+                        r.uv_zoom_spread[1] <= r.uv_zoom_spread[0] + opt.zoom_max_worse) {
+                        U.uv = std::move(fine);
+                        r.uv_zoom = true;
+                    }
+                }
+                r.ms.emplace_back("zoomed flattening pass", ms_since(tz));
+            }
         } else {
             r.uv_rejected = true;
         }
@@ -647,7 +753,8 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         warp4 = identity_grid(W, H);
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
-        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows, opt.faint_lines);
+        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows, opt.faint_lines,
+                           opt.robust_solve);
         r.lines = fitted_lines(r.warp, W, H, r.rot);
         // on a UVDoc page the line refinement only corrects what is left: a correction that
         // stretches or squeezes the page locally is a tracing failure (dense staves, broken table
@@ -660,7 +767,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
                 // the faint rules may be what overstretches it (picture edges, a rule traced into
                 // text): the reference lines alone
                 WarpDebug w2;
-                GridMap m2 = unwarp_map(stage1, &w2, ignore.empty() ? nullptr : &ignore, opt.share_rows, false);
+                GridMap m2 = unwarp_map(stage1, &w2, ignore.empty() ? nullptr : &ignore, opt.share_rows, false, opt.robust_solve);
                 double f2 = 0, q2 = local_distortion(w2, &f2);
                 if (q2 <= opt.max_line_distortion && f2 <= opt.max_line_distortion_frac) {
                     warp4 = std::move(m2);
@@ -673,6 +780,8 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
             if (bad) {
                 warp4 = identity_grid(W, H);
                 r.lines_rejected = true;
+            } else if (opt.max_local_rescale > 0) {
+                r.bumps_faded = soften_bumps(warp4, opt.max_local_rescale);
             }
         }
     }
@@ -685,8 +794,18 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");
     final_resample(photo, r, opt);
-    if (opt.uv_shading && opt.remove_shadows) {
-        // shadows: the page divided by the net's shading map, sampled through the same map
+    // shadows: SyntheticDoc's shading map (sampled through the same map) and / or the shadow net
+    // on the flattened page; the net replaces the map unless shade_after_uv
+    auto shade = [&] {
+        auto ts = Clock::now();
+        report(opt, 92, "Removing shadows");
+        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side);
+        r.shadows_removed |= r.shade_net;
+        r.ms.emplace_back("shadow net", ms_since(ts));
+    };
+    const bool net = opt.remove_shadows && opt.shade_net;
+    if (net && !opt.shade_after_uv) shade();
+    if (opt.uv_shading && opt.remove_shadows && !r.shade_net) {
         auto ts = Clock::now();
         UvShading sh;
         sh.data = opt.uv_shading;
@@ -704,6 +823,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         r.shadows_removed = true;
         r.ms.emplace_back("shadow removal", ms_since(ts));
     }
+    if (net && opt.shade_after_uv) shade();
     t0 = Clock::now();
     report(opt, 95, "Finishing");
     // paper mask: from this run's detection, or - when the corners were edited - from a fresh

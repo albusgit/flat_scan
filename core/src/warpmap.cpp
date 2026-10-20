@@ -182,7 +182,9 @@ cv::Mat faint_rules(const cv::Mat& Df, bool hz, int klen, double lo = 25, double
             centre.push_back(Dat(along, ctr));
             side.push_back(std::min(Dat(along, ctr - off), Dat(along, ctr + off)));
         }
-        if (widths.empty() || median(widths) > maxw || median(side) >= 0.4 * median(centre)) continue;
+        // and 2+ px: a 1-px run at this threshold is dots merged by the blur (a chart's dotted
+        // gridline), whose jittery trace bends the text beside it
+        if (widths.empty() || median(widths) > maxw || median(widths) < 2 || median(side) >= 0.4 * median(centre)) continue;
         cv::Mat roi = out(cv::Rect(x, y, w, h));
         cv::Mat sel = lab(cv::Rect(x, y, w, h)) == i;
         roi.setTo(255, sel);
@@ -652,7 +654,10 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
     return keep;
 }
 
-void trace_bounds(const Line& L, const Lines& perp, double lo, double hi, double& a2, double& b2, double ext = 200, double pad = 6) {
+// free_ext (app): how far a trace may run past an end with no perpendicular rule to meet; there it
+// only walks into what lies beside the line (a chart's dotted gridline into the text next to it)
+void trace_bounds(const Line& L, const Lines& perp, double lo, double hi, double& a2, double& b2, double ext = 200, double pad = 6,
+                  double free_ext = 200) {
     double p = L[0], a = L[1], b = L[2];
     bool hl = false, hr = false;
     double ml = -1e300, mr = 1e300;
@@ -661,8 +666,8 @@ void trace_bounds(const Line& L, const Lines& perp, double lo, double hi, double
             if (P[0] <= a + 10) { hl = true; ml = std::max(ml, P[0]); }
             if (P[0] >= b - 10) { hr = true; mr = std::min(mr, P[0]); }
         }
-    a2 = std::max({lo, a - ext, hl ? ml - pad : -1e9});
-    b2 = std::min({hi, b + ext, hr ? mr + pad : 1e9});
+    a2 = std::max({lo, a - (hl ? ext : free_ext), hl ? ml - pad : -1e9});
+    b2 = std::min({hi, b + (hr ? ext : free_ext), hr ? mr + pad : 1e9});
 }
 
 }  // namespace
@@ -826,7 +831,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
             const Line& L = lines[li];
             double p = L[0], a = L[1], b = L[2], th = L[3];
             double a2, b2;
-            trace_bounds(L, perp, lo, hi, a2, b2);
+            trace_bounds(L, perp, lo, hi, a2, b2, 200, 6, faint ? 40 : 200);
             std::vector<long> t;
             Vec c, wd, prior_v;
             const Vec* prior = nullptr;
@@ -1119,7 +1124,7 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint) {
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1289,6 +1294,39 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         });
         Fx = xyv.empty() ? zero_field(gw2, gh2, G) : solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
         ty.join();
+        // robust (app): a line the solved field does not follow - one that is not straight on the
+        // paper (a curve, a mis-trace, two pieces forced to one height) - is down-weighted as a
+        // whole, w = 1 / (1 + (median |residual| / 3 px)^2), and the fields solved again (IRLS:
+        // 2 reweights on the coarse pass, 1 on the fine one). Whole lines, not samples: a correct
+        // line with one sharp bend keeps its weight. A line's samples share its ideal position
+        // (the y of a horizontal sample, the x of a vertical one), which groups them.
+        if (robust) {
+            const double c = 3.0;
+            auto line_weights = [&](const std::vector<std::array<double, 2>>& pos, const Vec& v, const Field& F, int key) {
+                std::map<double, std::vector<size_t>> groups;
+                for (size_t i = 0; i < pos.size(); ++i) groups[pos[i][key]].push_back(i);
+                Vec w(pos.size(), 1.0);
+                for (const auto& kv : groups) {
+                    Vec r;
+                    for (size_t i : kv.second) r.push_back(std::fabs(v[i] - F.sample(pos[i][0], pos[i][1])));
+                    double m = median(r) / c, q = 1 / (1 + m * m);
+                    for (size_t i : kv.second) w[i] = q;
+                }
+                return w;
+            };
+            for (int rw = 0; rw < (it == 0 ? 2 : 1); ++rw) {
+                Vec wy = line_weights(xy, val, Fy, 1), wx = line_weights(xyv, valv, Fx, 0);
+                for (size_t i = 0; i < wy.size(); ++i) wy[i] *= wts[i];
+                Field Fy0 = Fy, Fx0 = Fx;
+                std::thread t2([&] { if (!xy.empty()) Fy = solve_field(xy, val, &wy, gw2, gh2, G, &Fy0, nullptr); });
+                if (!xyv.empty()) Fx = solve_field(xyv, valv, &wx, gw2, gh2, G, &Fx0, nullptr);
+                t2.join();
+                double down = 0;
+                for (double q : wx) down += q < 0.5;
+                for (size_t i = 0; i < wy.size(); ++i) down += wy[i] < 0.5 * wts[i];
+                d.n_downweighted = (int)down;
+            }
+        }
         if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
         Fy_prev = Fy; Fx_prev = Fx;
     }
