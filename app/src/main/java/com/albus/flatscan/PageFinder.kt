@@ -34,16 +34,26 @@ class PageFinder(private val ctx: Context) {
     }
 
     /** The net's logits for [photo] (float[2 * 256 * 256]: page paper, book gutter), or null. */
+    fun logits(photo: Bitmap): FloatArray? = run(photo)?.first
+
+    /** [logits] with how long the call took. */
     @Synchronized
-    fun logits(photo: Bitmap): FloatArray? {
+    fun run(photo: Bitmap): Pair<FloatArray, NetTiming>? {
+        val t0 = System.nanoTime()
+        val loaded = session != null
         val s = session() ?: return null
+        val loadMs = if (loaded) 0.0 else NetTiming.msSince(t0)
+        val t1 = System.nanoTime()
         val x = NativeLib.segInput(photo) ?: return null
+        val inputMs = NetTiming.msSince(t1)
         val env = OrtEnvironment.getEnvironment()
         return OnnxTensor.createTensor(env, FloatBuffer.wrap(x), longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong())).use { t ->
+            val t2 = System.nanoTime()
             s.run(mapOf(s.inputNames.first() to t)).use { r ->
+                val runMs = NetTiming.msSince(t2)
                 val fb = (r.get(0) as OnnxTensor).floatBuffer
                 if (fb.remaining() != 2 * SIZE * SIZE) return null
-                FloatArray(fb.remaining()).also { fb.get(it) }
+                FloatArray(fb.remaining()).also { fb.get(it) } to NetTiming(runMs, inputMs, loadMs, "1x3x${SIZE}x$SIZE")
             }
         }
     }
