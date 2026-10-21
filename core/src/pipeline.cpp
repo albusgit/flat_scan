@@ -431,6 +431,23 @@ double local_distortion(const WarpDebug& d, double* frac) {
     return v[k];
 }
 
+// the spots where the line stage overstretches the page (|det J - 1| > 0.2 per field cell, the outer
+// 2 cells left out as in local_distortion), widened by 24 px: CV_8U, w x h, 255 there
+cv::Mat distortion_spots(const WarpDebug& d, int w, int h) {
+    const Field &Fx = d.Fx, &Fy = d.Fy;
+    cv::Mat m = cv::Mat::zeros(h, w, CV_8U);
+    for (int i = 2; i + 3 < Fx.gh; ++i)
+        for (int j = 2; j + 3 < Fx.gw; ++j) {
+            auto V = [&](const Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
+            double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
+            double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
+            if (std::fabs((1 + xx) * (1 + yy) - xy * yx - 1) > 0.2)
+                cv::rectangle(m, cv::Rect(j * Fx.g, i * Fx.g, Fx.g, Fx.g), 255, -1);
+        }
+    cv::dilate(m, m, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(49, 49)));
+    return m;
+}
+
 // Neural pages: the stage-1 page is already flat, so a line correction that locally rescales it by
 // more than thr (|det J - 1| of a 4-px cell) is a wrong constraint's doing (a mis-traced line pulling
 // the text beside it), never real flattening. The correction is faded out around such cells
@@ -678,6 +695,57 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
     return out;
 }
 
+// The line stage on a page the nets flattened, with its guards. The page is already flat, so a
+// correction that stretches or squeezes it locally (|det J - 1| p99 above max_line_distortion, or
+// more than max_line_distortion_frac of the cells above 0.2) is a tracing failure (dense staves,
+// broken rules, a rule traced into text). Then, in turn: the same lines with their samples in the
+// overstretched spots left out (as if the user had ignored those areas; the nets' page stays as it
+// is there), the reference lines alone, and no line stage at all. Kept corrections that rescale a
+// spot by more than max_local_rescale are faded out there (soften_bumps). ignore: the user's areas
+// (CV_8U, page size) or empty. Sets r.warp, r.line_distortion, r.lines_spots_dropped,
+// r.lines_rejected, r.bumps_faded; returns the map on the 4-px grid.
+GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const PipelineOptions& opt, PipelineResult& r) {
+    // the rule net's output is kept for a second unwarp_map run on the same page (the local retry)
+    std::vector<float> net_out;
+    int net_w = 0, net_h = 0;
+    RuleNetFn net = [&](std::vector<float>& io, int w, int h) {
+        if (!net_out.empty() && w == net_w && h == net_h) { io = net_out; return true; }
+        if (!opt.rule_net(io, w, h)) return false;
+        net_out = io; net_w = w; net_h = h;
+        return true;
+    };
+    const RuleNetFn* netp = opt.rule_net ? &net : nullptr;
+    GridMap m = unwarp_map(page, &r.warp, ignore.empty() ? nullptr : &ignore, opt.share_rows, opt.faint_lines, opt.robust_solve,
+                           opt.colour_edges, netp);
+    double frac = 0, p99 = local_distortion(r.warp, &frac);
+    r.line_distortion = p99;
+    auto ok = [&](double q, double f) { return q <= opt.max_line_distortion && f <= opt.max_line_distortion_frac; };
+    bool bad = !ok(p99, frac);
+    if (bad && opt.faint_lines) {
+        cv::Mat spots = distortion_spots(r.warp, page.cols, page.rows);
+        if (!ignore.empty()) spots |= ignore;
+        WarpDebug w1;
+        GridMap m1 = unwarp_map(page, &w1, &spots, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp);
+        double f1 = 0, q1 = local_distortion(w1, &f1);
+        if (ok(q1, f1)) {
+            m = std::move(m1); r.warp = std::move(w1); r.line_distortion = q1; r.lines_spots_dropped = true; bad = false;
+        }
+    }
+    if (bad && opt.faint_lines) {
+        // the faint rules may be what overstretches it (picture edges, a rule traced into text)
+        WarpDebug w2;
+        GridMap m2 = unwarp_map(page, &w2, ignore.empty() ? nullptr : &ignore, opt.share_rows, false, opt.robust_solve);
+        double f2 = 0, q2 = local_distortion(w2, &f2);
+        if (ok(q2, f2)) { m = std::move(m2); r.warp = std::move(w2); r.line_distortion = q2; bad = false; }
+    }
+    if (bad) {
+        r.lines_rejected = true;
+        return identity_grid(page.cols, page.rows);
+    }
+    if (opt.max_local_rescale > 0) r.bumps_faded = soften_bumps(m, opt.max_local_rescale, extension_support(r.warp, m.gw, m.gh, m.stride));
+    return m;
+}
+
 PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     PipelineResult r;
     auto t0 = Clock::now(), tall = Clock::now();
@@ -869,38 +937,16 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         warp4 = identity_grid(W, H);
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
-        warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, r.mode == GeomMode::Neural && opt.share_rows, opt.faint_lines,
-                           opt.robust_solve, opt.colour_edges);
-        r.lines = fitted_lines(r.warp, W, H, r.rot);
-        // on a UVDoc page the line refinement only corrects what is left: a correction that
-        // stretches or squeezes the page locally is a tracing failure (dense staves, broken table
-        // rules), and the UVDoc page is kept as it is
         if (r.mode == GeomMode::Neural) {
-            double frac = 0, p99 = local_distortion(r.warp, &frac);
-            r.line_distortion = p99;
-            bool bad = p99 > opt.max_line_distortion || frac > opt.max_line_distortion_frac;
-            if (bad && opt.faint_lines) {
-                // the faint rules may be what overstretches it (picture edges, a rule traced into
-                // text): the reference lines alone
-                WarpDebug w2;
-                GridMap m2 = unwarp_map(stage1, &w2, ignore.empty() ? nullptr : &ignore, opt.share_rows, false, opt.robust_solve);
-                double f2 = 0, q2 = local_distortion(w2, &f2);
-                if (q2 <= opt.max_line_distortion && f2 <= opt.max_line_distortion_frac) {
-                    warp4 = std::move(m2);
-                    r.warp = std::move(w2);
-                    r.lines = fitted_lines(r.warp, W, H, r.rot);
-                    r.line_distortion = q2;
-                    bad = false;
-                }
-            }
-            if (bad) {
-                warp4 = identity_grid(W, H);
-                r.lines_rejected = true;
-            } else if (opt.max_local_rescale > 0) {
-                r.bumps_faded = soften_bumps(warp4, opt.max_local_rescale, extension_support(r.warp, warp4.gw, warp4.gh, warp4.stride));
-            }
+            warp4 = neural_line_stage(stage1, ignore, opt, r);
+        } else {
+            warp4 = unwarp_map(stage1, &r.warp, ignore.empty() ? nullptr : &ignore, false, opt.faint_lines, opt.robust_solve, opt.colour_edges,
+                               opt.rule_net ? &opt.rule_net : nullptr);
         }
+        r.lines = fitted_lines(r.warp, W, H, r.rot);
     }
+    r.rule_net = !r.warp.PH.empty();
+    r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_unclipped = r.warp.net.unclipped; r.net_kept = r.warp.S2.n_net_kept;
     r.stage1 = stage1;
     r.ms.emplace_back("warp map", ms_since(t0));
     for (auto& m : r.warp.ms) r.ms.emplace_back("  " + m.first, m.second);
@@ -1025,15 +1071,9 @@ PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {
     report(opt, 5, "Tracing lines and solving the warp map");
     if (opt.scan_flattened) {
         // an already flattened page (another method's output): the neural-page line stage and its guards
-        r.final_map = unwarp_map(scan, &r.warp, nullptr, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges);
-        double frac = 0, p99 = local_distortion(r.warp, &frac);
-        r.line_distortion = p99;
-        if (p99 > opt.max_line_distortion || frac > opt.max_line_distortion_frac) {
-            r.final_map = identity_grid(scan.cols, scan.rows);
-            r.lines_rejected = true;
-        } else if (opt.max_local_rescale > 0) {
-            r.bumps_faded = soften_bumps(r.final_map, opt.max_local_rescale, extension_support(r.warp, r.final_map.gw, r.final_map.gh, r.final_map.stride));
-        }
+        r.final_map = neural_line_stage(scan, cv::Mat(), opt, r);
+        r.rule_net = !r.warp.PH.empty();
+        r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_unclipped = r.warp.net.unclipped; r.net_kept = r.warp.S2.n_net_kept;
     } else {
         r.final_map = unwarp_map(scan, &r.warp);
     }

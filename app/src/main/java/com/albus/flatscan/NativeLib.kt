@@ -12,6 +12,11 @@ fun interface ShadeNetRunner {
     fun shade(input: FloatArray, width: Int, height: Int): FloatArray?
 }
 
+/** The rule net ([RuleNet]): planar BGR [0, 1], 3 x height x width in, rule probabilities 2 x height x width ([horizontal, vertical]) out, or null. */
+fun interface RuleNetRunner {
+    fun rules(input: FloatArray, width: Int, height: Int): FloatArray?
+}
+
 /** Filters of the filter strip; [id] is the native enum value (core/src/cleanup.h Filter). */
 enum class FilterKind(val id: Int, val label: String) {
     Original(0, "Original"),
@@ -75,7 +80,8 @@ object NativeLib {
      * the first pass on the whole photo whose outline gave those crops ([uvRecrop]); a grid that finds
      * the same page is used even where the page finder disagrees. uvShading:
      * SyntheticDoc's shading map for its crop (shadow removal), or null. shadeNet: the shadow net, run
-     * on the flattened page after SyntheticDoc's map, or null.
+     * on the flattened page after SyntheticDoc's map, or null. ruleNet: the rule net, run on the
+     * stage-1 page in the line refinement, or null.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
@@ -83,7 +89,7 @@ object NativeLib {
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
         uvOut: FloatArray?, uvCrop: IntArray?, uvOut2: FloatArray?, uvCrop2: IntArray?,
         uvPass1: FloatArray?, uvCropPass1: IntArray?, uvShading: FloatArray?,
-        shadeNet: ShadeNetRunner?, listener: ProgressListener?,
+        shadeNet: ShadeNetRunner?, ruleNet: RuleNetRunner?, listener: ProgressListener?,
     ): Long
 
     /**

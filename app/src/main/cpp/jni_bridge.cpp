@@ -408,7 +408,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jfloatArray uv_out, jintArray uv_crop_a, jfloatArray uv_out2,
                                                                   jintArray uv_crop2_a, jfloatArray uv_pass1, jintArray uv_crop_pass1_a,
-                                                                  jfloatArray uv_shading, jobject shade_net,
+                                                                  jfloatArray uv_shading, jobject shade_net, jobject rule_net,
                                                                   jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
@@ -479,6 +479,28 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
             return ok;
         };
     }
+    // the rule net: RuleNetRunner.rules(float[], int, int) -> float[2 * w * h] on this thread
+    jmethodID rule_mid = nullptr;
+    if (rule_net) {
+        jclass rc = env->GetObjectClass(rule_net);
+        rule_mid = env->GetMethodID(rc, "rules", "([FII)[F");
+        env->DeleteLocalRef(rc);
+    }
+    if (rule_mid) {
+        o.rule_net = [&](std::vector<float>& io, int w, int h) {
+            jfloatArray in = env->NewFloatArray((jsize)io.size());
+            if (!in) return false;
+            env->SetFloatArrayRegion(in, 0, (jsize)io.size(), io.data());
+            auto out = (jfloatArray)env->CallObjectMethod(rule_net, rule_mid, in, (jint)w, (jint)h);
+            env->DeleteLocalRef(in);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+            const jsize n = (jsize)2 * w * h;
+            bool ok = out && env->GetArrayLength(out) == n;
+            if (ok) { io.resize((size_t)n); env->GetFloatArrayRegion(out, 0, n, io.data()); }
+            if (out) env->DeleteLocalRef(out);
+            return ok;
+        };
+    }
     Progress progress(env, listener);
     o.progress = [&](int pct, const char* stage) { progress(pct, stage); };
     try {
@@ -517,7 +539,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
-      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false");
+      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
+      << ", \"rule_net\": " << (r.rule_net ? "true" : "false") << ", \"net\": [" << r.net_dropped << ", " << r.net_added << ", " << r.net_unclipped
+      << ", " << r.net_kept << "], \"spots_dropped\": " << (r.lines_spots_dropped ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
     f << ", \"ms\": {";
     for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << escape(r.ms[i].first) << "\": " << (long)r.ms[i].second;

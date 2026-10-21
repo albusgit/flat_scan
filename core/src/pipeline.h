@@ -121,6 +121,11 @@ struct PipelineOptions {
     // (brighten only). Empty / false: not run. Runs after SyntheticDoc's map when both are given
     // and shade_after_uv; otherwise it replaces it.
     std::function<bool(std::vector<float>& io, int w, int h)> shade_net;
+    // The rule net (RuleNet, tools/rule_net): called in the line stage with the stage-1 page at half
+    // size (planar BGR in [0, 1], 3 x h x w, sides multiples of 32), it replaces the buffer with
+    // 2 x h x w rule probabilities [horizontal, vertical] (RuleNetFn). Empty / false: the line stage
+    // finds rules from the darkness map alone.
+    RuleNetFn rule_net;
     // The flattening nets for the zoomed second pass (uv_zoom): net(model, io) replaces the net's
     // input with its grid. Empty: no zoomed pass.
     UvNetFn uv_net;
@@ -152,10 +157,13 @@ struct PipelineResult {
     bool uv_zoom = false;             // ... the zoomed grid was kept
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
+    bool lines_spots_dropped = false; // ... too large at first: kept with the lines' samples in the overstretched spots left out
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it
     bool shadows_removed = false;     // the shading map was applied to the page
     bool shade_net = false;           // ... the shadow net's map (ShadeNet)
+    bool rule_net = false;            // the rule net ran in the line stage (RuleNet)
+    int net_dropped = 0, net_added = 0, net_unclipped = 0, net_kept = 0;   // ... its effect (NetLineStats, Samples::n_net_kept)
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;

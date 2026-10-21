@@ -12,6 +12,8 @@ object Features {
     const val UVDOC = true
     /** The shadow net (assets/models/shadenet.onnx) divides shadows out of the page. */
     const val NEURAL_SHADOWS = true
+    /** The rule net (assets/models/rulenet.onnx) tells the line refinement which lines are printed rules. */
+    const val RULE_NET = true
 }
 
 /** User settings and remembered choices (SharedPreferences). */
@@ -66,6 +68,11 @@ class Settings(ctx: Context) {
     var neuralShadows: Boolean
         get() = p.getBoolean("neural_shadows", Features.NEURAL_SHADOWS)
         set(v) = p.edit().putBoolean("neural_shadows", v).apply()
+
+    /** Let the rule net decide which lines the line refinement straightens. */
+    var ruleNet: Boolean
+        get() = p.getBoolean("rule_net", Features.RULE_NET)
+        set(v) = p.edit().putBoolean("rule_net", v).apply()
 
     /** Show the crop screen for every page; otherwise only doubtful crops (quality gate) stop there. */
     var reviewCrops: Boolean

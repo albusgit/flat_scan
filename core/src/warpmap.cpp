@@ -726,6 +726,104 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
     return keep;
 }
 
+// ------------------------------------------------------------------ rule net (app)
+// the net's highest rule probability within +-r px across the line at (along k, across c)
+inline float prob_at(const cv::Mat& P, bool hz, long k, double c, int r) {
+    const int n_a = hz ? P.cols : P.rows, n_c = hz ? P.rows : P.cols;
+    if (k < 0 || k >= n_a) return 0.f;
+    long c0 = std::max(0L, (long)std::lround(c) - r), c1 = std::min((long)n_c - 1, (long)std::lround(c) + r);
+    float m = 0.f;
+    for (long q = c0; q <= c1; ++q) m = std::max(m, hz ? P.at<float>((int)q, (int)k) : P.at<float>((int)k, (int)q));
+    return m;
+}
+
+// share of the stretch [a, b] along a line at pos (every 2 px) the net marks as a rule of the
+// line's direction (probability >= 0.5 within +-r px)
+double net_cover(const cv::Mat& P, bool hz, double pos, double a, double b, int r) {
+    long n = 0, hit = 0;
+    for (long k = pyint(a); k <= pyint(b); k += 2, ++n) hit += prob_at(P, hz, k, pos, r) >= 0.5f;
+    return n ? (double)hit / n : 0.0;
+}
+
+// share of a trace's samples (every 4th) that sit on a rule the net marks
+double trace_on_rule(const cv::Mat& P, bool hz, const Vec& tv, const Vec& cv) {
+    long n = 0, hit = 0;
+    for (size_t i = 0; i < tv.size(); i += 4, ++n) hit += prob_at(P, hz, pyint(tv[i]), cv[i], 2) >= 0.5f;
+    return n ? (double)hit / n : 0.0;
+}
+
+// App, with the rule net (probabilities PH / PV on the page, CV_32F): the found segments are kept
+// only where the net marks them as rules over at least half their length - text rows set against
+// a rule, letter strokes, a picture's or colour block's edge, the paper's own edge are not - and
+// the net's own rules are added where no segment was found (pale rules under the threshold, rules
+// bent too far for the straight-run search: >= 80 px along, <= 14 px thick; the tracer then
+// follows the ink); found pieces of one such rule are joined into one line. A rule the net sees
+// on past a found segment's end is left to extend_trace.
+void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, NetLineStats& st) {
+    for (int hz = 1; hz >= 0; --hz) {
+        Lines& A = hz ? H : V;
+        const cv::Mat& P = hz ? PH : PV;
+        Lines keep;
+        for (const auto& L : A) {
+            if (net_cover(P, hz, L[0], L[1], L[2], std::max(4, (int)(L[3] / 2) + 3)) >= 0.5) keep.push_back(L);
+            else ++st.dropped;
+        }
+        A.swap(keep);
+        cv::Mat bin = P > 0.5f, lab, sts, cen;
+        int n = cv::connectedComponentsWithStats(bin, lab, sts, cen, 8);
+        for (int i = 1; i < n; ++i) {
+            int x = sts.at<int>(i, 0), y = sts.at<int>(i, 1), w = sts.at<int>(i, 2), h = sts.at<int>(i, 3);
+            int along = hz ? w : h, a0 = hz ? x : y;
+            if (along < 80) continue;
+            std::vector<double> cs(along, 0.0), cnt(along, 0.0);   // centre across, pixel count, per position along
+            for (int r = 0; r < h; ++r)
+                for (int c = 0; c < w; ++c)
+                    if (lab.at<int>(y + r, x + c) == i) {
+                        int k = hz ? c : r;
+                        cs[k] += hz ? y + r : x + c; cnt[k] += 1;
+                    }
+            Vec th;
+            for (int k = 0; k < along; ++k)
+                if (cnt[k] > 0) th.push_back(cnt[k]);
+            if (th.empty() || median(th) > 14) continue;
+            auto centre = [&](int k) {   // nearest position along with pixels
+                for (int d = 0; d < along; ++d) {
+                    if (k + d < along && cnt[k + d] > 0) return cs[k + d] / cnt[k + d];
+                    if (k - d >= 0 && cnt[k - d] > 0) return cs[k - d] / cnt[k - d];
+                }
+                return 0.0;
+            };
+            // the found lines on this rule: overlapping it along, within 6 px of its centre there
+            std::vector<size_t> on;
+            double covered = 0;
+            for (size_t j = 0; j < A.size(); ++j) {
+                const Line& L = A[j];
+                double o0 = std::max(L[1], (double)a0), o1 = std::min(L[2], (double)(a0 + along - 1));
+                if (o1 <= o0) continue;
+                double d = std::fabs(L[0] - centre((int)((o0 + o1) / 2) - a0));
+                if (d < 6) on.push_back(j);
+                if (d < 10) covered += o1 - o0;
+            }
+            Vec thv = th;
+            if (on.size() >= 2) {
+                // one rule found as pieces (it waves too much for the straight-run search, so only its
+                // flatter stretches were found, each traced to a height of its own): one line along
+                // the whole of it, traced from its middle
+                double lo = a0, hi = a0 + along - 1;
+                for (size_t j : on) { lo = std::min(lo, A[j][1]); hi = std::max(hi, A[j][2]); }
+                Line J{centre(std::min(along - 1, std::max(0, (int)((lo + hi) / 2) - a0))), lo, hi, median(thv), hi - lo};
+                for (size_t q = on.size(); q-- > 0;) A.erase(A.begin() + (long)on[q]);
+                A.push_back(J);
+                st.joined += (int)on.size();
+                continue;
+            }
+            if (covered > 0.3 * along) continue;
+            A.push_back({centre(along / 2), (double)a0, (double)(a0 + along - 1), median(thv), (double)along});
+            ++st.added;
+        }
+    }
+}
+
 // App, neural pages: follows a rule's ink on past the end of its trace (dir +1 / -1). A rule is cut
 // where the found rules crossing it end (clip in get_lines, trace_bounds): a table's outer side runs
 // on past the last row rule found to cross it (short last rows, a header bent at a curled corner),
@@ -735,8 +833,14 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
 // one wide run, a miss), at the image edge, 40 px off the rule's ideal, or where the trace turns
 // more than ~11 deg off the rule's own direction (a rounded corner turning into its side; the last
 // 10 px of the turn are dropped). Kept if it runs >= 30 px with hits on >= 70 % of it.
+// With the rule net (P), a hit must also lie on a rule it marks (probability >= 0.3): the ink beside
+// a rule's end (a text row, a picture) is not followed.
+// It stops where it reaches another found line of its direction (within 8 px across, inside its
+// stretch +-5 px): that is another piece of the rule (or a parallel rule), with a trace and an ideal of
+// its own; running over it set two heights for one place and tore the page between them (a wavy
+// table found as short pieces). share_ideals joins the pieces instead.
 void extend_trace(const DView& D, bool hz, const Vec& tv, const Vec& cv, int dir, double thr, long maxrun, double mw, double ideal,
-                  double slope0, Vec& et, Vec& ec) {
+                  double slope0, Vec& et, Vec& ec, const cv::Mat* P = nullptr, const Lines* others = nullptr) {
     et.clear(); ec.clear();
     const long n_a = hz ? D.cols : D.rows, n_c = hz ? D.rows : D.cols;
     std::vector<double> ht, hc;   // hits, the trace's own end first
@@ -757,8 +861,13 @@ void extend_trace(const DView& D, bool hz, const Vec& tv, const Vec& cv, int dir
         sl = den != 0.0 ? (m * sxy - sx * sy) / den : sl;
         double guess = den != 0.0 ? (sy - sl * sx) / m + sl * k : sy / m, v, ww;
         if (std::fabs(sl - slope0) > 0.2 || std::fabs(guess - ideal) > 40) break;
+        if (others) {
+            bool met = false;
+            for (const auto& O : *others) met |= k >= O[1] - 5 && k <= O[2] + 5 && std::fabs(guess - O[0]) < 8;
+            if (met) break;
+        }
         measure(D, hz, k, guess, 4, thr, maxrun, n_c, v, ww);
-        if (!std::isnan(v) && std::fabs(v - guess) < 2 && ww >= 0.6 * mw && ww <= 1.7 * mw + 1) {
+        if (!std::isnan(v) && std::fabs(v - guess) < 2 && ww >= 0.6 * mw && ww <= 1.7 * mw + 1 && (!P || prob_at(*P, hz, k, v, 2) >= 0.3f)) {
             ht.push_back((double)k); hc.push_back(v);
             et.push_back((double)k); ec.push_back(v);
             miss = 0;
@@ -828,7 +937,7 @@ cv::Mat darkness_fast(const cv::Mat& img) {
     return D;
 }
 
-void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
+void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* PH, const cv::Mat* PV, NetLineStats* stats) {
     cv::Mat ink = D > 45.f;   // 0 / 255
     cv::Mat ink_h = ink, ink_v = ink;
     if (faint) {   // app: faint printed rules too (faint_rules)
@@ -857,7 +966,13 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     // follows the rule and drops the tilted piece (share_ideals still gives them one height)
     H.insert(H.end(), Hc.begin(), Hc.end());
     V.insert(V.end(), Vc.begin(), Vc.end());
-    auto clip = [faint](Lines& A, const Lines& B, double tol) {
+    NetLineStats st_local;
+    NetLineStats& st = stats ? *stats : st_local;
+    const bool net = faint && PH && PV && !PH->empty() && !PV->empty();
+    if (net) net_lines(H, V, *PH, *PV, st);
+    // net: an end the net sees as rule over >= 70 % of the stretch clip would cut stays (a table's
+    // side running on past the last row rule found to cross it)
+    auto clip = [&](Lines& A, const Lines& B, double tol, bool hz) {
         for (auto& L : A) {
             bool any = false;
             double mn = 1e300, mx = -1e300;
@@ -868,14 +983,20 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
                 double a = std::max(L[1], mn - tol), b = std::min(L[2], mx + tol);
                 // app: a box side whose far edge is too faint to be found keeps its length
                 if (faint && b - a < 0.5 * (L[2] - L[1])) continue;
+                if (net) {
+                    const cv::Mat& P = hz ? *PH : *PV;
+                    int r = std::max(4, (int)(L[3] / 2) + 3);
+                    if (a > L[1] + 10 && net_cover(P, hz, L[0], L[1], a, r) >= 0.7) { a = L[1]; ++st.unclipped; }
+                    if (b < L[2] - 10 && net_cover(P, hz, L[0], b, L[2], r) >= 0.7) { b = L[2]; ++st.unclipped; }
+                }
                 L[1] = a;
                 L[2] = b;
                 L[4] = L[2] - L[1];
             }
         }
     };
-    clip(H, V, 20);
-    clip(V, H, 20);
+    clip(H, V, 20, true);
+    clip(V, H, 20, false);
     auto snap = [](Lines& A, const Lines& B, double tol) {
         for (auto& L : A) {
             Vec cr;
@@ -918,11 +1039,29 @@ void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
             if (r[0] > t1[i]) { t1[i] = r[0]; c1[i] = r[1] + r[2]; }
         }
     }
+    // each piece's trace, sorted along (for the overlap test below)
+    std::vector<Vec> st(n), sc(n);
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<std::pair<double, double>> q;
+        for (const auto& r : per[i]) q.push_back({r[0], r[1] + r[2]});
+        std::sort(q.begin(), q.end());
+        for (const auto& e : q) { st[i].push_back(e.first); sc[i].push_back(e.second); }
+    }
     for (size_t i = 0; i < n; ++i)
         for (size_t j = i + 1; j < n; ++j) {
             if (per[i].empty() || per[j].empty()) continue;
             double gap = std::max(t0[i], t0[j]) - std::min(t1[i], t1[j]);
             if (std::fabs(ideal[i] - ideal[j]) <= 6 && gap < 80) { parent[find(i)] = find(j); continue; }
+            // (app) pieces whose traces run on the same ink (median 2 px apart over >= 16 px of
+            // overlap) are one rule, however far apart their ideals: a wavy rule found as pieces
+            // at its flatter stretches, each traced on over its neighbours' ground. Two heights
+            // for one place tore the page there.
+            if (gap <= -16) {
+                Vec d;
+                for (double t = std::max(t0[i], t0[j]); t <= std::min(t1[i], t1[j]); t += 4)
+                    d.push_back(std::fabs(interp(t, st[i], sc[i]) - interp(t, st[j], sc[j])));
+                if (d.size() >= 4 && median(d) <= 2) { parent[find(i)] = find(j); continue; }
+            }
             // pieces that physically continue each other (their traces meet within 5 px across a
             // gap < 40 px) are one line even when a curl moved one piece's ideal (box sides
             // stacked down a curled page edge)
@@ -942,7 +1081,7 @@ void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
 }
 
 Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* prior_dx, const Field* prior_dy, int threads,
-                bool share_rows = false, bool faint = false) {
+                bool share_rows = false, bool faint = false, const cv::Mat* PH = nullptr, const cv::Mat* PV = nullptr) {
     Samples out;
     for (int pass = 0; pass < 2; ++pass) {
         bool hz = pass == 0;
@@ -953,7 +1092,8 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         double lo = 1e300, hi = -1e300;
         for (const auto& L : lines) { lo = std::min(lo, L[1]); hi = std::max(hi, L[2]); }
         std::vector<std::vector<std::array<double, 3>>> per(lines.size());
-        std::atomic<int> bowed{0}, extended{0};
+        std::atomic<int> bowed{0}, extended{0}, net_kept{0};
+        const cv::Mat* P = (hz ? PH : PV) && !(hz ? PH : PV)->empty() ? (hz ? PH : PV) : nullptr;
         std::vector<std::array<double, 2>> span(lines.size(), {NaN, NaN});
         std::vector<std::array<std::array<double, 2>, 2>> ext_piece(lines.size(), {{{NaN, NaN}, {NaN, NaN}}});
         auto one = [&](size_t li) {
@@ -1025,7 +1165,12 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 Vec dev;
                 for (size_t i = 0; i < tv.size(); ++i) dev.push_back(std::fabs(cv[i] - polyval(pf, tv[i])));
                 std::sort(dev.begin(), dev.end());
-                if (dev[(size_t)(0.95 * (dev.size() - 1))] > 3 + 0.01 * (tv.back() - tv.front())) { ++bowed; return; }
+                // with the rule net: a bowed trace that lies on a rule the net marks is a rule the
+                // page still bends (a curled corner), and straightening it is the point
+                if (dev[(size_t)(0.95 * (dev.size() - 1))] > 3 + 0.01 * (tv.back() - tv.front())) {
+                    if (P && trace_on_rule(*P, hz, tv, cv) >= 0.8) ++net_kept;
+                    else { ++bowed; return; }
+                }
             }
             // app, neural pages: the rule's ink on past where the trace was cut (extend_trace); the
             // extension keeps the line's ideal, so the page there is straightened with the rest of it
@@ -1035,8 +1180,11 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                     if (ok[i]) ws.push_back(wd[i]);
                 double mw = median(ws), slope0 = polyfit(tv, cv, 1)[0];
                 Vec bt0, bc0, ft, fc;
-                extend_trace(D, hz, tv, cv, -1, thr, maxrun, mw, ideal, slope0, bt0, bc0);
-                extend_trace(D, hz, tv, cv, 1, thr, maxrun, mw, ideal, slope0, ft, fc);
+                Lines others;   // the other lines of this direction near this one
+                for (size_t j = 0; j < lines.size(); ++j)
+                    if (j != li && std::fabs(lines[j][0] - p) < 60) others.push_back(lines[j]);
+                extend_trace(D, hz, tv, cv, -1, thr, maxrun, mw, ideal, slope0, bt0, bc0, P, &others);
+                extend_trace(D, hz, tv, cv, 1, thr, maxrun, mw, ideal, slope0, ft, fc, P, &others);
                 if (!bt0.empty() || !ft.empty()) {
                     extended += (int)!bt0.empty() + (int)!ft.empty();
                     if (!bt0.empty()) ext_piece[li][0] = {bt0.front(), tv.front()};
@@ -1093,6 +1241,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         if (share_rows) share_ideals(per);
         out.n_bowed += bowed;
         out.n_extended += extended;
+        out.n_net_kept += net_kept;
         (hz ? out.span_h : out.span_v) = span;
         for (size_t li = 0; li < lines.size(); ++li)   // ideals after share_ideals
             for (const auto& e : ext_piece[li])
@@ -1420,7 +1569,31 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges) {
+// the page at half size (INTER_AREA), padded to multiples of 32 (edge pixels repeated), through the
+// net; its two maps cropped and scaled back to the page (bilinear)
+bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& PV) {
+    if (!net || bgr.empty()) return false;
+    const int w2 = (bgr.cols + 1) / 2, h2 = (bgr.rows + 1) / 2, pw = (w2 + 31) / 32 * 32, ph = (h2 + 31) / 32 * 32;
+    cv::Mat small, pad;
+    cv::resize(bgr, small, cv::Size(w2, h2), 0, 0, cv::INTER_AREA);
+    cv::copyMakeBorder(small, pad, 0, ph - h2, 0, pw - w2, cv::BORDER_REPLICATE);
+    const size_t plane = (size_t)pw * ph;
+    std::vector<float> io(3 * plane);
+    for (int y = 0; y < ph; ++y) {
+        const uint8_t* r = pad.ptr<uint8_t>(y);
+        for (int x = 0; x < pw; ++x)
+            for (int k = 0; k < 3; ++k) io[k * plane + (size_t)y * pw + x] = r[3 * x + k] / 255.f;
+    }
+    if (!net(io, pw, ph) || io.size() != 2 * plane) return false;
+    for (int k = 0; k < 2; ++k) {
+        cv::Mat m(ph, pw, CV_32F, io.data() + k * plane);
+        cv::resize(m(cv::Rect(0, 0, w2, h2)), k ? PV : PH, bgr.size(), 0, 0, cv::INTER_LINEAR);
+    }
+    return true;
+}
+
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges,
+                   const RuleNetFn* rule_net) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1445,8 +1618,28 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     // ---- global stage (global_grid)
     std::vector<DLine> Hs, Vs;
     std::vector<cv::Point2d> sp, dp;
+    // the rule net on the page as given (its maps follow the global stage's remap below)
+    cv::Mat P0h, P0v;
+    if (faint && rule_net && *rule_net) {
+        if (!rule_probs(src, *rule_net, P0h, P0v)) { P0h.release(); P0v.release(); }
+        d.ms.emplace_back("rule net", ms_since(t0));
+        t0 = Clock::now();
+    }
     try {
         dewarp_detect(src, Hs, Vs, faint);
+        if (!P0h.empty()) {   // the global grid from rules only: a line the net marks over half its samples
+            for (int hz = 1; hz >= 0; --hz) {
+                std::vector<DLine>& A = hz ? Hs : Vs;
+                std::vector<DLine> keep;
+                for (auto& L : A) {
+                    long n = 0, hit = 0;
+                    for (size_t i = 0; i < L.t.size(); i += 4, ++n) hit += prob_at(hz ? P0h : P0v, hz, (long)L.t[i], L.v[i], 2) >= 0.5f;
+                    if (n && 2 * hit >= n) keep.push_back(std::move(L));
+                    else ++d.net.dropped_global;
+                }
+                A.swap(keep);
+            }
+        }
         build_controls(Hs, Vs, sp, dp);
     } catch (const std::exception&) {
         sp.clear(); dp.clear();
@@ -1500,6 +1693,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     // A_img = remap(src, xx + GX(xx/32, yy/32), ...): exact bilinear at x/32 (no border taps needed)
     if (skip_global) {
         d.A_img = src.clone();
+        d.PH = P0h; d.PV = P0v;
     } else {
         std::vector<float> gx(d.GX.v.begin(), d.GX.v.end()), gy(d.GY.v.begin(), d.GY.v.end());
         d.A_img.create(h, w, src.type());
@@ -1522,13 +1716,21 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
             }
             cv::Mat dst = d.A_img.rowRange(y0, y1);
             cv::remap(src, dst, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar::all(255));
+            if (!P0h.empty()) {
+                if (d.PH.empty()) { d.PH.create(h, w, CV_32F); d.PV.create(h, w, CV_32F); }
+                cv::Mat ph = d.PH.rowRange(y0, y1), pv = d.PV.rowRange(y0, y1);
+                cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+            }
         }
     }
     d.D = darkness_fast(d.A_img);
     d.ms.emplace_back("global_remap+darkness", ms_since(t0));
     t0 = Clock::now();
     // ---- local stage (local_field)
-    get_lines(d.D, d.H, d.V, faint);
+    const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
+    const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
+    get_lines(d.D, d.H, d.V, faint, PH, PV, &d.net);
     const int GC = 16, GF = 8;
     if (d.H.empty() || d.V.empty()) {
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
@@ -1539,7 +1741,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         return compose_maps(d, w, h);
     }
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
-    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint);
+    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint, PH, PV);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
@@ -1566,7 +1768,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         const Samples& S = it == 0 ? d.S1 : d.S2;
         if (it == 1) {
             auto tc = Clock::now();
-            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint);
+            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
             drop(d.S2.h, true);
             drop(d.S2.v, false);
             d.ms.emplace_back("trace pass2", ms_since(tc));

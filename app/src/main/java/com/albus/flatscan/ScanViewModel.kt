@@ -130,6 +130,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val uvNet = FlatNet(app, FlatNet.UVDOC)
     private val sdNet = FlatNet(app, FlatNet.SYNTHDOC)
     private val shadeNet = ShadeNet(app)
+    private val ruleNet = RuleNet(app)
     private val logitsLock = Any()
     /** Page-finder output for one photo bitmap (detection and processing use the same photo). */
     private var logitsCache: Pair<Bitmap, FloatArray?>? = null
@@ -700,7 +701,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------ pages
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
-            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7|pass1=1|hrfirst=2|fold=1"
+            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=9|rulenet=" + settings.ruleNet + "|pass1=1|hrfirst=2|fold=1"
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
@@ -883,6 +884,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val useUv = settings.uvDoc
         val nets = settings.flatNets
         val shadows = settings.neuralShadows
+        val rules = settings.ruleNet
         val focal = focalPx
         recropBackup = null
         screen = Screen.Processing
@@ -927,7 +929,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     NativeLib.process(
                         p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(),
                         first?.second?.grid, first?.first, secondGrid, secondCrop,
-                        pass1?.second?.grid, pass1?.first, null, if (shadows) shadeNet else null,
+                        pass1?.second?.grid, pass1?.first, null, if (shadows) shadeNet else null, if (rules) ruleNet else null,
                     ) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }
@@ -1128,7 +1130,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                             "\nNets compared: text-row spread %.2f / %.2f deg".format(a.optDouble(0), a.optDouble(1)) else ""
                     } ?: "") +
                     if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
-                    else "\nLine refinement: applied"
+                    else "\nLine refinement: applied" + (if (info.optBoolean("spots_dropped")) " (lines left out where they overstretched the page)" else "") +
+                        (info.optJSONArray("net")?.takeIf { info.optBoolean("rule_net") }?.let { a ->
+                            "\n  rule net: %d lines dropped, %d added, %d ends kept, %d bent rules kept".format(a.optInt(0), a.optInt(1), a.optInt(2), a.optInt(3))
+                        } ?: "")
                 edited -> "Geometry: homography (corners adjusted by hand)"
                 reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"
                 info.optBoolean("uv_rejected") && mode == "surface" ->

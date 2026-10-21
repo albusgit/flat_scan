@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "npz.h"
 #include "cleanup.h"
@@ -32,6 +33,17 @@ static std::string strs(const std::vector<std::string>& v) {
     std::string o = "[";
     for (size_t i = 0; i < v.size(); ++i) o += (i ? ", \"" : "\"") + v[i] + "\"";
     return o + "]";
+}
+
+// a command line for std::system: cmd /c on Windows needs the whole line quoted once more
+static std::string shell_line(const std::string& py, const std::string& script, const std::vector<std::string>& args) {
+    std::string c = "\"" + py + "\" -I \"" + script + "\"";
+    for (const auto& a : args) c += " \"" + a + "\"";
+#ifdef _WIN32
+    return "\"" + c + "\"";
+#else
+    return c;
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -111,8 +123,7 @@ int main(int argc, char** argv) {
             std::string fin = base + ".zin.f32", fout = base + ".zout.f32";
             std::string onnx = repo + (model == 1 ? "/app/src/main/assets/models/syntheticdoc.onnx" : "/app/src/main/assets/models/uvdoc.onnx");
             { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
-            std::string cmd = "\"\"" + py + "\" -I \"" + repo + "/tools/shadow_net/run_onnx.py\" \"" + onnx + "\" \"" + fin + "\" \"" + fout + "\" " +
-                              std::to_string(sp.in_w) + " " + std::to_string(sp.in_h) + "\"";
+            std::string cmd = shell_line(py, repo + "/tools/shadow_net/run_onnx.py", {onnx, fin, fout, std::to_string(sp.in_w), std::to_string(sp.in_h)});
             if (std::system(cmd.c_str()) != 0) return false;
             io.assign((size_t)sp.output_len(), 0.f);
             std::ifstream f(fout, std::ios::binary);
@@ -136,8 +147,7 @@ int main(int argc, char** argv) {
         std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
         o.shade_net = [=](std::vector<float>& io, int w, int h) {
             { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
-            std::string cmd = "\"\"" + py + "\" -I \"" + script + "\" \"" + model + "\" \"" + fin + "\" \"" + fout + "\" " +
-                              std::to_string(w) + " " + std::to_string(h) + "\"";
+            std::string cmd = shell_line(py, script, {model, fin, fout, std::to_string(w), std::to_string(h)});
             if (std::system(cmd.c_str()) != 0) return false;
             std::ifstream f(fout, std::ios::binary);
             f.read((char*)io.data(), io.size() * 4);
@@ -147,6 +157,25 @@ int main(int argc, char** argv) {
         };
         o.shade_after_uv = std::getenv("FS_SHADE_AFTER") != nullptr;
         if (const char* ls = std::getenv("FS_SHADE_LS")) o.shade_long_side = std::atoi(ls);
+    }
+    // FS_RULE_NET=MODEL.onnx: the rule net, run by tools/shadow_net/run_onnx.py with FS_PYTHON (raw
+    // float32 files next to OUT; the model outputs 2 x h x w probabilities)
+    if (const char* rm = std::getenv("FS_RULE_NET")) {
+        std::string model = rm, py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
+        std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
+        std::string fin = base + ".rnin.f32", fout = base + ".rnout.f32";
+        std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
+        o.rule_net = [=](std::vector<float>& io, int w, int h) {
+            { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
+            std::string cmd = shell_line(py, script, {model, fin, fout, std::to_string(w), std::to_string(h)});
+            if (std::system(cmd.c_str()) != 0) return false;
+            io.assign((size_t)2 * w * h, 0.f);
+            std::ifstream f(fout, std::ios::binary);
+            f.read((char*)io.data(), io.size() * 4);
+            bool ok = (size_t)f.gcount() == io.size() * 4;
+            std::remove(fin.c_str()); std::remove(fout.c_str());
+            return ok;
+        };
     }
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
@@ -240,7 +269,9 @@ int main(int argc, char** argv) {
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
-      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
+      << ", \"net\": [" << r.warp.net.dropped << ", " << r.warp.net.added << ", " << r.warp.net.unclipped << ", " << r.warp.S2.n_net_kept << "], \"spots_dropped\": "
+      << (r.lines_spots_dropped ? "true" : "false") << ", \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;
@@ -298,6 +329,18 @@ int main(int argc, char** argv) {
             t << "V " << L[0] << " " << L[1] << " " << L[2] << " " << L[3] << " " << L[4] << "\n";
         }
         cv::imwrite(p + "_segs.jpg", v, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // PREFIX_rules.jpg: the rule net's probabilities over the stage-1 page (red horizontal, blue vertical)
+        if (!r.warp.PH.empty() && r.warp.PH.size() == r.stage1.size()) {
+            cv::Mat rv = r.stage1.clone();
+            for (int y = 0; y < rv.rows; ++y)
+                for (int x = 0; x < rv.cols; ++x) {
+                    float a = r.warp.PH.at<float>(y, x), b = r.warp.PV.at<float>(y, x);
+                    cv::Vec3b& q = rv.at<cv::Vec3b>(y, x);
+                    if (a > 0.5f) q = {0, 0, 255};
+                    if (b > 0.5f) q = {255, 0, 0};
+                }
+            cv::imwrite(p + "_rules.jpg", rv, {cv::IMWRITE_JPEG_QUALITY, 85});
+        }
         // PREFIX_det.png: |det J - 1| of the line stage per 8-px cell (x 1000, 0.2 = 200), stage-1 size / 8
         const fs::Field &Fx = r.warp.Fx, &Fy = r.warp.Fy;
         if (Fx.gw > 3 && Fx.gh > 3) {
@@ -311,6 +354,11 @@ int main(int argc, char** argv) {
                 }
             cv::imwrite(p + "_det.png", dm);
         }
+    }
+    // FS_DUMP_MAP=P.npz: the final backward map on its 4-px grid ("x", "y": gh x gw, photo / scan px)
+    if (const char* dm = std::getenv("FS_DUMP_MAP"); dm && r.ok) {
+        const GridMap& g = r.final_map;
+        write_npz(dm, {{"x", NpyArray::f32({(size_t)g.gh, (size_t)g.gw}, g.x.data())}, {"y", NpyArray::f32({(size_t)g.gh, (size_t)g.gw}, g.y.data())}});
     }
     if (r.ok && std::string(argv[2]) != "-") {
         cv::Mat bgr;
