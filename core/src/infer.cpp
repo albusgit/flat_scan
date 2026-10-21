@@ -108,6 +108,13 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+Ort::Env& ort_env() {
+    // never destroyed: sessions held in static objects may outlive any other order of teardown
+    static Ort::Env* env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "flatscan");
+    return *env;
+}
+
+#ifdef FS_ORT_QNN
 // SHA-256 (FIPS 180-4), for the compiled-model cache key
 std::string sha256_hex(const std::vector<uint8_t>& data) {
     static const uint32_t K[64] = {
@@ -146,13 +153,6 @@ std::string sha256_hex(const std::vector<uint8_t>& data) {
     return s;
 }
 
-Ort::Env& ort_env() {
-    // never destroyed: sessions held in static objects may outlive any other order of teardown
-    static Ort::Env* env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "flatscan");
-    return *env;
-}
-
-#ifdef FS_ORT_QNN
 // The SoC for the compiled-model cache key (Android 12+: ro.soc.model, else the board platform).
 std::string soc_name() {
 #ifdef __ANDROID__
