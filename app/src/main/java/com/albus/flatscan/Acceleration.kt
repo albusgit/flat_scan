@@ -10,11 +10,14 @@ import java.io.File
  * runs on the CPU for the rest of the app's life). CPU is the default: an accelerated path changes the
  * nets' outputs within the tolerances of jni_bridge.cpp (benchBackends) and is opt-in.
  *  * [AUTO]: on first use per (SoC, app version) the self-test photo's nets run on the CPU and on every
- *    accelerator this ONNX Runtime build has except NNAPI ([candidates]); per group the fastest backend whose outputs
- *    match the CPU's within the tolerances is kept ([Settings.autoChoice]);
+ *    accelerator in [candidates] (QNN only); per group the fastest backend whose outputs match the CPU's
+ *    within the tolerances is kept ([Settings.autoChoice]);
  *  * [NPU]: Qualcomm QNN HTP (fp16) for the flattening nets and the shadow net;
  *  * [NNAPI]: Android NNAPI (fp16) for the same nets; not in the QNN build's ONNX Runtime (arm64-v8a
- *    built with -Port=qnn, the default), where it falls back to the CPU.
+ *    built with -Port=qnn, the default), where it falls back to the CPU. Not offered in Settings
+ *    ([CHOICES]): on the x86_64 emulator ORT 1.22.0's NNAPI and XNNPACK EPs aborted the process inside
+ *    Run (std::terminate, which no CPU fallback can catch). The debug batch mode still takes it
+ *    (`--es accel nnapi`), for checking it on a device (PLAN Stream G).
  * The page finder always runs on the CPU (PLAN: 34 NNAPI partitions).
  */
 object Accel {
@@ -26,7 +29,6 @@ object Accel {
         AUTO to "Auto: the fastest backend whose results match the CPU",
         CPU to "CPU (reference results)",
         NPU to "NPU (Qualcomm QNN)",
-        NNAPI to "NNAPI (experimental)",
     )
 
     /**
@@ -50,14 +52,13 @@ object Accel {
     }
 
     /**
-     * Auto's candidates: the accelerators this ONNX Runtime build has (backend names for benchBackends).
-     * Not NNAPI: on the x86_64 emulator (nnapi-reference) ORT 1.22.0's NNAPI EP aborted the process inside
-     * Run (std::terminate, which no fallback can catch), and NNAPI in Auto is PLAN Stream G (not started).
-     * NNAPI stays selectable by hand as experimental.
+     * Auto's candidates (backend names for benchBackends): QNN when this ONNX Runtime build has it. Not
+     * NNAPI or XNNPACK: on the x86_64 emulator both aborted the process inside ORT 1.22.0's Run
+     * (std::terminate in libonnxruntime.so on uvdoc_static, nnapi-reference / XNNPACK), which no CPU
+     * fallback can catch; NNAPI in Auto is PLAN Stream G (not started).
      */
     fun candidates(): String = listOfNotNull(
         "qnn".takeIf { NetEnv.has("QNNExecutionProvider") },
-        "xnnpack".takeIf { NetEnv.has("XnnpackExecutionProvider") },
     ).joinToString(",")
 
     /** The plan of a stored Auto benchmark ([Settings.autoChoice]) if it was made on this SoC and app version. */
