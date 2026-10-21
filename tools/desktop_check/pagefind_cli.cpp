@@ -53,6 +53,6 @@ int main(int argc, char** argv) {
       << ", \"empty\": " << (r.empty ? "true" : "false") << ", \"spread\": " << (r.spread ? "true" : "false")
       << ", \"area_frac\": " << num(r.area_frac) << ", \"net_margin\": " << num(r.net_margin)
       << ", \"edge_strength\": " << num(r.edge_strength) << ", \"edge_at_limit\": " << num(r.edge_at_limit)
-      << ", \"halves\": [" << r.halves[0] << ", " << r.halves[1] << "]}\n";
+      << ", \"halves\": [" << r.halves[0] << ", " << r.halves[1] << "], \"across\": " << num(r.across) << ", \"folded\": " << (r.folded ? "true" : "false") << "}\n";
     return 0;
 }

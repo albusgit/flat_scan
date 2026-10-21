@@ -265,8 +265,15 @@ nets traced the page right and were rejected for disagreeing with it. Two receip
   text rows are straighter by 3 deg or more (`uv_prefer_margin`). With a 0.3 deg margin UVDoc won 12
   DocUNet photos and was worse on 8 of them (LD +36 on a folded receipt): its straighter rows came with
   uneven stretching the row angles cannot see.
-- **Orientation**: decided on the page stretched to its measured shape (`page_hw_ratio`), and a long
-  narrow upright page needs 4x more vertical than horizontal text to turn (monospaced receipts).
+- **Orientation**: decided on the page stretched to its measured shape (`page_hw_ratio`). A page turns
+  only if its vertical text scores 2x the horizontal (`orient_min_ratio`; sideways pages 3.8-5.9, upright
+  pages up to 1.0: a dense index page turned on 1.01), a long narrow page only at 4x (monospaced receipts).
+- **Folds are not book spreads** (`select_page`): a gutter splits the paper into two pages only if the
+  paper is at least 0.87x as wide across it as it is long, or the frame cuts the paper. A page folded
+  down its middle measures 0.58-0.80; 53 synthetic spreads (`seg/synth.py`) 0.94-1.77 when in the frame,
+  all still split. On the three folded DocUNet pages the hidden half had cost 0.019 AD, more than the
+  app's whole AD gap to the official SyntheticDoc-HR code; with them fixed the gap is gone.
+  A wide page folded down its middle still looks like a spread (DocUNet 10-2, across 1.7).
 
 DocUNet, 128 images (document 64 left out, as the papers); our scorer reads ~0.017 high on MS-SSIM and
 ~0.023 low on AD against the papers, so both scales are given:
@@ -275,7 +282,8 @@ DocUNet, 128 images (document 64 left out, as the papers); our scorer reads ~0.0
 |---|---|---|---|---|
 | Round 7 app, automatic | 0.550 | 8.60 | 0.287 | 0.533 / 8.60 / 0.310 |
 | High-res first only | 0.558 | 8.00 | 0.274 | |
-| **Round 8, automatic** | **0.588** | **5.30** | **0.208** | **0.571 / 5.30 / 0.231** |
+| **Round 8, automatic** | **0.590** | **5.16** | **0.189** | **0.573 / 5.16 / 0.212** |
+| Round 8 before the fold and orientation fixes | 0.588 | 5.30 | 0.208 | 0.571 / 5.30 / 0.231 |
 | Round 8, UVDoc chosen at a 0.3 deg margin | 0.584 | 5.76 | 0.229 | 0.567 / 5.76 / 0.252 |
 | Round 8, UVDoc first | 0.578 | 6.12 | 0.241 | |
 | Round 8, high-res net only | 0.586 | 5.54 | 0.218 | 0.569 / 5.54 / 0.241 |
@@ -283,8 +291,7 @@ DocUNet, 128 images (document 64 left out, as the papers); our scorer reads ~0.0
 | SyntheticDoc high-res, official code (photos already cropped to the page) | 0.589 | 5.43 | 0.192 | 0.570 / 5.51 / 0.219 (paper) |
 | UVDoc (published outputs) | 0.560 | 6.90 | 0.294 | 0.544 / 6.83 / 0.315 (paper) |
 
-The app now scores better than the best released model on LD and MS-SSIM (AD 0.231 vs 0.219), fully
-automatic. The high-res net alone scores worse (LD 5.54): its grid is rejected on a folded index page
+The app now scores better than the best released model on all three metrics, fully automatic. The high-res net alone scores worse (LD 5.54): its grid is rejected on a folded index page
 (DocUNet 18-1, LD 34 vs 4.9 with UVDoc) and on two cookbook pages of our 35 photos, where UVDoc
 keeps the text rows straight (spread 5.8 -> 2.6 deg). 35 photos: text-row spread mean 1.27 -> 1.65 deg,
 table-line p90 15.9 -> 14.7 px; the spread rises on pages that now keep content round 7 cut off (the tax

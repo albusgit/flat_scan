@@ -102,6 +102,8 @@ struct PipelineOptions {
     bool auto_orient = true;          // decide 0/90/180/270 on the homography page
     bool orient_on_stage1 = false;    // reference-code behaviour (decide on stage 1); off = brief
     bool orient_true_aspect = true;   // decide on the page stretched to its measured height / width (page_hw_ratio)
+    double orient_min_ratio = 2.0;    // a page turns only if its vertical text scores this many times the horizontal
+                                      // (sideways pages 3.8-5.9; upright pages up to 1.0, receipts 1.7)
     double orient_min_conf = 0.2;     // sideways pages: CW only if the upright cue is below -this (it is
                                       // Hebrew-specific: ~0 on other or low-confidence pages)
     bool reference_orient = false;    // ungated decision, exactly the reference (parity tests)

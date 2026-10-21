@@ -795,7 +795,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     if (opt.auto_orient) {
         t0 = Clock::now();
         cv::Mat op = (opt.orient_on_stage1 || r.mode == GeomMode::Homography) ? stage1 : remap_unroll(photo, Uh);
-        double min_ratio = 1.0;
+        double min_ratio = opt.orient_min_ratio;
         if (opt.orient_true_aspect) {
             // decided on the page at its own shape (a long receipt is not A4)
             double hw = page_hw_ratio(U), k = hw * op.cols / op.rows;

@@ -36,6 +36,8 @@ struct PageSelection {
     double area_frac = 0;
     cv::Point2d gutter_c, gutter_t;   // gutter line: centre, direction (working px)
     int halves[2] = {0, 0};
+    double across = 0;           // spread: the paper's extent across the gutter / along it
+    bool folded = false;         // the gutter is a fold of one page (kept whole)
 };
 
 // pagefind.select_page on the page / gutter probability maps (working size, float32)
@@ -59,6 +61,8 @@ struct PageFindResult {
     double edge_strength = -1, edge_at_limit = -1;   // of pages[0]; -1 when not refined
     cv::Point2d gutter_c, gutter_t;       // photo px
     int halves[2] = {0, 0};
+    double across = 0;                    // spread: the paper's extent across the gutter / along it
+    bool folded = false;                  // the gutter is a fold of one page (kept whole)
 };
 
 // pagefind.paper_mask with Predictor.probs: bgr = the photo the logits were computed on (any

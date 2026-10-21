@@ -299,6 +299,8 @@ PageSelection select_page(const cv::Mat& p, const cv::Mat& g, double thr) {
         std::vector<double> qt(mpts.size());
         for (size_t i = 0; i < mpts.size(); ++i) qt[i] = (mpts[i].x - c.x) * t.x + (mpts[i].y - c.y) * t.y;
         double mext = ptp(qt);
+        for (size_t i = 0; i < mpts.size(); ++i) qt[i] = (mpts[i].x - c.x) * nrm.x + (mpts[i].y - c.y) * nrm.y;
+        const double across = mext > 0 ? ptp(qt) / mext : 0;
         bool straight = std::sqrt(ev0) < 0.03 * std::max(h, w);
         if (ext > 0.55 * mext && straight) {
             cv::Mat A = cv::Mat::zeros(m.size(), CV_8U), B = cv::Mat::zeros(m.size(), CV_8U);
@@ -313,9 +315,32 @@ PageSelection select_page(const cv::Mat& p, const cv::Mat& g, double thr) {
             r.gutter_c = c;
             r.gutter_t = t;
             r.halves[0] = a; r.halves[1] = bb;
+            r.across = across;
+            // the paper's share of each frame side (a band 1% of the frame wide)
+            const int band = std::max(3, (int)std::lround(0.01 * std::max(h, w)));
+            double touch = 0;
+            for (int side = 0; side < 4; ++side) {
+                bool horiz = side < 2;
+                int len = horiz ? w : h, hit = 0;
+                for (int i = 0; i < len; ++i) {
+                    bool any = false;
+                    for (int d = 0; d < band && !any; ++d) {
+                        int x = horiz ? i : (side == 2 ? d : w - 1 - d), y = horiz ? (side == 0 ? d : h - 1 - d) : i;
+                        any = m.at<uint8_t>(y, x) != 0;
+                    }
+                    hit += any;
+                }
+                touch = std::max(touch, (double)hit / len);
+            }
             if (std::min(a, bb) < 0.3 * std::max(a, bb)) {
                 m = a > bb ? A : B;   // the other page is only a sliver at the frame edge
                 r.pages = 1;
+            } else if (across < 0.87 && touch < 0.05) {
+                // a page folded down the middle, all in the frame: two pages side by side are wider
+                // across the gutter than along it (DocUNet folds 0.58-0.80; synthetic spreads in the
+                // frame >= 0.94, below that only when the frame cuts the paper)
+                r.pages = 1;
+                r.folded = true;
             } else {
                 r.pages = 2;
                 r.other = a > bb ? B : A;
@@ -353,6 +378,8 @@ PageFindResult find_page_net(const cv::Mat& img, const float* logits, bool refin
     res.gutter_c = sel.gutter_c / s;
     res.gutter_t = sel.gutter_t;
     res.halves[0] = sel.halves[0]; res.halves[1] = sel.halves[1];
+    res.across = sel.across;
+    res.folded = sel.folded;
     cv::Mat m = sel.mask;
     if (cv::countNonZero(m) < 0.02 * m.total()) {   // nothing page-like: whole frame (projector screen, close-up)
         res.whole_frame = true;
