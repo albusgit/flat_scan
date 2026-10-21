@@ -315,9 +315,17 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
 | Android arm64 | NPU: Qualcomm QNN HTP, fp16 | UVDoc (both passes), ShadeNet; SyntheticDoc-HR only where Auto measured it within tolerance | `onnxruntime-android-qnn` 1.22.0 + `qnn-runtime` 2.33.0 (HTP V68-V79). Compiled graphs are cached in `noBackupFilesDir/qnn_cache` (key: model SHA-256, SoC, QNN and ORT versions). Licence: Qualcomm "AI Stack License", shipped in `assets/licenses/`; `-Port=plain` builds without any Qualcomm library. |
 | Android | NNAPI, fp16 | same | **Debug batch mode only** (`--es accel nnapi`), not in Settings: on the x86_64 emulator ORT's NNAPI EP aborted the app inside Run (`std::terminate`, which no fallback can catch). Only in `onnxruntime-android` (x86_64, or arm64 with `-Port=plain`); the QNN AAR has no NNAPI EP. |
 | Android | XNNPACK | same | Compiled in, but not used: as an Auto candidate it aborted the app on the emulator in the same way. |
+| Android arm64, any GPU with OpenCL (Mali, Adreno, Xclipse) | GPU: LiteRT 1.4.0 GPU delegate, **fp32 compute** | UVDoc (both passes), SyntheticDoc-HR, ShadeNet (512 x 352) | Not ONNX Runtime: `Backend::LiteRtGpu` in `infer.cpp` runs `.tflite` copies of the nets (`app/src/main/litert/models/`, fp16 weights, fp32 compute and I/O, `tools/litert/convert.py`) on the GPU delegate, whole graph or nothing (a partial delegation falls back to the CPU). LiteRT is loaded at run time from the `litert_gpu` pack (`dlopen`, no link-time dependency). Compiled kernels are cached in the app's cache folder. A phone without an OpenCL library gets no GPU backend (LiteRT 1.4.0's delegate crashes there, so `infer.cpp` checks first). |
 | Desktop (`tools/desktop_check`) | CPU, DirectML, CUDA | all five | `--backend` / `FS_BACKEND`. CUDA runs **without TF32** (`use_tf32=0`): with ORT's default TF32, SyntheticDoc-HR's grid moved by p99 0.50 px on the RTX 5060. TensorRT, OpenVINO, CoreML and QNN (Snapdragon X) are compiled in behind CMake options (`FS_ORT_<EP>`) but were not run (no hardware or package here). |
 
 - The **page finder always runs on the CPU** (34 NNAPI partitions; HardSigmoid is unsupported).
+- **Why LiteRT for the GPU, not NNAPI:** NNAPI is deprecated since Android 15, and ORT's NNAPI EP aborted
+  the app on the emulator (above). LiteRT's GPU delegate (Google's successor for on-device GPU inference) goes
+  straight to the GPU through OpenCL (OpenGL ES as its fallback), on any SoC. ONNX Runtime stays for the CPU
+  path (the bit-identical reference) and for the Qualcomm NPU (QNN). The GPU runs in full precision, so its
+  results should match the CPU closely. On the desktop, the LiteRT models match ORT's CPU within 0.0034 px
+  (35 photos, `docs/results/litert/models.txt`). **The GPU delegate itself has not run yet**: the emulator has
+  no OpenCL, so phone results are a HUMAN GATE (`docs/results/litert/STATUS.md`).
 - Accelerators get **fixed-shape models** (`tools/accel/prepare_models.py`, `tools/shadow_net/export.py --static`):
   `uvdoc_static.onnx`, `syntheticdoc_hr_static.onnx` (unused `shading` output removed) and
   `shadenet_512x352.onnx` (the A4 page always gives the shadow net 512 x 352). NNAPI coverage: 1 partition /
@@ -347,13 +355,16 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
 
 ### Settings > Acceleration, and how Auto chooses
 
-The choices are Auto / CPU / NPU (Qualcomm QNN). **The default is CPU**: Auto stays
+The choices are Auto / CPU / NPU (Qualcomm QNN) / GPU (LiteRT). **The default is CPU**: Auto stays
 opt-in until it has been checked on a phone. Backends are chosen per group: page finder (always CPU),
 UVDoc (both passes), SyntheticDoc-HR, shadow net. NPU puts UVDoc and the shadow net on QNN and keeps
-SyntheticDoc-HR on the CPU (its fp16 stand-in misses the tolerance, above).
+SyntheticDoc-HR on the CPU (its fp16 stand-in misses the tolerance, above). GPU puts all three flattening /
+shadow groups on the LiteRT GPU (fp32, so SyntheticDoc-HR goes too); the page finder stays on the CPU.
+Choosing GPU or Auto fetches the `litert_gpu` pack first, on any phone.
 
-**Auto** runs once per (SoC, app version). The bundled self-test photo's nets run on the CPU and on QNN,
-if this ORT build has it (NNAPI and XNNPACK are left out, see above; without QNN, Auto is the CPU). Per group, Auto keeps the fastest backend whose outputs
+**Auto** runs once per (SoC, app version). The bundled self-test photo's nets run on the CPU, on QNN
+if this ORT build has it, and on the LiteRT GPU once its pack is loaded (NNAPI and XNNPACK are left out, see
+above; with neither candidate, Auto is the CPU). Per group, Auto keeps the fastest backend whose outputs
 match the CPU within the tolerances below, and stores the choice. Processing details and the benchmark report
 (Settings > *Run the acceleration benchmark*) show it. A net that fails on an accelerator at run time moves
 to the CPU for the rest of the session.
@@ -418,6 +429,7 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 ./gradlew assembleDebug -Ppacks=false                    # the old single APK with every QNN library (162 MB)
 ./gradlew assembleDebug -Port=plain                      # no Qualcomm code at all (121 MB)
 ./gradlew assembleDebug -Pabis=arm64-v8a,x86_64          # also an emulator ABI
+./gradlew assembleDebug -PlitertInBase=true -PcompressLibs=true   # GPU (LiteRT) test APK: runtime + models in the base (125 MB)
 ```
 
 **Packaging: an app bundle with on-demand NPU packs.** Each phone gets only what it uses:
@@ -435,10 +447,13 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
   base's native libraries stay uncompressed in the APK, so they are not copied out at install.
 - The GPU backend (Settings > Acceleration > GPU, LiteRT) is the on-demand pack `litert_gpu`. It holds
   LiteRT 1.4.0's `libtensorflowlite_jni.so` and `libtensorflowlite_gpu_jni.so` and the `.tflite` models from
-  `app/src/main/litert/models/`. Without the models the pack is a 2.8 MB download (arm64). Any phone fetches it
+  `app/src/main/litert/models/`: a 33.0 MB download for an arm64 phone (2.8 MB of it the libraries). Any phone fetches it
   (`Packs.kt`) when GPU or Auto is chosen, and loads it with `NativeLib.loadLiteRt`. Build options:
   `-PlitertAbi=x86_64` packs the emulator ABI instead. `-PlitertInBase=true` puts the same files in the base
   APK under `assets/litert/`, which gives one sideload test APK.
+- Sizes (litert/main, arm64-v8a, `bundletool get-size total`): base 81.0 MB; base + `litert_gpu` 114.0 MB;
+  base + `qnn_htp` + `qnn_v73` 137.4 MB; all of them 170.4 MB. The sideload GPU test APK
+  (`assembleDebug -PlitertInBase=true -PcompressLibs=true`, no NPU libraries) is 124.8 MB.
 
 To install on a phone without Play (USB debugging on), use bundletool. It installs only that phone's splits
 and stages the packs, so the app "downloads" them from the phone itself:
