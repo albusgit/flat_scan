@@ -13,7 +13,7 @@
 
 namespace fs {
 enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet };
-enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML };
+enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu };
 struct InferConfig {
     std::function<std::vector<uint8_t>(const std::string& file)> load;  // model bytes (Android: AAssetManager)
     std::vector<Backend> preference;   // tried in order per net; CPU is always appended last
@@ -21,6 +21,7 @@ struct InferConfig {
     bool fp16 = true;                  // accelerators only; CPU stays fp32
     int threads = 0;                   // 0: ORT default
     std::string qnn_dir;               // folder of libQnnHtp.so (Android: the qnn_htp asset pack); empty: the library path
+    std::string litert_dir;          // folder of libtensorflowlite_jni.so + libtensorflowlite_gpu_jni.so (Android: the litert_gpu pack); empty: no LiteRT
 };
 struct Tensor { std::vector<int64_t> shape; std::vector<float> data; };
 class Inference {
