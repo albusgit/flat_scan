@@ -11,6 +11,11 @@
         android:label="@string/app_name"
         android:largeHeap="true"
         android:theme="@style/Theme.FlatScan">
+        <!-- the GPU (LiteRT) backend: the vendor's OpenCL library, which an app targeting API 31+ can only
+             open when it is declared here; optional (a phone without it has no GPU backend, infer.cpp) -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL-car.so" android:required="false" />
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
