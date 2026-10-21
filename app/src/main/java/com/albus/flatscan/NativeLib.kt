@@ -46,7 +46,7 @@ object NativeLib {
 
     /**
      * The nets' backends (core/src/infer.h, ONNX Runtime in libflatscan): per group, the backends to try
-     * in order, comma separated ("cpu", "qnn", "nnapi", "xnnpack"; "" = CPU only; the CPU is always the
+     * in order, comma separated ("cpu", "qnn", "gpu", "nnapi", "xnnpack"; "" = CPU only; the CPU is always the
      * last resort): [finder] the page finder, [flat] UVDoc (both passes), [hr] SyntheticDoc high-res,
      * [shade] the shadow net. Models come from [assets] (models/); [cacheDir] keeps QNN's compiled graphs;
      * [threads]: ONNX Runtime intra-op threads (0: its default). [staticModels]: the CPU runs the
@@ -63,6 +63,13 @@ object NativeLib {
      * (ADSP_LIBRARY_PATH). JSON: ok, loaded (library names), adsp_library_path, error.
      */
     @JvmStatic external fun loadQnn(libDir: String, modelsDir: String, htpDirs: String): String
+
+    /**
+     * The LiteRT GPU runtime from the litert_gpu pack ([LiteRtPacks]): [libDir] libtensorflowlite_jni and
+     * libtensorflowlite_gpu_jni (the "gpu" backend's runtime), [modelsDir] its .tflite models. JSON: ok,
+     * loaded (library names), error.
+     */
+    @JvmStatic external fun loadLiteRt(libDir: String, modelsDir: String): String
 
     /** JSON: with_ort, ort (ONNX Runtime version), providers (the execution providers this build has). */
     @JvmStatic external fun ortInfo(): String

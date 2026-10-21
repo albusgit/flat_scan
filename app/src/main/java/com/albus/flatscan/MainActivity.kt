@@ -51,14 +51,15 @@ class MainActivity : ComponentActivity() {
      * Debug builds: the batch mode (ScanViewModel.runBatch), e.g.
      * `adb shell am start -S -n com.albus.flatscan/.MainActivity --es batch s35 --es accel cpu` (-S: a fresh
      * start; to a running app the intent only brings it to the front); extras: batch
-     * (the folder under files/batch), out, accel (auto, cpu, npu, nnapi), shade (--ez), ext (.jpg / .png),
+     * (the folder under files/batch), out, accel (auto, cpu, npu, gpu, nnapi), shade (--ez), ext (.jpg / .png),
      * static_models (--ez), only (comma-separated names), qnn_packs (--ez: fetch the NPU packs on any phone,
-     * to check their delivery on an emulator).
+     * to check their delivery on an emulator), litert_pack (--ez: fetch the LiteRT GPU pack whatever accel is).
      */
     private fun startBatch(i: Intent?) {
         val set = i?.getStringExtra("batch") ?: return
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
         if (i.getBooleanExtra("qnn_packs", false)) QnnPacks.force = true
+        if (i.getBooleanExtra("litert_pack", false)) LiteRtPacks.force = true
         vm.runBatch(
             set, i.getStringExtra("out"), i.getStringExtra("accel"), if (i.hasExtra("shade")) i.getBooleanExtra("shade", true) else null,
             i.getStringExtra("ext"), i.getBooleanExtra("static_models", false), i.getStringExtra("only"),

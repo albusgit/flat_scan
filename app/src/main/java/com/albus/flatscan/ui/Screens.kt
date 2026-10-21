@@ -83,6 +83,7 @@ import com.albus.flatscan.Accel
 import com.albus.flatscan.BuildConfigInfo
 import com.albus.flatscan.FilterKind
 import com.albus.flatscan.NetEnv
+import com.albus.flatscan.LiteRtPacks
 import com.albus.flatscan.QnnPacks
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
@@ -315,7 +316,8 @@ fun SettingsScreen(vm: ScanViewModel) {
                 "Where the neural nets run. The CPU gives the reference results; an accelerator is used only for the nets " +
                     "whose results match the CPU closely, and any net that fails on it runs on the CPU. " +
                     "ONNX Runtime ${NetEnv.ortVersion}, providers in this build: ${NetEnv.providers.joinToString(", ").ifEmpty { "none" }}. " +
-                    "The NPU libraries are downloaded on first use, on Snapdragon phones only: ${QnnPacks.status}.",
+                    "The NPU libraries are downloaded on first use, on Snapdragon phones only: ${QnnPacks.status}. " +
+                    "The GPU runtime (LiteRT, full precision) is downloaded when GPU or Auto is first used, on any phone: ${LiteRtPacks.status}.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             if (accel == Accel.AUTO) {
