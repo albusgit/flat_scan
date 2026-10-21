@@ -312,7 +312,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Self-test and benchmark")
             Text(
-                "Processes a bundled test page 6 times and checks the result against the reference implementation. Takes about a minute.",
+                "Processes a bundled test page 6 times and checks the result against the reference implementation, then times the neural nets on it 6 times. Takes a few minutes.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(8.dp))

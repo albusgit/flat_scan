@@ -28,8 +28,11 @@ class FlatNet(private val ctx: Context, val model: Int) {
     private val inH = if (model == SYNTHDOC) 1440 else 712
     private val gridPoints = if (model == SYNTHDOC) 121 * 177 else 45 * 31
 
-    /** The net's grid (float[2 * gh * gw]) and, for SyntheticDoc, its shading map (float[3 * inH * inW]). */
-    class Output(val grid: FloatArray, val shading: FloatArray?)
+    /**
+     * The net's grid (float[2 * gh * gw]) and, for SyntheticDoc, its shading map (float[3 * inH * inW]);
+     * [ms]: how long this call took.
+     */
+    class Output(val grid: FloatArray, val shading: FloatArray?, val ms: NetTiming)
 
     @Synchronized
     private fun session(): OrtSession? {
@@ -52,16 +55,23 @@ class FlatNet(private val ctx: Context, val model: Int) {
      */
     @Synchronized
     fun run(photo: Bitmap, crop: IntArray, logits: FloatArray?, pageIndex: Int): Output? {
+        val t0 = System.nanoTime()
+        val loaded = session != null
         val s = session() ?: return null
+        val loadMs = if (loaded) 0.0 else NetTiming.msSince(t0)
+        val t1 = System.nanoTime()
         val x = NativeLib.uvInput(photo, crop, logits, pageIndex) ?: return null
         if (x.size != 3 * inW * inH) return null
+        val inputMs = NetTiming.msSince(t1)
         val env = OrtEnvironment.getEnvironment()
         return OnnxTensor.createTensor(env, FloatBuffer.wrap(x), longArrayOf(1, 3, inH.toLong(), inW.toLong())).use { t ->
+            val t2 = System.nanoTime()
             s.run(mapOf(s.inputNames.first() to t)).use { r ->
+                val runMs = NetTiming.msSince(t2)
                 val g = (r.get(0) as OnnxTensor).floatBuffer
                 if (g.remaining() != 2 * gridPoints) return null
                 val grid = FloatArray(g.remaining()).also { g.get(it) }
-                Output(grid, null)
+                Output(grid, null, NetTiming(runMs, inputMs, loadMs, "1x3x${inH}x$inW"))
             }
         }
     }
