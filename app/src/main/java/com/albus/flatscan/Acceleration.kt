@@ -10,7 +10,7 @@ import java.io.File
  * runs on the CPU for the rest of the app's life). CPU is the default: an accelerated path changes the
  * nets' outputs within the tolerances of jni_bridge.cpp (benchBackends) and is opt-in.
  *  * [AUTO]: on first use per (SoC, app version) the self-test photo's nets run on the CPU and on every
- *    accelerator this ONNX Runtime build has ([candidates]); per group the fastest backend whose outputs
+ *    accelerator this ONNX Runtime build has except NNAPI ([candidates]); per group the fastest backend whose outputs
  *    match the CPU's within the tolerances is kept ([Settings.autoChoice]);
  *  * [NPU]: Qualcomm QNN HTP (fp16) for the flattening nets and the shadow net;
  *  * [NNAPI]: Android NNAPI (fp16) for the same nets; not in the QNN build's ONNX Runtime (arm64-v8a
@@ -49,10 +49,14 @@ object Accel {
         else -> null
     }
 
-    /** Auto's candidates: the accelerators this ONNX Runtime build has (backend names for benchBackends). */
+    /**
+     * Auto's candidates: the accelerators this ONNX Runtime build has (backend names for benchBackends).
+     * Not NNAPI: on the x86_64 emulator (nnapi-reference) ORT 1.22.0's NNAPI EP aborted the process inside
+     * Run (std::terminate, which no fallback can catch), and NNAPI in Auto is PLAN Stream G (not started).
+     * NNAPI stays selectable by hand as experimental.
+     */
     fun candidates(): String = listOfNotNull(
         "qnn".takeIf { NetEnv.has("QNNExecutionProvider") },
-        "nnapi".takeIf { NetEnv.has("NnapiExecutionProvider") },
         "xnnpack".takeIf { NetEnv.has("XnnpackExecutionProvider") },
     ).joinToString(",")
 
