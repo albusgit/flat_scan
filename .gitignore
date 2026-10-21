@@ -10,3 +10,4 @@ app/build/
 /results/
 __pycache__/
 .claude/
+build-host-win/
