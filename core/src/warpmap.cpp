@@ -758,9 +758,10 @@ double trace_on_rule(const cv::Mat& P, bool hz, const Vec& tv, const Vec& cv) {
 // a rule, letter strokes, a picture's or colour block's edge, the paper's own edge are not - and
 // the net's own rules are added where no segment was found (pale rules under the threshold, rules
 // bent too far for the straight-run search: >= 80 px along, <= 14 px thick; the tracer then
-// follows the ink); found pieces of one such rule are joined into one line. A rule the net sees
+// follows the ink) if their ink is at least as dark as a faint printed rule; found pieces of one such
+// rule are joined into one line. A rule the net sees
 // on past a found segment's end is left to extend_trace.
-void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, NetLineStats& st) {
+void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, const cv::Mat& D, NetLineStats& st) {
     for (int hz = 1; hz >= 0; --hz) {
         Lines& A = hz ? H : V;
         const cv::Mat& P = hz ? PH : PV;
@@ -824,7 +825,22 @@ void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, NetLine
                 st.joined += (int)on.size();
                 continue;
             }
-            if (covered > 0.3 * along || std::getenv("FS_NET_NOADD")) continue;
+            if (covered > 0.3 * along) continue;
+            // as dark as a faint printed rule (median peak darkness >= 25, the faint-rule threshold):
+            // the net also marks rules printed on the back of the sheet or on a sheet behind it, seen
+            // through the paper at darkness 7 - 17, whose traces are too noisy to straighten by
+            Vec pk;
+            for (int k = 0; k < along; k += 4) {
+                if (cnt[k] <= 0) continue;
+                float m = 0;
+                int c = (int)std::lround(cs[k] / cnt[k]);
+                for (int q = c - 3; q <= c + 3; ++q) {
+                    int r = hz ? q : a0 + k, cc = hz ? a0 + k : q;
+                    if (r >= 0 && cc >= 0 && r < D.rows && cc < D.cols) m = std::max(m, D.at<float>(r, cc));
+                }
+                pk.push_back(m);
+            }
+            if (pk.empty() || median(pk) < 25) { ++st.too_faint; continue; }
             A.push_back({centre(along / 2), (double)a0, (double)(a0 + along - 1), median(thv), (double)along});
             ++st.added;
         }
@@ -986,7 +1002,7 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* 
     NetLineStats st_local;
     NetLineStats& st = stats ? *stats : st_local;
     const bool net = faint && PH && PV && !PH->empty() && !PV->empty();
-    if (net) net_lines(H, V, *PH, *PV, st);
+    if (net) net_lines(H, V, *PH, *PV, D, st);
     // (a rule's end past the outermost rule found to cross it is left to extend_trace, with or without
     // the net: keeping the found segment's length there capped the trace at the crossing rule's
     // straight position, short of a curled corner)

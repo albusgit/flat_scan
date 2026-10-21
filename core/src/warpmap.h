@@ -33,6 +33,7 @@ using RuleNetFn = std::function<bool(std::vector<float>& io, int w, int h)>;
 struct NetLineStats {
     int dropped = 0;   // found segments the net does not mark as rules (text rows, letters, edges)
     int added = 0;     // rules only the net saw (too faint, too bent for the straight-run search)
+    int too_faint = 0; // ... not added: fainter than a faint printed rule (seen through the paper)
     int joined = 0;    // found pieces joined into one line along a rule the net sees whole
     int dropped_global = 0;   // global-stage grid lines the net does not mark as rules
 };
