@@ -5,6 +5,8 @@
 #include <cmath>
 #include <vector>
 
+#include "nputil.h"
+
 namespace fs {
 
 namespace {
@@ -15,7 +17,7 @@ float magnitudes(const GridMap& d, cv::Mat& mag) {
     all.reserve((size_t)d.gh * d.gw);
     for (int i = 0; i < d.gh; ++i)
         for (int j = 0; j < d.gw; ++j) {
-            float v = std::hypot(d.x[(size_t)i * d.gw + j], d.y[(size_t)i * d.gw + j]);
+            float v = hypot_xy(d.x[(size_t)i * d.gw + j], d.y[(size_t)i * d.gw + j]);
             mag.at<float>(i, j) = v;
             all.push_back(v);
         }

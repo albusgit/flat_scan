@@ -13,6 +13,7 @@
 #include "gpu.h"
 #include "log.h"
 #include "orient.h"
+#include "nputil.h"
 
 #pragma STDC FP_CONTRACT OFF
 
@@ -1035,7 +1036,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     // detection if its corners agree with the user's (otherwise the outline is not trusted)
     if (opt.corners_edited) {
         PageCorners pd = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
-        double diag = std::hypot(photo.cols, photo.rows), worst = 0;
+        double diag = hypot_xy((double)photo.cols, (double)photo.rows), worst = 0;
         for (int k = 0; k < 4 && pd.ok; ++k) worst = std::max(worst, cv::norm(pd.pts[k] - corners[k]));
         if (pd.ok && worst < 0.03 * diag) pc = pd;
     }

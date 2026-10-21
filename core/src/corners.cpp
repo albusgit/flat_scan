@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "nputil.h"
+
 #pragma STDC FP_CONTRACT OFF
 
 namespace fs {
@@ -34,7 +36,7 @@ bool paper_mask(const cv::Mat& img, std::vector<cv::Point2d>& contour, cv::Mat& 
         const uint8_t* q = lab8.ptr<uint8_t>(y);
         for (int x = 0; x < img.cols; ++x) {
             float a = (float)q[3 * x + 1] - 128.f, b = (float)q[3 * x + 2] - 128.f;
-            float c = std::hypot(a, b) * 8.f;                       // float32, as numpy
+            float c = hypot_xy(a, b) * 8.f;                          // float32, as numpy
             c = std::min(std::max(c, 0.f), 255.f);
             chroma8.at<uint8_t>(y, x) = (uint8_t)c;                 // astype(uint8) truncates
             L8.at<uint8_t>(y, x) = q[3 * x];
