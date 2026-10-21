@@ -696,31 +696,63 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
     return out;
 }
 
-// How straight the traced rules of a line stage run (a WarpDebug's S2 samples, positions on its
-// A_img) once a local field (Fx, Fy of the same A_img; null: none, the page as it is) is applied: a
-// sample (along t, ideal, disp) lands at ideal + disp - F(t, ideal) across; per line (one ideal) the
-// p95 distance of its samples from their straight fit, averaged over the lines (px)
-double rule_straightness(const Samples& S, const Field* Fx, const Field* Fy) {
-    double sum = 0;
-    int n = 0;
+// The traced rules of a line stage (its S2 samples, grouped by ideal) as points on the page it ran
+// on: A_img's p is the page's p + G(p) (the global field; zero when the global stage was skipped).
+// Every 2nd sample; lines with fewer than 10 points are left out.
+struct PageTraces {
+    std::vector<std::vector<cv::Point2d>> pts;
+    std::vector<char> hz;
+};
+PageTraces page_traces(const WarpDebug& d) {
+    PageTraces T;
+    const bool glob = d.n_ctrl > 0 && !d.GX.v.empty();
     for (int hz = 1; hz >= 0; --hz) {
-        std::map<double, std::pair<Vec, Vec>> lines;
-        for (const auto& r : hz ? S.h : S.v) {
-            double c = r[1] + r[2];
-            if (Fx && Fy) c -= hz ? Fy->sample(r[0], r[1]) : Fx->sample(r[1], r[0]);
-            lines[r[1]].first.push_back(r[0]); lines[r[1]].second.push_back(c);
+        std::map<double, std::vector<cv::Point2d>> lines;
+        size_t k = 0;
+        for (const auto& r : hz ? d.S2.h : d.S2.v) {
+            if (k++ % 2) continue;
+            double x = hz ? r[0] : r[1] + r[2], y = hz ? r[1] + r[2] : r[0];
+            if (glob) { double gx = d.GX.sample(x, y), gy = d.GY.sample(x, y); x += gx; y += gy; }
+            lines[r[1]].push_back({x, y});
         }
-        for (auto& kv : lines) {
-            Vec &t = kv.second.first, &c = kv.second.second;
-            if (t.size() < 10) continue;
-            Vec p = polyfit(t, c, 1), d;
-            for (size_t i = 0; i < t.size(); ++i) d.push_back(std::fabs(c[i] - polyval(p, t[i])));
-            std::sort(d.begin(), d.end());
-            sum += d[(size_t)(0.95 * (d.size() - 1))];
-            ++n;
-        }
+        for (auto& kv : lines)
+            if (kv.second.size() >= 10) { T.pts.push_back(std::move(kv.second)); T.hz.push_back((char)hz); }
     }
-    return n ? sum / n : 0.0;
+    return T;
+}
+
+// a backward map (output -> page, 4-px grid) at an output point, bilinear, clamped to the grid
+cv::Point2d map_at(const GridMap& g, double x, double y) {
+    double gx = std::min(std::max(x / g.stride, 0.0), g.gw - 1.0), gy = std::min(std::max(y / g.stride, 0.0), g.gh - 1.0);
+    int j = std::min((int)gx, g.gw - 2), i = std::min((int)gy, g.gh - 2);
+    double tx = gx - j, ty = gy - i;
+    auto at = [&](const std::vector<float>& v, int a, int b) { return (double)v[(size_t)a * g.gw + b]; };
+    auto bil = [&](const std::vector<float>& v) {
+        return (1 - ty) * ((1 - tx) * at(v, i, j) + tx * at(v, i, j + 1)) + ty * ((1 - tx) * at(v, i + 1, j) + tx * at(v, i + 1, j + 1));
+    };
+    return {bil(g.x), bil(g.y)};
+}
+
+// How straight those rules come out through map m (null: the page as it is): each point's output
+// position (m inverted by fixed-point steps from the point itself; the line stage moves the page
+// by tens of px at most), per line the p95 distance from its straight fit across the line,
+// averaged over the lines (px)
+double straightness_through(const PageTraces& T, const GridMap* m) {
+    double sum = 0;
+    for (size_t l = 0; l < T.pts.size(); ++l) {
+        Vec t, c;
+        for (const auto& s : T.pts[l]) {
+            cv::Point2d p = s;
+            if (m)
+                for (int it = 0; it < 10; ++it) { cv::Point2d q = map_at(*m, p.x, p.y); p += s - q; }
+            t.push_back(T.hz[l] ? p.x : p.y); c.push_back(T.hz[l] ? p.y : p.x);
+        }
+        Vec f = polyfit(t, c, 1), d;
+        for (size_t i = 0; i < t.size(); ++i) d.push_back(std::fabs(c[i] - polyval(f, t[i])));
+        std::sort(d.begin(), d.end());
+        sum += d[(size_t)(0.95 * (d.size() - 1))];
+    }
+    return T.pts.empty() ? 0.0 : sum / T.pts.size();
 }
 
 // The line stage on a page the nets flattened, with its guards. The page is already flat, so a
@@ -728,12 +760,13 @@ double rule_straightness(const Samples& S, const Field* Fx, const Field* Fy) {
 // more than max_line_distortion_frac of the cells above 0.2) is a tracing failure (dense staves,
 // broken rules, a rule traced into text). Then, in turn: the same lines without those that pass
 // through the overstretched spots (the nets' page stays as it is there), the reference lines alone,
-// and no line stage at all. Kept corrections that rescale a
-// spot by more than max_local_rescale are faded out there (soften_bumps). ignore: the user's areas
-// (CV_8U, page size) or empty. Sets r.warp, r.line_distortion, r.lines_spots_dropped,
-// r.lines_rejected, r.bumps_faded; returns the map on the 4-px grid.
+// and no line stage at all. Corrections that rescale a spot by more than max_local_rescale are
+// faded out there (soften_bumps), and a candidate must leave the rules the first attempt traced
+// straighter than the page as it is (straightness_through, by 0.1 px). ignore: the user's areas
+// (CV_8U, page size) or empty. Sets r.warp, r.line_distortion, r.line_straightness,
+// r.lines_spots_dropped, r.lines_rejected, r.bumps_faded; returns the map on the 4-px grid.
 GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const PipelineOptions& opt, PipelineResult& r) {
-    // the rule net's output is kept for a second unwarp_map run on the same page (the local retry)
+    // the rule net's output is kept for the further unwarp_map runs on the same page (the retry)
     std::vector<float> net_out;
     int net_w = 0, net_h = 0;
     RuleNetFn net = [&](std::vector<float>& io, int w, int h) {
@@ -743,42 +776,46 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         return true;
     };
     const RuleNetFn* netp = opt.rule_net ? &net : nullptr;
-    GridMap m = unwarp_map(page, &r.warp, ignore.empty() ? nullptr : &ignore, opt.share_rows, opt.faint_lines, opt.robust_solve,
-                           opt.colour_edges, netp);
-    double frac = 0, p99 = local_distortion(r.warp, &frac);
-    r.line_distortion = p99;
-    auto ok = [&](double q, double f) { return q <= opt.max_line_distortion && f <= opt.max_line_distortion_frac; };
-    bool bad = !ok(p99, frac);
-    if (bad && opt.faint_lines) {
-        // the lines through them are left out whole: dropping only their samples there straightened a
-        // rule on one side of a spot and not on the other (steps, bumps, half-straightened rules)
-        cv::Mat spots = distortion_spots(r.warp, page.cols, page.rows);
+    const cv::Mat* ig = ignore.empty() ? nullptr : &ignore;
+    WarpDebug w0;
+    GridMap m0 = unwarp_map(page, &w0, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp);
+    // the yardstick for every candidate: the rules the first attempt traced, all of them
+    const PageTraces T = page_traces(w0);
+    const double s_page = straightness_through(T, nullptr);
+    r.line_straightness[0] = s_page;
+    // a candidate is kept if it neither overstretches the page nor leaves those rules less straight
+    // than the page as it is (a fallback that drops some lines can bend the rules they were on)
+    auto take = [&](WarpDebug& w, GridMap& m) {
+        double f = 0, q = local_distortion(w, &f);
+        if (r.line_distortion < 0) r.line_distortion = q;
+        if (q > opt.max_line_distortion || f > opt.max_line_distortion_frac) return false;
+        if (opt.max_local_rescale > 0) r.bumps_faded = soften_bumps(m, opt.max_local_rescale, extension_support(w, m.gw, m.gh, m.stride));
+        double st = straightness_through(T, &m);
+        if (T.pts.size() >= 3 && st > s_page - 0.1) return false;
+        r.line_straightness[1] = st;
+        r.line_distortion = q;
+        r.warp = std::move(w);
+        return true;
+    };
+    if (take(w0, m0)) return m0;
+    if (opt.faint_lines) {
+        // the same lines without those that pass through the overstretched spots (left out whole:
+        // dropping only their samples there straightened a rule on one side of a spot and not on
+        // the other); the nets' page stays as it is there
+        cv::Mat spots = distortion_spots(w0, page.cols, page.rows);
         WarpDebug w1;
-        GridMap m1 = unwarp_map(page, &w1, ignore.empty() ? nullptr : &ignore, opt.share_rows, opt.faint_lines, opt.robust_solve,
-                                opt.colour_edges, netp, &spots);
-        double f1 = 0, q1 = local_distortion(w1, &f1);
-        // ... and it must leave the page's rules (all of the first attempt's, the dropped ones too)
-        // straighter than the page as it is: without the lines through the spots, the rest can bend
-        // the rules there by a few px (a table whose rows all ran through one spot)
-        double s0 = rule_straightness(r.warp.S2, nullptr, nullptr), s1 = rule_straightness(r.warp.S2, &w1.Fx, &w1.Fy);
-        r.retry_straightness[0] = s0; r.retry_straightness[1] = s1;
-        if (ok(q1, f1) && s1 < s0 - 0.1) {
-            m = std::move(m1); r.warp = std::move(w1); r.line_distortion = q1; r.lines_spots_dropped = true; bad = false;
-        }
-    }
-    if (bad && opt.faint_lines) {
-        // the faint rules may be what overstretches it (picture edges, a rule traced into text)
+        GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots);
+        if (take(w1, m1)) { r.lines_spots_dropped = true; return m1; }
+        // the reference lines alone: the faint rules may be what overstretches it (picture edges, a
+        // rule traced into text)
         WarpDebug w2;
-        GridMap m2 = unwarp_map(page, &w2, ignore.empty() ? nullptr : &ignore, opt.share_rows, false, opt.robust_solve);
-        double f2 = 0, q2 = local_distortion(w2, &f2);
-        if (ok(q2, f2)) { m = std::move(m2); r.warp = std::move(w2); r.line_distortion = q2; bad = false; }
+        GridMap m2 = unwarp_map(page, &w2, ig, opt.share_rows, false, opt.robust_solve);
+        if (take(w2, m2)) return m2;
     }
-    if (bad) {
-        r.lines_rejected = true;
-        return identity_grid(page.cols, page.rows);
-    }
-    if (opt.max_local_rescale > 0) r.bumps_faded = soften_bumps(m, opt.max_local_rescale, extension_support(r.warp, m.gw, m.gh, m.stride));
-    return m;
+    r.warp = std::move(w0);
+    r.lines_rejected = true;
+    r.bumps_faded = 0;
+    return identity_grid(page.cols, page.rows);
 }
 
 PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {

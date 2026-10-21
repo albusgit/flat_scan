@@ -158,7 +158,7 @@ struct PipelineResult {
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
     bool lines_spots_dropped = false; // ... too large at first: kept without the lines through the overstretched spots
-    double retry_straightness[2] = {-1, -1};   // ... that retry: the rules' mean p95 deviation (px) as they are / with it
+    double line_straightness[2] = {-1, -1};    // ... the traced rules' mean p95 deviation (px): on the page as it is / through the kept map
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it
     bool shadows_removed = false;     // the shading map was applied to the page
