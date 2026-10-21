@@ -39,11 +39,12 @@ OPENCV_BIN = r"C:\Users\User\Android\opencv\build\x64\vc16\bin"
 
 
 def photo_set(name):
+    # forward slashes: pipeline_cli writes the path into its JSON unescaped
     if name == "s35":
-        out = [(os.path.basename(p)[:-4], p) for p in sorted(glob.glob(os.path.join(S35_DIR, "*.jpg")))]
-        return out + [("500c2810-image", RECEIPT)]
+        out = [(os.path.basename(p)[:-4], p.replace("\\", "/")) for p in sorted(glob.glob(os.path.join(S35_DIR, "*.jpg")))]
+        return out + [("500c2810-image", RECEIPT.replace("\\", "/"))]
     if name == "docunet":
-        return [(f"{k}_{m}", os.path.join(DOCUNET, f"{k}_{m} copy.png")) for k in range(1, 66) for m in (1, 2)]
+        return [(f"{k}_{m}", os.path.join(DOCUNET, f"{k}_{m} copy.png").replace("\\", "/")) for k in range(1, 66) for m in (1, 2)]
     raise SystemExit("unknown set " + name)
 
 
@@ -228,7 +229,7 @@ def main():
     for n, t in res:
         times[n] = t
     print(f"{a.cmd} {a.set}: {len(jobs)} photos in {time.perf_counter() - t0:.0f} s")
-    json.dump(times, open(os.path.join(a.out, f"times_{a.cmd}.json"), "w"), indent=1)
+    json.dump(times, open(os.path.join(a.out, f"times_{a.cmd}.txt"), "w"), indent=1)
 
 
 if __name__ == "__main__":
