@@ -1,8 +1,15 @@
-# Desktop builds of the core for the round-4 checks (Windows / MSVC or Linux / GCC), without
-# EGL / GLES: gpu_stub.cpp reports no GPU, so the core runs its CPU paths.
+# Desktop builds of the core for the round-4 checks (Windows / MSVC or Linux / GCC).
 #   pagefind_cli: the page-finder port only (tools/pagefind_parity.py)
 #   pipeline_cli: the whole photo pipeline (tools/round4_check.py), the nets in-process through
 #                 core/src/infer.cpp (ONNX Runtime 1.22.0, the app's version)
+# GPU (the core's GLES 3.1 compute stages, core/src/gpu.cpp): -DFS_DESKTOP_GPU=
+#   OFF   (default) gpu_stub.cpp reports no GPU, so the core runs its CPU paths
+#   WGL   Windows: gpu.cpp unchanged over gpu_gl43.cpp, which implements the EGL / GLES calls on the
+#         system OpenGL driver (an ES 3.2 context through WGL, else desktop GL 4.3+ core)
+#   MESA  Windows: gpu.cpp on Mesa's EGL / GLES (mesa-dist-win in MESA_DIR, as host/CMakeLists.txt;
+#         GALLIUM_DRIVER=d3d12 the real GPU through Direct3D 12, llvmpipe the CPU rasteriser)
+# With a GPU, fs_cli (host/fs_cli.cpp: selftest-resample, gpu-stages, gpu-bench) is built too, and
+# pipeline_cli FS_GPU=1 turns the GPU stages on (PipelineOptions::use_gpu; default off as before).
 # ONNX Runtime: -DFS_ORT_ROOT=<onnxruntime-win-x64-1.22.0> (default: $ENV{FS_ORT_ROOT}, else
 # C:/Users/User/Android/ort/onnxruntime-win-x64-1.22.0 when it exists); without it the nets cannot
 # run in-process (pipeline_cli then only takes net outputs from files). Execution providers beyond
@@ -15,9 +22,27 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d photo)
 set(CORE ${CMAKE_CURRENT_LIST_DIR}/../../core/src)
+set(FS_DESKTOP_GPU OFF CACHE STRING "GPU for the core's compute stages: OFF (gpu_stub.cpp), WGL (gpu_gl43.cpp) or MESA")
+set_property(CACHE FS_DESKTOP_GPU PROPERTY STRINGS OFF WGL MESA)
+set(MESA_DIR "C:/Users/User/Android/mesa" CACHE PATH "mesa-dist-win: release/x64, devel/include, devel/lib/x64 (MESA; WGL takes only the Khronos headers)")
 file(GLOB CORE_SOURCES ${CORE}/*.cpp)
-list(REMOVE_ITEM CORE_SOURCES ${CORE}/gpu.cpp)
-add_library(core_nogpu STATIC ${CORE_SOURCES} gpu_stub.cpp)
+if(FS_DESKTOP_GPU STREQUAL "OFF")
+  list(REMOVE_ITEM CORE_SOURCES ${CORE}/gpu.cpp)
+  add_library(core_nogpu STATIC ${CORE_SOURCES} gpu_stub.cpp)
+elseif(FS_DESKTOP_GPU STREQUAL "WGL" AND WIN32)
+  add_library(core_nogpu STATIC ${CORE_SOURCES} gpu_gl43.cpp)
+  # the EGL / GLES functions are defined in gpu_gl43.cpp, not imported from a DLL
+  target_compile_definitions(core_nogpu PRIVATE KHRONOS_STATIC)
+  target_include_directories(core_nogpu PRIVATE ${MESA_DIR}/devel/include)
+  target_link_libraries(core_nogpu PUBLIC gdi32 user32)
+elseif(FS_DESKTOP_GPU STREQUAL "MESA" AND WIN32)
+  add_library(core_nogpu STATIC ${CORE_SOURCES})
+  target_include_directories(core_nogpu PRIVATE ${MESA_DIR}/devel/include)
+  target_link_libraries(core_nogpu PUBLIC ${MESA_DIR}/devel/lib/x64/libEGL.lib ${MESA_DIR}/devel/lib/x64/libGLESv2.lib)
+else()
+  message(FATAL_ERROR "FS_DESKTOP_GPU=${FS_DESKTOP_GPU}: OFF, or WGL / MESA on Windows")
+endif()
+message(STATUS "Desktop GPU: ${FS_DESKTOP_GPU}")
 target_include_directories(core_nogpu PUBLIC ${CORE})
 target_link_libraries(core_nogpu PUBLIC ${OpenCV_LIBS})
 if(MSVC)
@@ -59,4 +84,17 @@ if(FS_ORT_ROOT AND WIN32)
   # next to the exe: Windows has an older onnxruntime.dll in System32 that would be found first
   file(GLOB FS_ORT_DLLS ${FS_ORT_ROOT}/lib/*.dll)
   add_custom_command(TARGET pipeline_cli POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FS_ORT_DLLS} $<TARGET_FILE_DIR:pipeline_cli>)
+endif()
+if(NOT FS_DESKTOP_GPU STREQUAL "OFF")
+  target_compile_definitions(pipeline_cli PRIVATE FS_DESKTOP_GPU)
+  # the host harness's GPU checks against this build's GPU (Stream E's sources, unchanged)
+  set(HOST ${CMAKE_CURRENT_LIST_DIR}/../../host)
+  add_executable(fs_cli ${HOST}/fs_cli.cpp ${HOST}/cli_ext.cpp ${HOST}/gpu_stages.cpp)
+  target_include_directories(fs_cli PRIVATE ${HOST})
+  target_link_libraries(fs_cli PRIVATE core_nogpu)
+  if(FS_DESKTOP_GPU STREQUAL "MESA")
+    foreach(dll libEGL.dll libGLESv2.dll libgallium_wgl.dll opengl32.dll dxil.dll)
+      add_custom_command(TARGET fs_cli POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MESA_DIR}/release/x64/${dll} $<TARGET_FILE_DIR:fs_cli>)
+    endforeach()
+  endif()
 endif()
