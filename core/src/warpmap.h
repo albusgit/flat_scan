@@ -63,7 +63,8 @@ struct WarpDebug {
     int n_downweighted = 0;                        // robust solve: samples left at < half weight (last pass)
     std::vector<std::array<double, 4>> G_lines;   // global-stage grid lines: [horizontal (1/0), straightened
                                                   // position, start, end] (stage-1 frame)
-    int n_ignored = 0;                            // samples dropped by the ignore mask
+    int n_ignored = 0;                            // samples dropped by the ignore mask (and drop_lines)
+    int n_lines_dropped = 0;                      // lines left out whole by drop_lines
     Field GX, GY, Fx1, Fy1, Fx, Fy;
     cv::Mat A_img, D;
     cv::Mat PH, PV;                               // app: rule net probabilities on A_img (CV_32F), empty without it
@@ -84,10 +85,13 @@ struct WarpDebug {
 // solved again, so one wrong line cannot bend the area around it.
 // edges (app, with share_rows): long straight boundaries between colour areas are lines too
 // (colour_edges in warpmap.cpp).
+// drop_lines (app): CV_8U of src's size; every line (samples sharing one ideal) with a sample on a
+// non-zero pixel is left out whole (the line stage's local retry, neural_line_stage).
 // rule_net (app, with faint): which found lines are rules, which rules were missed, how far a
 // rule runs and whether a bent trace is a rule (see net_lines in warpmap.cpp); null: no net.
 GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false,
-                   bool faint = false, bool robust = false, bool edges = false, const RuleNetFn* rule_net = nullptr);
+                   bool faint = false, bool robust = false, bool edges = false, const RuleNetFn* rule_net = nullptr,
+                   const cv::Mat* drop_lines = nullptr);
 
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);

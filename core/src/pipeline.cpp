@@ -698,9 +698,9 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
 // The line stage on a page the nets flattened, with its guards. The page is already flat, so a
 // correction that stretches or squeezes it locally (|det J - 1| p99 above max_line_distortion, or
 // more than max_line_distortion_frac of the cells above 0.2) is a tracing failure (dense staves,
-// broken rules, a rule traced into text). Then, in turn: the same lines with their samples in the
-// overstretched spots left out (as if the user had ignored those areas; the nets' page stays as it
-// is there), the reference lines alone, and no line stage at all. Kept corrections that rescale a
+// broken rules, a rule traced into text). Then, in turn: the same lines without those that pass
+// through the overstretched spots (the nets' page stays as it is there), the reference lines alone,
+// and no line stage at all. Kept corrections that rescale a
 // spot by more than max_local_rescale are faded out there (soften_bumps). ignore: the user's areas
 // (CV_8U, page size) or empty. Sets r.warp, r.line_distortion, r.lines_spots_dropped,
 // r.lines_rejected, r.bumps_faded; returns the map on the 4-px grid.
@@ -722,10 +722,12 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     auto ok = [&](double q, double f) { return q <= opt.max_line_distortion && f <= opt.max_line_distortion_frac; };
     bool bad = !ok(p99, frac);
     if (bad && opt.faint_lines) {
+        // the lines through them are left out whole: dropping only their samples there straightened a
+        // rule on one side of a spot and not on the other (steps, bumps, half-straightened rules)
         cv::Mat spots = distortion_spots(r.warp, page.cols, page.rows);
-        if (!ignore.empty()) spots |= ignore;
         WarpDebug w1;
-        GridMap m1 = unwarp_map(page, &w1, &spots, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp);
+        GridMap m1 = unwarp_map(page, &w1, ignore.empty() ? nullptr : &ignore, opt.share_rows, opt.faint_lines, opt.robust_solve,
+                                opt.colour_edges, netp, &spots);
         double f1 = 0, q1 = local_distortion(w1, &f1);
         if (ok(q1, f1)) {
             m = std::move(m1); r.warp = std::move(w1); r.line_distortion = q1; r.lines_spots_dropped = true; bad = false;

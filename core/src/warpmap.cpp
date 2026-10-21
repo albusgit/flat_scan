@@ -2,6 +2,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -1599,7 +1600,7 @@ bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& 
 }
 
 GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges,
-                   const RuleNetFn* rule_net) {
+                   const RuleNetFn* rule_net, const cv::Mat* drop_lines) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1616,6 +1617,22 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const std::array<double, 3>& r) {
                        return hz ? ignored(r[0], r[1] + r[2]) : ignored(r[1] + r[2], r[0]);
                    }), rows.end());
+        d.n_ignored += (int)(n0 - rows.size());
+    };
+    // drop_lines: a line (the samples sharing one ideal) with any sample on it is left out whole
+    const bool dropping = drop_lines && !drop_lines->empty() && drop_lines->size() == src.size();
+    auto drop_whole = [&](std::vector<std::array<double, 3>>& rows, bool hz) {
+        if (!dropping) return;
+        auto on = [&](const std::array<double, 3>& r) {
+            int xi = (int)std::lround(hz ? r[0] : r[1] + r[2]), yi = (int)std::lround(hz ? r[1] + r[2] : r[0]);
+            return xi >= 0 && yi >= 0 && xi < drop_lines->cols && yi < drop_lines->rows && drop_lines->at<uint8_t>(yi, xi) != 0;
+        };
+        std::set<double> hit;
+        for (const auto& r : rows)
+            if (on(r)) hit.insert(r[1]);
+        size_t n0 = rows.size();
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const std::array<double, 3>& r) { return hit.count(r[1]) > 0; }), rows.end());
+        d.n_lines_dropped += (int)hit.size();
         d.n_ignored += (int)(n0 - rows.size());
     };
     const int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
@@ -1752,6 +1769,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
         drop(d.M, false);
+        drop_whole(d.M, false);
     }
     if (edges && share_rows) {
         Lines eh, ev;
@@ -1761,10 +1779,15 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.E_lines.insert(d.E_lines.end(), ev.begin(), ev.end());
         drop(d.EH, true);
         drop(d.EV, false);
+        drop_whole(d.EH, true);
+        drop_whole(d.EV, false);
     }
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
+    drop_whole(d.S1.h, true);
+    drop_whole(d.S1.v, false);
+    drop_whole(d.T, true);
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
     Field Fx_prev, Fy_prev;
@@ -1777,6 +1800,8 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
             d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
             drop(d.S2.h, true);
             drop(d.S2.v, false);
+            drop_whole(d.S2.h, true);
+            drop_whole(d.S2.v, false);
             d.ms.emplace_back("trace pass2", ms_since(tc));
         }
         const Samples& SS = it == 0 ? d.S1 : d.S2;
