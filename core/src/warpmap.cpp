@@ -1835,7 +1835,10 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
     get_lines(d.D, d.H, d.V, faint, PH, PV, &d.net);
     const int GC = 16, GF = 8;
-    if (d.H.empty() || d.V.empty()) {
+    // (app: lines of one direction alone are straightened too - a ruled sheet, a receipt with only
+    // horizontal rules, a page whose vertical "rules" the rule net found to be picture edges; the
+    // other direction gets a zero field. The reference needs both.)
+    if (faint ? (d.H.empty() && d.V.empty()) : (d.H.empty() || d.V.empty())) {
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
         // pages then get the surface model only.
         d.n_text = 0;
