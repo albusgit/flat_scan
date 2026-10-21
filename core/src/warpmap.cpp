@@ -358,6 +358,16 @@ void add_regularizer(Stencil& S) {
     for (size_t i = 0; i < (size_t)gw * gh; ++i) S.a[i * NOFF + 6] += 1e-9;
 }
 
+// The fields' CG tolerance (warpmap.h: set_warp_cg_rtol). 1e-8 is the reference.
+static std::atomic<double>& cg_rtol_store() {
+    static std::atomic<double> v{[] {
+        const char* e = std::getenv("FS_CG_RTOL");
+        double r = e ? std::atof(e) : 0;
+        return r > 0 ? r : 1e-8;
+    }()};
+    return v;
+}
+
 // warpmap.solve: regularised least squares on a G-px grid
 Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh,
                   int G, const Field* warm, int* iters) {
@@ -385,7 +395,7 @@ Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& value
     SolveStats st;
     Field F;
     F.gw = gw; F.gh = gh; F.g = G;
-    F.v = solve_spd_grid(M, rhs, gw, gh, warm ? &x0 : nullptr, 1e-8, 1000, &st);
+    F.v = solve_spd_grid(M, rhs, gw, gh, warm ? &x0 : nullptr, warp_cg_rtol(), 1000, &st);
     if (iters) *iters = st.iterations;
     return F;
 }
@@ -1310,6 +1320,9 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 }
 
 }  // namespace
+
+void set_warp_cg_rtol(double rtol) { cg_rtol_store() = rtol > 0 ? rtol : 1e-8; }
+double warp_cg_rtol() { return cg_rtol_store().load(); }
 
 GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges) {
     WarpDebug local;
