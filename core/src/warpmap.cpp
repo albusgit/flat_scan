@@ -1389,10 +1389,12 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     d.ms.emplace_back("global", ms_since(t0));
     t0 = Clock::now();
     // A_img = remap(src, xx + GX(xx/32, yy/32), ...): exact bilinear at x/32 (no border taps needed)
+    std::vector<float> gx(d.GX.v.begin(), d.GX.v.end()), gy(d.GY.v.begin(), d.GY.v.end());
     if (skip_global) {
         d.A_img = src.clone();
+    } else if (gpu_stages_enabled() && remap_offset_gpu(src, gx, gy, gw, gh, GG, d.A_img)) {
+        // the same map and bicubic on the GPU, byte-identical (resample.h)
     } else {
-        std::vector<float> gx(d.GX.v.begin(), d.GX.v.end()), gy(d.GY.v.begin(), d.GY.v.end());
         d.A_img.create(h, w, src.type());
         const int band = 64;
         cv::Mat mx(band, w, CV_32F), my(band, w, CV_32F);
