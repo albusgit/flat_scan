@@ -81,6 +81,40 @@ val syncQnnPacks by tasks.registering {
     }
 }
 if (usePacks) rootProject.subprojects { if (name in qnnPacks) tasks.configureEach { dependsOn(syncQnnPacks) } }
+// LiteRT (TensorFlow Lite) for the GPU backend: core/src/infer.cpp dlopens its runtime and GPU delegate from
+// the folder NativeLib.loadLiteRt gives (no link-time dependency: a build or phone without them runs as before).
+// The two libraries (arm64-v8a; -PlitertAbi=x86_64 for an x86_64 emulator build) and the GPU models
+// (app/src/main/litert/models/*.tflite: fp16 weights, fp32 compute) go into the on-demand asset pack litert_gpu
+// (its git-ignored src/main/assets: assets/litert/lib/, assets/litert/models/), which the app fetches on any
+// phone when GPU or Auto is chosen (LiteRtPacks in Packs.kt). Without the models folder the pack has only the
+// libraries (the GPU then falls back to the CPU). -PlitertInBase=true: the same files go into the base APK
+// under assets/litert/ instead (a single sideload test APK; copied out to files/litert on first use).
+val litertVersion = "1.4.0"
+val litertAars: Configuration by configurations.creating { isTransitive = false }
+val litertAbi = project.findProperty("litertAbi") as String? ?: "arm64-v8a"
+val litertInBase = (project.findProperty("litertInBase") as String?).toBoolean()
+val litertLibs = listOf("libtensorflowlite_jni.so", "libtensorflowlite_gpu_jni.so")
+val litertModels = file("src/main/litert/models")
+val litertOut = if (litertInBase) layout.buildDirectory.dir("litert/assets").get().asFile else rootProject.file("litert_gpu/src/main/assets")
+val syncLitertPack by tasks.registering {
+    inputs.property("abi", litertAbi)
+    inputs.files(litertAars)
+    inputs.files(fileTree(litertModels) { include("*.tflite") })
+    outputs.dir(litertOut)
+    doLast {
+        project.delete(litertOut)
+        project.copy {
+            litertAars.files.forEach { aar -> from(zipTree(aar)) { include(litertLibs.map { "jni/$litertAbi/$it" }); eachFile { path = "litert/lib/$name" } } }
+            from(litertModels) { include("*.tflite"); eachFile { path = "litert/models/$name" } }
+            includeEmptyDirs = false
+            into(litertOut)
+        }
+        val got = File(litertOut, "litert/lib").list().orEmpty().toSet()
+        require(got == litertLibs.toSet()) { "LiteRT $litertVersion AARs, $litertAbi: found ${got.sorted()}, expected $litertLibs" }
+    }
+}
+if (litertInBase) tasks.configureEach { if (name.startsWith("merge") && name.endsWith("Assets")) dependsOn(syncLitertPack) }
+else rootProject.subprojects { if (name == "litert_gpu") tasks.configureEach { dependsOn(syncLitertPack) } }
 // CMake configures against the unpacked package; the merge tasks package it
 tasks.configureEach {
     if (name.startsWith("configureCMake") || name.startsWith("buildCMake") || name.startsWith("generateJsonModel") ||
@@ -134,6 +168,7 @@ android {
         if (usePacks) ignoreAssetsPatterns += npuModels.map { "!$it" }
     }
     if (usePacks) assetPacks += qnnPacks.map { ":$it" }
+    if (!litertInBase) assetPacks += ":litert_gpu"
     bundle {
         abi { enableSplit = true }
         density { enableSplit = true }
@@ -141,6 +176,7 @@ android {
     }
     sourceSets["main"].jniLibs.srcDir(ortDir.map { it.dir("jni") })
     sourceSets["main"].assets.srcDir(ortDir.map { it.dir("assets") })
+    if (litertInBase) sourceSets["main"].assets.srcDir(litertOut)
     buildFeatures {
         compose = true
         prefab = true
@@ -172,6 +208,9 @@ dependencies {
     ortPlain("com.microsoft.onnxruntime:onnxruntime-android:$ortVersion@aar")
     ortQnn("com.microsoft.onnxruntime:onnxruntime-android-qnn:$ortVersion@aar")
     ortQnn("com.qualcomm.qti:qnn-runtime:$qnnVersion@aar")
+    // the GPU backend's runtime, for the litert_gpu pack only (syncLitertPack; not linked, not in lib/)
+    litertAars("com.google.ai.edge.litert:litert:$litertVersion@aar")
+    litertAars("com.google.ai.edge.litert:litert-gpu:$litertVersion@aar")
     implementation(platform("androidx.compose:compose-bom:2025.05.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")

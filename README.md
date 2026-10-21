@@ -433,6 +433,12 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
   downloads 137 MB in total. Other phones never download the packs.
 - The libraries are then loaded from the pack's files (`NativeLib.loadQnn`, `ADSP_LIBRARY_PATH`). The
   base's native libraries stay uncompressed in the APK, so they are not copied out at install.
+- The GPU backend (Settings > Acceleration > GPU, LiteRT) is the on-demand pack `litert_gpu`. It holds
+  LiteRT 1.4.0's `libtensorflowlite_jni.so` and `libtensorflowlite_gpu_jni.so` and the `.tflite` models from
+  `app/src/main/litert/models/`. Without the models the pack is a 2.8 MB download (arm64). Any phone fetches it
+  (`Packs.kt`) when GPU or Auto is chosen, and loads it with `NativeLib.loadLiteRt`. Build options:
+  `-PlitertAbi=x86_64` packs the emulator ABI instead. `-PlitertInBase=true` puts the same files in the base
+  APK under `assets/litert/`, which gives one sideload test APK.
 
 To install on a phone without Play (USB debugging on), use bundletool. It installs only that phone's splits
 and stages the packs, so the app "downloads" them from the phone itself:
