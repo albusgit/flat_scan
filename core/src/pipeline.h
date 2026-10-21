@@ -88,6 +88,7 @@ struct PipelineOptions {
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
     bool colour_edges = true;         // neural pages: long straight boundaries between colour areas are lines too (warpmap colour_edges)
+    bool second_line_pass = true;     // neural pages: the line stage again on its own output, kept if the rules come out straighter
     bool faint_lines = true;          // also find and trace printed rules too pale for the darkness-45 threshold (warpmap faint_rules)
     bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
     double max_local_rescale = 0.35;  // neural pages: line corrections that rescale a spot by more than this are faded out there (0: off;
@@ -158,6 +159,8 @@ struct PipelineResult {
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
     bool lines_spots_dropped = false; // ... too large at first: kept without the lines through the overstretched spots
+    double second_pass[3] = {-1, -1, -1};   // ... the second pass: its distortion, its rules' deviation before / after (px)
+    bool second_pass_kept = false;
     double line_straightness[2] = {-1, -1};    // ... the traced rules' mean p95 deviation (px): on the page as it is / through the kept map
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it

@@ -817,7 +817,37 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         r.warp = std::move(w);
         return true;
     };
-    if (take(w0, m0)) return m0;
+    // a second trace-and-solve pass on the page the first one straightened (Marior, ArbDR: run again
+    // on the own output, keep it only if it helps): rules too bent to be found or traced on the
+    // first page are found there. Its map composes with the first (the page is resampled once, at
+    // the end). Kept if it stays within the distortion guard, straightens the rules it traced by
+    // > 0.1 px on average and leaves the first pass's rules no less straight.
+    auto second_pass = [&](GridMap& m) {
+        if (!opt.second_line_pass) return;
+        cv::Mat page2 = resample_cpu(page, m);
+        if (page2.channels() == 4) cv::cvtColor(page2, page2, cv::COLOR_BGRA2BGR);
+        RuleNetFn net2 = opt.rule_net;   // the page moved: the net runs again
+        WarpDebug w;
+        GridMap m2 = unwarp_map(page2, &w, nullptr, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges,
+                                opt.rule_net ? &net2 : nullptr);
+        double f = 0, q = local_distortion(w, &f);
+        r.second_pass[0] = q;
+        if (q > opt.max_line_distortion || f > opt.max_line_distortion_frac) return;
+        const PageTraces T2 = page_traces(w);
+        double b2 = straightness_through(T2, nullptr), a2 = straightness_through(T2, &m2);
+        r.second_pass[1] = b2; r.second_pass[2] = a2;
+        if (T2.pts.size() < 3 || a2 > b2 - 0.1) return;
+        GridMap c = m2;   // composite: output -> page2 (m2) -> page (m)
+        for (size_t i = 0; i < c.x.size(); ++i) {
+            cv::Point2d q2 = map_at(m, m2.x[i], m2.y[i]);
+            c.x[i] = (float)q2.x; c.y[i] = (float)q2.y;
+        }
+        if (straightness_through(T, &c) > r.line_straightness[1] + 0.05) return;
+        r.line_straightness[1] = straightness_through(T, &c);
+        m = std::move(c);
+        r.second_pass_kept = true;
+    };
+    if (take(w0, m0)) { second_pass(m0); return m0; }
     if (opt.faint_lines) {
         // the same lines without those that pass through the overstretched spots (left out whole:
         // dropping only their samples there straightened a rule on one side of a spot and not on
@@ -825,12 +855,12 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         cv::Mat spots = distortion_spots(w0, page.cols, page.rows);
         WarpDebug w1;
         GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots);
-        if (take(w1, m1)) { r.lines_spots_dropped = true; return m1; }
+        if (take(w1, m1)) { r.lines_spots_dropped = true; second_pass(m1); return m1; }
         // the reference lines alone: the faint rules may be what overstretches it (picture edges, a
         // rule traced into text)
         WarpDebug w2;
         GridMap m2 = unwarp_map(page, &w2, ig, opt.share_rows, false, opt.robust_solve);
-        if (take(w2, m2)) return m2;
+        if (take(w2, m2)) { second_pass(m2); return m2; }
     }
     r.warp = std::move(w0);
     r.lines_rejected = true;
