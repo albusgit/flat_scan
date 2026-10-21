@@ -71,8 +71,10 @@ double page_hw_ratio(const Unroll& U) {
 }
 
 // stage-1 page: cv2.remap(photo, U) with U evaluated exactly per pixel, in row bands
-cv::Mat remap_unroll(const cv::Mat& photo, const Unroll& U) {
+// (gpu: the same map, the bicubic on the GPU, byte-identical; CPU when that fails)
+cv::Mat remap_unroll(const cv::Mat& photo, const Unroll& U, bool gpu = false) {
     cv::Mat out(U.H, U.W, photo.type());
+    if (gpu && remap_cubic_gpu(photo, U.W, U.H, [&U](int x, int y) { return U.at(x, y); }, out)) return out;
     const int band = 32;
     int nb = (U.H + band - 1) / band;
     int nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
@@ -625,6 +627,7 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
 }
 
 PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
+    GpuStageScope gpu_stages(opt.use_gpu);   // the global stage's remap (warpmap.cpp)
     PipelineResult r;
     auto t0 = Clock::now(), tall = Clock::now();
     report(opt, 2, "Finding the page");
@@ -736,7 +739,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
                     Us.W = W / 2;
                     Us.H = H / 2;
                     int rows = 0;
-                    r.uv_spread[k] = text_row_spread(remap_unroll(photo, Us), &rows);
+                    r.uv_spread[k] = text_row_spread(remap_unroll(photo, Us, opt.use_gpu), &rows);
                     if (rows < 5) r.uv_spread[k] = -1;
                 }
                 if (r.uv_spread[0] >= 0 && r.uv_spread[1] >= 0 && r.uv_spread[1] < r.uv_spread[0] - opt.uv_prefer_margin) pick = 1;
@@ -790,11 +793,11 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     }
     t0 = Clock::now();
     report(opt, 20, "Unrolling the page");
-    cv::Mat stage1 = remap_unroll(photo, U);
+    cv::Mat stage1 = remap_unroll(photo, U, opt.use_gpu);
     r.ms.emplace_back("stage-1 page", ms_since(t0));
     if (opt.auto_orient) {
         t0 = Clock::now();
-        cv::Mat op = (opt.orient_on_stage1 || r.mode == GeomMode::Homography) ? stage1 : remap_unroll(photo, Uh);
+        cv::Mat op = (opt.orient_on_stage1 || r.mode == GeomMode::Homography) ? stage1 : remap_unroll(photo, Uh, opt.use_gpu);
         double min_ratio = opt.orient_min_ratio;
         if (opt.orient_true_aspect) {
             // decided on the page at its own shape (a long receipt is not A4)
@@ -966,6 +969,7 @@ void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper) {
 }
 
 PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {
+    GpuStageScope gpu_stages(opt.use_gpu);   // the global stage's remap (warpmap.cpp)
     PipelineResult r;
     auto t0 = Clock::now();
     report(opt, 5, "Tracing lines and solving the warp map");
