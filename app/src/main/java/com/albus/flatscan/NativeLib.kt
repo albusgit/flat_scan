@@ -47,14 +47,14 @@ object NativeLib {
     /**
      * The nets' backends (core/src/infer.h, ONNX Runtime in libflatscan): per group, the backends to try
      * in order, comma separated ("cpu", "qnn", "nnapi", "xnnpack"; "" = CPU only; the CPU is always the
-     * last resort): [finder] the page finder, [flat] the flattening nets (UVDoc, SyntheticDoc high-res),
+     * last resort): [finder] the page finder, [flat] UVDoc (both passes), [hr] SyntheticDoc high-res,
      * [shade] the shadow net. Models come from [assets] (models/); [cacheDir] keeps QNN's compiled graphs;
      * [threads]: ONNX Runtime intra-op threads (0: its default). [staticModels]: the CPU runs the
      * fixed-shape copies of UVDoc and SyntheticDoc high-res (debug, HUMAN GATE A-1). A group whose
      * backends did not change keeps its loaded sessions.
      */
     @JvmStatic external fun configureNets(
-        assets: AssetManager, cacheDir: String, finder: String, flat: String, shade: String, threads: Int, staticModels: Boolean,
+        assets: AssetManager, cacheDir: String, finder: String, flat: String, hr: String, shade: String, threads: Int, staticModels: Boolean,
     )
 
     /** JSON: with_ort, ort (ONNX Runtime version), providers (the execution providers this build has). */
@@ -101,7 +101,9 @@ object NativeLib {
      * JSON: ok, error, mode, fell_back, fit_median_px, rot, gpu_resample, legend_px (wrinkle
      * map scale top, px), has_paper_mask, needs_manual_crop, fit_median_full_px, the finder
      * fields of [detect] (when detection ran), accel (nets: per net run_ms, input_ms, first_use,
-     * backend, shape; flattening_nets_ms, process_ms), per-stage ms.
+     * backend, shape; flattening_nets_ms: the flattening nets' own time, which runs beside the CPU
+     * stages; nets_overlap: 1 beside them, 0 after the detection, -1 not run; nets_wait_ms: how long
+     * processing waited for them; process_ms), per-stage ms.
      */
     @JvmStatic external fun info(handle: Long): String
 

@@ -310,8 +310,8 @@ struct Progress {
 
 // ---- the nets (core/src/nets.h on core/src/infer.h, ONNX Runtime from the AAR). One Inference per
 // group of nets, so that Settings > Acceleration (or Auto's choice) can give each group its own
-// backends: the page finder, the flattening nets (UVDoc and SyntheticDoc high-res, which
-// run_flat_nets runs on one Inference) and the shadow net. An Inference keeps its sessions for the
+// backends: the page finder, UVDoc (both passes), SyntheticDoc high-res (its own group: its fp16 grid
+// misses the accelerator tolerance where UVDoc's meets it, Gate A) and the shadow net. An Inference keeps its sessions for the
 // life of the process and moves a net to its next backend (CPU last) on any failure, so a net that
 // failed on an accelerator stays on the CPU until the next configureNets with other backends.
 struct NetGroup {
@@ -326,7 +326,7 @@ struct NetGroup {
 };
 
 std::mutex g_nets_mu;             // guards everything below
-std::shared_ptr<NetGroup> g_finder, g_flat, g_shade;
+std::shared_ptr<NetGroup> g_finder, g_flat, g_hr, g_shade;
 jobject g_assets = nullptr;       // global reference: keeps the AAssetManager alive
 AAssetManager* g_mgr = nullptr;
 std::string g_cache_dir;          // QNN context binaries (noBackupFilesDir/qnn_cache)
@@ -462,14 +462,14 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env,
     return env->NewStringUTF(s.c_str());
 }
 
-// Settings > Acceleration: the backends of each net group (names as nets.h parse_backends, comma
-// separated; "" = CPU only), the QNN compiled-model cache, intra-op threads (0: ORT's default).
+// Settings > Acceleration: the backends of each net group (finder, flat: UVDoc, hr: SyntheticDoc
+// high-res, shade; names as nets.h parse_backends, comma separated; "" = CPU only), the QNN compiled-model cache, intra-op threads (0: ORT's default).
 // staticModels: the CPU loads uvdoc_static / syntheticdoc_hr_static instead of the originals (HUMAN
 // GATE A-1). A group whose settings are unchanged keeps its Inference and sessions.
 JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* env, jclass, jobject assets, jstring cache_dir, jstring finder,
-                                                                       jstring flat, jstring shade, jint threads, jboolean static_models) {
+                                                                       jstring flat, jstring hr, jstring shade, jint threads, jboolean static_models) {
     std::string cd = cache_dir ? jstr(env, cache_dir) : "", pf = finder ? jstr(env, finder) : "", fl = flat ? jstr(env, flat) : "",
-                sh = shade ? jstr(env, shade) : "";
+                hs = hr ? jstr(env, hr) : "", sh = shade ? jstr(env, shade) : "";
     std::lock_guard<std::mutex> lk(g_nets_mu);
     if (!g_assets && assets) {
         g_assets = env->NewGlobalRef(assets);
@@ -484,6 +484,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     };
     set(g_finder, pf);
     set(g_flat, fl);
+    set(g_hr, hs);
     set(g_shade, sh);
 }
 
@@ -592,28 +593,22 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.render_w = render_w;
     o.use_gpu = use_gpu;
     Progress progress(env, listener);
-    // the flattening nets: with automatic corners a first UVDoc pass on the whole photo, then UVDoc and
-    // SyntheticDoc high-res on the page it found (the high-res grid in the first slot)
+    // the flattening nets, run by run_photo beside its CPU stages (PipelineOptions::flat_nets, Gate D:
+    // the same outputs as before them): with automatic corners a first UVDoc pass on the whole photo,
+    // then UVDoc and SyntheticDoc high-res on the page it found (the high-res grid in the first slot).
+    // They run on a worker thread, which must not touch JNI: their entries are made after run_photo.
     std::ostringstream acc;   // the "accel" nets entries (info)
     NetsResult nets;
-    double nets_ms = 0;
+    std::shared_ptr<NetGroup> flat_g, hr_g;
     if (flatten && !perspective_only) {
-        progress(0, "Flattening (neural nets)");
-        auto g = group(g_flat);
+        flat_g = group(g_flat);
+        hr_g = group(g_hr);
         NetsRequest rq;
-        rq.corners = o.corners;
         rq.corners_edited = o.corners_edited;
         rq.nets = (FlatNets)std::min(2, std::max(0, (int)flat_nets));
         rq.seg_logits = o.seg_logits;
         rq.page_index = page_index;
-        auto t0 = Clock::now();
-        nets = run_flat_nets(bgr, rq, *g->inf);
-        nets_ms = ms_since(t0);
-        nets.apply(o);
-        for (const NetRun& n : nets.runs) {
-            const bool first = g->first_use(n.name == "synthdoc_hr" ? NetId::SynthDocHR : NetId::UVDoc);
-            acc << (acc.tellp() > 0 ? ", " : "") << "\"" << net_key(n.name) << "\": " << net_entry(n.ok, n.ms, n.total_ms, first, n.backend, run_shape(n.name));
-        }
+        o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
     }
     // the shadow net, after SyntheticDoc's grid (as with the Kotlin ShadeNet)
     ShadeRun shade;
@@ -640,9 +635,15 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         r.ok = false;
         r.error = e.what();
     }
+    for (const NetRun& n : nets.runs) {
+        const bool hr_net = n.name == "synthdoc_hr";
+        const bool first = (hr_net ? hr_g : flat_g)->first_use(hr_net ? NetId::SynthDocHR : NetId::UVDoc);
+        acc << (acc.tellp() > 0 ? ", " : "") << "\"" << net_key(n.name) << "\": " << net_entry(n.ok, n.ms, n.total_ms, first, n.backend, run_shape(n.name));
+    }
     if (shade.calls > 0) acc << (acc.tellp() > 0 ? ", " : "") << "\"shadenet\": " << shade.entry();
     std::ostringstream a;
-    a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(nets_ms) << ", \"process_ms\": " << std::lround(ms_since(t1));
+    a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(std::max(0.0, r.nets_ms)) << ", \"nets_overlap\": " << r.nets_overlap
+      << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"process_ms\": " << std::lround(ms_since(t1));
     s->accel = a.str();
     if (!r.ok) LOGI("pipeline failed: %s", r.error.c_str());
     progress(100, "Done");
@@ -999,9 +1000,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_selfTest(JNIEnv* env
 // ---- Settings > Acceleration > Auto: the nets on the bundled self-test photo, on the CPU and on every
 // candidate backend, timed and compared with the CPU on the same inputs (made as automatic processing
 // makes them; the shadow net gets the photo at the A4 page's net size, 352 x 512). A backend is
-// acceptable for a group of nets when each net of the group ran on it (no fallback to the next backend)
-// within the accelerator tolerances below; Auto takes the fastest acceptable backend per group, the CPU
-// when none is faster. The page finder stays on the CPU (PLAN: 34 NNAPI partitions).
+// acceptable for a group of nets (UVDoc's two passes; SyntheticDoc high-res; the shadow net) when each
+// net of the group ran on it (no fallback to the next backend) within the accelerator tolerances below;
+// Auto takes the fastest acceptable backend per group, the CPU when none is faster. The page finder stays on the CPU (PLAN: 34 NNAPI partitions).
 // Accelerator tolerances (the CPU path itself stays bit-identical):
 //   flattening nets: Gate A's grid measure (grid_px), p99 <= 0.25 px (Gate A's target) and max <= 1 px
 //                    of the 1600 x 2263 analysis page;
@@ -1114,14 +1115,15 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
                 r.pass = in[k].model < 0 ? r.p99 <= AUTO_SHADE_P99 && r.max <= AUTO_SHADE_MAX : r.p99 <= AUTO_GRID_P99_PX && r.max <= AUTO_GRID_MAX_PX;
             }
         // the fastest acceptable backend per group (the CPU's own runs are the reference: acceptable)
-        auto choose = [&](bool shade) {
+        // model: 0 UVDoc, 2 SyntheticDoc high-res, -1 the shadow net
+        auto choose = [&](int model) {
             size_t best = 0;
             double best_ms = -1;
             for (size_t bi = 0; bi < all.size(); ++bi) {
                 double sum = 0;
                 bool okb = true, any = false;
                 for (size_t k = 0; k < in.size(); ++k) {
-                    if ((in[k].model < 0) != shade) continue;
+                    if (in[k].model != model) continue;
                     any = true;
                     const Res& r = res[bi][k];
                     okb = okb && r.ran && (bi == 0 || r.pass);
@@ -1147,11 +1149,11 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             }
             o << "}}";
         }
-        o << "], \"choice\": {\"finder\": \"cpu\", \"flat\": \"" << backend_name(choose(false)) << "\", \"shade\": \"" << backend_name(choose(true))
-          << "\"}}";
+        o << "], \"choice\": {\"finder\": \"cpu\", \"flat\": \"" << backend_name(choose(0)) << "\", \"hr\": \"" << backend_name(choose(2))
+          << "\", \"shade\": \"" << backend_name(choose(-1)) << "\"}}";
     } catch (const std::exception& e) {
         o.str("");
-        o << "{\"ok\": false, \"error\": \"" << escape(e.what()) << "\", \"choice\": {\"finder\": \"cpu\", \"flat\": \"cpu\", \"shade\": \"cpu\"}}";
+        o << "{\"ok\": false, \"error\": \"" << escape(e.what()) << "\", \"choice\": {\"finder\": \"cpu\", \"flat\": \"cpu\", \"hr\": \"cpu\", \"shade\": \"cpu\"}}";
     }
     progress(100, "Done");
     return env->NewStringUTF(o.str().c_str());
@@ -1221,20 +1223,33 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
             o.shade_net = sr.fn();
             o.shade_after_uv = true;
         }
-        // the flattening nets as the app runs them (FS_NETS=1)
-        PageCorners pc = detect_corners(img, o.max_analysis_side, logits, 0);
-        if (!pc.ok) {
+        // the flattening nets as the app runs them (FS_NETS=1): inside run_photo, beside its CPU stages,
+        // on its detection's corners
+        NetsRequest rq;
+        rq.seg_logits = logits;
+        NetsResult nets;
+        auto flat_g = group(g_flat), hr_g = group(g_hr);
+        o.flat_nets = flat_nets_fn(img, rq, *flat_g->inf, &nets, hr_g->inf.get());
+        PipelineResult r;
+        auto t_run = Clock::now();
+        try {
+            r = run_photo(img, o);
+        } catch (const std::exception& e) {
+            r.ok = false;
+            r.error = std::string("exception: ") + e.what();
+        }
+        const double run_ms = ms_since(t_run);
+        if (!r.ok && r.error == "no page found") {
             f << ", \"ok\": false, \"error\": \"no page found\"}";
         } else {
-            NetsRequest rq;
-            rq.corners = pc.pts;
-            rq.seg_logits = logits;
-            auto g = group(g_flat);
-            NetsResult nets = run_flat_nets(img, rq, *g->inf);
-            nets.apply(o);
             for (const NetRun& n : nets.runs)
                 net_json << net_sep() << "\"" << n.name << "\": {\"ok\": " << (n.ok ? "true" : "false") << ", \"backend\": \"" << backend_name(n.backend)
                          << "\", \"ms\": " << cli_num(n.ms) << ", \"total_ms\": " << cli_num(n.total_ms) << "}";
+            net_json << net_sep() << "\"overlap\": {\"mode\": \"" << (r.nets_overlap == 1 ? "overlap" : r.nets_overlap == 0 ? "sequential" : "none")
+                     << "\", \"orient_page_reused\": " << (r.orient_page_reused ? "true" : "false") << ", \"orient_reused\": " << (r.orient_reused ? "true" : "false")
+                     << ", \"nets_ms\": " << cli_num(r.nets_ms) << ", \"wait_ms\": " << cli_num(r.nets_wait_ms) << ", \"join_ms\": " << cli_num(r.nets_join_ms) << ", \"stages\": [";
+            for (size_t i = 0; i < r.ms.size(); ++i) net_json << (i ? ", " : "") << "[\"" << r.ms[i].first << "\", " << cli_num(r.ms[i].second) << "]";
+            net_json << "]}";
             auto put = [&](const char* tag, const std::vector<float>& gr, const UvCrop& c) {
                 if (gr.empty()) return;
                 const UvSpec& sp = uv_spec(c.model);
@@ -1243,15 +1258,6 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
             put("_p1.npz", nets.grid_pass1, nets.crop_pass1);
             put(nets.crop1.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid1, nets.crop1);
             put(nets.crop2.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid2, nets.crop2);
-            PipelineResult r;
-            auto t_run = Clock::now();
-            try {
-                r = run_photo(img, o);
-            } catch (const std::exception& e) {
-                r.ok = false;
-                r.error = std::string("exception: ") + e.what();
-            }
-            const double run_ms = ms_since(t_run);
             if (o.shade_net)
                 net_json << net_sep() << "\"shadenet\": {\"ok\": " << (r.shade_net ? "true" : "false") << ", \"backend\": \""
                          << backend_name(sr.g->inf->backend(NetId::ShadeNet)) << "\", \"ms\": " << cli_num(sr.run_ms) << "}";

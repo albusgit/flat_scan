@@ -11,8 +11,10 @@ import java.io.File
  * nets' outputs within the tolerances of jni_bridge.cpp (benchBackends) and is opt-in.
  *  * [AUTO]: on first use per (SoC, app version) the self-test photo's nets run on the CPU and on every
  *    accelerator in [candidates] (QNN only); per group the fastest backend whose outputs match the CPU's
- *    within the tolerances is kept ([Settings.autoChoice]);
- *  * [NPU]: Qualcomm QNN HTP (fp16) for the flattening nets and the shadow net;
+ *    within the tolerances is kept ([Settings.autoChoice]), SyntheticDoc high-res judged on its own;
+ *  * [NPU]: Qualcomm QNN HTP (fp16) for UVDoc and the shadow net. SyntheticDoc high-res stays on the
+ *    CPU: its fp16 grid missed the accelerator tolerance (Gate A's fp16 stand-in: p99 0.95 px against
+ *    0.25 px; UVDoc 0.08 px). Auto still tries it on QNN and keeps it there only where it passes;
  *  * [NNAPI]: Android NNAPI (fp16) for the same nets; not in the QNN build's ONNX Runtime (arm64-v8a
  *    built with -Port=qnn, the default), where it falls back to the CPU. Not offered in Settings
  *    ([CHOICES]): on the x86_64 emulator ORT 1.22.0's NNAPI and XNNPACK EPs aborted the process inside
@@ -33,21 +35,23 @@ object Accel {
 
     /**
      * The backends of each group of nets, comma separated ("" = CPU only): [finder] the page finder,
-     * [flat] the flattening nets, [shade] the shadow net. [setting]: the Settings value it came from.
+     * [flat] UVDoc (both passes), [hr] SyntheticDoc high-res, [shade] the shadow net. [setting]: the
+     * Settings value it came from.
      */
-    data class Plan(val setting: String, val finder: String, val flat: String, val shade: String, val note: String = "") {
-        val cpuOnly: Boolean get() = finder.isEmpty() && flat.isEmpty() && shade.isEmpty()
+    data class Plan(val setting: String, val finder: String, val flat: String, val hr: String, val shade: String, val note: String = "") {
+        val cpuOnly: Boolean get() = finder.isEmpty() && flat.isEmpty() && hr.isEmpty() && shade.isEmpty()
         private fun name(b: String) = b.ifEmpty { "cpu" }
-        fun summary(): String = "page finder ${name(finder)}, flattening nets ${name(flat)}, shadow net ${name(shade)}"
+        fun summary(): String = "page finder ${name(finder)}, UVDoc ${name(flat)}, SyntheticDoc high-res ${name(hr)}, shadow net ${name(shade)}"
+        fun key(): String = "${name(finder)}/${name(flat)}/${name(hr)}/${name(shade)}"
         fun toJson(): JSONObject = JSONObject().put("setting", setting).put("finder", name(finder)).put("flat", name(flat))
-            .put("shade", name(shade)).put("note", note)
+            .put("hr", name(hr)).put("shade", name(shade)).put("note", note)
     }
 
     /** The plan of a fixed setting; null for [AUTO] (its plan comes from the stored benchmark). */
     fun fixed(setting: String): Plan? = when (setting) {
-        CPU -> Plan(CPU, "", "", "")
-        NPU -> Plan(NPU, "", "qnn", "qnn")
-        NNAPI -> Plan(NNAPI, "", "nnapi", "nnapi")
+        CPU -> Plan(CPU, "", "", "", "")
+        NPU -> Plan(NPU, "", "qnn", "", "qnn")
+        NNAPI -> Plan(NNAPI, "", "nnapi", "", "nnapi")
         else -> null
     }
 
@@ -67,7 +71,9 @@ object Accel {
         if (j.optString("soc") != NetEnv.soc || j.optString("app") != BuildConfigInfo.VERSION) return null
         val c = j.optJSONObject("bench")?.optJSONObject("choice") ?: return null
         fun b(k: String) = c.optString(k, "cpu").let { if (it == "cpu") "" else it }
-        return Plan(AUTO, b("finder"), b("flat"), b("shade"), "benchmarked ${j.optString("at")}")
+        // a benchmark from before SyntheticDoc high-res had its own group has no "hr": run it again
+        if (!c.has("hr")) return null
+        return Plan(AUTO, b("finder"), b("flat"), b("hr"), b("shade"), "benchmarked ${j.optString("at")}")
     }
 }
 

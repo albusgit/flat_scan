@@ -79,7 +79,7 @@ void NetsResult::apply(PipelineOptions& o) const {
     if (!grid_pass1.empty()) { o.uv_out_pass1 = grid_pass1.data(); o.uv_crop_pass1 = crop_pass1; }
 }
 
-NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference& inf) {
+NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference& uv_inf, Inference* hr) {
     NetsResult r;
     if (!rq.flatten || rq.perspective_only || photo.empty()) return r;
     // the other page of a book spread is hidden from every net (uvInput)
@@ -96,6 +96,7 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
     auto run = [&](const char* name, const UvCrop& c, std::vector<float>& grid) {
         auto t0 = Clock::now();
         const NetId id = c.model == 2 ? NetId::SynthDocHR : NetId::UVDoc;
+        Inference& inf = c.model == 2 && hr ? *hr : uv_inf;
         const UvSpec& sp = uv_spec(c.model);
         NetRun nr;
         nr.name = name;
@@ -158,11 +159,11 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
     return r;
 }
 
-FlatNetsFn flat_nets_fn(const cv::Mat& photo, const NetsRequest& rq, Inference& inf, NetsResult* keep) {
-    return [photo, rq, &inf, keep](const NetCornersFn& corners) {
+FlatNetsFn flat_nets_fn(const cv::Mat& photo, const NetsRequest& rq, Inference& inf, NetsResult* keep, Inference* hr) {
+    return [photo, rq, &inf, keep, hr](const NetCornersFn& corners) {
         NetsRequest q = rq;
         q.corners_fn = corners;
-        NetsResult n = run_flat_nets(photo, q, inf);
+        NetsResult n = run_flat_nets(photo, q, inf, hr);
         FlatNetGrids g;
         g.grid1 = n.grid1;
         g.grid2 = n.grid2;

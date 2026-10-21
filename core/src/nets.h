@@ -61,12 +61,14 @@ struct NetsResult {
     void apply(PipelineOptions& o) const;
 };
 
-NetsResult run_flat_nets(const cv::Mat& photo_bgr, const NetsRequest& rq, Inference& inf);
+// hr (optional): SyntheticDoc high-res runs on this Inference instead of inf (its own backends: the
+// app keeps it on the CPU where its fp16 grid misses the accelerator tolerance)
+NetsResult run_flat_nets(const cv::Mat& photo_bgr, const NetsRequest& rq, Inference& inf, Inference* hr = nullptr);
 // PipelineOptions::flat_nets: run_flat_nets on this photo with rq, the corners from run_photo (the
 // detection, or rq.corners_edited's hand-set corners: set rq.corners_edited as the options'
 // corners_edited). It may run on a worker thread (overlap_nets); keep (optional) receives the runs
 // and grids, to be read after run_photo returned.
-FlatNetsFn flat_nets_fn(const cv::Mat& photo_bgr, const NetsRequest& rq, Inference& inf, NetsResult* keep = nullptr);
+FlatNetsFn flat_nets_fn(const cv::Mat& photo_bgr, const NetsRequest& rq, Inference& inf, NetsResult* keep = nullptr, Inference* hr = nullptr);
 
 // PipelineOptions::shade_net: ShadeNet on the planar BGR page (3 x h x w), replaced by its shading map.
 // ms (optional): accumulates the run time.

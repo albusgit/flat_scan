@@ -306,7 +306,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- the nets' backends (Settings > Acceleration)
     /** The groups' backends as last given to [NativeLib.configureNets]. */
-    @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "")
+    @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "", "")
     private val netsLock = Any()
 
     init {
@@ -318,12 +318,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The current setting's plan: a fixed setting's, Auto's stored choice, or the CPU while Auto has not run. */
     fun currentPlan(): Accel.Plan = Accel.fixed(settings.acceleration) ?: Accel.autoPlan(settings.autoChoice)
-        ?: Accel.Plan(Accel.AUTO, "", "", "", "not benchmarked yet")
+        ?: Accel.Plan(Accel.AUTO, "", "", "", "", "not benchmarked yet")
 
     private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) {
         val app = getApplication<Application>()
         val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
-        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.shade, 0, staticModels)
+        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, 0, staticModels)
         netPlan = plan
     }
 
@@ -381,7 +381,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         b.optJSONObject("choice")?.let { c ->
-            sb.append("\nAuto's choice: page finder ${c.optString("finder")}, flattening nets ${c.optString("flat")}, shadow net ${c.optString("shade")}\n")
+            sb.append("\nAuto's choice: page finder ${c.optString("finder")}, UVDoc ${c.optString("flat")}, SyntheticDoc high-res ${c.optString("hr")}, shadow net ${c.optString("shade")}\n")
         }
         sb.append("\nJSON (send this back with the report):\n").append(stored.toString())
         return sb.toString()
@@ -1020,7 +1020,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
             "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7|pass1=1|hrfirst=2|fold=1" +
-            currentPlan().let { if (it.cpuOnly) "" else "|accel=${it.finder}/${it.flat}/${it.shade}" }
+            currentPlan().let { if (it.cpuOnly) "" else "|accel=${it.key()}" }
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no

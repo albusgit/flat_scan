@@ -312,7 +312,7 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
 | Where | Backend | Nets | Notes |
 |---|---|---|---|
 | Android, all ABIs | CPU (default) | all five | ORT C++ from the AAR, linked into `libflatscan` (the Java ORT and the Kotlin net code are gone). Same outputs as before. |
-| Android arm64 | NPU: Qualcomm QNN HTP, fp16 | UVDoc (both passes), SyntheticDoc-HR, ShadeNet | `onnxruntime-android-qnn` 1.22.0 + `qnn-runtime` 2.33.0 (HTP V68-V79). Compiled graphs are cached in `noBackupFilesDir/qnn_cache` (key: model SHA-256, SoC, QNN and ORT versions). Licence: Qualcomm "AI Stack License", shipped in `assets/licenses/`; `-Port=plain` builds without any Qualcomm library. |
+| Android arm64 | NPU: Qualcomm QNN HTP, fp16 | UVDoc (both passes), ShadeNet; SyntheticDoc-HR only where Auto measured it within tolerance | `onnxruntime-android-qnn` 1.22.0 + `qnn-runtime` 2.33.0 (HTP V68-V79). Compiled graphs are cached in `noBackupFilesDir/qnn_cache` (key: model SHA-256, SoC, QNN and ORT versions). Licence: Qualcomm "AI Stack License", shipped in `assets/licenses/`; `-Port=plain` builds without any Qualcomm library. |
 | Android | NNAPI, fp16 | same | **Debug batch mode only** (`--es accel nnapi`), not in Settings: on the x86_64 emulator ORT's NNAPI EP aborted the app inside Run (`std::terminate`, which no fallback can catch). Only in `onnxruntime-android` (x86_64, or arm64 with `-Port=plain`); the QNN AAR has no NNAPI EP. |
 | Android | XNNPACK | same | Compiled in, but not used: as an Auto candidate it aborted the app on the emulator in the same way. |
 | Desktop (`tools/desktop_check`) | CPU, DirectML, CUDA | all five | `--backend` / `FS_BACKEND`. CUDA runs **without TF32** (`use_tf32=0`): with ORT's default TF32, SyntheticDoc-HR's grid moved by p99 0.50 px on the RTX 5060. TensorRT, OpenVINO, CoreML and QNN (Snapdragon X) are compiled in behind CMake options (`FS_ORT_<EP>`) but were not run (no hardware or package here). |
@@ -327,7 +327,8 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
 - **QNN / NNAPI fp16 accuracy is not measured on a device.** The fp16 stand-in (the fp16 model on the desktop
   CPU EP; it rounds weights and activations, not the accumulation) moves the grids by p99 0.08 px for UVDoc
   and **0.95 px for SyntheticDoc-HR** (max 2.64 px, 35 photos). If real HTP fp16 behaves like the stand-in,
-  SyntheticDoc-HR fails Auto's tolerance and the flattening nets stay on the CPU.
+  SyntheticDoc-HR fails Auto's tolerance. It therefore has its own backend choice: the NPU setting keeps it
+  on the CPU, and Auto moves it to QNN only on a phone where it passes. UVDoc and ShadeNet still go to the NPU.
 - **GPU image stages** (GLES 3.1 compute, CPU fallback, `use_gpu`): besides the final resample and cleanup,
   the warp map's global remap now runs on the GPU (`Gpu::remap_offset`). It is on by default where the
   context has `precise` (ES 3.2 or `GL_EXT_gpu_shader5`). The stage-1, uv-spread and orientation pages have a
@@ -337,8 +338,9 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
   them it runs detection, surface fit, quality gate, the orientation page and a provisional orientation
   decision. It redoes the orientation page when a grid moved the corners (`uv_defines_page`), and the decision
   when the page-shape test differs. The output is the same as sequential. `pipeline_cli` uses it
-  (`FS_NETS=1`; `FS_SEQUENTIAL=1` for the old order). **The app does not use it yet**: its `process()` runs the
-  nets first, then `run_photo`.
+  (`FS_NETS=1`; `FS_SEQUENTIAL=1` for the old order), and so does the app (`process()` and the debug batch
+  mode hand `run_photo` the nets through `flat_nets_fn`). Processing details report `nets_overlap` and
+  `nets_wait_ms`.
 - **Desktop GPU**: `-DFS_DESKTOP_GPU=WGL` runs `core/src/gpu.cpp` on the system OpenGL driver (an ES 3.2
   context through WGL, or GL 4.6 core with `FS_GL_PROFILE=core`); `MESA` uses Mesa (d3d12 or llvmpipe);
   `OFF` (default) keeps `gpu_stub.cpp`. `pipeline_cli` turns the GPU stages on with `FS_GPU=1`.
@@ -347,7 +349,8 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
 
 The choices are Auto / CPU / NPU (Qualcomm QNN). **The default is CPU**: Auto stays
 opt-in until it has been checked on a phone. Backends are chosen per group: page finder (always CPU),
-flattening nets (UVDoc and SyntheticDoc-HR share one choice), shadow net.
+UVDoc (both passes), SyntheticDoc-HR, shadow net. NPU puts UVDoc and the shadow net on QNN and keeps
+SyntheticDoc-HR on the CPU (its fp16 stand-in misses the tolerance, above).
 
 **Auto** runs once per (SoC, app version). The bundled self-test photo's nets run on the CPU and on QNN,
 if this ORT build has it (NNAPI and XNNPACK are left out, see above; without QNN, Auto is the CPU). Per group, Auto keeps the fastest backend whose outputs
