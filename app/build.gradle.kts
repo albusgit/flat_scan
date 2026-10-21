@@ -4,6 +4,51 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// ONNX Runtime for the nets, linked into libflatscan through its C/C++ API (core/src/infer.cpp). The AARs
+// ship no prefab, so unpackOrt extracts their headers and libraries into build/ort/<flavour> (headers/,
+// jni/<ABI>/, the layout core/CMakeLists.txt's FS_ORT_ROOT reads), which also feeds jniLibs:
+//  * arm64-v8a: onnxruntime-android-qnn (the QNN execution provider; it has no NNAPI provider) and the
+//    QNN HTP libraries of com.qualcomm.qti:qnn-runtime (HTP v68-v79, the system library and the on-device
+//    graph preparer; the DSP and GPU backends are left out), whose licence and notice file go to
+//    assets/licenses/ (the licence lets them be redistributed only inside an application, with the notices);
+//  * every other ABI (the x86_64 emulator): onnxruntime-android, the same ORT version (NNAPI, XNNPACK).
+// -Port=plain: onnxruntime-android on arm64-v8a too (NNAPI instead of QNN, no Qualcomm libraries).
+val ortVersion = "1.22.0"
+val qnnVersion = "2.33.0"
+val ortFlavour = (project.findProperty("ort") as String? ?: "qnn").also { require(it == "qnn" || it == "plain") { "-Port=qnn|plain" } }
+val ortDir = layout.buildDirectory.dir("ort/$ortFlavour")
+val ortPlain: Configuration by configurations.creating { isTransitive = false }
+val ortQnn: Configuration by configurations.creating { isTransitive = false }
+// -PqnnHtp=V73,V75: only these HTP generations (default all the AAR has: V68 Snapdragon 888 .. V79 8 Elite)
+val qnnHtp = (project.findProperty("qnnHtp") as String? ?: "V68,V69,V73,V75,V79").split(",").map { it.trim().uppercase() }
+val qnnLibs = listOf("libQnnHtp.so", "libQnnHtpPrepare.so", "libQnnSystem.so") +
+    qnnHtp.flatMap { listOf("libQnnHtp${it}Skel.so", "libQnnHtp${it}Stub.so") }
+val unpackOrt by tasks.registering(Sync::class) {
+    into(ortDir)
+    val qnn = ortFlavour == "qnn"
+    from({ zipTree(ortPlain.singleFile) }) {
+        include("headers/**")
+        include("jni/*/libonnxruntime.so")
+        if (qnn) exclude("jni/arm64-v8a/**")
+    }
+    if (qnn) {
+        from({ zipTree(ortQnn.files.single { it.name.startsWith("onnxruntime-android-qnn") }) }) {
+            include("jni/arm64-v8a/libonnxruntime.so")
+        }
+        from({ zipTree(ortQnn.files.single { it.name.startsWith("qnn-runtime") }) }) {
+            include(qnnLibs.map { "jni/arm64-v8a/$it" })
+            include("LICENSE.pdf", "NOTICE.txt")
+            eachFile { if (!path.startsWith("jni/")) path = "assets/licenses/qnn-runtime-$qnnVersion-$name" }
+        }
+    }
+    includeEmptyDirs = false
+}
+// CMake configures against the unpacked package; the merge tasks package it
+tasks.configureEach {
+    if (name.startsWith("configureCMake") || name.startsWith("buildCMake") || name.startsWith("generateJsonModel") ||
+        (name.startsWith("merge") && (name.endsWith("JniLibFolders") || name.endsWith("Assets")))) dependsOn(unpackOrt)
+}
+
 android {
     namespace = "com.albus.flatscan"
     compileSdk = 35
@@ -21,6 +66,10 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += listOf("-DANDROID_STL=c++_shared", "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+                // ONNX Runtime for the nets (core/src/infer.cpp), unpacked by unpackOrt; the execution
+                // providers are looked up at run time, so each ABI uses those its library has
+                arguments += listOf("-DFS_ORT_ROOT=" + ortDir.get().asFile.invariantSeparatorsPath,
+                    "-DFS_ORT_QNN=ON", "-DFS_ORT_NNAPI=ON", "-DFS_ORT_XNNPACK=ON")
                 cppFlags += listOf("-std=c++17", "-fexceptions", "-frtti")
             }
         }
@@ -44,6 +93,8 @@ android {
     androidResources {
         noCompress += "onnx"
     }
+    sourceSets["main"].jniLibs.srcDir(ortDir.map { it.dir("jni") })
+    sourceSets["main"].assets.srcDir(ortDir.map { it.dir("assets") })
     buildFeatures {
         compose = true
         prefab = true
@@ -66,8 +117,9 @@ android {
 
 dependencies {
     implementation("org.opencv:opencv:4.11.0")
-    // page finder net (assets/models/pagefinder.onnx)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
+    ortPlain("com.microsoft.onnxruntime:onnxruntime-android:$ortVersion@aar")
+    ortQnn("com.microsoft.onnxruntime:onnxruntime-android-qnn:$ortVersion@aar")
+    ortQnn("com.qualcomm.qti:qnn-runtime:$qnnVersion@aar")
     implementation(platform("androidx.compose:compose-bom:2025.05.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")

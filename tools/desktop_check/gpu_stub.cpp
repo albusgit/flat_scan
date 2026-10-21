@@ -13,6 +13,8 @@ bool Gpu::available() {
     return false;
 }
 bool Gpu::resample(const cv::Mat&, const GridMap&, cv::Mat&) { return false; }
+bool Gpu::remap_offset(const cv::Mat&, const GridMap&, cv::Mat&) { return false; }
+bool Gpu::remap_dense(const cv::Mat&, const cv::Mat&, const cv::Mat&, cv::Mat&) { return false; }
 bool Gpu::expand_maps(const GridMap&, cv::Mat&, cv::Mat&) { return false; }
 bool Gpu::background_quarter(const cv::Mat&, cv::Mat&) { return false; }
 bool Gpu::filter(const cv::Mat&, const PageParams&, Filter, float, const Adjust&, cv::Mat&) { return false; }

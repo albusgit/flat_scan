@@ -63,6 +63,13 @@ struct WarpDebug {
 GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false,
                    bool faint = false, bool robust = false, bool edges = false);
 
+// Report-only option (docs/results/accel/cg_rtol.txt): the relative-residual tolerance of the
+// warp map's conjugate-gradient field solves. Default 1e-8, the reference; a looser value is
+// faster and changes the map. Process-wide; FS_CG_RTOL=x in the environment sets it at start
+// (desktop harnesses); values <= 0 restore the default. The app never sets it.
+void set_warp_cg_rtol(double rtol);
+double warp_cg_rtol();
+
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint = false);

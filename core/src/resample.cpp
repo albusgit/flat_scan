@@ -2,9 +2,12 @@
 
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #pragma STDC FP_CONTRACT OFF
+
+#include "gpu.h"
 
 namespace fs {
 
@@ -168,6 +171,81 @@ cv::Mat resample_model(const cv::Mat& src, const GridMap& g) {
         }
     }
     return out;
+}
+
+// ---- GPU paths of the other bicubic stages
+static thread_local bool t_gpu_stages = false;
+
+GpuStageScope::GpuStageScope(bool on) : prev_(t_gpu_stages) { t_gpu_stages = on; }
+GpuStageScope::~GpuStageScope() { t_gpu_stages = prev_; }
+bool gpu_stages_enabled() { return t_gpu_stages; }
+
+static std::atomic<bool> g_policy_dense{GpuStagePolicy().dense}, g_policy_offset{GpuStagePolicy().offset};
+void set_gpu_stage_policy(const GpuStagePolicy& p) {
+    g_policy_dense = p.dense;
+    g_policy_offset = p.offset;
+}
+GpuStagePolicy gpu_stage_policy() {
+    GpuStagePolicy p;
+    p.dense = g_policy_dense.load();
+    p.offset = g_policy_offset.load();
+    return p;
+}
+
+static std::atomic<long> g_dense{0}, g_offset{0};
+GpuStageCounts gpu_stage_counts() {
+    GpuStageCounts c;
+    c.dense = g_dense.load();
+    c.offset = g_offset.load();
+    return c;
+}
+
+bool gpu_stage_ready(const cv::Mat& src, int out_w, int out_h) {
+    if (src.empty() || src.depth() != CV_8U || (src.channels() != 3 && src.channels() != 4) || out_w < 1 || out_h < 1) return false;
+    Gpu& gpu = Gpu::instance();
+    if (!gpu.available()) return false;
+    int m = gpu.max_texture_size();
+    return src.cols <= m && src.rows <= m && out_w <= m && out_h <= m;
+}
+
+// the GPU works on RGBA; the bicubic is per channel, so BGR in / BGR out is the same bytes
+static cv::Mat as_rgba(const cv::Mat& src) {
+    if (src.channels() == 4) return src;
+    cv::Mat o;
+    cv::cvtColor(src, o, cv::COLOR_BGR2BGRA);
+    return o;
+}
+static void from_rgba(const cv::Mat& rgba, int channels, cv::Mat& out) {
+    if (channels == 4) out = rgba;
+    else cv::cvtColor(rgba, out, cv::COLOR_BGRA2BGR);
+}
+
+bool remap_dense_gpu(const cv::Mat& src, const cv::Mat& mx, const cv::Mat& my, cv::Mat& out) {
+    if (!gpu_stage_policy().dense || !gpu_stage_ready(src, mx.cols, mx.rows)) return false;
+    cv::Mat o;
+    if (!Gpu::instance().remap_dense(as_rgba(src), mx, my, o)) return false;
+    from_rgba(o, src.channels(), out);
+    ++g_dense;
+    return true;
+}
+
+bool remap_offset_gpu(const cv::Mat& src, const std::vector<float>& gx, const std::vector<float>& gy, int gw, int gh, int stride,
+                      cv::Mat& out) {
+    const int w = src.cols, h = src.rows;
+    // the CPU path reads samples ix + 1, iy + 1 without clamping: the grid must cover them
+    if (stride < 1 || gw < (w - 1) / stride + 2 || gh < (h - 1) / stride + 2) return false;
+    if (!gpu_stage_policy().offset) return false;
+    if ((size_t)gw * gh != gx.size() || gx.size() != gy.size() || !gpu_stage_ready(src, w, h)) return false;
+    // the map is float arithmetic: without `precise` a driver may fuse it and round differently
+    if (!Gpu::instance().precise()) return false;
+    GridMap off;
+    off.out_w = w; off.out_h = h; off.gw = gw; off.gh = gh; off.stride = stride;
+    off.x = gx; off.y = gy;
+    cv::Mat o;
+    if (!Gpu::instance().remap_offset(as_rgba(src), off, o)) return false;
+    from_rgba(o, src.channels(), out);
+    ++g_offset;
+    return true;
 }
 
 }  // namespace fs

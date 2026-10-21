@@ -1,0 +1,40 @@
+INFO:  Checking shadenet_512x352.onnx for usability with ORT Mobile.
+INFO:  Checking NNAPI
+INFO:  1 partitions with a total of 64/64 nodes can be handled by the NNAPI EP.
+INFO:  	Partition sizes: [64]
+DEBUG:  Nodes in group: Conv:/e1/e1.0/e1.0.0/Conv,Relu:/e1/e1.0/e1.0.2/Relu,Conv:/e1/e1.1/e1.1.0/Conv,Relu:/e1/e1.1/e1.1.2/Relu,Conv:/e2/e2.0/e2.0.0/Conv,Relu:/e2/e2.0/e2.0.2/Relu,Conv:/e2/e2.1/e2.1.0/Conv,Relu:/e2/e2.1/e2.1.2/Relu,Conv:/e3/e3.0/e3.0.0/Conv,Relu:/e3/e3.0/e3.0.2/Relu,Conv:/e3/e3.1/e3.1.0/Conv,Relu:/e3/e3.1/e3.1.2/Relu,Conv:/e4/e4.0/e4.0.0/Conv,Relu:/e4/e4.0/e4.0.2/Relu,Conv:/e4/e4.1/e4.1.0/Conv,Relu:/e4/e4.1/e4.1.2/Relu,Conv:/e5/e5.0/e5.0.0/Conv,Relu:/e5/e5.0/e5.0.2/Relu,Conv:/e5/e5.1/e5.1.0/Conv,Relu:/e5/e5.1/e5.1.2/Relu,Conv:/ctx/ctx.0/ctx.0.0/Conv,Relu:/ctx/ctx.0/ctx.0.2/Relu,Conv:/ctx/ctx.1/ctx.1.0/Conv,Relu:/ctx/ctx.1/ctx.1.2/Relu,ReduceMean:/ReduceMean,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu,Mul:/Expand_as_mul,Concat:/Concat,Conv:/fuse/fuse.0/Conv,Relu:/fuse/fuse.2/Relu,Resize:/d4/Resize,Concat:/d4/Concat_1,Conv:/d4/c/c.0/c.0.0/Conv,Relu:/d4/c/c.0/c.0.2/Relu,Conv:/d4/c/c.1/c.1.0/Conv,Relu:/d4/c/c.1/c.1.2/Relu,Resize:/d3/Resize,Concat:/d3/Concat_1,Conv:/d3/c/c.0/c.0.0/Conv,Relu:/d3/c/c.0/c.0.2/Relu,Conv:/d3/c/c.1/c.1.0/Conv,Relu:/d3/c/c.1/c.1.2/Relu,Resize:/d2/Resize,Concat:/d2/Concat_1,Conv:/d2/c/c.0/c.0.0/Conv,Relu:/d2/c/c.0/c.0.2/Relu,Conv:/d2/c/c.1/c.1.0/Conv,Relu:/d2/c/c.1/c.1.2/Relu,Resize:/d1/Resize,Concat:/d1/Concat_1,Conv:/d1/c/c.0/c.0.0/Conv,Relu:/d1/c/c.0/c.0.2/Relu,Conv:/d1/c/c.1/c.1.0/Conv,Relu:/d1/c/c.1/c.1.2/Relu,Resize:/Resize_1,Conv:/out1/Conv,Resize:/Resize,Concat:/Concat_3,Conv:/head/head.0/Conv,Relu:/head/head.1/Relu,Conv:/head/head.2/Conv,Add:/Add,Sigmoid:/Sigmoid
+INFO:  Unsupported nodes due to operator=0
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 2D Conv is supported. Weights and bias should be constant.
+     ai.onnx:Resize:Only 2D Resize is supported.
+INFO:  NNAPI should work well for this model as there is one partition covering 100.0% of the nodes in the model.
+INFO:  Model should perform well with NNAPI as is: YES
+INFO:  ================
+INFO:  
+INFO:  Checking CoreML NeuralNetwork
+INFO:  2 partitions with a total of 63/64 nodes can be handled by the CoreML NeuralNetwork EP.
+INFO:  	Partition sizes: [24, 39]
+DEBUG:  Nodes in group: Conv:/e1/e1.0/e1.0.0/Conv,Relu:/e1/e1.0/e1.0.2/Relu,Conv:/e1/e1.1/e1.1.0/Conv,Relu:/e1/e1.1/e1.1.2/Relu,Conv:/e2/e2.0/e2.0.0/Conv,Relu:/e2/e2.0/e2.0.2/Relu,Conv:/e2/e2.1/e2.1.0/Conv,Relu:/e2/e2.1/e2.1.2/Relu,Conv:/e3/e3.0/e3.0.0/Conv,Relu:/e3/e3.0/e3.0.2/Relu,Conv:/e3/e3.1/e3.1.0/Conv,Relu:/e3/e3.1/e3.1.2/Relu,Conv:/e4/e4.0/e4.0.0/Conv,Relu:/e4/e4.0/e4.0.2/Relu,Conv:/e4/e4.1/e4.1.0/Conv,Relu:/e4/e4.1/e4.1.2/Relu,Conv:/e5/e5.0/e5.0.0/Conv,Relu:/e5/e5.0/e5.0.2/Relu,Conv:/e5/e5.1/e5.1.0/Conv,Relu:/e5/e5.1/e5.1.2/Relu,Conv:/ctx/ctx.0/ctx.0.0/Conv,Relu:/ctx/ctx.0/ctx.0.2/Relu,Conv:/ctx/ctx.1/ctx.1.0/Conv,Relu:/ctx/ctx.1/ctx.1.2/Relu
+DEBUG:  Nodes in group: Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu,Mul:/Expand_as_mul,Concat:/Concat,Conv:/fuse/fuse.0/Conv,Relu:/fuse/fuse.2/Relu,Resize:/d4/Resize,Concat:/d4/Concat_1,Conv:/d4/c/c.0/c.0.0/Conv,Relu:/d4/c/c.0/c.0.2/Relu,Conv:/d4/c/c.1/c.1.0/Conv,Relu:/d4/c/c.1/c.1.2/Relu,Resize:/d3/Resize,Concat:/d3/Concat_1,Conv:/d3/c/c.0/c.0.0/Conv,Relu:/d3/c/c.0/c.0.2/Relu,Conv:/d3/c/c.1/c.1.0/Conv,Relu:/d3/c/c.1/c.1.2/Relu,Resize:/d2/Resize,Concat:/d2/Concat_1,Conv:/d2/c/c.0/c.0.0/Conv,Relu:/d2/c/c.0/c.0.2/Relu,Conv:/d2/c/c.1/c.1.0/Conv,Relu:/d2/c/c.1/c.1.2/Relu,Resize:/d1/Resize,Concat:/d1/Concat_1,Conv:/d1/c/c.0/c.0.0/Conv,Relu:/d1/c/c.0/c.0.2/Relu,Conv:/d1/c/c.1/c.1.0/Conv,Relu:/d1/c/c.1/c.1.2/Relu,Resize:/Resize_1,Conv:/out1/Conv,Resize:/Resize,Concat:/Concat_3,Conv:/head/head.0/Conv,Relu:/head/head.1/Relu,Conv:/head/head.2/Conv,Add:/Add,Sigmoid:/Sigmoid
+INFO:  Unsupported nodes due to operator=1
+INFO:  	Unsupported ops: ai.onnx:ReduceMean
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 1D/2D Conv is supported. Weights and bias should be constant.
+     ai.onnx:Resize:4D input. `coordinate_transformation_mode` == `asymmetric`. `mode` == `linear` or `nearest`. `nearest_mode` == `floor`. `exclude_outside` == false `scales` or `sizes` must be constant.
+INFO:  CoreML NeuralNetwork can be considered for this model as there are two partitions covering 98.4% of the nodes. Performance testing is required to validate.
+INFO:  Model should perform well with CoreML NeuralNetwork as is: MAYBE
+INFO:  ================
+INFO:  
+INFO:  Checking CoreML MLProgram
+INFO:  1 partitions with a total of 64/64 nodes can be handled by the CoreML MLProgram EP.
+INFO:  	Partition sizes: [64]
+DEBUG:  Nodes in group: Conv:/e1/e1.0/e1.0.0/Conv,Relu:/e1/e1.0/e1.0.2/Relu,Conv:/e1/e1.1/e1.1.0/Conv,Relu:/e1/e1.1/e1.1.2/Relu,Conv:/e2/e2.0/e2.0.0/Conv,Relu:/e2/e2.0/e2.0.2/Relu,Conv:/e2/e2.1/e2.1.0/Conv,Relu:/e2/e2.1/e2.1.2/Relu,Conv:/e3/e3.0/e3.0.0/Conv,Relu:/e3/e3.0/e3.0.2/Relu,Conv:/e3/e3.1/e3.1.0/Conv,Relu:/e3/e3.1/e3.1.2/Relu,Conv:/e4/e4.0/e4.0.0/Conv,Relu:/e4/e4.0/e4.0.2/Relu,Conv:/e4/e4.1/e4.1.0/Conv,Relu:/e4/e4.1/e4.1.2/Relu,Conv:/e5/e5.0/e5.0.0/Conv,Relu:/e5/e5.0/e5.0.2/Relu,Conv:/e5/e5.1/e5.1.0/Conv,Relu:/e5/e5.1/e5.1.2/Relu,Conv:/ctx/ctx.0/ctx.0.0/Conv,Relu:/ctx/ctx.0/ctx.0.2/Relu,Conv:/ctx/ctx.1/ctx.1.0/Conv,Relu:/ctx/ctx.1/ctx.1.2/Relu,ReduceMean:/ReduceMean,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu,Mul:/Expand_as_mul,Concat:/Concat,Conv:/fuse/fuse.0/Conv,Relu:/fuse/fuse.2/Relu,Resize:/d4/Resize,Concat:/d4/Concat_1,Conv:/d4/c/c.0/c.0.0/Conv,Relu:/d4/c/c.0/c.0.2/Relu,Conv:/d4/c/c.1/c.1.0/Conv,Relu:/d4/c/c.1/c.1.2/Relu,Resize:/d3/Resize,Concat:/d3/Concat_1,Conv:/d3/c/c.0/c.0.0/Conv,Relu:/d3/c/c.0/c.0.2/Relu,Conv:/d3/c/c.1/c.1.0/Conv,Relu:/d3/c/c.1/c.1.2/Relu,Resize:/d2/Resize,Concat:/d2/Concat_1,Conv:/d2/c/c.0/c.0.0/Conv,Relu:/d2/c/c.0/c.0.2/Relu,Conv:/d2/c/c.1/c.1.0/Conv,Relu:/d2/c/c.1/c.1.2/Relu,Resize:/d1/Resize,Concat:/d1/Concat_1,Conv:/d1/c/c.0/c.0.0/Conv,Relu:/d1/c/c.0/c.0.2/Relu,Conv:/d1/c/c.1/c.1.0/Conv,Relu:/d1/c/c.1/c.1.2/Relu,Resize:/Resize_1,Conv:/out1/Conv,Resize:/Resize,Concat:/Concat_3,Conv:/head/head.0/Conv,Relu:/head/head.1/Relu,Conv:/head/head.2/Conv,Add:/Add,Sigmoid:/Sigmoid
+INFO:  Unsupported nodes due to operator=0
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 1D/2D Conv is supported. Bias if provided must be constant.
+     ai.onnx:Resize:See [resize_op_builder.cc](https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/core/providers/coreml/builders/impl/resize_op_builder.cc) implementation. There are too many permutations to describe the valid combinations.
+INFO:  CoreML MLProgram should work well for this model as there is one partition covering 100.0% of the nodes in the model.
+INFO:  Model should perform well with CoreML MLProgram as is: YES
+INFO:  ================
+INFO:  
+INFO:  As NNAPI or CoreML may provide benefits with this model it is recommended to compare the performance of the model using the NNAPI EP on Android, and the CoreML EP on iOS, against the performance using the CPU EP.

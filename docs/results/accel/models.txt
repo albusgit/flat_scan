@@ -1,0 +1,34 @@
+Stream A (models), 2026-10-21. Tools: C:/Users/User/Android/accel_venv (Python 3.11, onnxruntime 1.22.0 = the
+app's ORT, onnx 1.18.0, onnxconverter-common 1.16.0, onnxsim 0.8.1 installed but not used, see prepare_models.py);
+torch export with C:/Users/User/Desktop/round4_robustness/.venv (torch 2.11.0+cu128).
+
+New assets (app/src/main/assets/models; originals untouched; .onnx is stored uncompressed in the APK, noCompress)
+  file                          bytes       sha256 (first 16)  made by
+  uvdoc_static.onnx             15,829,095  3dc29bcb7ee0782c   python tools/accel/prepare_models.py
+  syntheticdoc_hr_static.onnx   15,908,223  8ae80078c64f2a4a   python tools/accel/prepare_models.py
+  shadenet_512x352.onnx          1,051,804  4d53735a68de17b3   python tools/shadow_net/export.py --static
+                                                                 C:/Users/User/Desktop/shadow_train/final_11k.pt
+                                                                 app/src/main/assets/models 352
+  APK size: +32,789,122 bytes (31.3 MiB) per APK, all ABIs (assets are ABI independent).
+  Re-running both commands reproduces these files byte for byte. `export.py final_11k.pt OUT.onnx` reproduces the
+  shipped shadenet.onnx byte for byte, so the checkpoint is the shipped model's.
+  Only W = 352 of ShadeNet is shipped: the output page is always A4, so apply_shade_net gives the net 512 x 352
+  (all 35 photos: 512 x 352); other widths (export.py --static default 288..512) and the CPU use shadenet.onnx.
+
+Mobile usability checker (python -m onnxruntime.tools.check_onnx_model_mobile_usability --log_level debug,
+logs usability_<model>.txt here), NNAPI:
+  uvdoc.onnx                  1 partition, 103/103 nodes      uvdoc_static.onnx            1 partition, 103/103 (100 %)
+  syntheticdoc_hr.onnx        5 partitions, 133/138           syntheticdoc_hr_static.onnx  1 partition, 107/107 (100 %)
+  shadenet.onnx               6 partitions,  39/113           shadenet_512x352.onnx        1 partition,   64/64 (100 %)
+
+compare_outputs.py on the 35 photos' real net inputs (compare_outputs.txt here; inputs from tools/accel/net_inputs.py,
+ORT 1.22.0 CPU EP, default session options):
+  fp32 static vs original: uvdoc (pass 1 + re-crop) and syntheticdoc_hr bit-identical on all 35 (105 runs).
+  ShadeNet 512x352 vs shadenet.onnx: not bit-identical at the default optimisation level (max |diff| 2.4e-7 =
+  6e-5 levels; ORT turns constant-size Resizes into NCHWc Upsample), bit-identical at ORT_ENABLE_BASIC.
+  It is for accelerators only; the CPU path keeps shadenet.onnx.
+  fp16 proxy (BN folded, all tensors fp16 on the ORT CPU EP; rounds activations, not the accumulation):
+    UVDoc pass 1   grid p99 0.083 px, max 0.122 px of the 1600 x 2263 page   (target p99 < 0.25: met)
+    UVDoc re-crop  grid p99 0.078 px, max 0.123 px                          (met)
+    SynthDoc-HR    grid p99 0.954 px, max 2.641 px                          (NOT met)
+    ShadeNet       shading p99 0.068, max 0.113 8-bit levels

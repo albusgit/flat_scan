@@ -1,15 +1,11 @@
 package com.albus.flatscan
 
+import android.content.res.AssetManager
 import android.graphics.Bitmap
 
 /** Progress callback from the native pipeline (called on the processing thread). */
 fun interface ProgressListener {
     fun onProgress(percent: Int, stage: String)
-}
-
-/** The shadow net ([ShadeNet]): planar BGR [0, 1], 3 x height x width in, the shading map (same layout) out, or null. */
-fun interface ShadeNetRunner {
-    fun shade(input: FloatArray, width: Int, height: Int): FloatArray?
 }
 
 /** Filters of the filter strip; [id] is the native enum value (core/src/cleanup.h Filter). */
@@ -49,10 +45,28 @@ object NativeLib {
     @JvmStatic external fun gpuInfo(): String
 
     /**
-     * Input of the page-finder net for this photo (seg/segnet.py to_input): the whole photo squashed
-     * to 256 x 256, RGB, ImageNet-normalised, NCHW float[3 * 256 * 256]; null if unreadable.
+     * The nets' backends (core/src/infer.h, ONNX Runtime in libflatscan): per group, the backends to try
+     * in order, comma separated ("cpu", "qnn", "nnapi", "xnnpack"; "" = CPU only; the CPU is always the
+     * last resort): [finder] the page finder, [flat] UVDoc (both passes), [hr] SyntheticDoc high-res,
+     * [shade] the shadow net. Models come from [assets] (models/); [cacheDir] keeps QNN's compiled graphs;
+     * [threads]: ONNX Runtime intra-op threads (0: its default). [staticModels]: the CPU runs the
+     * fixed-shape copies of UVDoc and SyntheticDoc high-res (debug, HUMAN GATE A-1). A group whose
+     * backends did not change keeps its loaded sessions.
      */
-    @JvmStatic external fun segInput(photo: Bitmap): FloatArray?
+    @JvmStatic external fun configureNets(
+        assets: AssetManager, cacheDir: String, finder: String, flat: String, hr: String, shade: String, threads: Int, staticModels: Boolean,
+    )
+
+    /** JSON: with_ort, ort (ONNX Runtime version), providers (the execution providers this build has). */
+    @JvmStatic external fun ortInfo(): String
+
+    /**
+     * The page-finder net's logits for [photo] (float[2 * 256 * 256]: page paper, book gutter), or null
+     * (net unavailable: the colour-threshold detector is used). [timing] (1 element, optional) receives
+     * its processing-details entry: JSON run_ms, input_ms (the rest of the call; on first use also the
+     * session's creation), first_use, backend, shape.
+     */
+    @JvmStatic external fun pageFinder(photo: Bitmap, timing: Array<String?>?): FloatArray?
 
     /**
      * Page detection for the crop screen. logits: the page-finder net's output for this photo
@@ -70,44 +84,26 @@ object NativeLib {
      * forceHomography: the quality gate flagged the crop, use the homography path.
      * perspectiveOnly: the user turned the unwarp off (homography, no warp map).
      * ignore: areas whose lines the warp map must not use, page fractions [x0, y0, x1, y1, ...].
-     * uvOut / uvCrop, uvOut2 / uvCrop2: flattening-net grids ([FlatNet.run]) for those crops of this
-     * photo (the first is preferred; the straighter stage-1 page wins), or null. uvPass1 / uvCropPass1:
-     * the first pass on the whole photo whose outline gave those crops ([uvRecrop]); a grid that finds
-     * the same page is used even where the page finder disagrees. uvShading:
-     * SyntheticDoc's shading map for its crop (shadow removal), or null. shadeNet: the shadow net, run
-     * on the flattened page after SyntheticDoc's map, or null.
+     * flatten: the flattening nets (UVDoc on the whole photo with automatic corners, then UVDoc and
+     * SyntheticDoc high-res on the page it found; core/src/nets.cpp) unless perspectiveOnly; flatNets:
+     * 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc high-res only. shadows: the shadow
+     * net on the flattened page. The nets run on [configureNets]' backends; their timings and backends
+     * are in [info]'s "accel".
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        uvOut: FloatArray?, uvCrop: IntArray?, uvOut2: FloatArray?, uvCrop2: IntArray?,
-        uvPass1: FloatArray?, uvCropPass1: IntArray?, uvShading: FloatArray?,
-        shadeNet: ShadeNetRunner?, listener: ProgressListener?,
+        flatten: Boolean, flatNets: Int, shadows: Boolean, listener: ProgressListener?,
     ): Long
-
-    /**
-     * Flattening net [model] (0 UVDoc, 1 SyntheticDoc): the part of a [width] x [height] photo it
-     * sees for [corners] -> [x, y, w, h, turned, model].
-     */
-    @JvmStatic external fun uvCrop(width: Int, height: Int, corners: FloatArray, model: Int): IntArray
-
-    /**
-     * The re-crop for net [model]: the page outline of a first pass's [grid] (on [crop]) plus a margin,
-     * turned when that page is landscape -> [x, y, w, h, turned, model], or null.
-     */
-    @JvmStatic external fun uvRecrop(width: Int, height: Int, grid: FloatArray, crop: IntArray, model: Int): IntArray?
-
-    /**
-     * Flattening-net input for [crop] of [photo]: float[3 * in_h * in_w] (RGB 0..1, NCHW), or null. With the
-     * page finder's [logits], the other page of a book spread (not [pageIndex]) is hidden.
-     */
-    @JvmStatic external fun uvInput(photo: Bitmap, crop: IntArray, logits: FloatArray?, pageIndex: Int): FloatArray?
 
     /**
      * JSON: ok, error, mode, fell_back, fit_median_px, rot, gpu_resample, legend_px (wrinkle
      * map scale top, px), has_paper_mask, needs_manual_crop, fit_median_full_px, the finder
-     * fields of [detect] (when detection ran), per-stage ms.
+     * fields of [detect] (when detection ran), accel (nets: per net run_ms, input_ms, first_use,
+     * backend, shape; flattening_nets_ms: the flattening nets' own time, which runs beside the CPU
+     * stages; nets_overlap: 1 beside them, 0 after the detection, -1 not run; nets_wait_ms: how long
+     * processing waited for them; process_ms), per-stage ms.
      */
     @JvmStatic external fun info(handle: Long): String
 
@@ -165,4 +161,20 @@ object NativeLib {
      * returns per-stage median / p95 timings and peak memory as JSON.
      */
     @JvmStatic external fun selfTest(photo: Bitmap, refGridPath: String, runs: Int, listener: ProgressListener?): String
+
+    /**
+     * Settings > Acceleration > Auto: the nets on the self-test [photo] on the CPU and on each of
+     * [candidates] (backend names, comma separated), [runs] timed runs after a first one, compared with the
+     * CPU (accelerator tolerances in jni_bridge.cpp). JSON: ok, tolerance, backends [{backend, nets:
+     * {key: {ran, first_ms, median_ms, p95_ms, p99_diff, max_diff, pass}}}], choice {finder, flat, shade}.
+     */
+    @JvmStatic external fun benchBackends(photo: Bitmap, candidates: String, runs: Int, listener: ProgressListener?): String
+
+    /**
+     * Debug batch mode: the image file [photoPath] as tools/desktop_check/pipeline_cli runs it with the nets
+     * in-process (shade: with the shadow net), on [configureNets]' backends; writes [outBase].json (the
+     * returned JSON line), the page [outBase] + [pageExt] (".jpg" q85 or ".png") and the nets' outputs
+     * ([outBase]_logits.npz, _p1.npz, _rc0.npz, _rc2.npz).
+     */
+    @JvmStatic external fun batchPhoto(photoPath: String, outBase: String, pageExt: String, shade: Boolean): String
 }

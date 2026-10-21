@@ -1,0 +1,69 @@
+Stream B: desktop CPU times, nets in-process (core/src/infer.cpp on ONNX Runtime C++ 1.22.0, CPU EP)
+=====================================================================================================
+
+Machine: i5-14400F (10 cores / 16 threads), 32 GB, Windows 11; MSVC Release (/fp:precise), OpenCV 4.11 vc16.
+Measured 2026-10-21 12:25-12:30 while other agents' jobs were running on the same machine (no heavy
+lock was held by anyone during the run, but the CPU was not idle): treat these as indicative, not a
+clean benchmark.
+
+Build:  tools/desktop_check (see the gate commands below), commit d64f88f on accel/b.
+Run:    python -I tools/desktop_check/gate_b.py new s35 OUT --cli tools/desktop_check/build/pipeline_cli.exe --shade --jobs 1
+        (pipeline_cli PHOTO OUT.jpg net with FS_NETS=1 FS_SHADE_NET=... FS_SHADE_AFTER=1: page finder,
+        first UVDoc pass, UVDoc + SyntheticDoc-HR on the re-crop, ShadeNet, all through Inference)
+Set:    the 35 photos (34 round-4 photos + the hand-held receipt), one photo per process, one at a time.
+
+"ms" = Inference::last_ms (the ORT Run call alone). "first call" = input preparation + checks + the
+session creation (model load, graph optimisation) on the first use of that net in the process; the
+app keeps its sessions, so from the second photo on only "ms" (plus input preparation) is paid.
+uvdoc's first call is cheap because uv_pass1 already created the UVDoc session.
+
+ORT default intra-op threads (FS_ORT_THREADS unset), 35 photos:
+net            n  median ms   mean ms   max ms   first call incl. session create (median ms)
+page_finder   35       22.8      24.8     43.3   180.4
+uv_pass1      35       52.9      58.3    161.0   236.6
+uvdoc         35       53.0      59.0    197.1   59.6
+synthdoc_hr   35      520.2     533.4    764.5   785.9
+shadenet      35       21.5      24.5     47.9   (not split out; inside run_photo)
+nets sum      35      676.1     699.9   1186.6   (the five ORT runs)
+pipeline_ms   35     1766.4    1798.3   3979.0   (run_photo alone, ShadeNet included; nets before it excluded)
+process wall  35     3544.1    3793.8   6011.1   (pipeline_cli process: start, model reads, image read/write)
+
+Per page, nets + pipeline:
+  page finder + flattening nets "first call" times + pipeline_ms  median 3016  mean 3113  max 5357 ms
+  (one photo per process, sessions created for it)
+  page finder + flattening nets "ms" + pipeline_ms                 median 2416  mean 2474  max 4694 ms
+  (sessions already created, the app's steady state; input preparation of the flattening nets not counted)
+
+Python ORT 1.22.0 path it replaces (gate_b.py ref: pagefind_cli / pipeline_cli FS_UVIN dumps -> Python
+onnxruntime, intra_op_num_threads 2, sessions reused within the process; ShadeNet through the
+run_onnx.py subprocess), 3 photos, --jobs 1, Run times measured in Python around session.run
+(docres__151_in ran first, so its page_finder / uv_pass1 / synthdoc_hr include session creation):
+  docres__151_in:           page_finder py  148 / c++ 21 ms, uv_pass1 py 248 / c++ 52, uvdoc py 155 / c++ 50, synthdoc_hr py 1372 / c++ 492
+  scanner_samples__receipt: page_finder py   41 / c++ 22 ms, uv_pass1 py 268 / c++ 54, uvdoc py 218 / c++ 54, synthdoc_hr py 1405 / c++ 513
+  user__page3_sideways:     page_finder py   52 / c++ 23 ms, uv_pass1 py 286 / c++ 53, uvdoc py 340 / c++ 53, synthdoc_hr py 2481 / c++ 509
+
+Same 3 photos in-process with FS_ORT_THREADS=2 (the Python reference's thread count; outputs still
+bit-identical to the reference):
+  docres__151_in:           page_finder 31, uv_pass1 148, uvdoc 154, synthdoc_hr 1124, shadenet 54 ms; pipeline_ms 1860
+  scanner_samples__receipt: page_finder 30, uv_pass1 152, uvdoc 144, synthdoc_hr 1169, shadenet 74 ms; pipeline_ms 1564
+  user__page3_sideways:     page_finder 29, uv_pass1 141, uvdoc 147, synthdoc_hr 1401, shadenet 96 ms; pipeline_ms 2406
+So most of the C++ vs Python difference above is the thread count (16 vs 2), not the binding; the
+in-process path also drops the subprocess round trips and npz files of the Python path.
+
+Parity measured alongside (CPU backend, bit for bit: page finder logits, the three flattening-net
+grids, output page, JSON without the new "nets" / "pipeline_ms" keys):
+  35 photos, this timing run vs the Python ORT 1.22.0 reference: 35/35 identical.
+  tools/round4_check.py on the reference and on the in-process outputs: identical report.
+  DocUNet: 34 photos (1_1 .. 17_2) identical to the 1.22.0 reference and to docunet_bench/work/new_fold2;
+  the other 96 not run in this attempt (speed mode: the Coordinator runs the full gate).
+
+Builds checked in this attempt (compile + link):
+  tools/desktop_check, MSVC, EP options OFF (default): pipeline_cli.exe / pagefind_cli.exe.
+  tools/desktop_check with -DFS_ORT_QNN=ON -DFS_ORT_XNNPACK=ON -DFS_ORT_CUDA=ON -DFS_ORT_TENSORRT=ON
+    -DFS_ORT_DML=ON -DFS_ORT_OPENVINO=ON -DFS_ORT_COREML=ON against the CPU-only win-x64 1.22.0 package:
+    builds; `--backend cuda,tensorrt,dml,openvino,xnnpack` on scanner_samples__receipt falls back to
+    CPU for every net and stays bit-identical to the reference.
+  NDK 27.2 clang: infer.cpp + nets.cpp for arm64-v8a against onnxruntime-android-qnn 1.22.0 (QNN,
+    XNNPACK, NNAPI on) and x86_64 against onnxruntime-android 1.22.0 (NNAPI, XNNPACK on).
+  ./gradlew assembleDebug (app unchanged; the core now also compiles nets.cpp and the infer.cpp stub): passes.
+  host/ (Linux fs_cli): not built (WSL Ubuntu here has no compiler / OpenCV).

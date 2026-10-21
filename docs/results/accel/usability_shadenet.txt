@@ -1,0 +1,120 @@
+INFO:  Checking shadenet.onnx for usability with ORT Mobile.
+INFO:  Checking NNAPI
+INFO:  6 partitions with a total of 39/113 nodes can be handled by the NNAPI EP.
+INFO:  	Partition sizes: [27, 2, 2, 2, 2, 4]
+DEBUG:  Nodes in group: Gather:/Gather_1,Gather:/Gather,Unsqueeze:/Unsqueeze_3,Unsqueeze:/Unsqueeze_2,Concat:/Concat_2,Gather:/d1/Gather_1,Gather:/d1/Gather,Unsqueeze:/d1/Unsqueeze_1,Unsqueeze:/d1/Unsqueeze,Concat:/d1/Concat,Gather:/d2/Gather_1,Gather:/d2/Gather,Unsqueeze:/d2/Unsqueeze_1,Unsqueeze:/d2/Unsqueeze,Concat:/d2/Concat,Gather:/d3/Gather_1,Gather:/d3/Gather,Unsqueeze:/d3/Unsqueeze_1,Unsqueeze:/d3/Unsqueeze,Concat:/d3/Concat,Gather:/d4/Gather_1,Gather:/d4/Gather,Unsqueeze:/d4/Unsqueeze_1,Unsqueeze:/d4/Unsqueeze,Concat:/d4/Concat,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu
+DEBUG:  Nodes in group: Slice:/d4/Slice,Concat:/d4/Concat_1
+DEBUG:  Nodes in group: Slice:/d3/Slice,Concat:/d3/Concat_1
+DEBUG:  Nodes in group: Slice:/d2/Slice,Concat:/d2/Concat_1
+DEBUG:  Nodes in group: Slice:/d1/Slice,Concat:/d1/Concat_1
+DEBUG:  Nodes in group: Slice:/Slice_1,Concat:/Concat_4,Slice:/Slice,Concat:/Concat_3
+INFO:  Unsupported nodes due to operator=13
+INFO:  	Unsupported ops: ai.onnx:Expand,ai.onnx:Shape
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 2D Conv is supported. Weights and bias should be constant.
+     ai.onnx:Gather:Input indices should be constant if not int32 type.
+     ai.onnx:Resize:Only 2D Resize is supported.
+     ai.onnx:Unsqueeze:Input axes should be constant.
+INFO:  Unsupported nodes due to input having a dynamic shape=73
+INFO:  NNAPI is not recommended with this model as there are 6 partitions covering 34.5% of the nodes in the model. This will most likely result in worse performance than just using the CPU EP.
+INFO:  Model should perform well with NNAPI as is: NO
+INFO:  --------
+INFO:  Checking if model will perform better if the dynamic shapes are fixed...
+INFO:  Partition information if the model was updated to make the shapes fixed:
+INFO:  7 partitions with a total of 100/113 nodes can be handled by the NNAPI EP.
+INFO:  	Partition sizes: [32, 23, 8, 8, 8, 9, 12]
+DEBUG:  Nodes in group: Conv:/e1/e1.0/e1.0.0/Conv,Relu:/e1/e1.0/e1.0.2/Relu,Gather:/Gather_1,Gather:/Gather,Conv:/e1/e1.1/e1.1.0/Conv,Unsqueeze:/Unsqueeze_3,Unsqueeze:/Unsqueeze_2,Relu:/e1/e1.1/e1.1.2/Relu,Concat:/Concat_2,Conv:/e2/e2.0/e2.0.0/Conv,Relu:/e2/e2.0/e2.0.2/Relu,Conv:/e2/e2.1/e2.1.0/Conv,Relu:/e2/e2.1/e2.1.2/Relu,Conv:/e3/e3.0/e3.0.0/Conv,Relu:/e3/e3.0/e3.0.2/Relu,Conv:/e3/e3.1/e3.1.0/Conv,Relu:/e3/e3.1/e3.1.2/Relu,Conv:/e4/e4.0/e4.0.0/Conv,Relu:/e4/e4.0/e4.0.2/Relu,Conv:/e4/e4.1/e4.1.0/Conv,Relu:/e4/e4.1/e4.1.2/Relu,Conv:/e5/e5.0/e5.0.0/Conv,Relu:/e5/e5.0/e5.0.2/Relu,Conv:/e5/e5.1/e5.1.0/Conv,Relu:/e5/e5.1/e5.1.2/Relu,Conv:/ctx/ctx.0/ctx.0.0/Conv,Relu:/ctx/ctx.0/ctx.0.2/Relu,Conv:/ctx/ctx.1/ctx.1.0/Conv,Relu:/ctx/ctx.1/ctx.1.2/Relu,ReduceMean:/ReduceMean,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu
+DEBUG:  Nodes in group: Gather:/d1/Gather_1,Gather:/d1/Gather,Gather:/d2/Gather_1,Gather:/d2/Gather,Gather:/d3/Gather_1,Gather:/d3/Gather,Gather:/d4/Gather_1,Gather:/d4/Gather,Unsqueeze:/d1/Unsqueeze_1,Unsqueeze:/d1/Unsqueeze,Unsqueeze:/d2/Unsqueeze_1,Unsqueeze:/d2/Unsqueeze,Unsqueeze:/d3/Unsqueeze_1,Unsqueeze:/d3/Unsqueeze,Unsqueeze:/d4/Unsqueeze_1,Unsqueeze:/d4/Unsqueeze,Concat:/Concat,Concat:/d1/Concat,Concat:/d2/Concat,Concat:/d3/Concat,Concat:/d4/Concat,Conv:/fuse/fuse.0/Conv,Relu:/fuse/fuse.2/Relu
+DEBUG:  Nodes in group: Slice:/d4/Slice,Concat:/d4/Concat_1,Resize:/d4/Resize,Concat:/d4/Concat_2,Conv:/d4/c/c.0/c.0.0/Conv,Relu:/d4/c/c.0/c.0.2/Relu,Conv:/d4/c/c.1/c.1.0/Conv,Relu:/d4/c/c.1/c.1.2/Relu
+DEBUG:  Nodes in group: Slice:/d3/Slice,Concat:/d3/Concat_1,Resize:/d3/Resize,Concat:/d3/Concat_2,Conv:/d3/c/c.0/c.0.0/Conv,Relu:/d3/c/c.0/c.0.2/Relu,Conv:/d3/c/c.1/c.1.0/Conv,Relu:/d3/c/c.1/c.1.2/Relu
+DEBUG:  Nodes in group: Slice:/d2/Slice,Concat:/d2/Concat_1,Resize:/d2/Resize,Concat:/d2/Concat_2,Conv:/d2/c/c.0/c.0.0/Conv,Relu:/d2/c/c.0/c.0.2/Relu,Conv:/d2/c/c.1/c.1.0/Conv,Relu:/d2/c/c.1/c.1.2/Relu
+DEBUG:  Nodes in group: Slice:/d1/Slice,Concat:/d1/Concat_1,Resize:/d1/Resize,Concat:/d1/Concat_2,Conv:/d1/c/c.0/c.0.0/Conv,Relu:/d1/c/c.0/c.0.2/Relu,Conv:/d1/c/c.1/c.1.0/Conv,Relu:/d1/c/c.1/c.1.2/Relu,Conv:/out1/Conv
+DEBUG:  Nodes in group: Slice:/Slice_1,Slice:/Slice,Concat:/Concat_4,Concat:/Concat_3,Resize:/Resize_1,Resize:/Resize,Concat:/Concat_5,Conv:/head/head.0/Conv,Relu:/head/head.1/Relu,Conv:/head/head.2/Conv,Add:/Add,Sigmoid:/Sigmoid
+INFO:  Unsupported nodes due to operator=13
+INFO:  	Unsupported ops: ai.onnx:Expand,ai.onnx:Shape
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 2D Conv is supported. Weights and bias should be constant.
+     ai.onnx:Gather:Input indices should be constant if not int32 type.
+     ai.onnx:Resize:Only 2D Resize is supported.
+     ai.onnx:Unsqueeze:Input axes should be constant.
+INFO:  NNAPI is not recommended with this model as there are 7 partitions covering 88.5% of the nodes in the model. This will most likely result in worse performance than just using the CPU EP.
+INFO:  Model should perform well with NNAPI if modified to have fixed input shapes: NO
+INFO:  ================
+INFO:  
+INFO:  Checking CoreML NeuralNetwork
+INFO:  6 partitions with a total of 29/113 nodes can be handled by the CoreML NeuralNetwork EP.
+INFO:  	Partition sizes: [12, 7, 2, 2, 2, 4]
+DEBUG:  Nodes in group: Gather:/Gather_1,Gather:/Gather,Gather:/d1/Gather_1,Gather:/d1/Gather,Gather:/d2/Gather_1,Gather:/d2/Gather,Gather:/d3/Gather_1,Gather:/d3/Gather,Gather:/d4/Gather_1,Gather:/d4/Gather,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu
+DEBUG:  Nodes in group: Concat:/Concat_2,Concat:/d1/Concat,Concat:/d2/Concat,Concat:/d3/Concat,Concat:/d4/Concat,Slice:/d4/Slice,Concat:/d4/Concat_1
+DEBUG:  Nodes in group: Slice:/d3/Slice,Concat:/d3/Concat_1
+DEBUG:  Nodes in group: Slice:/d2/Slice,Concat:/d2/Concat_1
+DEBUG:  Nodes in group: Slice:/d1/Slice,Concat:/d1/Concat_1
+DEBUG:  Nodes in group: Slice:/Slice_1,Concat:/Concat_4,Slice:/Slice,Concat:/Concat_3
+INFO:  Unsupported nodes due to operator=12
+INFO:  	Unsupported ops: ai.onnx:Expand,ai.onnx:ReduceMean,ai.onnx:Unsqueeze
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 1D/2D Conv is supported. Weights and bias should be constant.
+     ai.onnx:Gather:Input `indices` with scalar value is not supported.
+     ai.onnx:Resize:4D input. `coordinate_transformation_mode` == `asymmetric`. `mode` == `linear` or `nearest`. `nearest_mode` == `floor`. `exclude_outside` == false `scales` or `sizes` must be constant.
+     ai.onnx:Shape:Attribute `start` with non-default value is not supported. Attribute `end` is not supported.
+     ai.onnx:Slice:Inputs `starts`, `ends`, `axes`, and `steps` should be constant. Empty slice is not supported.
+INFO:  Unsupported nodes due to input having a dynamic shape=73
+INFO:  CoreML NeuralNetwork is not recommended with this model as there are 6 partitions covering 25.7% of the nodes in the model. This will most likely result in worse performance than just using the CPU EP.
+INFO:  Model should perform well with CoreML NeuralNetwork as is: NO
+INFO:  --------
+INFO:  Checking if model will perform better if the dynamic shapes are fixed...
+INFO:  Partition information if the model was updated to make the shapes fixed:
+INFO:  3 partitions with a total of 101/113 nodes can be handled by the CoreML NeuralNetwork EP.
+INFO:  	Partition sizes: [40, 7, 54]
+DEBUG:  Nodes in group: Conv:/e1/e1.0/e1.0.0/Conv,Shape:/Shape_2,Relu:/e1/e1.0/e1.0.2/Relu,Gather:/Gather_1,Gather:/Gather,Conv:/e1/e1.1/e1.1.0/Conv,Relu:/e1/e1.1/e1.1.2/Relu,Conv:/e2/e2.0/e2.0.0/Conv,Shape:/d1/Shape_1,Relu:/e2/e2.0/e2.0.2/Relu,Gather:/d1/Gather_1,Gather:/d1/Gather,Conv:/e2/e2.1/e2.1.0/Conv,Relu:/e2/e2.1/e2.1.2/Relu,Conv:/e3/e3.0/e3.0.0/Conv,Shape:/d2/Shape_1,Relu:/e3/e3.0/e3.0.2/Relu,Gather:/d2/Gather_1,Gather:/d2/Gather,Conv:/e3/e3.1/e3.1.0/Conv,Relu:/e3/e3.1/e3.1.2/Relu,Conv:/e4/e4.0/e4.0.0/Conv,Shape:/d3/Shape_1,Relu:/e4/e4.0/e4.0.2/Relu,Gather:/d3/Gather_1,Gather:/d3/Gather,Conv:/e4/e4.1/e4.1.0/Conv,Relu:/e4/e4.1/e4.1.2/Relu,Conv:/e5/e5.0/e5.0.0/Conv,Shape:/d4/Shape_1,Relu:/e5/e5.0/e5.0.2/Relu,Gather:/d4/Gather_1,Gather:/d4/Gather,Conv:/e5/e5.1/e5.1.0/Conv,Relu:/e5/e5.1/e5.1.2/Relu,Conv:/ctx/ctx.0/ctx.0.0/Conv,Relu:/ctx/ctx.0/ctx.0.2/Relu,Conv:/ctx/ctx.1/ctx.1.0/Conv,Relu:/ctx/ctx.1/ctx.1.2/Relu,Shape:/Shape
+DEBUG:  Nodes in group: Concat:/Concat_2,Concat:/d1/Concat,Concat:/d2/Concat,Concat:/d3/Concat,Concat:/d4/Concat,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu
+DEBUG:  Nodes in group: Concat:/Concat,Conv:/fuse/fuse.0/Conv,Relu:/fuse/fuse.2/Relu,Shape:/d4/Shape_2,Slice:/d4/Slice,Concat:/d4/Concat_1,Resize:/d4/Resize,Concat:/d4/Concat_2,Conv:/d4/c/c.0/c.0.0/Conv,Relu:/d4/c/c.0/c.0.2/Relu,Conv:/d4/c/c.1/c.1.0/Conv,Relu:/d4/c/c.1/c.1.2/Relu,Shape:/d3/Shape_2,Slice:/d3/Slice,Concat:/d3/Concat_1,Resize:/d3/Resize,Concat:/d3/Concat_2,Conv:/d3/c/c.0/c.0.0/Conv,Relu:/d3/c/c.0/c.0.2/Relu,Conv:/d3/c/c.1/c.1.0/Conv,Relu:/d3/c/c.1/c.1.2/Relu,Shape:/d2/Shape_2,Slice:/d2/Slice,Concat:/d2/Concat_1,Resize:/d2/Resize,Concat:/d2/Concat_2,Conv:/d2/c/c.0/c.0.0/Conv,Relu:/d2/c/c.0/c.0.2/Relu,Conv:/d2/c/c.1/c.1.0/Conv,Relu:/d2/c/c.1/c.1.2/Relu,Shape:/d1/Shape_2,Slice:/d1/Slice,Concat:/d1/Concat_1,Resize:/d1/Resize,Concat:/d1/Concat_2,Conv:/d1/c/c.0/c.0.0/Conv,Relu:/d1/c/c.0/c.0.2/Relu,Conv:/d1/c/c.1/c.1.0/Conv,Relu:/d1/c/c.1/c.1.2/Relu,Shape:/Shape_4,Conv:/out1/Conv,Slice:/Slice_1,Shape:/Shape_3,Concat:/Concat_4,Slice:/Slice,Resize:/Resize_1,Concat:/Concat_3,Resize:/Resize,Concat:/Concat_5,Conv:/head/head.0/Conv,Relu:/head/head.1/Relu,Conv:/head/head.2/Conv,Add:/Add,Sigmoid:/Sigmoid
+INFO:  Unsupported nodes due to operator=12
+INFO:  	Unsupported ops: ai.onnx:Expand,ai.onnx:ReduceMean,ai.onnx:Unsqueeze
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 1D/2D Conv is supported. Weights and bias should be constant.
+     ai.onnx:Gather:Input `indices` with scalar value is not supported.
+     ai.onnx:Resize:4D input. `coordinate_transformation_mode` == `asymmetric`. `mode` == `linear` or `nearest`. `nearest_mode` == `floor`. `exclude_outside` == false `scales` or `sizes` must be constant.
+     ai.onnx:Shape:Attribute `start` with non-default value is not supported. Attribute `end` is not supported.
+     ai.onnx:Slice:Inputs `starts`, `ends`, `axes`, and `steps` should be constant. Empty slice is not supported.
+INFO:  CoreML NeuralNetwork is not recommended with this model as there are 3 partitions covering 89.4% of the nodes in the model. This will most likely result in worse performance than just using the CPU EP.
+INFO:  Model should perform well with CoreML NeuralNetwork if modified to have fixed input shapes: NO
+INFO:  ================
+INFO:  
+INFO:  Checking CoreML MLProgram
+INFO:  6 partitions with a total of 29/113 nodes can be handled by the CoreML MLProgram EP.
+INFO:  	Partition sizes: [17, 2, 2, 2, 2, 4]
+DEBUG:  Nodes in group: Unsqueeze:/Unsqueeze_3,Unsqueeze:/Unsqueeze_2,Concat:/Concat_2,Unsqueeze:/d1/Unsqueeze_1,Unsqueeze:/d1/Unsqueeze,Concat:/d1/Concat,Unsqueeze:/d2/Unsqueeze_1,Unsqueeze:/d2/Unsqueeze,Concat:/d2/Concat,Unsqueeze:/d3/Unsqueeze_1,Unsqueeze:/d3/Unsqueeze,Concat:/d3/Concat,Unsqueeze:/d4/Unsqueeze_1,Unsqueeze:/d4/Unsqueeze,Concat:/d4/Concat,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu
+DEBUG:  Nodes in group: Slice:/d4/Slice,Concat:/d4/Concat_1
+DEBUG:  Nodes in group: Slice:/d3/Slice,Concat:/d3/Concat_1
+DEBUG:  Nodes in group: Slice:/d2/Slice,Concat:/d2/Concat_1
+DEBUG:  Nodes in group: Slice:/d1/Slice,Concat:/d1/Concat_1
+DEBUG:  Nodes in group: Slice:/Slice_1,Concat:/Concat_4,Slice:/Slice,Concat:/Concat_3
+INFO:  Unsupported nodes due to operator=11
+INFO:  	Unsupported ops: ai.onnx:Expand,ai.onnx:Gather
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 1D/2D Conv is supported. Bias if provided must be constant.
+     ai.onnx:Resize:See [resize_op_builder.cc](https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/core/providers/coreml/builders/impl/resize_op_builder.cc) implementation. There are too many permutations to describe the valid combinations.
+     ai.onnx:Slice:starts/ends/axes/steps must be constant initializers.
+INFO:  Unsupported nodes due to input having a dynamic shape=73
+INFO:  CoreML MLProgram is not recommended with this model as there are 6 partitions covering 25.7% of the nodes in the model. This will most likely result in worse performance than just using the CPU EP.
+INFO:  Model should perform well with CoreML MLProgram as is: NO
+INFO:  --------
+INFO:  Checking if model will perform better if the dynamic shapes are fixed...
+INFO:  Partition information if the model was updated to make the shapes fixed:
+INFO:  2 partitions with a total of 102/113 nodes can be handled by the CoreML MLProgram EP.
+INFO:  	Partition sizes: [33, 69]
+DEBUG:  Nodes in group: Conv:/e1/e1.0/e1.0.0/Conv,Shape:/Shape_2,Relu:/e1/e1.0/e1.0.2/Relu,Conv:/e1/e1.1/e1.1.0/Conv,Relu:/e1/e1.1/e1.1.2/Relu,Conv:/e2/e2.0/e2.0.0/Conv,Shape:/d1/Shape_1,Relu:/e2/e2.0/e2.0.2/Relu,Conv:/e2/e2.1/e2.1.0/Conv,Relu:/e2/e2.1/e2.1.2/Relu,Conv:/e3/e3.0/e3.0.0/Conv,Shape:/d2/Shape_1,Relu:/e3/e3.0/e3.0.2/Relu,Conv:/e3/e3.1/e3.1.0/Conv,Relu:/e3/e3.1/e3.1.2/Relu,Conv:/e4/e4.0/e4.0.0/Conv,Shape:/d3/Shape_1,Relu:/e4/e4.0/e4.0.2/Relu,Conv:/e4/e4.1/e4.1.0/Conv,Relu:/e4/e4.1/e4.1.2/Relu,Conv:/e5/e5.0/e5.0.0/Conv,Shape:/d4/Shape_1,Relu:/e5/e5.0/e5.0.2/Relu,Conv:/e5/e5.1/e5.1.0/Conv,Relu:/e5/e5.1/e5.1.2/Relu,Conv:/ctx/ctx.0/ctx.0.0/Conv,Relu:/ctx/ctx.0/ctx.0.2/Relu,Conv:/ctx/ctx.1/ctx.1.0/Conv,Relu:/ctx/ctx.1/ctx.1.2/Relu,Shape:/Shape,ReduceMean:/ReduceMean,Conv:/glob/glob.0/Conv,Relu:/glob/glob.1/Relu
+DEBUG:  Nodes in group: Unsqueeze:/Unsqueeze_3,Unsqueeze:/Unsqueeze_2,Unsqueeze:/d1/Unsqueeze_1,Unsqueeze:/d1/Unsqueeze,Unsqueeze:/d2/Unsqueeze_1,Unsqueeze:/d2/Unsqueeze,Unsqueeze:/d3/Unsqueeze_1,Unsqueeze:/d3/Unsqueeze,Unsqueeze:/d4/Unsqueeze_1,Unsqueeze:/d4/Unsqueeze,Concat:/Concat,Concat:/Concat_2,Concat:/d1/Concat,Concat:/d2/Concat,Concat:/d3/Concat,Concat:/d4/Concat,Conv:/fuse/fuse.0/Conv,Relu:/fuse/fuse.2/Relu,Shape:/d4/Shape_2,Slice:/d4/Slice,Concat:/d4/Concat_1,Resize:/d4/Resize,Concat:/d4/Concat_2,Conv:/d4/c/c.0/c.0.0/Conv,Relu:/d4/c/c.0/c.0.2/Relu,Conv:/d4/c/c.1/c.1.0/Conv,Relu:/d4/c/c.1/c.1.2/Relu,Shape:/d3/Shape_2,Slice:/d3/Slice,Concat:/d3/Concat_1,Resize:/d3/Resize,Concat:/d3/Concat_2,Conv:/d3/c/c.0/c.0.0/Conv,Relu:/d3/c/c.0/c.0.2/Relu,Conv:/d3/c/c.1/c.1.0/Conv,Relu:/d3/c/c.1/c.1.2/Relu,Shape:/d2/Shape_2,Slice:/d2/Slice,Concat:/d2/Concat_1,Resize:/d2/Resize,Concat:/d2/Concat_2,Conv:/d2/c/c.0/c.0.0/Conv,Relu:/d2/c/c.0/c.0.2/Relu,Conv:/d2/c/c.1/c.1.0/Conv,Relu:/d2/c/c.1/c.1.2/Relu,Shape:/d1/Shape_2,Slice:/d1/Slice,Concat:/d1/Concat_1,Resize:/d1/Resize,Concat:/d1/Concat_2,Conv:/d1/c/c.0/c.0.0/Conv,Relu:/d1/c/c.0/c.0.2/Relu,Conv:/d1/c/c.1/c.1.0/Conv,Relu:/d1/c/c.1/c.1.2/Relu,Shape:/Shape_4,Conv:/out1/Conv,Slice:/Slice_1,Shape:/Shape_3,Concat:/Concat_4,Slice:/Slice,Resize:/Resize_1,Concat:/Concat_3,Resize:/Resize,Concat:/Concat_5,Conv:/head/head.0/Conv,Relu:/head/head.1/Relu,Conv:/head/head.2/Conv,Add:/Add,Sigmoid:/Sigmoid
+INFO:  Unsupported nodes due to operator=11
+INFO:  	Unsupported ops: ai.onnx:Expand,ai.onnx:Gather
+INFO:  	Caveats that have not been checked and may result in a node not actually being supported:  
+     ai.onnx:Conv:Only 1D/2D Conv is supported. Bias if provided must be constant.
+     ai.onnx:Resize:See [resize_op_builder.cc](https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/core/providers/coreml/builders/impl/resize_op_builder.cc) implementation. There are too many permutations to describe the valid combinations.
+     ai.onnx:Slice:starts/ends/axes/steps must be constant initializers.
+INFO:  CoreML MLProgram can be considered for this model as there are two partitions covering 90.3% of the nodes. Performance testing is required to validate.
+INFO:  Model should perform well with CoreML MLProgram if modified to have fixed input shapes: MAYBE
+INFO:  Shapes can be altered using python -m onnxruntime.tools.make_dynamic_shape_fixed
+INFO:  ================
+INFO:  
+INFO:  As NNAPI or CoreML may provide benefits with this model it is recommended to compare the performance of the model using the NNAPI EP on Android, and the CoreML EP on iOS, against the performance using the CPU EP.

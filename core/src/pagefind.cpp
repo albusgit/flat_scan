@@ -54,6 +54,25 @@ double ptp(const std::vector<double>& v) {
     return *mm.second - *mm.first;
 }
 
+// cv::GaussianBlur(col, out, Size(1, 0), sigma) of a float64 column, written out as the desktop OpenCV
+// computes it: OpenCV's kernel, k0 x0 + sum_j kj (x-j + xj) in that order, BORDER_REFLECT_101.
+// OpenCV's Android build fuses these steps into FMAs (measured: 93 of 300 values differ), which moved
+// the refined outline, the corners and the surface fit between the desktop and the phone.
+cv::Mat gauss_col64(const cv::Mat& col, double sigma) {
+    const int n = col.rows, ks = cvRound(sigma * 4 * 2 + 1) | 1, r = ks / 2;   // createGaussianKernels, non-8U
+    cv::Mat kk = cv::getGaussianKernel(ks, sigma, CV_64F);                     // bit-exact on every build
+    const double* k = kk.ptr<double>() + r;
+    const double* x = col.ptr<double>();
+    cv::Mat out(n, 1, CV_64F);
+    for (int i = 0; i < n; ++i) {
+        double s = k[0] * x[i];
+        for (int j = 1; j <= r; ++j)
+            s += k[j] * (x[cv::borderInterpolate(i - j, n, cv::BORDER_REFLECT_101)] + x[cv::borderInterpolate(i + j, n, cv::BORDER_REFLECT_101)]);
+        out.at<double>(i) = s;
+    }
+    return out;
+}
+
 // outline (working px) -> refined outline, full-resolution mask and contour
 FoundPage finish_page(const cv::Mat& sm, const cv::Mat& m, double s, int W, int H, bool refine) {
     FoundPage fp;
@@ -103,7 +122,7 @@ std::vector<cv::Point2d> resample_closed(const std::vector<cv::Point2d>& c, doub
     s[0] = 0;
     for (size_t i = 0; i < n; ++i) {
         const cv::Point2d &a = c[i], &b = c[(i + 1) % n];
-        s[i + 1] = s[i] + std::hypot(b.x - a.x, b.y - a.y);     // np.cumsum: sequential
+        s[i + 1] = s[i] + hypot_xy(b.x - a.x, b.y - a.y);     // np.cumsum: sequential
         cx[i] = a.x; cy[i] = a.y;
     }
     cx[n] = c[0].x; cy[n] = c[0].y;
@@ -141,7 +160,7 @@ std::vector<cv::Point2d> refine_contour(const cv::Mat& img, const std::vector<cv
         for (int i = 0; i < pad; ++i) col.at<double>(i) = k ? pts[n - pad + i].y : pts[n - pad + i].x;
         for (int i = 0; i < n; ++i) col.at<double>(pad + i) = k ? pts[i].y : pts[i].x;
         for (int i = 0; i < pad; ++i) col.at<double>(pad + n + i) = k ? pts[i].y : pts[i].x;
-        cv::GaussianBlur(col, bl, cv::Size(1, 0), 4);
+        bl = gauss_col64(col, 4);
         for (int i = 0; i < n; ++i) (k ? sm[i].y : sm[i].x) = bl.at<double>(pad + i);
     }
     std::vector<cv::Point2d> nr(n);
@@ -256,7 +275,7 @@ PageSelection select_page(const cv::Mat& p, const cv::Mat& g, double thr) {
     int k = 1;
     double best = -1e300;
     for (int i = 1; i < n; ++i) {
-        double d = std::hypot((cen.at<double>(i, 0) - w / 2.0) / w, (cen.at<double>(i, 1) - h / 2.0) / h);
+        double d = hypot_xy((cen.at<double>(i, 0) - w / 2.0) / w, (cen.at<double>(i, 1) - h / 2.0) / h);
         double sc = st.at<int>(i, cv::CC_STAT_AREA) * (1 - 0.6 * d);
         if (sc > best) { best = sc; k = i; }
     }
@@ -366,7 +385,7 @@ PageFindResult find_page_net(const cv::Mat& img, const float* logits, bool refin
         cv::resize(l, up, cv::Size(sw, sh), 0, 0, cv::INTER_CUBIC);
         for (int y = 0; y < up.rows; ++y) {
             float* q = up.ptr<float>(y);
-            for (int x = 0; x < up.cols; ++x) q[x] = 1.f / (1.f + std::exp(-q[x]));
+            for (int x = 0; x < up.cols; ++x) q[x] = 1.f / (1.f + (float)std::exp(-(double)q[x]));   // expf rounds differently per libm, this does not
         }
         pg[c] = up;
     }
