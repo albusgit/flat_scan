@@ -71,7 +71,7 @@ unchanged. Bit-identical outputs mean unchanged scores (DocUNet LD 5.162 / MS-SS
 | C: Gradle | **pass**: `assembleDebug -Pabis=arm64-v8a,x86_64` and `assembleDebug` (arm64, QNN) | `bash <SCR>/coordF/gradle_locked.sh LOG assembleDebug [-Pabis=arm64-v8a,x86_64]` | `<SCR>/coordF/gradle_*.log` |
 | C: emulator (AVD fs35, x86_64, API 35), debug batch mode on the bundled self-test photo (`assets/selftest/photo1.png`, no shadow net, PNG), Acceleration=CPU | **pass**: page finder logits, p1, rc0, rc2 bit-identical, page pixel-identical to the desktop CPU (pipeline_cli, in-process nets); JSON differs only in `fit_median_px` 1.87128 vs 1.87126 (known: MSVC vs NDK clang) | `NNAPI_RUN=0 bash <SCR>/coordF/emu_check.sh <SCR>/coordF/final_both3.apk <SCR>/coordF/emu4`, then `$PY -I <SCR>/coordF/cmp_st.py <SCR>/coordF/st_desk <SCR>/coordF/emu4/st_cpu` | `<SCR>/coordF/emu4/cmp_st_cpu.txt`, `emu4/st_cpu/` |
 | C: emulator, Acceleration=Auto | **pass after the fixes**: the Auto benchmark ran with no candidates and chose the CPU; output identical to the CPU run; no crash (the app was still running at the end) | same run, `st_auto` | `<SCR>/coordF/emu4/cmp_st_auto.txt`, `emu4/logcat_all.txt` (`auto acceleration {...}`) |
-| Final APK | `assembleDebug` (arm64-v8a, QNN): 162,438,548 B, sha256 `3d58dd16...ef206` | | `<OUT>/flatscan-accel-debug.apk`; emulator build (arm64 + x86_64): `<OUT>/check/flatscan-accel-debug-arm64+x86_64.apk` |
+| Final APK | `assembleDebug` (arm64-v8a, QNN, accel/main c09ed92): 162,440,484 B, sha256 `52ff671e...2c527f`; `-Port=plain` (no Qualcomm libraries): 121,177,777 B, sha256 `015aee5b...27ce80f` | | `<OUT>/flatscan-accel-debug.apk`, `<OUT>/flatscan-accel-plain-debug.apk`; emulator build (arm64 + x86_64): `<OUT>/check/flatscan-accel-debug-arm64+x86_64.apk` |
 
 The desktop reference for the self-test photo was made with
 `FS_NETS=1 FS_SEQUENTIAL=1 FS_NET_DUMP=<SCR>/coordF/st_desk/photo1 tools/desktop_check/build/pipeline_cli.exe --backend cpu app/src/main/assets/selftest/photo1.png <SCR>/coordF/st_desk/photo1.png net`.
@@ -123,19 +123,26 @@ The desktop reference for the self-test photo was made with
 
 ## Open issues
 
-- **App does not use the overlap yet.** `jni_bridge.cpp` `process()` and `batchPhoto` run `run_flat_nets` and then
-  `run_photo`. To use it, set `o.flat_nets = flat_nets_fn(bgr, rq, *g->inf, &keep)` (nets.h). The callback runs on a
-  worker thread: no JNI env, no GL context. HUMAN GATE D-1 needs this first.
-- **Core JSON platform difference**: the surface-fit residual `fit_median_px` differs between the MSVC desktop and
-  NDK clang (emulator) builds: self-test photo 1.87128 vs 1.87126; DocUNet 17_2 11.9626 vs 12.7768 (Stream C).
-  Nets, grids and pages are identical, but a value near the 3 px surface threshold could flip the quality gate on a
-  phone. This is in the core's C++ (surface fit), not acceleration code. It needs investigation (libm, or an
-  iteration difference).
+- **Surface-fit residual across builds (partly fixed, accel/fit, merged c09ed92).** Cause and numbers:
+  `docs/results/accel/fit_portability.txt`. `std::hypot`, the page finder's `expf` and OpenCV's float64 outline blur
+  rounded differently on Android; they now use portable forms (desktop outputs unchanged: 35 + 130 photos
+  identical). Page corners are now identical desktop vs x86_64 on 166 of 166 pages (before: 8), arm64 (emulator
+  translation) 20 of 166. The fit itself still differs in its last bits (OpenCV's solvePnP, libm in the fit), and
+  on badly conditioned fits that picks another local minimum: DocUNet 17_2 desktop 11.96 px vs emulator 17.04 px
+  (p90 160 px; the photo already has "corner outside the photo"). 15 px gate flips on 2 of 165 photos (x86_64);
+  no page changed (all 165 in mode uvdoc). Making it bit-identical would need our own pose, Rodrigues and libm,
+  and replacing OpenCV's NEON image operations on arm64: not done.
+- Re-check after the fixes (accel/main c09ed92): `bash <SCR>/coordF/cpu_check.sh <SCR>/fix/cpu`: 0 of 35 and
+  0 of 20 differ (reference, overlapped, sequential). Emulator (`<SCR>/fix/emu_check.sh`, outputs `<SCR>/fix/emu2`):
+  self-test photo CPU and Auto: nets, page and **JSON** identical to the desktop; DocUNet 1_1, 4_2, 17_2, 18_1:
+  nets and pages identical, the residual differs by <= 7e-5 px except 17_2 (above). The app ran the nets in
+  mode "overlap".
 - **NNAPI / XNNPACK abort inside ORT 1.22.0** on the emulator (above). They are not reachable from Settings or Auto.
   Re-test them on a real phone, or with a newer ORT, before re-enabling them (PLAN Stream G).
-- SynthDoc-HR's fp16 stand-in misses the 0.25 px target. Auto (per group) would then keep UVDoc on the CPU too,
-  because both flattening nets share one choice. Splitting the choice per net needs an `InferConfig` / nets.h
-  contract change.
+- SynthDoc-HR's fp16 stand-in misses the 0.25 px target. **Resolved in the app (6e11ba2):** SynthDoc-HR is its
+  own group (`configureNets` hr, `run_flat_nets(..., Inference* hr)`); NPU keeps it on the CPU, Auto judges it on
+  its own (`choice.hr`). Whether real HTP fp16 passes is still HUMAN GATE 3 step 6.
+- **App overlap: done (6e11ba2).** `process()` and `batchPhoto` give `run_photo` the nets through `flat_nets_fn`.
 - The QNN AAR's CPU EP has not been measured on arm64 (HUMAN GATE 3, step 6).
 - `ADSP_LIBRARY_PATH` for the HTP skel has not been checked on a device.
 - APK +41.3 MB (arm64) for the QNN libraries, and +32.8 MB for the static models. HUMAN GATE A-1 could drop the
@@ -164,8 +171,9 @@ with `JAVA_HOME=/c/Users/User/Android/jdk17 ./gradlew assembleDebug`).
    `C:/Users/User/Android/ort/qnn-runtime-2.33.0.aar`.
 2. It is the Qualcomm "AI Stack License": redistribution only in object code inside the app; no reverse
    engineering; keep the notices; export control; indemnification; revocable.
-3. Decide whether to accept it. If not, build with `./gradlew assembleDebug -Port=plain`. That build has no
-   Qualcomm libraries and no NPU; the CPU path is unchanged.
+3. Decide whether to accept it. If not, ship `C:/Users/User/Desktop/fs_accel_out/flatscan-accel-plain-debug.apk`
+   (121.2 MB; built with `./gradlew assembleDebug -Port=plain` after deleting the old APK, since incremental
+   packaging keeps the removed libraries' space). It has no Qualcomm libraries and no NPU; the CPU path is unchanged.
 
 ### HUMAN GATE 0: per-net CPU timings (any arm64 phone; ideally a Snapdragon 8 Gen 2/3 plus one other SoC)
 
@@ -226,7 +234,7 @@ If p1, rc0 and rc2 are all the same, the arm64 CPU path can ship only the static
 
 ### HUMAN GATE D-1 (phone timing of the overlap)
 
-Blocked until the app sets `flat_nets` (open issue). Then:
+The app runs the nets beside the CPU stages (6e11ba2):
 1. Set Acceleration = NPU and process 3 photos with automatic corners.
 2. Copy from *Processing details* the stage times 'orientation, beside the nets', 'flattening nets, beside the CPU
    stages', 'waiting for the flattening nets' and 'total'.
