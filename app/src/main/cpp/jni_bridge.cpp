@@ -1,5 +1,6 @@
 // JNI bridge: Android Bitmaps (RGBA_8888) <-> the C++ core (BGR / BGRA cv::Mat).
 // Implements app/src/main/java/com/albus/flatscan/NativeLib.kt exactly.
+#include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
 #include <jni.h>
 #include <opencv2/imgcodecs.hpp>
@@ -9,22 +10,30 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "cleanup.h"
 #include "gpu.h"
+#include "infer.h"
 #include "log.h"
+#include "nets.h"
 #include "npz.h"
 #include "overlay.h"
 #include "pagefind.h"
 #include "pipeline.h"
 #include "uvdoc.h"
+
+#ifdef FS_WITH_ORT
+#include <onnxruntime_cxx_api.h>
+#endif
 
 using namespace fs;
 
@@ -44,6 +53,7 @@ struct Session {
     std::vector<std::pair<cv::Size, cv::Mat>> small;   // paper-filled page, INTER_AREA, by size
     cv::Mat page_orig, paper_orig;   // the page before the Erase tool (kept from its first use)
     bool use_gpu = true;
+    std::string accel;        // the nets' timings and backends: the members of info()'s "accel" object
 
     // paper-filled page at `sz` (the full page itself when sz is the page size)
     cv::Mat filled_at(cv::Size sz) {
@@ -298,6 +308,150 @@ struct Progress {
     }
 };
 
+// ---- the nets (core/src/nets.h on core/src/infer.h, ONNX Runtime from the AAR). One Inference per
+// group of nets, so that Settings > Acceleration (or Auto's choice) can give each group its own
+// backends: the page finder, the flattening nets (UVDoc and SyntheticDoc high-res, which
+// run_flat_nets runs on one Inference) and the shadow net. An Inference keeps its sessions for the
+// life of the process and moves a net to its next backend (CPU last) on any failure, so a net that
+// failed on an accelerator stays on the CPU until the next configureNets with other backends.
+struct NetGroup {
+    std::unique_ptr<Inference> inf;
+    std::string pref;             // backend names, comma separated ("" or "cpu": CPU only)
+    std::mutex mu;
+    std::set<int> used;           // nets that have run on this Inference (the first run creates the session)
+    bool first_use(NetId n) {
+        std::lock_guard<std::mutex> lk(mu);
+        return used.insert((int)n).second;
+    }
+};
+
+std::mutex g_nets_mu;             // guards everything below
+std::shared_ptr<NetGroup> g_finder, g_flat, g_shade;
+jobject g_assets = nullptr;       // global reference: keeps the AAssetManager alive
+AAssetManager* g_mgr = nullptr;
+std::string g_cache_dir;          // QNN context binaries (noBackupFilesDir/qnn_cache)
+int g_threads = 0;
+bool g_static_models = false;     // the CPU loads the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1)
+
+// assets/models/<file>, or empty (missing: that net or backend is unavailable)
+std::vector<uint8_t> load_model(std::string file) {
+    AAssetManager* mgr;
+    {
+        std::lock_guard<std::mutex> lk(g_nets_mu);
+        mgr = g_mgr;
+        if (g_static_models && file == "uvdoc.onnx") file = "uvdoc_static.onnx";
+        if (g_static_models && file == "syntheticdoc_hr.onnx") file = "syntheticdoc_hr_static.onnx";
+    }
+    std::vector<uint8_t> v;
+    if (!mgr) return v;
+    AAsset* a = AAssetManager_open(mgr, ("models/" + file).c_str(), AASSET_MODE_BUFFER);
+    if (!a) return v;
+    const off_t n = AAsset_getLength(a);
+    if (n > 0) {
+        v.resize((size_t)n);
+        const void* p = AAsset_getBuffer(a);
+        if (p) std::memcpy(v.data(), p, v.size());
+        else if (AAsset_read(a, v.data(), v.size()) != (int)v.size()) v.clear();
+    }
+    AAsset_close(a);
+    return v;
+}
+
+// caller holds g_nets_mu
+std::shared_ptr<NetGroup> make_group(const std::string& pref) {
+    auto g = std::make_shared<NetGroup>();
+    g->pref = pref;
+    InferConfig c;
+    c.load = load_model;
+    if (!parse_backends(pref, c.preference)) {
+        LOGI("nets: unknown backend in \"%s\": CPU only", pref.c_str());
+        c.preference.clear();
+    }
+    c.cache_dir = g_cache_dir;
+    c.threads = g_threads;
+    g->inf = Inference::create(c);
+    return g;
+}
+
+// the group's current Inference (CPU only until configureNets chooses)
+std::shared_ptr<NetGroup> group(std::shared_ptr<NetGroup>& slot) {
+    std::lock_guard<std::mutex> lk(g_nets_mu);
+    if (!slot) slot = make_group("");
+    return slot;
+}
+
+std::string shape_str(std::initializer_list<int64_t> s) {
+    std::string o;
+    for (int64_t d : s) o += (o.empty() ? "" : "x") + std::to_string(d);
+    return o;
+}
+
+// one net's entry in the processing details' "accel" nets (Phase 0 keys): run_ms the net's run
+// (Inference::last_ms), input_ms everything else the call took (bitmap, input, checks; on the net's
+// first use also creating its session), backend the one that ran
+std::string net_entry(bool ok, double run_ms, double total_ms, bool first, Backend b, const std::string& shape, int calls = 0) {
+    std::ostringstream f;
+    f << "{\"ok\": " << (ok ? "true" : "false") << ", \"run_ms\": " << json_num(std::round(run_ms * 10) / 10)
+      << ", \"input_ms\": " << json_num(std::round(std::max(0.0, total_ms - run_ms) * 10) / 10) << ", \"first_use\": " << (first ? "true" : "false")
+      << ", \"backend\": \"" << backend_name(b) << "\", \"shape\": \"" << shape << "\"";
+    if (calls > 0) f << ", \"calls\": " << calls;
+    f << "}";
+    return f.str();
+}
+
+// "uv_pass1" (nets.cpp) is "uvdoc_pass1" in the processing details, as Phase 0 named it
+const char* net_key(const std::string& run_name) { return run_name == "uv_pass1" ? "uvdoc_pass1" : run_name.c_str(); }
+
+std::string run_shape(const std::string& run_name) {
+    const UvSpec& sp = uv_spec(run_name == "synthdoc_hr" ? 2 : 0);
+    return shape_str({1, 3, sp.in_h, sp.in_w});
+}
+
+// the shadow net through Inference (nets.cpp shade_net_fn) with its timing
+struct ShadeRun {
+    std::shared_ptr<NetGroup> g;
+    double run_ms = 0, total_ms = 0;
+    int calls = 0;
+    bool first = false, ok = false;
+    std::string shape;
+    std::function<bool(std::vector<float>&, int, int)> fn() {
+        auto net = shade_net_fn(*g->inf, &run_ms);
+        return [this, net](std::vector<float>& io, int w, int h) {
+            if (calls++ == 0) first = g->first_use(NetId::ShadeNet);
+            auto t0 = Clock::now();
+            bool r = net(io, w, h);
+            total_ms += ms_since(t0);
+            ok = ok || r;
+            shape = shape_str({1, 3, h, w});
+            return r;
+        };
+    }
+    std::string entry() const { return net_entry(ok, run_ms, total_ms, first, g->inf->backend(NetId::ShadeNet), shape, calls); }
+};
+
+// Gate A's grid measure (tools/accel/compare_outputs.py grid_px): a grid point's move between grids a
+// and b (2 x gh x gw, normalised [-1, 1]) over a's own extent, times the 1600 x 2263 analysis page, px
+std::vector<double> grid_px(const std::vector<float>& a, const std::vector<float>& b, int gw, int gh) {
+    std::vector<double> d;
+    const size_t n = (size_t)gw * gh;
+    if (a.size() != 2 * n || b.size() != 2 * n || gw < 2 || gh < 2) return d;
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t m = v.size() / 2;
+        return v.size() % 2 ? v[m] : 0.5 * (v[m - 1] + v[m]);
+    };
+    std::vector<double> eu, ev;
+    for (int i = 0; i < gh; ++i) eu.push_back((double)a[(size_t)i * gw + gw - 1] - a[(size_t)i * gw]);
+    for (int j = 0; j < gw; ++j) ev.push_back((double)a[n + (size_t)(gh - 1) * gw + j] - a[n + j]);
+    const double ext_u = median(eu) / 2, ext_v = median(ev) / 2;
+    const double page_w = 1600, page_h = std::round(1600 * 297.0 / 210.0);
+    for (size_t k = 0; k < n; ++k) {
+        double du = ((double)b[k] - a[k]) / 2 / ext_u * page_w, dv = ((double)b[n + k] - a[n + k]) / 2 / ext_v * page_h;
+        d.push_back(std::hypot(du, dv));
+    }
+    return d;
+}
+
 }  // namespace
 
 extern "C" {
@@ -308,73 +462,73 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env,
     return env->NewStringUTF(s.c_str());
 }
 
-// segnet.to_input of the whole photo: float[3 * 256 * 256] (NCHW, ImageNet-normalised RGB), or null
-JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_segInput(JNIEnv* env, jclass, jobject bmp) {
+// Settings > Acceleration: the backends of each net group (names as nets.h parse_backends, comma
+// separated; "" = CPU only), the QNN compiled-model cache, intra-op threads (0: ORT's default).
+// staticModels: the CPU loads uvdoc_static / syntheticdoc_hr_static instead of the originals (HUMAN
+// GATE A-1). A group whose settings are unchanged keeps its Inference and sessions.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* env, jclass, jobject assets, jstring cache_dir, jstring finder,
+                                                                       jstring flat, jstring shade, jint threads, jboolean static_models) {
+    std::string cd = cache_dir ? jstr(env, cache_dir) : "", pf = finder ? jstr(env, finder) : "", fl = flat ? jstr(env, flat) : "",
+                sh = shade ? jstr(env, shade) : "";
+    std::lock_guard<std::mutex> lk(g_nets_mu);
+    if (!g_assets && assets) {
+        g_assets = env->NewGlobalRef(assets);
+        g_mgr = AAssetManager_fromJava(env, g_assets);
+    }
+    const bool same = cd == g_cache_dir && threads == g_threads && (bool)static_models == g_static_models;
+    g_cache_dir = cd;
+    g_threads = threads;
+    g_static_models = static_models;
+    auto set = [&](std::shared_ptr<NetGroup>& slot, const std::string& pref) {
+        if (!slot || slot->pref != pref || !same) slot = make_group(pref);
+    };
+    set(g_finder, pf);
+    set(g_flat, fl);
+    set(g_shade, sh);
+}
+
+// JSON: {"with_ort", "ort" (version), "providers": [the execution providers this ONNX Runtime build has]}
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_ortInfo(JNIEnv* env, jclass) {
+    std::ostringstream f;
+#ifdef FS_WITH_ORT
+    try {
+        std::vector<std::string> p = Ort::GetAvailableProviders();
+        f << "{\"with_ort\": true, \"ort\": \"" << escape(Ort::GetVersionString()) << "\", \"providers\": " << json_strings(p) << "}";
+    } catch (const std::exception& e) {
+        f.str("");
+        f << "{\"with_ort\": true, \"ort\": \"unknown\", \"providers\": [], \"error\": \"" << escape(e.what()) << "\"}";
+    }
+#else
+    f << "{\"with_ort\": false, \"ort\": \"none\", \"providers\": []}";
+#endif
+    return env->NewStringUTF(f.str().c_str());
+}
+
+// The page finder's logits for the whole photo (float[2 * 256 * 256]), or null (net unavailable: the
+// caller uses the colour threshold). timing (optional, 1 element): its "accel" nets entry (net_entry).
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_pageFinder(JNIEnv* env, jclass, jobject bmp, jobjectArray timing) {
+    auto t0 = Clock::now();
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
     if (bgr.empty()) return nullptr;
-    std::vector<float> x = seg_input(bgr);
-    jfloatArray a = env->NewFloatArray((jsize)x.size());
-    env->SetFloatArrayRegion(a, 0, (jsize)x.size(), x.data());
+    auto g = group(g_finder);
+    const bool first = g->first_use(NetId::PageFinder);
+    std::vector<float> lg;
+    const bool ok = page_finder_logits(bgr, *g->inf, lg);
+    if (!ok) return nullptr;
+    if (timing && env->GetArrayLength(timing) >= 1) {
+        std::string e = net_entry(true, g->inf->last_ms(NetId::PageFinder), ms_since(t0), first, g->inf->backend(NetId::PageFinder),
+                                  shape_str({1, 3, SEG_SIZE, SEG_SIZE}));
+        jstring js = env->NewStringUTF(e.c_str());
+        env->SetObjectArrayElement(timing, 0, js);
+        env->DeleteLocalRef(js);
+    }
+    jfloatArray a = env->NewFloatArray((jsize)lg.size());
+    env->SetFloatArrayRegion(a, 0, (jsize)lg.size(), lg.data());
     return a;
 }
 
 // -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
 //    "ok", "fit_median_px", "needs_manual_crop": [reasons], finder fields}, ...]} (2 pages: book spread)
-// flattening net (0 UVDoc, 1 SyntheticDoc): the part of the photo it sees for these corners
-// -> [x, y, w, h, turned, model]
-JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvCrop(JNIEnv* env, jclass, jint w, jint h, jfloatArray corners,
-                                                                    jint model) {
-    std::array<cv::Point2d, 4> c;
-    jfloat v[8] = {0};
-    if (corners && env->GetArrayLength(corners) == 8) env->GetFloatArrayRegion(corners, 0, 8, v);
-    for (int k = 0; k < 4; ++k) c[k] = cv::Point2d(v[2 * k], v[2 * k + 1]);
-    UvCrop u = uv_crop(cv::Size(w, h), c, model);
-    jint o[6] = {u.box.x, u.box.y, u.box.width, u.box.height, u.turned ? 1 : 0, u.model};
-    jintArray a = env->NewIntArray(6);
-    env->SetIntArrayRegion(a, 0, 6, o);
-    return a;
-}
-
-// the re-crop for net `model` on a first pass's grid (uv_crop_on_grid): -> [x, y, w, h, turned, model], or null
-JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvRecrop(JNIEnv* env, jclass, jint w, jint h, jfloatArray grid,
-                                                                      jintArray crop, jint model) {
-    UvCrop c;
-    if (!read_uv_crop(env, crop, c)) return nullptr;
-    std::vector<float> g = read_floats_exact(env, grid, uv_spec(c.model).output_len());
-    if (g.empty()) return nullptr;
-    UvGrid ug = uv_grid(g.data(), c);
-    if (!ug.ok) return nullptr;
-    UvCrop u = uv_crop_on_grid(cv::Size(w, h), ug, model);
-    jint o[6] = {u.box.x, u.box.y, u.box.width, u.box.height, u.turned ? 1 : 0, u.model};
-    jintArray a = env->NewIntArray(6);
-    env->SetIntArrayRegion(a, 0, 6, o);
-    return a;
-}
-
-// flattening-net input for a crop: float[3 * in_h * in_w] (RGB 0..1, NCHW), or null. With the page finder's
-// logits, the other page of a book spread (not pageIndex) is hidden from the net.
-JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_uvInput(JNIEnv* env, jclass, jobject bmp, jintArray crop,
-                                                                       jfloatArray logits, jint page_index) {
-    UvCrop c;
-    if (!read_uv_crop(env, crop, c)) return nullptr;
-    cv::Mat bgr = bitmap_to_bgr(env, bmp);
-    if (bgr.empty()) return nullptr;
-    cv::Mat blank;
-    std::vector<float> lg = read_logits(env, logits);
-    if (!lg.empty()) {
-        try {
-            PageFindResult f = find_page_net(bgr, lg.data());
-            if (f.pages.size() == 2) blank = f.pages[page_index == 1 ? 0 : 1].mask;
-        } catch (const std::exception& e) {
-            LOGI("uvInput: page finder failed: %s", e.what());
-        }
-    }
-    std::vector<float> x = uv_input(bgr, c, blank);
-    jfloatArray a = env->NewFloatArray((jsize)x.size());
-    env->SetFloatArrayRegion(a, 0, (jsize)x.size(), x.data());
-    return a;
-}
-
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,
                                                                    jfloat focal_px) {
     cv::Mat bgr = bitmap_to_bgr(env, bmp);
@@ -402,14 +556,14 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, 
     return env->NewStringUTF(f.str().c_str());
 }
 
+// flatten: Settings > neural flattening (the flattening nets run unless perspectiveOnly); flatNets:
+// 0 both, 1 UVDoc only, 2 SyntheticDoc high-res only; shadows: the shadow net. The nets run here,
+// through the groups' Inference (core/src/nets.cpp, as the Kotlin FlatNet / ShadeNet calls did).
 JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, jclass, jobject bmp, jfloatArray corners,
                                                                   jboolean edited, jfloat focal_px, jboolean auto_orient,
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
-                                                                  jfloatArray uv_out, jintArray uv_crop_a, jfloatArray uv_out2,
-                                                                  jintArray uv_crop2_a, jfloatArray uv_pass1, jintArray uv_crop_pass1_a,
-                                                                  jfloatArray uv_shading, jobject shade_net,
-                                                                  jobject listener) {
+                                                                  jboolean flatten, jint flat_nets, jboolean shadows, jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -433,54 +587,43 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.page_index = page_index;
     o.force_homography = force_homography;
     o.perspective_only = perspective_only;
-    // flattening nets: up to two grids (the first preferred) and SyntheticDoc's shading map
-    std::vector<float> uv, uv2, shading;
-    UvCrop c1, c2;
-    bool has1 = read_uv_crop(env, uv_crop_a, c1), has2 = read_uv_crop(env, uv_crop2_a, c2);
-    if (has1) uv = read_floats_exact(env, uv_out, uv_spec(c1.model).output_len());
-    if (has2) uv2 = read_floats_exact(env, uv_out2, uv_spec(c2.model).output_len());
-    if (uv.empty() && !uv2.empty()) { std::swap(uv, uv2); std::swap(c1, c2); }
-    if (!uv.empty()) { o.uv_out = uv.data(); o.uv_crop = c1; }
-    if (!uv2.empty()) { o.uv_out2 = uv2.data(); o.uv_crop2 = c2; }
-    // the first pass on the whole photo whose outline gave the crops (uv_crop_on_grid)
-    std::vector<float> p1;
-    UvCrop cp;
-    if (read_uv_crop(env, uv_crop_pass1_a, cp)) p1 = read_floats_exact(env, uv_pass1, uv_spec(cp.model).output_len());
-    if (!p1.empty()) { o.uv_out_pass1 = p1.data(); o.uv_crop_pass1 = cp; }
-    for (const UvCrop* c : {&c1, &c2}) {
-        if (c->model != 1 || !shading.empty()) continue;
-        if ((c == &c1 && !has1) || (c == &c2 && !has2)) continue;
-        shading = read_floats_exact(env, uv_shading, uv_spec(1).input_len());
-        if (!shading.empty()) { o.uv_shading = shading.data(); o.uv_shading_crop = *c; }
-    }
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
     o.auto_orient = auto_orient;
     o.render_w = render_w;
     o.use_gpu = use_gpu;
-    // the shadow net: ShadeNetRunner.shade(float[], int, int) -> float[] on this thread
-    jmethodID shade_mid = nullptr;
-    if (shade_net) {
-        jclass sc = env->GetObjectClass(shade_net);
-        shade_mid = env->GetMethodID(sc, "shade", "([FII)[F");
-        env->DeleteLocalRef(sc);
-    }
-    if (shade_mid) {
-        o.shade_after_uv = true;
-        o.shade_net = [&](std::vector<float>& io, int w, int h) {
-            jfloatArray in = env->NewFloatArray((jsize)io.size());
-            if (!in) return false;
-            env->SetFloatArrayRegion(in, 0, (jsize)io.size(), io.data());
-            auto out = (jfloatArray)env->CallObjectMethod(shade_net, shade_mid, in, (jint)w, (jint)h);
-            env->DeleteLocalRef(in);
-            if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-            bool ok = out && env->GetArrayLength(out) == (jsize)io.size();
-            if (ok) env->GetFloatArrayRegion(out, 0, (jsize)io.size(), io.data());
-            if (out) env->DeleteLocalRef(out);
-            return ok;
-        };
-    }
     Progress progress(env, listener);
+    // the flattening nets: with automatic corners a first UVDoc pass on the whole photo, then UVDoc and
+    // SyntheticDoc high-res on the page it found (the high-res grid in the first slot)
+    std::ostringstream acc;   // the "accel" nets entries (info)
+    NetsResult nets;
+    double nets_ms = 0;
+    if (flatten && !perspective_only) {
+        progress(0, "Flattening (neural nets)");
+        auto g = group(g_flat);
+        NetsRequest rq;
+        rq.corners = o.corners;
+        rq.corners_edited = o.corners_edited;
+        rq.nets = (FlatNets)std::min(2, std::max(0, (int)flat_nets));
+        rq.seg_logits = o.seg_logits;
+        rq.page_index = page_index;
+        auto t0 = Clock::now();
+        nets = run_flat_nets(bgr, rq, *g->inf);
+        nets_ms = ms_since(t0);
+        nets.apply(o);
+        for (const NetRun& n : nets.runs) {
+            const bool first = g->first_use(n.name == "synthdoc_hr" ? NetId::SynthDocHR : NetId::UVDoc);
+            acc << (acc.tellp() > 0 ? ", " : "") << "\"" << net_key(n.name) << "\": " << net_entry(n.ok, n.ms, n.total_ms, first, n.backend, run_shape(n.name));
+        }
+    }
+    // the shadow net, after SyntheticDoc's grid (as with the Kotlin ShadeNet)
+    ShadeRun shade;
+    if (shadows) {
+        shade.g = group(g_shade);
+        o.shade_after_uv = true;
+        o.shade_net = shade.fn();
+    }
     o.progress = [&](int pct, const char* stage) { progress(pct, stage); };
+    auto t1 = Clock::now();
     try {
         r = run_photo(bgr, o);
         bgr.release();
@@ -497,6 +640,10 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         r.ok = false;
         r.error = e.what();
     }
+    if (shade.calls > 0) acc << (acc.tellp() > 0 ? ", " : "") << "\"shadenet\": " << shade.entry();
+    std::ostringstream a;
+    a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(nets_ms) << ", \"process_ms\": " << std::lround(ms_since(t1));
+    s->accel = a.str();
     if (!r.ok) LOGI("pipeline failed: %s", r.error.c_str());
     progress(100, "Done");
     return (jlong)s.release();
@@ -519,6 +666,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
+    if (!s->accel.empty()) f << ", \"accel\": {" << s->accel << "}";
     f << ", \"ms\": {";
     for (size_t i = 0; i < r.ms.size(); ++i) f << (i ? ", " : "") << "\"" << escape(r.ms[i].first) << "\": " << (long)r.ms[i].second;
     f << "}}";
@@ -845,6 +993,331 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_selfTest(JNIEnv* env
     }
     progress(100, "Done");
     return env->NewStringUTF(o.str().c_str());
+}
+
+
+// ---- Settings > Acceleration > Auto: the nets on the bundled self-test photo, on the CPU and on every
+// candidate backend, timed and compared with the CPU on the same inputs (made as automatic processing
+// makes them; the shadow net gets the photo at the A4 page's net size, 352 x 512). A backend is
+// acceptable for a group of nets when each net of the group ran on it (no fallback to the next backend)
+// within the accelerator tolerances below; Auto takes the fastest acceptable backend per group, the CPU
+// when none is faster. The page finder stays on the CPU (PLAN: 34 NNAPI partitions).
+// Accelerator tolerances (the CPU path itself stays bit-identical):
+//   flattening nets: Gate A's grid measure (grid_px), p99 <= 0.25 px (Gate A's target) and max <= 1 px
+//                    of the 1600 x 2263 analysis page;
+//   shadow net: |shading difference| x 255, p99 <= 0.5 and max <= 2 levels (Gate A's fp16 stand-in: p99 0.07).
+constexpr double AUTO_GRID_P99_PX = 0.25, AUTO_GRID_MAX_PX = 1.0, AUTO_SHADE_P99 = 0.5, AUTO_SHADE_MAX = 2.0;
+
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv* env, jclass, jobject bmp, jstring candidates, jint runs,
+                                                                         jobject listener) {
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    const std::string cand_s = candidates ? jstr(env, candidates) : "";
+    Progress progress(env, listener);
+    std::ostringstream o;
+    try {
+        if (bgr.empty()) throw std::runtime_error("could not read the test photo");
+        runs = std::max(1, (int)runs);
+        std::vector<Backend> all = {Backend::CPU}, cands;
+        if (!parse_backends(cand_s, cands)) throw std::runtime_error("unknown backend in \"" + cand_s + "\"");
+        for (Backend b : cands)
+            if (std::find(all.begin(), all.end(), b) == all.end()) all.push_back(b);
+        auto make = [](Backend b) {
+            InferConfig c;
+            c.load = load_model;
+            if (b != Backend::CPU) c.preference = {b};
+            std::lock_guard<std::mutex> lk(g_nets_mu);
+            c.cache_dir = g_cache_dir;
+            c.threads = g_threads;
+            return Inference::create(c);
+        };
+        // the inputs, from CPU runs as automatic processing makes them
+        progress(1, "Auto: preparing the inputs (CPU)");
+        std::unique_ptr<Inference> cpu = make(Backend::CPU);
+        std::vector<float> lg;
+        const float* logits = page_finder_logits(bgr, *cpu, lg) ? lg.data() : nullptr;
+        PageCorners pc = detect_corners(bgr, 2400, logits, 0);
+        NetsRequest rq;
+        const double w1 = bgr.cols - 1.0, h1 = bgr.rows - 1.0;
+        rq.corners = pc.ok ? pc.pts : std::array<cv::Point2d, 4>{cv::Point2d(0, 0), cv::Point2d(w1, 0), cv::Point2d(w1, h1), cv::Point2d(0, h1)};
+        rq.seg_logits = logits;
+        NetsResult ref = run_flat_nets(bgr, rq, *cpu);
+        cv::Mat blank;
+        if (logits) {
+            PageFindResult f = find_page_net(bgr, logits);
+            if (f.pages.size() == 2) blank = f.pages[1].mask;
+        }
+        struct In { std::string key; NetId id; int model; Tensor x; };
+        std::vector<In> in;
+        auto add_uv = [&](const std::string& key, const UvCrop& c) {
+            const UvSpec& sp = uv_spec(c.model);
+            in.push_back({key, c.model == 2 ? NetId::SynthDocHR : NetId::UVDoc, c.model, Tensor{{1, 3, sp.in_h, sp.in_w}, uv_input(bgr, c, blank)}});
+        };
+        if (!ref.grid_pass1.empty()) add_uv("uvdoc_pass1", ref.crop_pass1);
+        if (!ref.grid2.empty()) add_uv("uvdoc", ref.crop2);
+        if (!ref.grid1.empty()) add_uv(ref.crop1.model == 2 ? "synthdoc_hr" : "uvdoc", ref.crop1);
+        {
+            const int sw = 352, sh = 512;
+            cv::Mat sm;
+            cv::resize(bgr, sm, cv::Size(sw, sh), 0, 0, cv::INTER_AREA);
+            Tensor t{{1, 3, sh, sw}, std::vector<float>((size_t)3 * sw * sh)};
+            for (int y = 0; y < sh; ++y)
+                for (int x = 0; x < sw; ++x)
+                    for (int c = 0; c < 3; ++c) t.data[((size_t)c * sh + y) * sw + x] = sm.at<cv::Vec3b>(y, x)[c] / 255.f;
+            in.push_back({"shadenet", NetId::ShadeNet, -1, std::move(t)});
+        }
+        // every backend on every input: a first run (session creation; QNN: the graph compile or the
+        // cached context) and `runs` timed runs
+        struct Res { bool ok = false, ran = false, pass = false; double first_ms = 0, median = 0, p95 = 0, p99 = 0, max = 0; std::vector<float> out; };
+        std::vector<std::vector<Res>> res(all.size(), std::vector<Res>(in.size()));
+        for (size_t bi = 0; bi < all.size(); ++bi) {
+            std::unique_ptr<Inference> own;
+            Inference* inf = cpu.get();
+            if (all[bi] != Backend::CPU) inf = (own = make(all[bi])).get();
+            for (size_t k = 0; k < in.size(); ++k) {
+                progress((int)(5 + 90 * (bi * in.size() + k) / (all.size() * in.size())),
+                         std::string("Auto: ") + in[k].key + " on " + backend_name(all[bi]));
+                Res& r = res[bi][k];
+                std::vector<Tensor> y;
+                auto t0 = Clock::now();
+                r.ok = inf->run(in[k].id, in[k].x, y) && !y.empty();
+                r.first_ms = ms_since(t0);
+                r.ran = r.ok && inf->backend(in[k].id) == all[bi];
+                if (!r.ran) continue;
+                std::vector<double> t;
+                for (int i = 0; i < runs && r.ok; ++i) {
+                    r.ok = inf->run(in[k].id, in[k].x, y) && !y.empty() && inf->backend(in[k].id) == all[bi];
+                    t.push_back(inf->last_ms(in[k].id));
+                }
+                r.ran = r.ok;
+                if (!r.ok) continue;
+                r.median = pct(t, 50);
+                r.p95 = pct(t, 95);
+                r.out = std::move(y[0].data);
+            }
+        }
+        // the differences from the CPU
+        for (size_t bi = 0; bi < all.size(); ++bi)
+            for (size_t k = 0; k < in.size(); ++k) {
+                Res& r = res[bi][k];
+                const Res& c = res[0][k];
+                if (!r.ran || !c.ran || r.out.size() != c.out.size()) continue;
+                std::vector<double> d;
+                if (in[k].model < 0) {
+                    for (size_t i = 0; i < r.out.size(); ++i) d.push_back(std::fabs((double)r.out[i] - c.out[i]) * 255);
+                } else {
+                    const UvSpec& sp = uv_spec(in[k].model);
+                    d = grid_px(c.out, r.out, sp.gw, sp.gh);
+                }
+                if (d.empty()) continue;
+                r.p99 = pct(d, 99);
+                r.max = *std::max_element(d.begin(), d.end());
+                r.pass = in[k].model < 0 ? r.p99 <= AUTO_SHADE_P99 && r.max <= AUTO_SHADE_MAX : r.p99 <= AUTO_GRID_P99_PX && r.max <= AUTO_GRID_MAX_PX;
+            }
+        // the fastest acceptable backend per group (the CPU's own runs are the reference: acceptable)
+        auto choose = [&](bool shade) {
+            size_t best = 0;
+            double best_ms = -1;
+            for (size_t bi = 0; bi < all.size(); ++bi) {
+                double sum = 0;
+                bool okb = true, any = false;
+                for (size_t k = 0; k < in.size(); ++k) {
+                    if ((in[k].model < 0) != shade) continue;
+                    any = true;
+                    const Res& r = res[bi][k];
+                    okb = okb && r.ran && (bi == 0 || r.pass);
+                    sum += r.median;
+                }
+                if (!any || !okb) continue;
+                if (best_ms < 0 || sum < best_ms) best = bi, best_ms = sum;
+            }
+            return all[best];
+        };
+        o << "{\"ok\": true, \"runs\": " << runs << ", \"corners_found\": " << (pc.ok ? "true" : "false")
+          << ", \"tolerance\": {\"grid_p99_px\": " << AUTO_GRID_P99_PX << ", \"grid_max_px\": " << AUTO_GRID_MAX_PX
+          << ", \"shade_p99_levels\": " << AUTO_SHADE_P99 << ", \"shade_max_levels\": " << AUTO_SHADE_MAX << "}, \"backends\": [";
+        for (size_t bi = 0; bi < all.size(); ++bi) {
+            o << (bi ? ", " : "") << "{\"backend\": \"" << backend_name(all[bi]) << "\", \"nets\": {";
+            for (size_t k = 0; k < in.size(); ++k) {
+                const Res& r = res[bi][k];
+                o << (k ? ", " : "") << "\"" << in[k].key << "\": {\"ran\": " << (r.ran ? "true" : "false") << ", \"first_ms\": " << std::lround(r.first_ms);
+                if (r.ran)
+                    o << ", \"median_ms\": " << json_num(std::round(r.median * 10) / 10) << ", \"p95_ms\": " << json_num(std::round(r.p95 * 10) / 10)
+                      << ", \"p99_diff\": " << json_num(r.p99) << ", \"max_diff\": " << json_num(r.max) << ", \"pass\": " << (bi == 0 || r.pass ? "true" : "false");
+                o << "}";
+            }
+            o << "}}";
+        }
+        o << "], \"choice\": {\"finder\": \"cpu\", \"flat\": \"" << backend_name(choose(false)) << "\", \"shade\": \"" << backend_name(choose(true))
+          << "\"}}";
+    } catch (const std::exception& e) {
+        o.str("");
+        o << "{\"ok\": false, \"error\": \"" << escape(e.what()) << "\", \"choice\": {\"finder\": \"cpu\", \"flat\": \"cpu\", \"shade\": \"cpu\"}}";
+    }
+    progress(100, "Done");
+    return env->NewStringUTF(o.str().c_str());
+}
+
+// ---- debug batch mode (ScanViewModel.runBatch): one photo file exactly as tools/desktop_check/pipeline_cli
+// runs it with the nets in-process (`FS_NETS=1 FS_NET_DUMP=OUT pipeline_cli PHOTO OUT.ext net`, with
+// shade: FS_SHADE_NET + FS_SHADE_AFTER), on the groups' backends: the same JSON line (returned, and
+// written to OUT.json), the page (OUT + ext: JPEG q85, or PNG) and the nets' outputs (OUT_logits.npz,
+// _p1.npz, _rc0.npz, _rc2.npz), so tools/desktop_check/gate_b.py cmp and the DocUNet scorer read a phone's
+// run like a desktop one. CPU image stages (use_gpu off), automatic corners, as pipeline_cli.
+static std::string cli_num(double v) {
+    if (!std::isfinite(v)) return "null";
+    char b[64];
+    std::snprintf(b, sizeof b, "%.6g", v);
+    return b;
+}
+
+static std::string cli_strs(const std::vector<std::string>& v) {
+    std::string o = "[";
+    for (size_t i = 0; i < v.size(); ++i) o += (i ? ", \"" : "\"") + v[i] + "\"";
+    return o + "]";
+}
+
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* env, jclass, jstring photo_path, jstring out_base, jstring page_ext,
+                                                                      jboolean shade) {
+    const std::string photo = jstr(env, photo_path), out = jstr(env, out_base), ext = jstr(env, page_ext);
+    std::ostringstream f;
+    try {
+        cv::Mat img = cv::imread(photo, cv::IMREAD_COLOR);
+        if (img.empty()) throw std::runtime_error("cannot read " + photo);
+        std::ostringstream net_json;
+        auto net_sep = [&]() { return net_json.tellp() > 0 ? ", " : ""; };
+        // the page finder (pipeline_cli LOGITS "net")
+        std::vector<float> lg;
+        {
+            auto g = group(g_finder);
+            auto t0 = Clock::now();
+            bool ok = page_finder_logits(img, *g->inf, lg);
+            net_json << "\"page_finder\": {\"ok\": " << (ok ? "true" : "false") << ", \"backend\": \"" << backend_name(g->inf->backend(NetId::PageFinder))
+                     << "\", \"ms\": " << cli_num(g->inf->last_ms(NetId::PageFinder)) << ", \"total_ms\": " << cli_num(ms_since(t0)) << "}";
+            if (ok) write_npz(out + "_logits.npz", {{"logits", NpyArray::f32({2, (size_t)SEG_SIZE, (size_t)SEG_SIZE}, lg.data())}});
+        }
+        const float* logits = lg.empty() ? nullptr : lg.data();
+        f << "{\"photo\": \"" << photo << "\", \"assess\": [";
+        try {
+            auto pages = assess_pages(img, logits, 0);
+            for (size_t i = 0; i < pages.size(); ++i) {
+                const auto& a = pages[i];
+                f << (i ? ", " : "") << "{\"ok\": " << (a.pc.ok ? "true" : "false") << ", \"fit_median_px\": " << cli_num(a.fit_median_px)
+                  << ", \"reasons\": " << cli_strs(a.reasons) << ", \"whole_frame\": " << (a.pc.whole_frame ? "true" : "false")
+                  << ", \"n_pages\": " << a.pc.n_pages << ", \"corners\": [";
+                for (int k = 0; k < 4; ++k) f << (k ? ", " : "") << cli_num(a.pc.pts[k].x) << ", " << cli_num(a.pc.pts[k].y);
+                f << "]}";
+            }
+            f << "]";
+        } catch (const std::exception& e) {
+            f << "], \"assess_error\": \"" << e.what() << "\"";
+        }
+        PipelineOptions o;
+        o.use_gpu = false;
+        o.seg_logits = logits;
+        o.zoom_pass = false;
+        ShadeRun sr;
+        if (shade) {
+            sr.g = group(g_shade);
+            o.shade_net = sr.fn();
+            o.shade_after_uv = true;
+        }
+        // the flattening nets as the app runs them (FS_NETS=1)
+        PageCorners pc = detect_corners(img, o.max_analysis_side, logits, 0);
+        if (!pc.ok) {
+            f << ", \"ok\": false, \"error\": \"no page found\"}";
+        } else {
+            NetsRequest rq;
+            rq.corners = pc.pts;
+            rq.seg_logits = logits;
+            auto g = group(g_flat);
+            NetsResult nets = run_flat_nets(img, rq, *g->inf);
+            nets.apply(o);
+            for (const NetRun& n : nets.runs)
+                net_json << net_sep() << "\"" << n.name << "\": {\"ok\": " << (n.ok ? "true" : "false") << ", \"backend\": \"" << backend_name(n.backend)
+                         << "\", \"ms\": " << cli_num(n.ms) << ", \"total_ms\": " << cli_num(n.total_ms) << "}";
+            auto put = [&](const char* tag, const std::vector<float>& gr, const UvCrop& c) {
+                if (gr.empty()) return;
+                const UvSpec& sp = uv_spec(c.model);
+                write_npz(out + tag, {{"out", NpyArray::f32({2, (size_t)sp.gh, (size_t)sp.gw}, gr.data())}});
+            };
+            put("_p1.npz", nets.grid_pass1, nets.crop_pass1);
+            put(nets.crop1.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid1, nets.crop1);
+            put(nets.crop2.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid2, nets.crop2);
+            PipelineResult r;
+            auto t_run = Clock::now();
+            try {
+                r = run_photo(img, o);
+            } catch (const std::exception& e) {
+                r.ok = false;
+                r.error = std::string("exception: ") + e.what();
+            }
+            const double run_ms = ms_since(t_run);
+            if (o.shade_net)
+                net_json << net_sep() << "\"shadenet\": {\"ok\": " << (r.shade_net ? "true" : "false") << ", \"backend\": \""
+                         << backend_name(sr.g->inf->backend(NetId::ShadeNet)) << "\", \"ms\": " << cli_num(sr.run_ms) << "}";
+            // the processing result: pipeline_cli's fields, in its order and format
+            f << ", \"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << r.error << "\", \"mode\": \"" << geom_mode_name(r.mode)
+              << "\", \"fit_median_full_px\": " << cli_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
+              << ", \"needs_manual_crop\": " << cli_strs(r.needs_manual_crop) << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl
+              << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size() << "], \"text_rows\": " << r.warp.n_text
+              << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << cli_num(r.uv_agreement)
+              << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false") << ", \"line_distortion\": " << cli_num(r.line_distortion)
+              << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << cli_num(r.fingers_erased)
+              << ", \"uv_model\": " << r.uv_model << ", \"uv_consistency\": " << cli_num(r.uv_consistency)
+              << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"orient\": [" << cli_num(r.orient_sh) << ", "
+              << cli_num(r.orient_sv) << ", " << cli_num(r.orient_upright) << "]" << ", \"uv_spread\": [" << cli_num(r.uv_spread[0]) << ", "
+              << cli_num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed
+              << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", "
+              << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted
+              << ", \"bumps_faded\": " << cli_num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << cli_num(r.uv_zoom_spread[0])
+              << ", " << cli_num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]";
+            if (r.ok) {
+                // warp-map field size and roughness, local area change (pipeline_cli field_stats, det_p99)
+                auto field_stats = [&](const char* name, const Field& a, const Field& b) {
+                    double mx = 0, gr = 0;
+                    for (const Field* F : {&a, &b}) {
+                        if (F->v.empty()) continue;
+                        for (int i = 0; i < F->gh; ++i)
+                            for (int j = 0; j < F->gw; ++j) {
+                                double v = F->v[(size_t)i * F->gw + j];
+                                mx = std::max(mx, std::fabs(v));
+                                if (j + 1 < F->gw) gr = std::max(gr, std::fabs(F->v[(size_t)i * F->gw + j + 1] - v) / F->g);
+                                if (i + 1 < F->gh) gr = std::max(gr, std::fabs(F->v[(size_t)(i + 1) * F->gw + j] - v) / F->g);
+                            }
+                    }
+                    f << ", \"" << name << "_max\": " << cli_num(mx) << ", \"" << name << "_grad\": " << cli_num(gr);
+                };
+                field_stats("global", r.warp.GX, r.warp.GY);
+                field_stats("local", r.warp.Fx, r.warp.Fy);
+                const Field &Fx = r.warp.Fx, &Fy = r.warp.Fy;
+                std::vector<double> dets;
+                for (int i = 2; i + 3 < Fx.gh; ++i)
+                    for (int j = 2; j + 3 < Fx.gw; ++j) {
+                        auto V = [&](const Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
+                        double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
+                        double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
+                        dets.push_back(std::fabs((1 + xx) * (1 + yy) - xy * yx - 1));
+                    }
+                if (!dets.empty()) {
+                    std::sort(dets.begin(), dets.end());
+                    size_t n20 = 0;
+                    for (double d : dets) n20 += d > 0.2;
+                    f << ", \"det_p99\": " << cli_num(dets[(size_t)(0.99 * (dets.size() - 1))]) << ", \"det_frac20\": " << cli_num((double)n20 / dets.size());
+                }
+            }
+            f << ", \"nets\": {" << net_json.str() << "}, \"pipeline_ms\": " << cli_num(run_ms) << "}";
+            if (r.ok) {
+                cv::Mat bgr;
+                cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);
+                cv::imwrite(out + ext, bgr, {cv::IMWRITE_JPEG_QUALITY, 85});
+            }
+        }
+    } catch (const std::exception& e) {
+        f.str("");
+        f << "{\"photo\": \"" << photo << "\", \"ok\": false, \"error\": \"" << escape(e.what()) << "\"}";
+    }
+    std::ofstream(out + ".json") << f.str();
+    return env->NewStringUTF(f.str().c_str());
 }
 
 }  // extern "C"

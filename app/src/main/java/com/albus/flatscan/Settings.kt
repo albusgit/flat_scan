@@ -67,6 +67,16 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("neural_shadows", Features.NEURAL_SHADOWS)
         set(v) = p.edit().putBoolean("neural_shadows", v).apply()
 
+    /** Where the nets run ([Accel]: auto, cpu, npu, nnapi); CPU unless chosen. */
+    var acceleration: String
+        get() = p.getString("acceleration", Accel.CPU).takeIf { s -> Accel.CHOICES.any { it.first == s } } ?: Accel.CPU
+        set(v) = p.edit().putString("acceleration", v).apply()
+
+    /** Auto's last benchmark: JSON soc, app (version), at, bench (NativeLib.benchBackends); null: none yet. */
+    var autoChoice: String?
+        get() = p.getString("accel_auto", null)
+        set(v) = p.edit().apply { if (v == null) remove("accel_auto") else putString("accel_auto", v) }.apply()
+
     /** Show the crop screen for every page; otherwise only doubtful crops (quality gate) stop there. */
     var reviewCrops: Boolean
         get() = p.getBoolean("review_crops", false)

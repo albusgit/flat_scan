@@ -126,13 +126,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private var recropBackup: CropBackup? = null
 
     // ---- page finder, quality gate, book spreads
-    private val finder = PageFinder(app)
-    private val uvNet = FlatNet(app, FlatNet.UVDOC)
-    private val sdNet = FlatNet(app, FlatNet.SYNTHDOC)
-    private val shadeNet = ShadeNet(app)
     private val logitsLock = Any()
-    /** Page-finder output for one photo bitmap (detection and processing use the same photo), with its timing. */
-    private var logitsCache: Triple<Bitmap, FloatArray?, NetTiming?>? = null
+    /**
+     * Page-finder output for one photo bitmap (detection and processing use the same photo), with its
+     * processing-details entry (NativeLib.pageFinder timing).
+     */
+    private var logitsCache: Triple<Bitmap, FloatArray?, String?>? = null
     /** Why the automatic crop on the crop screen is doubtful (quality gate); empty = trusted. */
     var cropReasons by mutableStateOf(listOf<String>())
         private set
@@ -257,11 +256,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 val app = getApplication<Application>()
                 val ref = java.io.File(app.cacheDir, "photo1_reference_warpmap.npz")
                 app.assets.open("selftest/photo1_reference_warpmap.npz").use { i -> ref.outputStream().use { i.copyTo(it) } }
-                val opts = android.graphics.BitmapFactory.Options().apply {
-                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                    inScaled = false
-                }
-                val bmp = app.assets.open("selftest/photo1.png").use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
+                val bmp = selfTestPhoto()
                 val thermalBefore = thermalStatus(app)
                 val json = NativeLib.selfTest(bmp, ref.absolutePath, runs) { pct, s ->
                     viewModelScope.launch(Dispatchers.Main) { selfTestStage = "$s ($pct%)" }
@@ -275,6 +270,121 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             selfTestReport = report
             selfTestRunning = false
         }
+    }
+
+    /** The bundled self-test photo (assets/selftest/photo1.png, 1659 x 2212). */
+    private fun selfTestPhoto(): Bitmap {
+        val opts = android.graphics.BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inScaled = false
+        }
+        return getApplication<Application>().assets.open("selftest/photo1.png").use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
+    }
+
+    /**
+     * Settings > Acceleration > "Run the benchmark": Auto's benchmark now (its result is kept as Auto's
+     * choice for this SoC and app version), with its report in the self-test area.
+     */
+    fun runAccelBenchmark() {
+        if (selfTestRunning) return
+        selfTestRunning = true
+        selfTestReport = ""
+        viewModelScope.launch {
+            val report = withContext(Dispatchers.Default) {
+                runCatching {
+                    synchronized(netsLock) {
+                        val stored = runAutoBenchmark { s -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s } }
+                        if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
+                        formatBench(stored)
+                    }
+                }.getOrElse { "Acceleration benchmark FAILED: ${it.message ?: it}" }
+            }
+            selfTestReport = report
+            selfTestRunning = false
+        }
+    }
+
+    // ---- the nets' backends (Settings > Acceleration)
+    /** The groups' backends as last given to [NativeLib.configureNets]. */
+    @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "")
+    private val netsLock = Any()
+
+    init {
+        // QNN HTP: the DSP loads its skeleton library from the app's native library directory
+        runCatching { android.system.Os.setenv("ADSP_LIBRARY_PATH", app.applicationInfo.nativeLibraryDir, true) }
+        // the CPU until processing asks for the setting's backends (ensureNets)
+        configureNets(netPlan)
+    }
+
+    /** The current setting's plan: a fixed setting's, Auto's stored choice, or the CPU while Auto has not run. */
+    fun currentPlan(): Accel.Plan = Accel.fixed(settings.acceleration) ?: Accel.autoPlan(settings.autoChoice)
+        ?: Accel.Plan(Accel.AUTO, "", "", "", "not benchmarked yet")
+
+    private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) {
+        val app = getApplication<Application>()
+        val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
+        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.shade, 0, staticModels)
+        netPlan = plan
+    }
+
+    /**
+     * The nets on the current setting's backends; with Auto and no benchmark for this SoC and app
+     * version yet, the benchmark runs first ([stage]: its progress; it takes seconds to minutes, as QNN
+     * compiles each graph on first use) and its choice is kept.
+     */
+    private fun ensureNets(stage: (String) -> Unit): Accel.Plan = synchronized(netsLock) {
+        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
+            stage("Choosing the acceleration (once per phone and app version)")
+            runAutoBenchmark(stage)
+        }
+        currentPlan().also { if (it != netPlan) configureNets(it) }
+    }
+
+    /** Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice]. */
+    private fun runAutoBenchmark(stage: (String) -> Unit): JSONObject {
+        val cand = Accel.candidates()
+        val bench = JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
+        val at = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.ROOT).format(java.util.Date())
+        val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
+        settings.autoChoice = stored.toString()
+        Log.i(TAG, "auto acceleration $stored")
+        return stored
+    }
+
+    /** A stored Auto benchmark ([runAutoBenchmark]) as report text, with its JSON. */
+    fun formatBench(stored: JSONObject): String {
+        val sb = StringBuilder()
+        val b = stored.optJSONObject("bench") ?: JSONObject()
+        sb.append("FlatScan ${BuildConfigInfo.VERSION} acceleration benchmark (measured on this device, ${stored.optString("at")})\n")
+        sb.append("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, SoC: ${stored.optString("soc")}\n")
+        sb.append("ONNX Runtime ${NetEnv.ortVersion}; providers: ${NetEnv.providers.joinToString(", ")}; candidates: ${stored.optString("candidates").ifEmpty { "none" }}\n")
+        if (!b.optBoolean("ok")) sb.append("FAILED: ").append(b.optString("error")).append("\n")
+        val tol = b.optJSONObject("tolerance")
+        if (tol != null) sb.append("Tolerance vs CPU: grids p99 <= %.2f px, max <= %.1f px (1600 x 2263 page); shadow net p99 <= %.1f, max <= %.1f levels\n".format(
+            tol.optDouble("grid_p99_px"), tol.optDouble("grid_max_px"), tol.optDouble("shade_p99_levels"), tol.optDouble("shade_max_levels")))
+        sb.append("%d timed runs after a first run (first: session creation, QNN graph compile or cached context). ms; diff vs CPU:\n".format(b.optInt("runs")))
+        val arr = b.optJSONArray("backends")
+        for (i in 0 until (arr?.length() ?: 0)) {
+            val be = arr!!.getJSONObject(i)
+            sb.append("\n").append(be.optString("backend")).append(":\n")
+            val nets = be.optJSONObject("nets") ?: continue
+            for (k in nets.keys()) {
+                val n = nets.getJSONObject(k)
+                if (!n.optBoolean("ran")) {
+                    sb.append("  %-14s did not run on this backend (first call %d ms)\n".format(k, n.optInt("first_ms")))
+                    continue
+                }
+                val unit = if (k == "shadenet") "levels" else "px"
+                sb.append("  %-14s first %6d  median %7.1f  p95 %7.1f  diff p99 %.3f max %.3f %s  %s\n".format(k, n.optInt("first_ms"),
+                    n.optDouble("median_ms"), n.optDouble("p95_ms"), n.optDouble("p99_diff"), n.optDouble("max_diff"), unit,
+                    if (n.optBoolean("pass")) "PASS" else "FAIL"))
+            }
+        }
+        b.optJSONObject("choice")?.let { c ->
+            sb.append("\nAuto's choice: page finder ${c.optString("finder")}, flattening nets ${c.optString("flat")}, shadow net ${c.optString("shade")}\n")
+        }
+        sb.append("\nJSON (send this back with the report):\n").append(stored.toString())
+        return sb.toString()
     }
 
     private fun thermalStatus(app: Application): String {
@@ -293,44 +403,40 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * warm-up, every net on whatever the settings say. Times in ms, measured on this device.
      */
     private fun benchNets(bmp: Bitmap, runs: Int, stage: (String) -> Unit): JSONObject {
-        val per = linkedMapOf<String, MutableList<NetTiming>>()
-        val warm = linkedMapOf<String, NetTiming>()
+        val plan = ensureNets(stage)
+        val per = linkedMapOf<String, MutableList<JSONObject>>()
+        val warm = linkedMapOf<String, JSONObject>()
         val walls = linkedMapOf<String, MutableList<Double>>()
         var geometry = ""
         val width = settings.outputWidth
         for (k in 0..runs) {
             stage(if (k == 0) "Nets: warm-up run" else "Nets: run $k of $runs")
-            val got = linkedMapOf<String, NetTiming>()
+            val got = linkedMapOf<String, JSONObject>()
             val t0 = System.nanoTime()
-            val f = finder.run(bmp) ?: throw IllegalStateException("page finder net unavailable")
-            got["page_finder"] = f.second
+            val ft = arrayOfNulls<String>(1)
+            val lg = NativeLib.pageFinder(bmp, ft) ?: throw IllegalStateException("page finder net unavailable")
+            ft[0]?.let { got["page_finder"] = JSONObject(it) }
             val td = System.nanoTime()
-            val pages = JSONObject(NativeLib.detect(bmp, f.first, 0f)).optJSONArray("pages")
+            val pages = JSONObject(NativeLib.detect(bmp, lg, 0f)).optJSONArray("pages")
             val pg = pages?.optJSONObject(0)?.let { DetectedPage.from(it) }
             if (pg == null || !pg.ok) throw IllegalStateException("no page found on the test photo")
-            val detectMs = NetTiming.msSince(td)
+            val detectMs = msSince(td)
             val c = FloatArray(8) { i -> if (i % 2 == 0) pg.corners[i / 2].x else pg.corners[i / 2].y }
-            val t1 = System.nanoTime()
-            val g = runNets(bmp, c, f.first, 0, useUv = true, po = false, edited = false, nets = 0) {}
-            val netsMs = NetTiming.msSince(t1)
-            for ((key, v) in g.timings()) got[key] = v
-            shadeNet.takeTimings()
-            val t2 = System.nanoTime()
             val h = NativeLib.process(
-                bmp, c, false, 0f, true, width, true, f.first, 0, pg.reasons.isNotEmpty(), false, FloatArray(0),
-                g.first?.second?.grid, g.first?.first, g.secondGrid, g.secondCrop, g.pass1?.second?.grid, g.pass1?.first,
-                null, shadeNet, null,
+                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, null,
             )
-            val coreMs = NetTiming.msSince(t2)
-            val pageMs = NetTiming.msSince(t0)
-            NetTiming.sum(shadeNet.takeTimings())?.let { got["shadenet"] = it }
+            val pageMs = msSince(t0)
             val info = if (h != 0L) JSONObject(NativeLib.info(h)).also { NativeLib.release(h) } else null
             if (info == null || !info.optBoolean("ok")) throw IllegalStateException("processing failed: ${info?.optString("error")}")
             geometry = info.optString("mode") + (if (info.optString("mode") == "uvdoc") " (model ${info.optInt("uv_model")})" else "") +
                 (if (info.optBoolean("shade_net")) ", shadow net applied" else "")
+            val a = info.optJSONObject("accel")
+            val n = a?.optJSONObject("nets")
+            for ((key, _) in NET_LABELS) n?.optJSONObject(key)?.let { got[key] = it }
             if (k == 0) { warm.putAll(got); continue }
             for ((key, v) in got) per.getOrPut(key) { mutableListOf() }.add(v)
-            for ((key, v) in listOf("detect" to detectMs, "flattening_nets" to netsMs, "process" to coreMs, "page" to pageMs))
+            for ((key, v) in listOf("detect" to detectMs, "flattening_nets" to (a?.optDouble("flattening_nets_ms") ?: 0.0),
+                "process" to (a?.optDouble("process_ms") ?: 0.0), "page" to pageMs))
                 walls.getOrPut(key) { mutableListOf() }.add(v)
         }
         fun stat(v: List<Double>) = JSONObject().put("median", pct(v, 50.0).roundToInt()).put("p95", pct(v, 95.0).roundToInt())
@@ -338,14 +444,106 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         for ((key, _) in NET_LABELS) {
             val v = per[key] ?: continue
             val w = warm[key]
-            nets.put(key, JSONObject().put("run_ms", stat(v.map { it.runMs })).put("input_ms", stat(v.map { it.inputMs }))
-                .put("warmup_run_ms", w?.runMs?.roundToInt()).put("load_ms", w?.loadMs?.roundToInt()).put("shape", v.last().shape)
-                .put("backend", NetEnv.BACKEND))
+            // warmup_input_ms: on a net's first use it includes creating its session (QNN: compiling the graph)
+            nets.put(key, JSONObject().put("run_ms", stat(v.map { it.optDouble("run_ms") })).put("input_ms", stat(v.map { it.optDouble("input_ms") }))
+                .put("warmup_run_ms", w?.optDouble("run_ms")?.roundToInt()).put("warmup_input_ms", w?.optDouble("input_ms")?.roundToInt())
+                .put("warmup_first_use", w?.optBoolean("first_use")).put("shape", v.last().optString("shape"))
+                .put("backend", v.last().optString("backend")))
         }
         val wall = JSONObject()
         for ((key, v) in walls) wall.put(key, stat(v))
-        return NetEnv.toJson().put("runs", runs).put("render_width", width).put("geometry", geometry).put("nets", nets)
+        return NetEnv.toJson(plan).put("runs", runs).put("render_width", width).put("geometry", geometry).put("nets", nets)
             .put("wall_ms", wall).put("peak_rss_mb", peakRssMb())
+    }
+
+    private fun msSince(t0: Long): Double = (System.nanoTime() - t0) / 1e6
+
+    // ---- debug batch mode (docs/accel/PLAN.md Stream C step 5)
+    var batchRunning by mutableStateOf(false)
+        private set
+    var batchStatus by mutableStateOf("")
+        private set
+
+    /**
+     * Debug builds ([MainActivity]: `adb shell am start -S -n com.albus.flatscan/.MainActivity --es batch SET`):
+     * every image (.jpg, .jpeg, .png) in files/batch/SET of the app's internal storage (written with
+     * `adb exec-in run-as com.albus.flatscan sh -c 'cat > files/batch/SET/NAME.jpg' < NAME.jpg`: files that
+     * adb pushes into the external directory are not readable by the app), else of its external files
+     * directory, processed as tools/desktop_check/pipeline_cli does with the nets in-process
+     * ([NativeLib.batchPhoto]), into batch_out/[out] (default SET_ACCEL) of the external files directory
+     * (/sdcard/Android/data/com.albus.flatscan/files, which adb pull reads): per photo
+     * NAME.json, the page NAME + [ext] and the nets' outputs NAME_logits / _p1 / _rc0 / _rc2.npz; run.json
+     * (device, backends, options), times_phone.txt (wall ms per photo) and, when finished, done.txt.
+     * Photos whose JSON exists are skipped, so a stopped run resumes. [accel]: an [Accel] setting for this
+     * run (default: the current one); [shade]: the shadow net (default on, off for SET "docunet", as
+     * gate_b.py); [ext]: ".jpg" or ".png" (default ".png" for "docunet", else ".jpg"); [staticModels]: the
+     * CPU runs the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1); [only]: comma-separated names.
+     */
+    fun runBatch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?) {
+        if (batchRunning) return
+        batchRunning = true
+        batchStatus = "Batch $set: starting"
+        viewModelScope.launch {
+            val msg = withContext(Dispatchers.Default) {
+                runCatching { batch(set, out, accel, shade, ext, staticModels, only) }
+                    .getOrElse { Log.e(TAG, "batch failed", it); "Batch $set FAILED: ${it.message ?: it}" }
+            }
+            Log.i(TAG, msg)
+            batchStatus = msg
+            batchRunning = false
+        }
+    }
+
+    private fun batch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?): String {
+        fun status(t: String) { viewModelScope.launch(Dispatchers.Main) { batchStatus = t } }
+        val root = getApplication<Application>().getExternalFilesDir(null) ?: error("no external files directory")
+        val inDir = File(getApplication<Application>().filesDir, "batch/$set").takeIf { it.isDirectory } ?: File(root, "batch/$set")
+        val keep = only?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()
+        val photos = inDir.listFiles { f -> f.isFile && f.extension.lowercase() in setOf("jpg", "jpeg", "png") }.orEmpty()
+            .filter { keep == null || it.nameWithoutExtension in keep }.sortedBy { it.name }
+        if (photos.isEmpty()) error("no images in ${inDir.absolutePath}")
+        val setting = accel?.lowercase() ?: settings.acceleration
+        val doShade = shade ?: (set != "docunet")
+        val pageExt = ext ?: if (set == "docunet") ".png" else ".jpg"
+        if (pageExt != ".jpg" && pageExt != ".png") error("ext must be .jpg or .png")
+        val plan = synchronized(netsLock) {
+            val pl = Accel.fixed(setting) ?: (Accel.autoPlan(settings.autoChoice)
+                ?: run { runAutoBenchmark { status("Batch $set: $it") }; Accel.autoPlan(settings.autoChoice) } ?: Accel.fixed(Accel.CPU)!!)
+            configureNets(pl, staticModels)
+            pl
+        }
+        val outDir = File(root, "batch_out/" + (out ?: "${set}_$setting")).apply { mkdirs() }
+        File(outDir, "done.txt").delete()
+        File(outDir, "run.json").writeText(NetEnv.toJson(plan).put("set", set).put("photos", photos.size).put("shade", doShade)
+            .put("ext", pageExt).put("static_models", staticModels).put("app", BuildConfigInfo.VERSION)
+            .put("started", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())).toString(1))
+        val timesFile = File(outDir, "times_phone.txt")
+        val times = runCatching { JSONObject(timesFile.readText()) }.getOrDefault(JSONObject())
+        var done = 0
+        var ok = 0
+        val t0 = System.nanoTime()
+        try {
+            for ((i, f) in photos.withIndex()) {
+                val name = f.nameWithoutExtension
+                if (File(outDir, "$name.json").exists()) continue
+                status("Batch $set (${plan.summary()}): ${i + 1} of ${photos.size}, $name")
+                val t = System.nanoTime()
+                val line = NativeLib.batchPhoto(f.absolutePath, File(outDir, name).absolutePath, pageExt, doShade)
+                val ms = msSince(t)
+                val good = runCatching { JSONObject(line).optBoolean("ok") }.getOrDefault(false)
+                done++
+                if (good) ok++
+                times.put(name, JSONObject().put("wall", ms.roundToInt()))
+                timesFile.writeText(times.toString(1))
+                Log.i(TAG, "batch $set ${i + 1}/${photos.size} $name ok=$good ${ms.roundToInt()} ms")
+            }
+        } finally {
+            synchronized(netsLock) { configureNets(currentPlan()) }
+        }
+        val msg = "Batch $set done: $done processed, ${photos.size - done} already there, $ok ok, %.0f s; %s -> %s".format(
+            msSince(t0) / 1000, plan.summary(), outDir.absolutePath)
+        File(outDir, "done.txt").writeText(msg + "\n")
+        return msg
     }
 
     /** Linear-interpolation percentile (jni_bridge.cpp pct). */
@@ -383,17 +581,18 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             sb.append("\nNeural nets: FAILED: ").append(it.message ?: it.toString()).append("\n")
             return
         }
-        sb.append("\nNeural nets on %s (ONNX Runtime %s; providers in this build: %s; %d cores)\n".format(
-            n.optString("backend"), n.optString("ort"), n.optString("ort_providers"), n.optInt("cores")))
-        sb.append("photo 1, automatic corners, every net on, render width %d, %d runs after 1 warm-up (median / p95 ms):\n".format(
+        sb.append("\nNeural nets: %s (acceleration %s; ONNX Runtime %s; providers in this build: %s; %d cores)\n".format(
+            n.optString("backend"), n.optJSONObject("acceleration")?.optString("setting"), n.optString("ort"), n.optString("ort_providers"), n.optInt("cores")))
+        sb.append("photo 1, automatic corners, every net on, render width %d, %d runs after 1 warm-up (median / p95 ms;\n".format(
             n.optInt("render_width"), n.optInt("runs")))
+        sb.append("other: input and checks; warm-up other includes creating the session, QNN: compiling the graph):\n")
         val nj = n.optJSONObject("nets")
         for ((key, label) in NET_LABELS) {
             val o = nj?.optJSONObject(key) ?: continue
             val r = o.optJSONObject("run_ms")
             val i = o.optJSONObject("input_ms")
-            sb.append("%-28s %6d / %6d  input %4d  warm-up %6d  load %5d  %s\n".format(label, r?.optInt("median") ?: 0, r?.optInt("p95") ?: 0,
-                i?.optInt("median") ?: 0, o.optInt("warmup_run_ms"), o.optInt("load_ms"), o.optString("shape")))
+            sb.append("%-28s %6d / %6d  other %4d  warm-up %6d + %6d  %s  %s\n".format(label, r?.optInt("median") ?: 0, r?.optInt("p95") ?: 0,
+                i?.optInt("median") ?: 0, o.optInt("warmup_run_ms"), o.optInt("warmup_input_ms"), o.optString("backend"), o.optString("shape")))
         }
         val w = n.optJSONObject("wall_ms")
         for ((key, label) in listOf("detect" to "Detection (core)", "flattening_nets" to "Flattening nets (wall)",
@@ -572,60 +771,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (!settings.pageFinderNet) return null
         synchronized(logitsLock) {
             logitsCache?.let { if (it.first === b) return it.second }
-            val l = runCatching { finder.run(b) }.onFailure { Log.e(TAG, "page finder failed", it) }.getOrNull()
-            logitsCache = Triple(b, l?.first, l?.second)
-            return l?.first
+            val t = arrayOfNulls<String>(1)
+            val l = runCatching { NativeLib.pageFinder(b, t) }.onFailure { Log.e(TAG, "page finder failed", it) }.getOrNull()
+            logitsCache = Triple(b, l, t[0])
+            return l
         }
     }
 
-    /** How long the page finder took on [b] (it ran when [logitsFor] first saw [b]), or null. */
-    private fun finderTiming(b: Bitmap): NetTiming? = synchronized(logitsLock) { logitsCache?.takeIf { it.first === b }?.third }
-
-    /** The flattening nets' grids for one page (the uv arguments of [NativeLib.process]) and their timings. */
-    private class NetGrids(
-        val pass1: Pair<IntArray, FlatNet.Output>?, val uv: Pair<IntArray, FlatNet.Output>?, val sd: Pair<IntArray, FlatNet.Output>?,
-    ) {
-        val first = sd ?: uv
-        // the second slot: UVDoc's grid next to SyntheticDoc's
-        val secondGrid = if (sd != null) uv?.second?.grid else null
-        val secondCrop = if (sd != null) uv?.first else null
-
-        /** Per-net timings, keyed as in the processing details' "accel" object. */
-        fun timings(): List<Pair<String, NetTiming>> =
-            listOfNotNull(pass1?.let { "uvdoc_pass1" to it.second.ms }, uv?.let { "uvdoc" to it.second.ms }, sd?.let { "synthdoc_hr" to it.second.ms })
-    }
-
-    /**
-     * The flattening nets for page corners [c] of [p] as processing runs them. [flattening] is called
-     * after the first pass, before the nets on the page's box.
-     */
-    private fun runNets(
-        p: Bitmap, c: FloatArray, logits: FloatArray?, pageIndex: Int, useUv: Boolean, po: Boolean, edited: Boolean, nets: Int,
-        flattening: () -> Unit,
-    ): NetGrids {
-        // automatic corners: a first UVDoc pass on the whole photo finds the page; the nets then
-        // run on its outline (a page finder that split a folded page or cut a curled one does
-        // not decide what the nets see)
-        val pass1: Pair<IntArray, FlatNet.Output>? = if (useUv && !po && !edited) {
-            val frame = floatArrayOf(0f, 0f, p.width - 1f, 0f, p.width - 1f, p.height - 1f, 0f, p.height - 1f)
-            val cr = NativeLib.uvCrop(p.width, p.height, frame, FlatNet.UVDOC)
-            runCatching { uvNet.run(p, cr, logits, pageIndex) }.onFailure { Log.e(TAG, "first flattening pass failed", it) }
-                .getOrNull()?.let { cr to it }
-        } else null
-        // the flattening nets on the page's box (the core checks them against the page finder
-        // and keeps SyntheticDoc high-res unless it is rejected or UVDoc's rows are far straighter;
-        // DocUNet LD 5.30, 5.76 when the straighter rows won by 0.3 deg, 6.12 with UVDoc first)
-        fun runNet(net: FlatNet): Pair<IntArray, FlatNet.Output>? {
-            val cr = pass1?.let { NativeLib.uvRecrop(p.width, p.height, it.second.grid, it.first, net.model) }
-                ?: NativeLib.uvCrop(p.width, p.height, c, net.model)
-            val out = runCatching { net.run(p, cr, logits, pageIndex) }.onFailure { Log.e(TAG, "flattening net ${net.model} failed", it) }.getOrNull()
-            return out?.let { cr to it }
-        }
-        flattening()
-        val uv = if (useUv && !po && nets != 2) runNet(uvNet) else null
-        val sd = if (useUv && !po && nets != 1) runNet(sdNet) else null
-        return NetGrids(pass1, uv, sd)
-    }
+    /** The page finder's processing-details entry for [b] (it ran when [logitsFor] first saw [b]), or null. */
+    private fun finderTiming(b: Bitmap): String? = synchronized(logitsLock) { logitsCache?.takeIf { it.first === b }?.third }
 
     /**
      * Finds the page(s) of the photo on the crop screen. [auto]: a trusted crop (quality gate)
@@ -795,7 +949,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (x1 - x0 < 64 || y1 - y0 < 64) return null
         val origin = Offset(x0.toFloat(), y0.toFloat())
         val crop = Bitmap.createBitmap(p, x0, y0, x1 - x0, y1 - y0)
-        val logits = if (settings.pageFinderNet) runCatching { finder.logits(crop) }.getOrNull() else null
+        val logits = if (settings.pageFinderNet) runCatching { NativeLib.pageFinder(crop, null) }.getOrNull() else null
         val res = JSONObject(NativeLib.detect(crop, logits, focal))
         val arr = res.optJSONArray("pages")
         val centre = Offset(loop.sumOf { it.x.toDouble() }.toFloat() / loop.size, loop.sumOf { it.y.toDouble() }.toFloat() / loop.size) - origin
@@ -865,7 +1019,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------ pages
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
-            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7|pass1=1|hrfirst=2|fold=1"
+            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7|pass1=1|hrfirst=2|fold=1" +
+            currentPlan().let { if (it.cpuOnly) "" else "|accel=${it.finder}/${it.flat}/${it.shade}" }
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
@@ -1062,27 +1217,18 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val (h, info) = withContext(nativeCtx) {
                 if (nativeHandle != 0L) NativeLib.release(nativeHandle)
                 nativeHandle = 0L
-                var accel: JSONObject? = null   // per-net timings, SoC and backend (docs/accel/PLAN.md Phase 0)
+                // per-net timings and backends, SoC, acceleration (docs/accel/PLAN.md Phase 0, Stream C)
+                var accel: (JSONObject) -> Unit = {}
                 val hh = try {
+                    val plan = if ((useUv && !po) || shadows) ensureNets { s -> viewModelScope.launch(Dispatchers.Main) { stage = s } } else netPlan
                     val reused = synchronized(logitsLock) { logitsCache?.first === p }
                     val logits = logitsFor(p)
-                    val t0 = System.nanoTime()
-                    val g = runNets(p, c, logits, pageIndex, useUv, po, edited, nets) {
-                        if (useUv || shadows) viewModelScope.launch(Dispatchers.Main) { stage = "Flattening (neural nets)" }
-                    }
-                    val netsMs = NetTiming.msSince(t0)
-                    shadeNet.takeTimings()
-                    val t1 = System.nanoTime()
+                    val finder = if (logits != null) finderTiming(p) else null
+                    accel = { j -> j.put("accel", accelJson(j.optJSONObject("accel"), finder, reused, plan)) }
                     NativeLib.process(
-                        p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(),
-                        g.first?.second?.grid, g.first?.first, g.secondGrid, g.secondCrop,
-                        g.pass1?.second?.grid, g.pass1?.first, null, if (shadows) shadeNet else null,
+                        p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows,
                     ) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
-                    }.also {
-                        val coreMs = NetTiming.msSince(t1)
-                        accel = runCatching { accelJson(if (logits != null) finderTiming(p) else null, reused, g, netsMs, coreMs) }
-                            .onFailure { Log.e(TAG, "net timings failed", it) }.getOrNull()
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "process failed", e)
@@ -1090,10 +1236,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 if (hh == 0L) return@withContext 0L to JSONObject().put("ok", false).put("error", "no session")
                 val j = JSONObject(NativeLib.info(hh))
-                accel?.let {
-                    j.put("accel", it)
-                    Log.i(TAG, "accel $it")
-                }
+                runCatching { accel(j) }.onFailure { Log.e(TAG, "net timings failed", it) }
+                j.optJSONObject("accel")?.let { Log.i(TAG, "accel $it") }
                 if (j.optBoolean("ok")) nativeHandle = hh else NativeLib.release(hh)
                 hh to j
             }
@@ -1270,18 +1414,17 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The processing details' "accel" object: SoC, backend, ONNX Runtime, and per net (keys of
-     * [NET_LABELS]) run / input / load ms and input shape; [finder] ran on the crop screen when
-     * [reused]. [netsMs]: the flattening nets' wall time, [coreMs]: NativeLib.process (incl. the shadow
-     * net, whose calls this thread made since the last [ShadeNet.takeTimings]).
+     * The processing details' "accel" object: the core's (nets: per net, keys of [NET_LABELS], run_ms,
+     * input_ms, first_use, backend, shape; flattening_nets_ms; process_ms) with the page finder's entry
+     * ([finder], run on the crop screen when [reused]) and the device facts and [plan] ([NetEnv]).
      */
-    private fun accelJson(finder: NetTiming?, reused: Boolean, g: NetGrids, netsMs: Double, coreMs: Double): JSONObject {
-        val n = JSONObject()
-        finder?.let { n.put("page_finder", it.toJson().put("reused", reused)) }
-        for ((k, v) in g.timings()) n.put(k, v.toJson())
-        val sh = shadeNet.takeTimings()
-        NetTiming.sum(sh)?.let { n.put("shadenet", it.toJson().put("calls", sh.size)) }
-        return NetEnv.toJson().put("nets", n).put("flattening_nets_ms", netsMs.roundToInt()).put("process_ms", coreMs.roundToInt())
+    private fun accelJson(core: JSONObject?, finder: String?, reused: Boolean, plan: Accel.Plan): JSONObject {
+        val a = core ?: JSONObject()
+        val n = a.optJSONObject("nets") ?: JSONObject().also { a.put("nets", it) }
+        finder?.let { n.put("page_finder", JSONObject(it).put("reused", reused)) }
+        val env = NetEnv.toJson(plan)
+        for (k in env.keys()) a.put(k, env.get(k))
+        return a
     }
 
     private fun describe(info: JSONObject, edited: Boolean, forced: Boolean, perspectiveOnly: Boolean, nIgnore: Int): String {
@@ -1325,11 +1468,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         sb.append("\nResample: ").append(if (info.optBoolean("gpu_resample")) "GPU" else "CPU fallback")
         sb.append("\n").append(gpuInfo)
         info.optJSONObject("accel")?.let { a ->
-            sb.append("\n\nNets on %s (ONNX Runtime %s), run / input / load:".format(a.optString("backend"), a.optString("ort")))
+            val ac = a.optJSONObject("acceleration")
+            sb.append("\n\nAcceleration: %s%s".format(Accel.CHOICES.firstOrNull { it.first == ac?.optString("setting") }?.second?.substringBefore(':') ?: "?",
+                ac?.optString("note")?.takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""))
+            sb.append("\nNets (ONNX Runtime %s), run / other ms, backend:".format(a.optString("ort")))
             val n = a.optJSONObject("nets")
             for ((k, label) in NET_LABELS) n?.optJSONObject(k)?.let { t ->
-                sb.append("\n%s: %.0f / %.0f / %.0f ms".format(label, t.optDouble("run_ms"), t.optDouble("input_ms"), t.optDouble("load_ms")))
+                sb.append("\n%s: %.0f / %.0f ms, %s".format(label, t.optDouble("run_ms"), t.optDouble("input_ms"), t.optString("backend")))
                 if (t.optBoolean("reused")) sb.append(" (ran on the crop screen)")
+                else if (t.optBoolean("first_use")) sb.append(" (first use: other includes loading)")
             }
             sb.append("\nFlattening nets: %d ms; processing (incl. shadow net): %d ms".format(a.optInt("flattening_nets_ms"), a.optInt("process_ms")))
             sb.append("\nSoC: ").append(a.optString("soc"))
