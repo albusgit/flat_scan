@@ -40,6 +40,9 @@ struct NetsRequest {
     FlatNets nets = FlatNets::Both;
     const float* seg_logits = nullptr;    // page finder output (hides the other page of a spread); may be null
     int page_index = 0;
+    // set: the corners come from here instead of `corners`, asked for only when a net needs them (no
+    // first-pass grid); null result: no page found, those nets do not run (flat_nets_fn)
+    NetCornersFn corners_fn;
 };
 
 struct NetRun {
@@ -59,6 +62,11 @@ struct NetsResult {
 };
 
 NetsResult run_flat_nets(const cv::Mat& photo_bgr, const NetsRequest& rq, Inference& inf);
+// PipelineOptions::flat_nets: run_flat_nets on this photo with rq, the corners from run_photo (the
+// detection, or rq.corners_edited's hand-set corners: set rq.corners_edited as the options'
+// corners_edited). It may run on a worker thread (overlap_nets); keep (optional) receives the runs
+// and grids, to be read after run_photo returned.
+FlatNetsFn flat_nets_fn(const cv::Mat& photo_bgr, const NetsRequest& rq, Inference& inf, NetsResult* keep = nullptr);
 
 // PipelineOptions::shade_net: ShadeNet on the planar BGR page (3 x h x w), replaced by its shading map.
 // ms (optional): accumulates the run time.

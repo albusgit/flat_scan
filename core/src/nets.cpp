@@ -130,17 +130,21 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
         r.crop_pass1 = uv_crop(photo.size(), frame, 0);
         run("uv_pass1", r.crop_pass1, r.grid_pass1);
     }
-    auto crop_for = [&](int model) {
+    // false: no first-pass grid and no page corners (corners_fn found no page)
+    auto crop_for = [&](int model, UvCrop& c) {
         if (!r.grid_pass1.empty()) {
             UvGrid g = uv_grid(r.grid_pass1.data(), r.crop_pass1);
-            if (g.ok) return uv_crop_on_grid(photo.size(), g, model);
+            if (g.ok) { c = uv_crop_on_grid(photo.size(), g, model); return true; }
         }
-        return uv_crop(photo.size(), rq.corners, model);
+        const std::array<cv::Point2d, 4>* q = rq.corners_fn ? rq.corners_fn() : &rq.corners;
+        if (!q) return false;
+        c = uv_crop(photo.size(), *q, model);
+        return true;
     };
     std::vector<float> uv, sd;
     UvCrop cu, cs;
-    if (rq.nets != FlatNets::SynthDocOnly) { cu = crop_for(0); run("uvdoc", cu, uv); }
-    if (rq.nets != FlatNets::UVDocOnly) { cs = crop_for(2); run("synthdoc_hr", cs, sd); }
+    if (rq.nets != FlatNets::SynthDocOnly && crop_for(0, cu)) run("uvdoc", cu, uv);
+    if (rq.nets != FlatNets::UVDocOnly && crop_for(2, cs)) run("synthdoc_hr", cs, sd);
     // SyntheticDoc high-res fills the first slot (run_photo keeps it unless UVDoc's rows are far
     // straighter), UVDoc the second; UVDoc alone the first
     if (!sd.empty()) {
@@ -152,6 +156,23 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
         r.crop1 = cu;
     }
     return r;
+}
+
+FlatNetsFn flat_nets_fn(const cv::Mat& photo, const NetsRequest& rq, Inference& inf, NetsResult* keep) {
+    return [photo, rq, &inf, keep](const NetCornersFn& corners) {
+        NetsRequest q = rq;
+        q.corners_fn = corners;
+        NetsResult n = run_flat_nets(photo, q, inf);
+        FlatNetGrids g;
+        g.grid1 = n.grid1;
+        g.grid2 = n.grid2;
+        g.grid_pass1 = n.grid_pass1;
+        g.crop1 = n.crop1;
+        g.crop2 = n.crop2;
+        g.crop_pass1 = n.crop_pass1;
+        if (keep) *keep = std::move(n);
+        return g;
+    };
 }
 
 std::function<bool(std::vector<float>&, int, int)> shade_net_fn(Inference& inf, double* ms) {

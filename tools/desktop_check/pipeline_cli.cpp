@@ -9,6 +9,10 @@
 // Python caches). --backend / FS_BACKEND=cpu,dml,...: the backends to try in order (CPU is always
 // last); FS_ORT_THREADS=n: intra-op threads (default: ORT's); FS_ORT_CACHE=DIR: compiled-model
 // cache. The JSON then has "nets" (per-net backend and times) and "pipeline_ms".
+// FS_NETS runs the flattening nets inside run_photo (PipelineOptions::flat_nets), beside its CPU
+// stages; FS_SEQUENTIAL=1: after the detection, nothing speculative (Gate D: the same outputs).
+// FS_NET_DELAY_MS=n: the nets take n ms longer without CPU load (an accelerator's time). "nets" then
+// has "overlap" (mode, what was reused, the nets' and the wait's ms), and "pipeline_ms" includes them.
 // FS_IGNORE="x0,y0,x1,y1;..." (output-page fractions): areas whose lines the warp map ignores;
 // FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
 // Prints one JSON line: the crop-screen assessment of every page (assess_pages) and the
@@ -25,6 +29,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "npz.h"
 #include "cleanup.h"
@@ -192,33 +197,26 @@ int main(int argc, char** argv) {
     // net input for the detected corners and exits; FS_UVOUT=Y.npz ("out": 2 x 45 x 31) uses it
     std::vector<float> uv, uv_sh, uv2, p1_store;
     NetsResult nets;
-    if (const char* nm = std::getenv("FS_NETS")) {
-        // the flattening nets in-process, as the app runs them (nets.cpp)
-        PageCorners pc;
-        if (frame_corners) pc.ok = true, pc.pts = o.corners;
-        else pc = detect_corners(img, o.max_analysis_side, logits, 0);
-        if (!pc.ok) { std::printf("%s, \"ok\": false, \"error\": \"no page found\"}\n", f.str().c_str()); return 0; }
+    const char* flat_nets = std::getenv("FS_NETS");
+    if (flat_nets) {
+        // the flattening nets in-process, as the app runs them (nets.cpp), inside run_photo: their
+        // corners are its detection (the same call detect_corners made here before)
         NetsRequest rq;
-        rq.corners = pc.pts;
         rq.corners_edited = frame_corners;
         rq.perspective_only = o.perspective_only;
-        rq.nets = std::string(nm) == "uv" ? FlatNets::UVDocOnly : std::string(nm) == "hr" ? FlatNets::SynthDocOnly : FlatNets::Both;
+        rq.nets = std::string(flat_nets) == "uv" ? FlatNets::UVDocOnly : std::string(flat_nets) == "hr" ? FlatNets::SynthDocOnly : FlatNets::Both;
         rq.seg_logits = logits;
-        nets = run_flat_nets(img, rq, inference());
-        nets.apply(o);
-        for (const NetRun& n : nets.runs)
-            net_json << net_sep() << "\"" << n.name << "\": {\"ok\": " << (n.ok ? "true" : "false") << ", \"backend\": \"" << backend_name(n.backend)
-                     << "\", \"ms\": " << num(n.ms) << ", \"total_ms\": " << num(n.total_ms) << "}";
-        if (dump) {
-            auto put = [&](const char* tag, const std::vector<float>& g, const UvCrop& c) {
-                if (g.empty()) return;
-                const UvSpec& sp = uv_spec(c.model);
-                write_npz(std::string(dump) + tag, {{"out", NpyArray::f32({2, (size_t)sp.gh, (size_t)sp.gw}, g.data())}});
+        FlatNetsFn fn = flat_nets_fn(img, rq, inference(), &nets);
+        if (const char* d = std::getenv("FS_NET_DELAY_MS")) {
+            const int delay = std::atoi(d);
+            fn = [fn, delay](const NetCornersFn& c) {
+                FlatNetGrids g = fn(c);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                return g;
             };
-            put("_p1.npz", nets.grid_pass1, nets.crop_pass1);
-            put(nets.crop1.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid1, nets.crop1);
-            put(nets.crop2.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid2, nets.crop2);
         }
+        o.flat_nets = fn;
+        o.overlap_nets = std::getenv("FS_SEQUENTIAL") == nullptr;
     } else if (std::getenv("FS_UVIN") || std::getenv("FS_UVOUT")) {
         PageCorners pc;
         if (frame_corners) pc.ok = true, pc.pts = o.corners;
@@ -291,6 +289,28 @@ int main(int argc, char** argv) {
         r.error = std::string("exception: ") + e.what();
     }
     const double run_ms = ms_since(t_run);
+    if (flat_nets) {
+        // no page: no nets and this short line, as before the nets moved into run_photo
+        if (!r.ok && r.error == "no page found" && !frame_corners) { std::printf("%s, \"ok\": false, \"error\": \"no page found\"}\n", f.str().c_str()); return 0; }
+        for (const NetRun& n : nets.runs)
+            net_json << net_sep() << "\"" << n.name << "\": {\"ok\": " << (n.ok ? "true" : "false") << ", \"backend\": \"" << backend_name(n.backend)
+                     << "\", \"ms\": " << num(n.ms) << ", \"total_ms\": " << num(n.total_ms) << "}";
+        net_json << net_sep() << "\"overlap\": {\"mode\": \"" << (r.nets_overlap == 1 ? "overlap" : r.nets_overlap == 0 ? "sequential" : "none")
+                 << "\", \"orient_page_reused\": " << (r.orient_page_reused ? "true" : "false") << ", \"orient_reused\": " << (r.orient_reused ? "true" : "false")
+                 << ", \"nets_ms\": " << num(r.nets_ms) << ", \"wait_ms\": " << num(r.nets_wait_ms) << ", \"join_ms\": " << num(r.nets_join_ms) << ", \"stages\": [";
+        for (size_t i = 0; i < r.ms.size(); ++i) net_json << (i ? ", " : "") << "[\"" << r.ms[i].first << "\", " << num(r.ms[i].second) << "]";
+        net_json << "]}";
+        if (dump) {
+            auto put = [&](const char* tag, const std::vector<float>& g, const UvCrop& c) {
+                if (g.empty()) return;
+                const UvSpec& sp = uv_spec(c.model);
+                write_npz(std::string(dump) + tag, {{"out", NpyArray::f32({2, (size_t)sp.gh, (size_t)sp.gw}, g.data())}});
+            };
+            put("_p1.npz", nets.grid_pass1, nets.crop_pass1);
+            put(nets.crop1.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid1, nets.crop1);
+            put(nets.crop2.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid2, nets.crop2);
+        }
+    }
     if (o.shade_net) {
         Inference& inf = inference();
         net_json << net_sep() << "\"shadenet\": {\"ok\": " << (r.shade_net ? "true" : "false") << ", \"backend\": \""
