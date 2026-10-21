@@ -20,6 +20,7 @@ struct InferConfig {
     std::string cache_dir;             // compiled-model cache (QNN context binaries)
     bool fp16 = true;                  // accelerators only; CPU stays fp32
     int threads = 0;                   // 0: ORT default
+    std::string qnn_dir;               // folder of libQnnHtp.so (Android: the qnn_htp asset pack); empty: the library path
 };
 struct Tensor { std::vector<int64_t> shape; std::vector<float> data; };
 class Inference {

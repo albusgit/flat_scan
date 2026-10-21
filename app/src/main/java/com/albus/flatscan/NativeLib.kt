@@ -57,6 +57,13 @@ object NativeLib {
         assets: AssetManager, cacheDir: String, finder: String, flat: String, hr: String, shade: String, threads: Int, staticModels: Boolean,
     )
 
+    /**
+     * The QNN libraries from the asset packs ([QnnPacks]): [libDir] libQnnHtp, libQnnHtpPrepare and libQnnSystem,
+     * [modelsDir] the static models, [htpDirs] (';'-separated) the Hexagon generations' skeleton + stub folders
+     * (ADSP_LIBRARY_PATH). JSON: ok, loaded (library names), adsp_library_path, error.
+     */
+    @JvmStatic external fun loadQnn(libDir: String, modelsDir: String, htpDirs: String): String
+
     /** JSON: with_ort, ort (ONNX Runtime version), providers (the execution providers this build has). */
     @JvmStatic external fun ortInfo(): String
 

@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -319,6 +321,7 @@ struct NetGroup {
     std::string pref;             // backend names, comma separated ("" or "cpu": CPU only)
     std::mutex mu;
     std::set<int> used;           // nets that have run on this Inference (the first run creates the session)
+    int gen = 0;                  // g_qnn_gen when it was made
     bool first_use(NetId n) {
         std::lock_guard<std::mutex> lk(mu);
         return used.insert((int)n).second;
@@ -332,6 +335,9 @@ AAssetManager* g_mgr = nullptr;
 std::string g_cache_dir;          // QNN context binaries (noBackupFilesDir/qnn_cache)
 int g_threads = 0;
 bool g_static_models = false;     // the CPU loads the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1)
+std::string g_qnn_dir;            // the QNN libraries (the qnn_htp pack's lib/, loadQnn); empty: not loaded
+std::string g_pack_models;        // the static models (the qnn_htp pack's models/); empty: from the APK's assets
+int g_qnn_gen = 0;                // bumped by loadQnn: groups made before it are remade
 
 // assets/models/<file>, or empty (missing: that net or backend is unavailable)
 std::vector<uint8_t> load_model(std::string file) {
@@ -343,6 +349,19 @@ std::vector<uint8_t> load_model(std::string file) {
         if (g_static_models && file == "syntheticdoc_hr.onnx") file = "syntheticdoc_hr_static.onnx";
     }
     std::vector<uint8_t> v;
+    std::string pack;
+    {
+        std::lock_guard<std::mutex> lk(g_nets_mu);
+        pack = g_pack_models;
+    }
+    // the static models come from the qnn_htp pack (not in the base APK with the packs)
+    if (!pack.empty()) {
+        std::ifstream f(pack + "/" + file, std::ios::binary);
+        if (f) {
+            v.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            if (!v.empty()) return v;
+        }
+    }
     if (!mgr) return v;
     AAsset* a = AAssetManager_open(mgr, ("models/" + file).c_str(), AASSET_MODE_BUFFER);
     if (!a) return v;
@@ -369,7 +388,9 @@ std::shared_ptr<NetGroup> make_group(const std::string& pref) {
     }
     c.cache_dir = g_cache_dir;
     c.threads = g_threads;
+    c.qnn_dir = g_qnn_dir;
     g->inf = Inference::create(c);
+    g->gen = g_qnn_gen;
     return g;
 }
 
@@ -480,12 +501,63 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     g_threads = threads;
     g_static_models = static_models;
     auto set = [&](std::shared_ptr<NetGroup>& slot, const std::string& pref) {
-        if (!slot || slot->pref != pref || !same) slot = make_group(pref);
+        if (!slot || slot->pref != pref || !same || slot->gen != g_qnn_gen) slot = make_group(pref);
     };
     set(g_finder, pf);
     set(g_flat, fl);
     set(g_hr, hs);
     set(g_shade, sh);
+}
+
+// The QNN libraries from the asset packs (QnnPacks.kt): lib_dir has libQnnHtp, libQnnHtpPrepare and
+// libQnnSystem, htp_dirs (';'-separated) one Hexagon generation's libQnnHtpV<n>Stub (CPU side) and Skel
+// (DSP side) each. The DSP finds the skeleton through ADSP_LIBRARY_PATH; the stubs and the common
+// libraries are loaded here by path, so that QNN's own dlopen of them by name finds them already loaded
+// (they are not in the app's native library directory). models_dir: the static models (load_model).
+// The groups made before are remade on their next configureNets. JSON {"ok", "loaded": [...], "error"}.
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_loadQnn(JNIEnv* env, jclass, jstring lib_dir, jstring models_dir, jstring htp_dirs) {
+    const std::string lib = jstr(env, lib_dir), models = jstr(env, models_dir), htp = jstr(env, htp_dirs);
+    std::vector<std::string> gens;
+    for (size_t p = 0; p <= htp.size();) {
+        size_t q = htp.find(';', p);
+        if (q == std::string::npos) q = htp.size();
+        if (q > p) gens.push_back(htp.substr(p, q - p));
+        p = q + 1;
+    }
+    std::string adsp;
+    for (const auto& g : gens) adsp += g + ";";
+    adsp += "/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp";
+    setenv("ADSP_LIBRARY_PATH", adsp.c_str(), 1);
+    std::vector<std::string> order = {lib + "/libQnnSystem.so"};
+    for (const auto& g : gens) {
+        const std::string v = g.substr(g.find_last_of('/') + 1);   // "v73"
+        order.push_back(g + "/libQnnHtpV" + v.substr(1) + "Stub.so");
+    }
+    order.push_back(lib + "/libQnnHtpPrepare.so");
+    order.push_back(lib + "/libQnnHtp.so");
+    std::ostringstream f;
+    std::vector<std::string> loaded;
+    std::string err;
+    for (const auto& path : order) {
+        if (dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
+            loaded.push_back(path.substr(path.find_last_of('/') + 1));
+        } else {
+            const char* e = dlerror();
+            err += (err.empty() ? "" : "; ") + std::string(e ? e : path.c_str());
+        }
+    }
+    // libQnnHtp is what the QNN EP opens; without it there is no NPU (a missing stub only loses that generation)
+    const bool ok = !loaded.empty() && loaded.back() == "libQnnHtp.so";
+    if (ok) {
+        std::lock_guard<std::mutex> lk(g_nets_mu);
+        g_qnn_dir = lib;
+        g_pack_models = models;
+        ++g_qnn_gen;
+    }
+    LOGI("loadQnn: %s, loaded %zu of %zu%s%s", ok ? "ok" : "failed", loaded.size(), order.size(), err.empty() ? "" : ", ", err.c_str());
+    f << "{\"ok\": " << (ok ? "true" : "false") << ", \"loaded\": " << json_strings(loaded) << ", \"adsp_library_path\": \"" << escape(adsp)
+      << "\", \"error\": \"" << escape(err) << "\"}";
+    return env->NewStringUTF(f.str().c_str());
 }
 
 // JSON: {"with_ort", "ort" (version), "providers": [the execution providers this ONNX Runtime build has]}
@@ -1029,6 +1101,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             std::lock_guard<std::mutex> lk(g_nets_mu);
             c.cache_dir = g_cache_dir;
             c.threads = g_threads;
+            c.qnn_dir = g_qnn_dir;
             return Inference::create(c);
         };
         // the inputs, from CPU runs as automatic processing makes them

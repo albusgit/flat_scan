@@ -167,12 +167,12 @@ std::string soc_name() {
 
 // The QNN HTP backend's API versions (core and backend) from QnnInterface_getProviders, which the
 // library exports; only the leading fields of QnnInterface_t (QnnInterface.h) are read.
-std::string qnn_version() {
+std::string qnn_version(const std::string& dir) {
 #if defined(__ANDROID__) || defined(__linux__)
     struct Ver { uint32_t major, minor, patch; };
     struct IfacePrefix { uint32_t backend_id; const char* provider_name; Ver core, backend; };
     using GetProviders = uint64_t (*)(const IfacePrefix*** list, uint32_t* n);
-    void* h = dlopen("libQnnHtp.so", RTLD_NOW | RTLD_LOCAL);
+    void* h = dlopen((dir.empty() ? std::string("libQnnHtp.so") : dir + "/libQnnHtp.so").c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) return "qnn-none";
     std::string v = "qnn-unknown";
     if (auto fn = (GetProviders)dlsym(h, "QnnInterface_getProviders")) {
@@ -189,6 +189,7 @@ std::string qnn_version() {
     dlclose(h);
     return v;
 #else
+    (void)dir;
     return "qnn";
 #endif
 }
@@ -271,11 +272,16 @@ struct Inference::Impl {
 #endif
             case Backend::QNN_HTP:
 #ifdef FS_ORT_QNN
+                // the whole graph on the NPU or no session: with ORT's CPU fallback a QNN backend that fails to
+                // set up (no DSP, wrong skeleton) leaves every node on the CPU EP and the net would be reported
+                // as "qnn" (seen on the emulator); this way it moves to the next backend, reported as such
+                so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
 #ifdef _WIN32
                 so.AppendExecutionProvider("QNN", {{"backend_path", "QnnHtp.dll"}, {"htp_performance_mode", "burst"},
                                                    {"enable_htp_fp16_precision", cfg.fp16 ? "1" : "0"}});
 #else
-                so.AppendExecutionProvider("QNN", {{"backend_path", "libQnnHtp.so"}, {"htp_performance_mode", "burst"},
+                so.AppendExecutionProvider("QNN", {{"backend_path", cfg.qnn_dir.empty() ? std::string("libQnnHtp.so") : cfg.qnn_dir + "/libQnnHtp.so"},
+                                                   {"htp_performance_mode", "burst"},
                                                    {"enable_htp_fp16_precision", cfg.fp16 ? "1" : "0"}});
 #endif
                 return true;
@@ -391,7 +397,7 @@ struct Inference::Impl {
             // QNN: the graph compiled for this SoC is kept as an EP-context model (QNN context binary
             // embedded); a cached one that fails to load is rebuilt
             if (b == Backend::QNN_HTP && !cfg.cache_dir.empty()) {
-                std::string key = sha256_hex(bytes).substr(0, 16) + "_" + soc_name() + "_" + qnn_version() + "_ort" + Ort::GetVersionString() +
+                std::string key = sha256_hex(bytes).substr(0, 16) + "_" + soc_name() + "_" + qnn_version(cfg.qnn_dir) + "_ort" + Ort::GetVersionString() +
                                   (cfg.fp16 ? "_fp16" : "_fp32");
                 for (char& c : key)
                     if (!(std::isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_')) c = '_';

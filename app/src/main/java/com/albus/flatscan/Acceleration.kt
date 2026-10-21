@@ -62,8 +62,11 @@ object Accel {
      * fallback can catch; NNAPI in Auto is PLAN Stream G (not started).
      */
     fun candidates(): String = listOfNotNull(
-        "qnn".takeIf { NetEnv.has("QNNExecutionProvider") },
+        "qnn".takeIf { NetEnv.has("QNNExecutionProvider") && QnnPacks.loaded },
     ).joinToString(",")
+
+    /** Whether [plan] puts a net on QNN (its libraries then come from the asset packs first). */
+    fun usesQnn(plan: Plan): Boolean = listOf(plan.finder, plan.flat, plan.hr, plan.shade).any { "qnn" in it }
 
     /** The plan of a stored Auto benchmark ([Settings.autoChoice]) if it was made on this SoC and app version. */
     fun autoPlan(stored: String?): Plan? {
@@ -102,6 +105,7 @@ object NetEnv {
 
     /** The processing details' / self-test's device facts; backend: the groups' backends. */
     fun toJson(plan: Accel.Plan): JSONObject = JSONObject().put("soc", soc).put("backend", plan.summary()).put("acceleration", plan.toJson())
-        .put("ort", ortVersion).put("ort_providers", providers.joinToString(", ")).put("cores", Runtime.getRuntime().availableProcessors())
+        .put("ort", ortVersion).put("ort_providers", providers.joinToString(", ")).put("qnn_packs", QnnPacks.status)
+        .put("cores", Runtime.getRuntime().availableProcessors())
         .put("device", "${Build.MANUFACTURER} ${Build.MODEL}").put("api", Build.VERSION.SDK_INT)
 }

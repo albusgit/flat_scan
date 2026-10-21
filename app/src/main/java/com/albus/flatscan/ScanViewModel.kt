@@ -293,7 +293,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val report = withContext(Dispatchers.Default) {
                 runCatching {
                     synchronized(netsLock) {
-                        val stored = runAutoBenchmark { s -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s } }
+                        val stage = { s: String -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s }; Unit }
+                        ensureQnn(Accel.AUTO, stage)
+                        val stored = runAutoBenchmark(stage)
                         if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
                         formatBench(stored)
                     }
@@ -310,7 +312,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val netsLock = Any()
 
     init {
-        // QNN HTP: the DSP loads its skeleton library from the app's native library directory
+        // QNN HTP: the skeleton libraries come from the asset packs (QnnPacks: NativeLib.loadQnn sets
+        // ADSP_LIBRARY_PATH); a -Ppacks=false build has them in the native library directory
         runCatching { android.system.Os.setenv("ADSP_LIBRARY_PATH", app.applicationInfo.nativeLibraryDir, true) }
         // the CPU until processing asks for the setting's backends (ensureNets)
         configureNets(netPlan)
@@ -333,11 +336,29 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * compiles each graph on first use) and its choice is kept.
      */
     private fun ensureNets(stage: (String) -> Unit): Accel.Plan = synchronized(netsLock) {
+        ensureQnn(settings.acceleration, stage)
         if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
             stage("Choosing the acceleration (once per phone and app version)")
             runAutoBenchmark(stage)
         }
         currentPlan().also { if (it != netPlan) configureNets(it) }
+    }
+
+    /**
+     * The NPU libraries ([QnnPacks]) before nets run on QNN: for the NPU setting, and for Auto before its
+     * benchmark (so that QNN is a candidate). A phone without a Snapdragon fetches nothing. A failed
+     * download leaves the nets on the CPU; [QnnPacks.status] says why (processing details, self-test).
+     */
+    private fun ensureQnn(setting: String, stage: (String) -> Unit) {
+        val wants = setting == Accel.AUTO || Accel.fixed(setting)?.let { Accel.usesQnn(it) } == true
+        if (!wants || QnnPacks.loaded || !NetEnv.has("QNNExecutionProvider")) return
+        if (QnnPacks.ensure(getApplication(), stage)) {
+            // the groups are remade with the QNN libraries (NativeLib.loadQnn); an Auto benchmark made
+            // without them (no QNN candidate) runs again
+            val cand = runCatching { JSONObject(settings.autoChoice ?: "").optString("candidates") }.getOrDefault("")
+            if (setting == Accel.AUTO && "qnn" !in cand) settings.autoChoice = null
+            configureNets(netPlan)
+        }
     }
 
     /** Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice]. */
@@ -507,6 +528,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val pageExt = ext ?: if (set == "docunet") ".png" else ".jpg"
         if (pageExt != ".jpg" && pageExt != ".png") error("ext must be .jpg or .png")
         val plan = synchronized(netsLock) {
+            ensureQnn(if (staticModels) Accel.NPU else setting) { status("Batch $set: $it") }
             val pl = Accel.fixed(setting) ?: (Accel.autoPlan(settings.autoChoice)
                 ?: run { runAutoBenchmark { status("Batch $set: $it") }; Accel.autoPlan(settings.autoChoice) } ?: Accel.fixed(Accel.CPU)!!)
             configureNets(pl, staticModels)

@@ -386,7 +386,10 @@ Per page with warm sessions, 5 of the 35 photos (`gate_f.sh smoke`, median of 3 
   took 0.3-0.9 s less (3 photos). The provisional orientation page was kept on 32 of 35 photos and 16 of 20
   DocUNet photos; the provisional orientation decision only on 24 of 35 and 3 of 20.
 - APK (debug, arm64-v8a): 121.2 MB before the QNN libraries, 162.4 MB with them (+41.3 MB download, +110 MB
-  installed; `libQnnHtpPrepare.so` alone is 23 MB). `-PqnnHtp=V73,V75,V79` saves 6.1 MB.
+  installed; `libQnnHtpPrepare.so` alone is 23 MB). `-PqnnHtp=V73,V75,V79` saves 6.1 MB. With the app bundle
+  (Build, below) the QNN libraries and static models are on-demand packs instead: 81 MB download for any arm64
+  phone, 137 MB for a Snapdragon 8 Gen 2 that uses the NPU. `dist/flatscan-debug.apk` is the single APK without
+  the NPU (`assembleDebug -PcompressLibs=true`, 89 MB).
 - Plan estimates, **not measured**: a flagship Snapdragon page takes 6-9 s today, 2.5-3.5 s with QNN, and
   1.5-2.5 s with overlap and GPU stages; nets 8-15x faster on Hexagon fp16.
 
@@ -409,8 +412,34 @@ OpenCV `4.11.0` comes from Maven Central (`org.opencv:opencv`, prefab). This is 
 
 ```bash
 echo "sdk.dir=$ANDROID_HOME" > local.properties
-./gradlew assembleDebug                                  # app/build/outputs/apk/debug/app-debug.apk
+./gradlew bundleDebug                                    # app/build/outputs/bundle/debug/app-debug.aab (bundleRelease for Play)
+./gradlew assembleDebug                                  # one APK without the NPU libraries (the NPU falls back to the CPU)
+./gradlew assembleDebug -PcompressLibs=true              # the same, native libraries compressed: dist/flatscan-debug.apk (89 MB)
+./gradlew assembleDebug -Ppacks=false                    # the old single APK with every QNN library (162 MB)
+./gradlew assembleDebug -Port=plain                      # no Qualcomm code at all (121 MB)
 ./gradlew assembleDebug -Pabis=arm64-v8a,x86_64          # also an emulator ABI
+```
+
+**Packaging: an app bundle with on-demand NPU packs.** Each phone gets only what it uses:
+
+- The base (ONNX Runtime, OpenCV, the four original models) is split by ABI, screen density and language.
+  Download for an arm64 phone: **81 MB** (`bundletool get-size total`), against 162 MB for the old single APK.
+- The Qualcomm NPU files are on-demand asset packs. `qnn_htp` holds libQnnHtp, libQnnHtpPrepare,
+  libQnnSystem and the three fixed-shape models. `qnn_v68` .. `qnn_v79` each hold one Hexagon generation's
+  skeleton and stub.
+- The app fetches them (`QnnPacks.kt`) only on a Snapdragon, and only when the NPU or Auto is chosen. It
+  takes only that SoC's generation (888 / 778G v68, 8 Gen 1 v69, 8 Gen 2 v73, 8 Gen 3 v75, 8 Elite v79).
+  Other Snapdragons fetch all five generations (about 3 MB each). A Snapdragon 8 Gen 2 using the NPU
+  downloads 137 MB in total. Other phones never download the packs.
+- The libraries are then loaded from the pack's files (`NativeLib.loadQnn`, `ADSP_LIBRARY_PATH`). The
+  base's native libraries stay uncompressed in the APK, so they are not copied out at install.
+
+To install on a phone without Play (USB debugging on), use bundletool. It installs only that phone's splits
+and stages the packs, so the app "downloads" them from the phone itself:
+
+```bash
+java -jar bundletool-all-1.18.1.jar build-apks --bundle=app-debug.aab --output=flatscan.apks --local-testing
+java -jar bundletool-all-1.18.1.jar install-apks --apks=flatscan.apks
 ```
 
 Host harness (Linux) for the acceptance tests:
