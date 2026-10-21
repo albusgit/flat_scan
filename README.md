@@ -299,6 +299,106 @@ form's header), that round 7 turned sideways (the dollar bill), and on the DocUN
 4.0 deg, but LD 41.9 -> 5.5: UVDoc's straight rows sat on a folded page). App: one extra UVDoc pass
 (0.1 s on the desktop CPU).
 
+## Acceleration: nets on the NPU / GPU, CPU stages beside the nets, more image stages on the GPU
+
+The nets now run inside the C++ core (`core/src/infer.*`, `core/src/nets.*`) on ONNX Runtime **1.22.0**
+(C++ API, the app's version), in the app and in the desktop harness. **The CPU path is unchanged, bit for
+bit**: every accelerated path is opt-in and falls back to the CPU on any error. Plan, gates and how to run
+them: `docs/accel/PLAN.md`, `docs/accel/NOTES.md`, `docs/results/accel/STATUS.md`. **Nothing here has run on
+a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
+
+### Backends
+
+| Where | Backend | Nets | Notes |
+|---|---|---|---|
+| Android, all ABIs | CPU (default) | all five | ORT C++ from the AAR, linked into `libflatscan` (the Java ORT and the Kotlin net code are gone). Same outputs as before. |
+| Android arm64 | NPU: Qualcomm QNN HTP, fp16 | UVDoc (both passes), SyntheticDoc-HR, ShadeNet | `onnxruntime-android-qnn` 1.22.0 + `qnn-runtime` 2.33.0 (HTP V68-V79). Compiled graphs are cached in `noBackupFilesDir/qnn_cache` (key: model SHA-256, SoC, QNN and ORT versions). Licence: Qualcomm "AI Stack License", shipped in `assets/licenses/`; `-Port=plain` builds without any Qualcomm library. |
+| Android | NNAPI, fp16 | same | **Debug batch mode only** (`--es accel nnapi`), not in Settings: on the x86_64 emulator ORT's NNAPI EP aborted the app inside Run (`std::terminate`, which no fallback can catch). Only in `onnxruntime-android` (x86_64, or arm64 with `-Port=plain`); the QNN AAR has no NNAPI EP. |
+| Android | XNNPACK | same | Compiled in, but not used: as an Auto candidate it aborted the app on the emulator in the same way. |
+| Desktop (`tools/desktop_check`) | CPU, DirectML, CUDA | all five | `--backend` / `FS_BACKEND`. CUDA runs **without TF32** (`use_tf32=0`): with ORT's default TF32, SyntheticDoc-HR's grid moved by p99 0.50 px on the RTX 5060. TensorRT, OpenVINO, CoreML and QNN (Snapdragon X) are compiled in behind CMake options (`FS_ORT_<EP>`) but were not run (no hardware or package here). |
+
+- The **page finder always runs on the CPU** (34 NNAPI partitions; HardSigmoid is unsupported).
+- Accelerators get **fixed-shape models** (`tools/accel/prepare_models.py`, `tools/shadow_net/export.py --static`):
+  `uvdoc_static.onnx`, `syntheticdoc_hr_static.onnx` (unused `shading` output removed) and
+  `shadenet_512x352.onnx` (the A4 page always gives the shadow net 512 x 352). NNAPI coverage: 1 partition /
+  100 % for all three (before: 5 partitions for SyntheticDoc-HR, 39 of 113 nodes for ShadeNet). On the CPU
+  the static UVDoc / SyntheticDoc-HR are bit-identical to the originals (ORT 1.22.0 on x64, 35 photos), but
+  the CPU still loads the original files. The three files add 32.8 MB to the APK.
+- **QNN / NNAPI fp16 accuracy is not measured on a device.** The fp16 stand-in (the fp16 model on the desktop
+  CPU EP; it rounds weights and activations, not the accumulation) moves the grids by p99 0.08 px for UVDoc
+  and **0.95 px for SyntheticDoc-HR** (max 2.64 px, 35 photos). If real HTP fp16 behaves like the stand-in,
+  SyntheticDoc-HR fails Auto's tolerance and the flattening nets stay on the CPU.
+- **GPU image stages** (GLES 3.1 compute, CPU fallback, `use_gpu`): besides the final resample and cleanup,
+  the warp map's global remap now runs on the GPU (`Gpu::remap_offset`). It is on by default where the
+  context has `precise` (ES 3.2 or `GL_EXT_gpu_shader5`). The stage-1, uv-spread and orientation pages have a
+  GPU path too (`Gpu::remap_dense`). It is off by default, because it was slower on the measured desktop
+  GPU. Every GPU stage is byte-identical to the CPU (`fs_cli selftest-resample`, `fs_cli gpu-stages`).
+- **Overlap** (`PipelineOptions::flat_nets`): `run_photo` starts the flattening nets on a worker thread. Beside
+  them it runs detection, surface fit, quality gate, the orientation page and a provisional orientation
+  decision. It redoes the orientation page when a grid moved the corners (`uv_defines_page`), and the decision
+  when the page-shape test differs. The output is the same as sequential. `pipeline_cli` uses it
+  (`FS_NETS=1`; `FS_SEQUENTIAL=1` for the old order). **The app does not use it yet**: its `process()` runs the
+  nets first, then `run_photo`.
+- **Desktop GPU**: `-DFS_DESKTOP_GPU=WGL` runs `core/src/gpu.cpp` on the system OpenGL driver (an ES 3.2
+  context through WGL, or GL 4.6 core with `FS_GL_PROFILE=core`); `MESA` uses Mesa (d3d12 or llvmpipe);
+  `OFF` (default) keeps `gpu_stub.cpp`. `pipeline_cli` turns the GPU stages on with `FS_GPU=1`.
+
+### Settings > Acceleration, and how Auto chooses
+
+The choices are Auto / CPU / NPU (Qualcomm QNN). **The default is CPU**: Auto stays
+opt-in until it has been checked on a phone. Backends are chosen per group: page finder (always CPU),
+flattening nets (UVDoc and SyntheticDoc-HR share one choice), shadow net.
+
+**Auto** runs once per (SoC, app version). The bundled self-test photo's nets run on the CPU and on QNN,
+if this ORT build has it (NNAPI and XNNPACK are left out, see above; without QNN, Auto is the CPU). Per group, Auto keeps the fastest backend whose outputs
+match the CPU within the tolerances below, and stores the choice. Processing details and the benchmark report
+(Settings > *Run the acceleration benchmark*) show it. A net that fails on an accelerator at run time moves
+to the CPU for the rest of the session.
+
+**Tolerances** (accelerated backends only; `AUTO_*` in `jni_bridge.cpp`; the CPU stays bit-identical):
+- flattening nets: grid difference in px of the 1600 x 2263 analysis page (Gate A's measure), p99 <= 0.25 px
+  and max <= 1 px;
+- shadow net: |shading difference| x 255, p99 <= 0.5 and max <= 2 levels.
+
+### Measured on the desktop
+
+Machine: i5-14400F, RTX 5060, Windows 11. Other jobs shared the machine, so the times are indicative.
+Per page with warm sessions, 5 of the 35 photos (`gate_f.sh smoke`, median of 3 passes after a warm-up; ms):
+
+| Nets | GPU image stages | page finder | UVDoc pass 1 | UVDoc | SD-HR | ShadeNet | nets sum | run_photo | page |
+|---|---|---|---|---|---|---|---|---|---|
+| CPU | off | 17 | 58 | 58 | 515 | 19 | 668 | 1673 | 2433 |
+| CPU | on | 17 | 58 | 58 | 513 | 19 | 665 | 1372 | 2132 |
+| DirectML | off | 9 | 16 | 15 | 59 | 7 | 106 | 1681 | 1908 |
+| DirectML | on | 2 | 7 | 7 | 24 | 6 | 47 | 1354 | 1511 |
+| CUDA (no TF32) | on | 5 | 10 | 10 | 29 | 4 | 58 | 1301 | 1512 |
+
+- The nets take 668 ms on the CPU and 47-58 ms on the GPU (11-14x). The page then waits on `run_photo`'s CPU
+  stages (about 1.3 s). The plan estimated 1.2-1.5 s per page on an NVIDIA desktop; measured 1.5 s.
+- DirectML / CUDA nets vs the CPU, grid p99: UVDoc 0.0006 / 0.025 px, SyntheticDoc-HR 0.0005 / 0.0006 px. No
+  pipeline decision changed on the 5 photos.
+- CUDA's first run on a new driver compiles ORT's kernels for sm_120. That took 55 s once; the driver caches it.
+- Overlap on the CPU backend gains little, because both branches share the cores. With the nets delayed by
+  1.5 s (an accelerator's time without its CPU load), the grids were ready at max(CPU branch, nets), and a page
+  took 0.3-0.9 s less (3 photos). The provisional orientation page was kept on 32 of 35 photos and 16 of 20
+  DocUNet photos; the provisional orientation decision only on 24 of 35 and 3 of 20.
+- APK (debug, arm64-v8a): 121.2 MB before the QNN libraries, 162.4 MB with them (+41.3 MB download, +110 MB
+  installed; `libQnnHtpPrepare.so` alone is 23 MB). `-PqnnHtp=V73,V75,V79` saves 6.1 MB.
+- Plan estimates, **not measured**: a flagship Snapdragon page takes 6-9 s today, 2.5-3.5 s with QNN, and
+  1.5-2.5 s with overlap and GPU stages; nets 8-15x faster on Hexagon fp16.
+
+### Checks at the final merge (2026-10-21; details and commands in STATUS.md)
+
+- CPU path with the nets in-process, overlapped and sequential: the 35 photos are bit-identical to the Python
+  ORT 1.22.0 path they replace (net outputs, pages, JSON). DocUNet 1_1..10_2 are identical to that path and
+  to the Round 8 pages (`work/new_fold2`). DocUNet was not re-scored: identical outputs keep LD 5.16.
+- Android x86_64 emulator, bundled self-test photo, debug batch mode: with Acceleration=CPU and with Auto
+  (no candidate on x86_64, so it chose the CPU) the page finder output, the three grids and the page are
+  bit-identical to the desktop CPU. Only the JSON's surface-fit residual differs (`fit_median_px` 1.87128 vs
+  1.87126: MSVC vs NDK clang). The first Auto run aborted the app inside ORT's NNAPI EP, the second inside its
+  XNNPACK EP; both were then removed from Auto and Settings (commits d4016c0, 94f9a0a).
+- Still needs a phone: STATUS.md, *Open HUMAN GATES*.
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.
@@ -344,21 +444,25 @@ core/src/    portable C++17, shared by app and host (compiled with -ffp-contract
   sparse       13-point stencil normal equations, MG-preconditioned CG
   pipeline     photo_pipeline.py orchestration, composition on the 4-px grid
   resample     map expansion + OpenCV-exact bicubic (CPU), table for the GPU
-  gpu          OpenGL ES 3.1 compute: resample, background, ink count, tone pass
+  gpu          OpenGL ES 3.1 compute: resample, remaps, background, ink count, tone pass
+  infer        the nets on ONNX Runtime C++ 1.22.0: one session per net, backend list with CPU fallback
+  nets         net orchestration: page finder input, UVDoc passes, re-crops, SyntheticDoc-HR, ShadeNet
   cleanup,solid  Auto color / Grayscale / Solid colors
 app/         Kotlin + Compose UI, CameraX, JNI bridge (app/src/main/cpp/jni_bridge.cpp)
-host/        fs_cli: the stage and acceptance harness
+host/        fs_cli: the stage and acceptance harness (Linux, or Windows with Mesa)
+tools/desktop_check/  pipeline_cli and the gate scripts (Windows; CPU, DirectML, CUDA, desktop GL)
 tools/       Python fixture exporters, comparators, acceptance runners
 ```
 
 | Stage | Where | Notes |
 |---|---|---|
+| Neural nets: page finder, UVDoc (whole photo, then re-crop), SyntheticDoc-HR, ShadeNet | CPU (ORT C++ 1.22.0, in the core); opt-in NPU (QNN HTP fp16) on Android, DirectML / CUDA on the desktop | Settings > Acceleration, default CPU. The page finder always runs on the CPU. Any accelerator failure falls back to the CPU. See [Acceleration](#acceleration-nets-on-the-npu--gpu-cpu-stages-beside-the-nets-more-image-stages-on-the-gpu). |
 | Page detection (`paper_mask`, `curved_corners`) | CPU (C++) | RANSAC draws come from the same numpy `default_rng(0)` stream. Runs on a copy no larger than 2400 px; the reference inputs are 2212–2300 px. |
 | Surface fit (10 unknowns) | CPU, multi-threaded | Port of `scipy.optimize.least_squares` (TRF, exact SVD trust region, 2-point Jacobian, Cauchy loss). The 10 coarse starts and the Jacobian columns run in parallel; this is deterministic. EXIF focal length is used when present. |
 | Homography fallback | CPU | Used when the user moved a corner (> 0.3% of the image size), when detection failed, or when the outline residual median is above 3 px. |
-| Stage-1 page, orientation page | CPU | `cv::remap` from the exact per-pixel unroll map, in row bands. |
+| Stage-1 page, orientation page | CPU; GPU path off by default | `cv::remap` from the exact per-pixel unroll map, in row bands. `Gpu::remap_dense` gives the same bytes, but was slower on the measured desktop GPU. With `flat_nets` (desktop `pipeline_cli`), the orientation page and a provisional decision are made while the flattening nets run. |
 | Orientation | CPU | Decided on the homography-rectified page, as the brief asks. Turned off if the user rotated the photo. |
-| Global stage, line detection, tracing (`trace_w2`), chaining, text rows | CPU, lines in parallel | |
+| Global stage, line detection, tracing (`trace_w2`), chaining, text rows | CPU, lines in parallel; global remap on the **GPU** where the context has `precise` | The global remap (`Gpu::remap_offset`) is byte-identical to the CPU; CPU fallback. |
 | Sparse solves (global 32 px, pass 1 16 px, pass 2 8 px warm-started) | CPU | CG preconditioned with a geometric multigrid V-cycle (Galerkin, symmetric Gauss-Seidel, dense Cholesky on the coarsest grid), rtol 1e-8. The x and y solves run in parallel. |
 | Composition | CPU, 4-px grid only | `F(p) = U(expand(warp4)(p))`, with cv2.remap's 1/32-px quantisation and `BORDER_REPLICATE`, evaluated in the rotated output frame exactly as `photo_pipeline` stores `warpmap.npz`. No full-resolution float map is allocated on the CPU. |
 | Map expansion + bicubic resample of the full photo | **GPU** (GLES 3.1 compute), CPU fallback | float32 maps; OpenCV `INTER_CUBIC` semantics: 1/32-px positions, its 15-bit weight table including its sum-correction quirk, white border. |
@@ -372,7 +476,7 @@ Analysis runs at 1600 px page width. The output-resolution setting (1240 / 1600 
 - **Crop:** auto-detected corners, 44 dp touch targets, a 3× magnifier loupe while dragging, and rotate 90°.
 - **Processing:** progress bar with the stage name.
 - **Result:** Before/After toggle; Auto color / Grayscale; Solid colors; Rotate; Save (JPG or one-page A4 PDF through the system file picker) and Share; a details dialog with per-stage times.
-- **Settings:** default colour mode, solid colours, output resolution, and an on-device self-test.
+- **Settings:** default colour mode, solid colours, output resolution, Acceleration (Auto / CPU / NPU), an on-device self-test and the acceleration benchmark.
 
 Light and dark themes follow the system setting.
 
@@ -456,6 +560,7 @@ For orientation only, single host runs of the whole C++ pipeline (not medians, n
 
 ## Not done / not verified on a real phone
 
+- **Acceleration (QNN, the Auto benchmark, GPU stages, overlap) has not run on a phone**; the steps are in `docs/results/accel/STATUS.md`.
 - **Nothing has run on a phone.** Round 4 ran the app on the Android 15 x86_64 emulator: gallery import, crop screen, processing, result screen, filters, the Pages screen, the page finder on ONNX Runtime and book spreads, all on the CPU path (the emulator offers only GLES 3.0).
   - Not verified: CameraX capture, save/share, the PDF output, the GPU paths on a device, and ONNX Runtime on arm64.
   - GLES 3.1 shader compilation on Adreno or Mali drivers has not been seen; the shaders were compiled and checked only on Mesa llvmpipe.
