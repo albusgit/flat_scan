@@ -824,7 +824,7 @@ void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, NetLine
                 st.joined += (int)on.size();
                 continue;
             }
-            if (covered > 0.3 * along) continue;
+            if (covered > 0.3 * along || std::getenv("FS_NET_NOADD")) continue;
             A.push_back({centre(along / 2), (double)a0, (double)(a0 + along - 1), median(thv), (double)along});
             ++st.added;
         }
