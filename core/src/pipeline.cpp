@@ -436,7 +436,11 @@ double local_distortion(const WarpDebug& d, double* frac) {
 // the text beside it), never real flattening. The correction is faded out around such cells
 // (widened by ~24 px, feathered over ~16 px); the rest of the page keeps it. g: the warp map on the
 // 4-px grid (absolute stage-1 px). Returns the share of grid nodes touched.
-double soften_bumps(GridMap& g, double thr) {
+// Exception (support, from extension_support): a stretch between two neighbouring rules that were
+// both followed through it (extend_trace) is measured, not invented - rows fanning together at a
+// curled corner, which straighten only if the page there is stretched by up to 2x. Those cells are
+// neither flagged nor faded (a fade spreading in from beside them bent the rows it reached).
+double soften_bumps(GridMap& g, double thr, const cv::Mat& support = cv::Mat()) {
     const int gw = g.gw, gh = g.gh;
     const double s = g.stride;
     if (gw < 3 || gh < 3) return 0;
@@ -446,6 +450,7 @@ double soften_bumps(GridMap& g, double thr) {
         for (int j = 0; j + 1 < gw; ++j) {
             double xj = (g.X(i, j + 1) - g.X(i, j)) / s, xi = (g.X(i + 1, j) - g.X(i, j)) / s;
             double yj = (g.Y(i, j + 1) - g.Y(i, j)) / s, yi = (g.Y(i + 1, j) - g.Y(i, j)) / s;
+            if (!support.empty() && support.at<uint8_t>(i, j)) continue;
             if (std::fabs(xj * yi - xi * yj - 1) > thr) { bad.at<uint8_t>(i, j) = 255; ++n_bad; }
         }
     if (n_bad == 0) return 0;
@@ -457,12 +462,44 @@ double soften_bumps(GridMap& g, double thr) {
     for (int i = 0; i < gh; ++i)
         for (int j = 0; j < gw; ++j) {
             double keep = 1 - std::min(1.0, 2.0 * m.at<float>(i, j));
-            if (keep >= 1) continue;
+            if (keep >= 1 || (!support.empty() && support.at<uint8_t>(i, j))) continue;
             ++touched;
             g.X(i, j) = (float)(s * j + keep * (g.X(i, j) - s * j));
             g.Y(i, j) = (float)(s * i + keep * (g.Y(i, j) - s * i));
         }
     return (double)touched / ((double)gw * gh);
+}
+
+// soften_bumps' support on the warp map's grid (gw x gh, stride s; output frame, where a traced
+// line sits at its ideal): where two extensions of one direction overlap along the lines and their
+// ideals are <= 150 px apart, the band between the ideals, widened by their spacing across (the
+// paper beyond the outermost rule of a fan is stretched with it, up to the page edge) and by 16 px
+// along
+cv::Mat extension_support(const WarpDebug& d, int gw, int gh, double s) {
+    cv::Mat m = cv::Mat::zeros(gh, gw, CV_8U);
+    for (int hz = 0; hz < 2; ++hz) {
+        std::vector<std::array<double, 3>> E = hz ? d.S2.ext_h : d.S2.ext_v;
+        if (E.empty()) E = hz ? d.S1.ext_h : d.S1.ext_v;
+        std::sort(E.begin(), E.end());
+        for (size_t i = 0; i < E.size(); ++i)
+            for (size_t j = i + 1; j < E.size() && E[j][0] - E[i][0] <= 150; ++j) {
+                double a = std::max(E[i][1], E[j][1]), b = std::min(E[i][2], E[j][2]);
+                if (b - a < 20 || E[j][0] - E[i][0] < 4) continue;
+                // the nearest overlapping neighbour only: the band ends at the next extended rule
+                bool between = false;
+                for (size_t k = i + 1; k < j; ++k) between |= std::min(b, E[k][2]) - std::max(a, E[k][1]) >= 20;
+                if (between) continue;
+                double gap = E[j][0] - E[i][0];
+                int c0 = std::max(0, (int)std::floor((E[i][0] - gap) / s)), c1 = (int)std::ceil((E[j][0] + gap) / s);
+                int t0 = std::max(0, (int)std::floor((a - 16) / s)), t1 = (int)std::ceil((b + 16) / s);
+                for (int c = c0; c <= c1; ++c)
+                    for (int t = t0; t <= t1; ++t) {
+                        int r = hz ? c : t, q = hz ? t : c;
+                        if (r < gh && q < gw) m.at<uint8_t>(r, q) = 1;
+                    }
+            }
+    }
+    return m;
 }
 
 // the lines the warp map used, as output-page fractions (PipelineResult::lines)
@@ -474,8 +511,25 @@ std::vector<std::array<float, 5>> fitted_lines(const WarpDebug& d, int W, int H,
         cv::Point2d a = rotate_pt(x0, y0, W, H, rot), b = rotate_pt(x1, y1, W, H, rot);
         out.push_back({(float)kind, (float)(a.x / Wr), (float)(a.y / Hr), (float)(b.x / Wr), (float)(b.y / Hr)});
     };
-    for (const auto& L : d.H) add(0, L[1], L[0], L[2], L[0]);
-    for (const auto& L : d.V) add(0, L[0], L[1], L[0], L[2]);
+    // ruled lines over the stretch their traces covered (both passes; extensions past the found
+    // segment included); a line that gave no samples (a curve left out, a failed trace) is not drawn
+    auto ruled = [&](const Lines& A, bool hz) {
+        const auto &s1 = hz ? d.S1.span_h : d.S1.span_v, &s2 = hz ? d.S2.span_h : d.S2.span_v;
+        for (size_t i = 0; i < A.size(); ++i) {
+            const Line& L = A[i];
+            double a = L[1], b = L[2];
+            if (s1.size() == A.size() || s2.size() == A.size()) {
+                a = 1e300; b = -1e300;
+                for (const auto* s : {&s1, &s2})
+                    if (s->size() == A.size() && !std::isnan((*s)[i][0])) { a = std::min(a, (*s)[i][0]); b = std::max(b, (*s)[i][1]); }
+                if (a > b) continue;
+            }
+            if (hz) add(0, a, L[0], b, L[0]);
+            else add(0, L[0], a, L[0], b);
+        }
+    };
+    ruled(d.H, true);
+    ruled(d.V, false);
     for (size_t i = 0; i < d.E_lines.size(); ++i) {   // colour-area boundaries, drawn as grid lines
         const auto& L = d.E_lines[i];
         if ((int)i < d.n_edges_h) add(2, L[1], L[0], L[2], L[0]);
@@ -843,7 +897,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
                 warp4 = identity_grid(W, H);
                 r.lines_rejected = true;
             } else if (opt.max_local_rescale > 0) {
-                r.bumps_faded = soften_bumps(warp4, opt.max_local_rescale);
+                r.bumps_faded = soften_bumps(warp4, opt.max_local_rescale, extension_support(r.warp, warp4.gw, warp4.gh, warp4.stride));
             }
         }
     }
@@ -978,7 +1032,7 @@ PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {
             r.final_map = identity_grid(scan.cols, scan.rows);
             r.lines_rejected = true;
         } else if (opt.max_local_rescale > 0) {
-            r.bumps_faded = soften_bumps(r.final_map, opt.max_local_rescale);
+            r.bumps_faded = soften_bumps(r.final_map, opt.max_local_rescale, extension_support(r.warp, r.final_map.gw, r.final_map.gh, r.final_map.stride));
         }
     } else {
         r.final_map = unwarp_map(scan, &r.warp);

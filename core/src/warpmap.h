@@ -26,6 +26,12 @@ struct Field {
 struct Samples {      // collect(): rows (along, ideal, disp)
     std::vector<std::array<double, 3>> h, v;
     int n_bowed = 0;  // traces left out as curves (share_rows)
+    // app: the stretch along each line (H, then V, by index) its samples cover, extensions included
+    // ([NaN, NaN]: the line gave no samples); n_extended: line ends continued past the detected segment
+    std::vector<std::array<double, 2>> span_h, span_v;
+    int n_extended = 0;
+    // app: those extensions, [ideal, start, end] along the line (bump guard support, pipeline.cpp)
+    std::vector<std::array<double, 3>> ext_h, ext_v;
 };
 
 struct WarpDebug {

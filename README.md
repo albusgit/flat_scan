@@ -299,6 +299,46 @@ form's header), that round 7 turned sideways (the dollar bill), and on the DocUN
 4.0 deg, but LD 41.9 -> 5.5: UVDoc's straight rows sat on a folded page). App: one extra UVDoc pass
 (0.1 s on the desktop CPU).
 
+## Round 9: table edges and curled corners no longer skipped
+
+On a two-page Hebrew form, the Lines tab showed table edges cut short: the right border and the
+Transaction column's edge stopped above the last rows, and the rows of a curled top corner were not
+used. The page stayed bent there. The ink of those lines had been found. Rules later in the line
+stage dropped it (`warpmap.cpp`, app path, neural pages only):
+
+- **Text rows passed as box sides.** The one-end short pass (round 6) took any ≥ 45 px horizontal
+  ink touching a rule at one end. Right-aligned text rows end at their column's rule, so 55 rows on
+  page 1 counted as rules. Their traces tore the page beside the rule, and the distortion guard then
+  dropped the whole app refinement (p99 0.25 > 0.2). The fallback, the reference lines alone, cuts
+  every rule at the outermost rule found crossing it (`clip`, `trace_bounds`). A one-end segment must
+  now be continuous ink (`ink_cover` ≥ 0.9 on the darkness map: rules ≥ 0.99, these rows ≤ 0.89).
+  Page 1 keeps the app refinement (p99 0.052).
+- **Traces continue past the cut** (`extend_trace`). From each end of an accepted trace, the rule's
+  ink is followed 1 px at a step: within 2 px of the line through the last 30 hits, as wide as the
+  rule, at most 6 missed steps in a row, ≤ 40 px off its ideal, and stopping where it turns > ~11°
+  (rounded corners). An extension is kept if it runs ≥ 30 px with hits on ≥ 70 % of it, and it gets
+  the line's ideal. It also follows rows into a curled corner whose border was not found.
+- **Bump guard:** a curled corner's rows fan together (spacing halves), so straightening them
+  stretches the page there by up to 2x. `soften_bumps` faded that out and left kinks. A band between
+  two neighbouring rules that were both extended through it (widened by their spacing and 16 px
+  along) is now neither flagged nor faded (`extension_support`).
+- **Lines tab:** ruled lines are drawn over the stretch their traces covered, extensions included.
+  Lines that gave no samples are not drawn. Before, every detected segment was drawn at its
+  detected length, including curves that were left out.
+
+Measured on the form's two pages and a third table page (desktop build; `p95` distance of each long
+rule from its straight fit on the finished page):
+
+| page | before: median / p90 (px) | after |
+|---|---|---|
+| form page 1 | 0.64 / 1.23 | 0.10 / 0.94 |
+| form page 2 (curled corner) | 0.72 / 1.47 | 0.70 / 1.53; corner rows straight (visual check) |
+| third page | 0.84 / 3.26 | 0.82 / 1.69 |
+
+The 35 photos and DocUNet were not re-run (not in this checkout). A ~20 px hook is left at the
+very tip of the curled corner, past the border, where no rule reaches. `pipeline_cli` prints
+`"extended"` (line ends continued, per pass).
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.

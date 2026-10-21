@@ -471,9 +471,42 @@ bool touches(const Line& seg, const Lines& perp, double tol, int need = 2) {
     return ok >= need;
 }
 
+// share of a segment's length where the darkness Df within th/2 + 2 px of its own position (the
+// median of the darkest rows across +-8 px) reaches half the segment's median peak: a printed rule
+// is continuous, a row of text closed into a segment has gaps between letters and words. On the
+// darkness map, not the ink mask: at the faint-rule threshold (25) a text row's letters merge.
+double ink_cover(const cv::Mat& Df, bool hz, const Line& s) {
+    int a = std::max(0, (int)s[1]), p = (int)std::lround(s[0]), n_c = hz ? Df.rows : Df.cols;
+    int b = std::min((int)s[2], (hz ? Df.cols : Df.rows) - 1);
+    if (b < a) return 0;
+    auto at = [&](int along, int across) { return across >= 0 && across < n_c ? (hz ? Df.at<float>(across, along) : Df.at<float>(along, across)) : 0.f; };
+    std::vector<int> rows;
+    for (int k = a; k <= b; ++k) {
+        int best = p;
+        for (int q = p - 8; q <= p + 8; ++q)
+            if (at(k, q) > at(k, best)) best = q;
+        rows.push_back(best);
+    }
+    std::nth_element(rows.begin(), rows.begin() + rows.size() / 2, rows.end());
+    int c = rows[rows.size() / 2], e = (int)(s[3] / 2 + 2);
+    Vec peak;
+    for (int k = a; k <= b; ++k) {
+        float m = 0;
+        for (int q = c - e; q <= c + e; ++q) m = std::max(m, at(k, q));
+        peak.push_back(m);
+    }
+    Vec sorted_peak = peak;
+    double half = 0.5 * median(sorted_peak);
+    int hit = 0;
+    for (double m : peak) hit += m >= half;
+    return (double)hit / peak.size();
+}
+
 // one_end (app): a segment of >= 45 px touching a perpendicular line at one end also counts - box
-// sides whose other edge is printed too faintly to be found (text strokes are shorter)
-Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp, bool one_end = false) {
+// sides whose other edge is printed too faintly to be found (text strokes are shorter). It must be
+// continuous ink (ink_cover >= 0.9): right-aligned text rows end at their column's rule and passed
+// as rules (a Hebrew form: 55 of them), and their traces tore the page beside the rule
+Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp, bool one_end = false, const cv::Mat* Df = nullptr) {
     Lines segs = segments(ink, hz, 35, 35), add;
     for (const auto& s : segs) {
         if (s[4] >= 150 && !one_end) continue;   // the long pass has it (unless it leans: app)
@@ -481,7 +514,7 @@ Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const 
         for (const auto& o : long_segs)
             if (std::fabs(o[0] - s[0]) < 12 && s[1] <= o[2] + 10 && s[2] >= o[1] - 10) { dup = true; break; }
         if (dup) continue;
-        if (touches(s, perp, 7) || (one_end && s[4] >= 45 && touches(s, perp, 7, 1))) add.push_back(s);
+        if (touches(s, perp, 7) || (one_end && s[4] >= 45 && touches(s, perp, 7, 1) && (!Df || ink_cover(*Df, hz, s) >= 0.9))) add.push_back(s);
     }
     return add;
 }
@@ -693,6 +726,55 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
     return keep;
 }
 
+// App, neural pages: follows a rule's ink on past the end of its trace (dir +1 / -1). A rule is cut
+// where the found rules crossing it end (clip in get_lines, trace_bounds): a table's outer side runs
+// on past the last row rule found to cross it (short last rows, a header bent at a curled corner),
+// and row rules run on into a curled corner whose border was not found. The page there stayed bent.
+// 1 px a step; the guess is the line through the last 30 hits; a hit is a run within 2 px of it,
+// as wide as the rule (chain_trace's band). Stops after 6 missed steps in a row (a crossing rule is
+// one wide run, a miss), at the image edge, 40 px off the rule's ideal, or where the trace turns
+// more than ~11 deg off the rule's own direction (a rounded corner turning into its side; the last
+// 10 px of the turn are dropped). Kept if it runs >= 30 px with hits on >= 70 % of it.
+void extend_trace(const DView& D, bool hz, const Vec& tv, const Vec& cv, int dir, double thr, long maxrun, double mw, double ideal,
+                  double slope0, Vec& et, Vec& ec) {
+    et.clear(); ec.clear();
+    const long n_a = hz ? D.cols : D.rows, n_c = hz ? D.rows : D.cols;
+    std::vector<double> ht, hc;   // hits, the trace's own end first
+    for (size_t i = 0; i < tv.size(); ++i) {
+        size_t q = dir > 0 ? tv.size() - 1 - i : i;
+        if (std::fabs(tv[q] - (dir > 0 ? tv.back() : tv.front())) > 40) break;
+        ht.insert(ht.begin(), tv[q]); hc.insert(hc.begin(), cv[q]);
+    }
+    if (ht.size() < 8) return;
+    const double start = dir > 0 ? tv.back() : tv.front();
+    long miss = 0;
+    double sl = slope0;
+    for (long k = pyint(start) + dir; 0 <= k && k < n_a && miss <= 6; k += dir) {
+        size_t m0 = ht.size() > 30 ? ht.size() - 30 : 0, m = ht.size() - m0;
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (size_t i = m0; i < ht.size(); ++i) { sx += ht[i]; sy += hc[i]; sxx += ht[i] * ht[i]; sxy += ht[i] * hc[i]; }
+        double den = m * sxx - sx * sx;
+        sl = den != 0.0 ? (m * sxy - sx * sy) / den : sl;
+        double guess = den != 0.0 ? (sy - sl * sx) / m + sl * k : sy / m, v, ww;
+        if (std::fabs(sl - slope0) > 0.2 || std::fabs(guess - ideal) > 40) break;
+        measure(D, hz, k, guess, 4, thr, maxrun, n_c, v, ww);
+        if (!std::isnan(v) && std::fabs(v - guess) < 2 && ww >= 0.6 * mw && ww <= 1.7 * mw + 1) {
+            ht.push_back((double)k); hc.push_back(v);
+            et.push_back((double)k); ec.push_back(v);
+            miss = 0;
+        } else {
+            ++miss;
+        }
+    }
+    if (std::fabs(sl - slope0) > 0.2) {
+        double cut = et.empty() ? 0 : et.back() - dir * 10.0;
+        while (!et.empty() && (dir > 0 ? et.back() > cut : et.back() < cut)) { et.pop_back(); ec.pop_back(); }
+    }
+    double run = et.empty() ? 0 : std::fabs(et.back() - start);
+    if (run < 30 || (double)et.size() < 0.7 * run) { et.clear(); ec.clear(); return; }
+    if (dir < 0) { std::reverse(et.begin(), et.end()); std::reverse(ec.begin(), ec.end()); }
+}
+
 // free_ext (app): how far a trace may run past an end with no perpendicular rule to meet; there it
 // only walks into what lies beside the line (a chart's dotted gridline into the text next to it)
 void trace_bounds(const Line& L, const Lines& perp, double lo, double hi, double& a2, double& b2, double ext = 200, double pad = 6,
@@ -761,10 +843,10 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     }
     H = segments(ink_h, true);
     V = segments(ink_v, false);
-    Lines Vs = short_segments(ink_v, false, V, H, faint);
+    Lines Vs = short_segments(ink_v, false, V, H, faint, &D);
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
-    Lines Hs = short_segments(ink_h, true, H, HV, faint);
+    Lines Hs = short_segments(ink_h, true, H, HV, faint, &D);
     Lines Hc, Vc;
     if (faint) corner_pairs(ink_h, ink_v, H, V, Hs, Vs, Hc, Vc);
     Lines h2 = H; h2.insert(h2.end(), Hs.begin(), Hs.end());
@@ -871,7 +953,9 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         double lo = 1e300, hi = -1e300;
         for (const auto& L : lines) { lo = std::min(lo, L[1]); hi = std::max(hi, L[2]); }
         std::vector<std::vector<std::array<double, 3>>> per(lines.size());
-        std::atomic<int> bowed{0};
+        std::atomic<int> bowed{0}, extended{0};
+        std::vector<std::array<double, 2>> span(lines.size(), {NaN, NaN});
+        std::vector<std::array<std::array<double, 2>, 2>> ext_piece(lines.size(), {{{NaN, NaN}, {NaN, NaN}}});
         auto one = [&](size_t li) {
             const Line& L = lines[li];
             double p = L[0], a = L[1], b = L[2], th = L[3];
@@ -943,6 +1027,26 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 std::sort(dev.begin(), dev.end());
                 if (dev[(size_t)(0.95 * (dev.size() - 1))] > 3 + 0.01 * (tv.back() - tv.front())) { ++bowed; return; }
             }
+            // app, neural pages: the rule's ink on past where the trace was cut (extend_trace); the
+            // extension keeps the line's ideal, so the page there is straightened with the rest of it
+            if (share_rows && faint && tv.size() >= 8) {
+                Vec ws;
+                for (size_t i = 0; i < n; ++i)
+                    if (ok[i]) ws.push_back(wd[i]);
+                double mw = median(ws), slope0 = polyfit(tv, cv, 1)[0];
+                Vec bt0, bc0, ft, fc;
+                extend_trace(D, hz, tv, cv, -1, thr, maxrun, mw, ideal, slope0, bt0, bc0);
+                extend_trace(D, hz, tv, cv, 1, thr, maxrun, mw, ideal, slope0, ft, fc);
+                if (!bt0.empty() || !ft.empty()) {
+                    extended += (int)!bt0.empty() + (int)!ft.empty();
+                    if (!bt0.empty()) ext_piece[li][0] = {bt0.front(), tv.front()};
+                    if (!ft.empty()) ext_piece[li][1] = {tv.back(), ft.back()};
+                    bt0.insert(bt0.end(), tv.begin(), tv.end()); bt0.insert(bt0.end(), ft.begin(), ft.end());
+                    bc0.insert(bc0.end(), cv.begin(), cv.end()); bc0.insert(bc0.end(), fc.begin(), fc.end());
+                    tv.swap(bt0); cv.swap(bc0);
+                }
+            }
+            span[li] = {tv.front(), tv.back()};
             // 4-px bins of consecutive samples
             Vec tt, cc;
             {
@@ -988,6 +1092,11 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         for (auto& q : ts) q.join();
         if (share_rows) share_ideals(per);
         out.n_bowed += bowed;
+        out.n_extended += extended;
+        (hz ? out.span_h : out.span_v) = span;
+        for (size_t li = 0; li < lines.size(); ++li)   // ideals after share_ideals
+            for (const auto& e : ext_piece[li])
+                if (!std::isnan(e[0]) && !per[li].empty()) (hz ? out.ext_h : out.ext_v).push_back({per[li][0][1], e[0], e[1]});
         for (auto& r : per) rows_out.insert(rows_out.end(), r.begin(), r.end());
     }
     return out;
