@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <thread>
 
 #include "gpu.h"
@@ -695,6 +696,33 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
     return out;
 }
 
+// How straight the traced rules of a line stage run (a WarpDebug's S2 samples, positions on its
+// A_img) once a local field (Fx, Fy of the same A_img; null: none, the page as it is) is applied: a
+// sample (along t, ideal, disp) lands at ideal + disp - F(t, ideal) across; per line (one ideal) the
+// p95 distance of its samples from their straight fit, averaged over the lines (px)
+double rule_straightness(const Samples& S, const Field* Fx, const Field* Fy) {
+    double sum = 0;
+    int n = 0;
+    for (int hz = 1; hz >= 0; --hz) {
+        std::map<double, std::pair<Vec, Vec>> lines;
+        for (const auto& r : hz ? S.h : S.v) {
+            double c = r[1] + r[2];
+            if (Fx && Fy) c -= hz ? Fy->sample(r[0], r[1]) : Fx->sample(r[1], r[0]);
+            lines[r[1]].first.push_back(r[0]); lines[r[1]].second.push_back(c);
+        }
+        for (auto& kv : lines) {
+            Vec &t = kv.second.first, &c = kv.second.second;
+            if (t.size() < 10) continue;
+            Vec p = polyfit(t, c, 1), d;
+            for (size_t i = 0; i < t.size(); ++i) d.push_back(std::fabs(c[i] - polyval(p, t[i])));
+            std::sort(d.begin(), d.end());
+            sum += d[(size_t)(0.95 * (d.size() - 1))];
+            ++n;
+        }
+    }
+    return n ? sum / n : 0.0;
+}
+
 // The line stage on a page the nets flattened, with its guards. The page is already flat, so a
 // correction that stretches or squeezes it locally (|det J - 1| p99 above max_line_distortion, or
 // more than max_line_distortion_frac of the cells above 0.2) is a tracing failure (dense staves,
@@ -729,7 +757,12 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         GridMap m1 = unwarp_map(page, &w1, ignore.empty() ? nullptr : &ignore, opt.share_rows, opt.faint_lines, opt.robust_solve,
                                 opt.colour_edges, netp, &spots);
         double f1 = 0, q1 = local_distortion(w1, &f1);
-        if (ok(q1, f1)) {
+        // ... and it must leave the page's rules (all of the first attempt's, the dropped ones too)
+        // straighter than the page as it is: without the lines through the spots, the rest can bend
+        // the rules there by a few px (a table whose rows all ran through one spot)
+        double s0 = rule_straightness(r.warp.S2, nullptr, nullptr), s1 = rule_straightness(r.warp.S2, &w1.Fx, &w1.Fy);
+        r.retry_straightness[0] = s0; r.retry_straightness[1] = s1;
+        if (ok(q1, f1) && s1 < s0 - 0.1) {
             m = std::move(m1); r.warp = std::move(w1); r.line_distortion = q1; r.lines_spots_dropped = true; bad = false;
         }
     }
