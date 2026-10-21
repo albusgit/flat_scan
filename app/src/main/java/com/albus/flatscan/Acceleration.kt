@@ -27,11 +27,14 @@ object Accel {
     const val CPU = "cpu"
     const val NPU = "npu"
     const val NNAPI = "nnapi"
-    val CHOICES = listOf(
-        AUTO to "Auto: the fastest backend whose results match the CPU",
-        CPU to "CPU (reference results)",
-        NPU to "NPU (Qualcomm QNN)",
-    )
+    /** NPU only in a build whose ONNX Runtime has QNN (-Port=qnn); the default build has no NPU for now. */
+    val CHOICES: List<Pair<String, String>> by lazy {
+        listOfNotNull(
+            AUTO to "Auto: the fastest backend whose results match the CPU",
+            CPU to "CPU (reference results)",
+            (NPU to "NPU (Qualcomm QNN)").takeIf { NetEnv.has("QNNExecutionProvider") },
+        )
+    }
 
     /**
      * The backends of each group of nets, comma separated ("" = CPU only): [finder] the page finder,

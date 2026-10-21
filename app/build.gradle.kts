@@ -12,7 +12,8 @@ plugins {
 //    graph preparer; the DSP and GPU backends are left out), whose licence and notice file go to
 //    assets/licenses/ (the licence lets them be redistributed only inside an application, with the notices);
 //  * every other ABI (the x86_64 emulator): onnxruntime-android, the same ORT version (NNAPI, XNNPACK).
-// -Port=plain: onnxruntime-android on arm64-v8a too (NNAPI instead of QNN, no Qualcomm libraries).
+// -Port=plain (the default for now: the NPU is off until it has been checked on a Snapdragon): onnxruntime-android
+// on arm64-v8a too, no Qualcomm libraries and no NPU packs; Settings then offers no NPU. -Port=qnn: the NPU build.
 //
 // Packaging (-Ppacks, default true with -Port=qnn): the base keeps ONNX Runtime and the original models;
 // the QNN libraries and the fixed-shape models only the NPU runs go into on-demand asset packs (qnn_htp:
@@ -24,7 +25,7 @@ plugins {
 // APK with every library in lib/ (compressed, extracted at install for the DSP).
 val ortVersion = "1.22.0"
 val qnnVersion = "2.33.0"
-val ortFlavour = (project.findProperty("ort") as String? ?: "qnn").also { require(it == "qnn" || it == "plain") { "-Port=qnn|plain" } }
+val ortFlavour = (project.findProperty("ort") as String? ?: "plain").also { require(it == "qnn" || it == "plain") { "-Port=qnn|plain" } }
 val ortDir = layout.buildDirectory.dir("ort/$ortFlavour")
 val ortPlain: Configuration by configurations.creating { isTransitive = false }
 val ortQnn: Configuration by configurations.creating { isTransitive = false }
@@ -142,8 +143,8 @@ android {
     }
     androidResources {
         noCompress += "onnx"
-        // with the packs the static models are in qnn_htp, not in the base
-        if (usePacks) ignoreAssetsPatterns += npuModels.map { "!$it" }
+        // only the NPU runs the static models: with the packs they are in qnn_htp, and -Port=plain has no NPU
+        if (usePacks || ortFlavour != "qnn") ignoreAssetsPatterns += npuModels.map { "!$it" }
     }
     if (usePacks) assetPacks += qnnPacks.map { ":$it" }
     bundle {
@@ -168,8 +169,9 @@ android {
     // the download).
     packaging {
         jniLibs {
-            // -PcompressLibs=true: compressed anyway (a smaller APK file to download directly, without the NPU)
-            useLegacyPackaging = !usePacks || (project.findProperty("compressLibs") as String?).toBoolean()
+            // -PcompressLibs=true: compressed anyway (a smaller APK file to download directly). -Port=plain needs no
+            // DSP access, so its libraries stay uncompressed as with the packs (less space on the phone)
+            useLegacyPackaging = (ortFlavour == "qnn" && !usePacks) || (project.findProperty("compressLibs") as String?).toBoolean()
             // OpenCV's AAR bundles an older, 4 KB-aligned libc++_shared; the NDK's own copy
             // (built by externalNativeBuild) is 16 KB-aligned and ABI-compatible
             pickFirsts += "**/libc++_shared.so"
