@@ -1,0 +1,46 @@
+compare_outputs.py: onnxruntime 1.22.0 CPU EP, onnx 1.18.0; static models C:\Users\User\Desktop\fs_accel_a\app\src\main\assets\models
+35 photos; grid diffs in px of the 1600 x 2263 analysis page (max / p99), shading in 8-bit levels
+500c2810-image                       uv_p1 same fp16 0.094/0.086  uv_rc0 same fp16 0.096/0.084  sdhr_rc2 same fp16 0.608/0.517  shade diff fp16 0.041/0.031
+dewarpnet__13_2_copy                 uv_p1 same fp16 0.081/0.076  uv_rc0 same fp16 0.081/0.076  sdhr_rc2 same fp16 0.429/0.342  shade diff fp16 0.066/0.046
+dewarpnet__14_2_copy                 uv_p1 same fp16 0.082/0.074  uv_rc0 same fp16 0.082/0.074  sdhr_rc2 same fp16 0.446/0.354  shade diff fp16 0.062/0.042
+dewarpnet__1_1_copy                  uv_p1 same fp16 0.080/0.072  uv_rc0 same fp16 0.080/0.072  sdhr_rc2 same fp16 0.434/0.350  shade diff fp16 0.055/0.036
+dewarpnet__4_2_copy                  uv_p1 same fp16 0.085/0.080  uv_rc0 same fp16 0.085/0.080  sdhr_rc2 same fp16 0.433/0.348  shade diff fp16 0.048/0.034
+docgeonet__63_2_copy                 uv_p1 same fp16 0.078/0.072  uv_rc0 same fp16 0.078/0.072  sdhr_rc2 same fp16 0.431/0.352  shade diff fp16 0.058/0.044
+docres__151_in                       uv_p1 same fp16 0.094/0.085  uv_rc0 same fp16 0.088/0.082  sdhr_rc2 same fp16 0.478/0.374  shade diff fp16 0.093/0.063
+docres__189_origin                   uv_p1 same fp16 0.103/0.096  uv_rc0 same fp16 0.089/0.084  sdhr_rc2 same fp16 0.498/0.386  shade diff fp16 0.062/0.052
+docres__190_in                       uv_p1 same fp16 0.090/0.078  uv_rc0 same fp16 0.082/0.075  sdhr_rc2 same fp16 0.430/0.350  shade diff fp16 0.094/0.066
+docres__208_in                       uv_p1 same fp16 0.090/0.086  uv_rc0 same fp16 0.087/0.083  sdhr_rc2 same fp16 0.450/0.378  shade diff fp16 0.113/0.080
+docres__218_in                       uv_p1 same fp16 0.104/0.094  uv_rc0 same fp16 0.090/0.083  sdhr_rc2 same fp16 0.494/0.400  shade diff fp16 0.095/0.070
+docres__for_appearance               uv_p1 same fp16 0.076/0.068  uv_rc0 same fp16 0.076/0.068  sdhr_rc2 same fp16 0.618/0.482  shade diff fp16 0.057/0.044
+docres__for_binarization             uv_p1 same fp16 0.077/0.071  uv_rc0 same fp16 0.077/0.071  sdhr_rc2 same fp16 0.491/0.351  shade diff fp16 0.039/0.026
+docres__for_deshadowing              uv_p1 same fp16 0.079/0.072  uv_rc0 same fp16 0.079/0.072  sdhr_rc2 same fp16 1.335/0.931  shade diff fp16 0.092/0.069
+docres__for_dewarping                uv_p1 same fp16 0.090/0.082  uv_rc0 same fp16 0.084/0.077  sdhr_rc2 same fp16 0.443/0.357  shade diff fp16 0.057/0.043
+docscanner__27_2_copy                uv_p1 same fp16 0.078/0.070  uv_rc0 same fp16 0.078/0.070  sdhr_rc2 same fp16 0.439/0.348  shade diff fp16 0.049/0.032
+docscanner__42_2_copy                uv_p1 same fp16 0.080/0.073  uv_rc0 same fp16 0.080/0.073  sdhr_rc2 same fp16 0.444/0.365  shade diff fp16 0.054/0.044
+docscanner__48_1_copy                uv_p1 same fp16 0.079/0.070  uv_rc0 same fp16 0.079/0.070  sdhr_rc2 same fp16 0.417/0.349  shade diff fp16 0.046/0.033
+doctr__25                            uv_p1 same fp16 0.089/0.079  uv_rc0 same fp16 0.082/0.074  sdhr_rc2 same fp16 0.417/0.352  shade diff fp16 0.059/0.046
+doctr__48_2_copy                     uv_p1 same fp16 0.077/0.071  uv_rc0 same fp16 0.077/0.071  sdhr_rc2 same fp16 0.406/0.337  shade diff fp16 0.052/0.036
+doctr__51_1_copy                     uv_p1 same fp16 0.080/0.071  uv_rc0 same fp16 0.080/0.071  sdhr_rc2 same fp16 0.405/0.345  shade diff fp16 0.051/0.036
+page_dewarp__boston_cooking_a        uv_p1 same fp16 0.078/0.074  uv_rc0 same fp16 0.077/0.073  sdhr_rc2 same fp16 0.854/0.658  shade diff fp16 0.069/0.043
+page_dewarp__boston_cooking_b        uv_p1 same fp16 0.078/0.075  uv_rc0 same fp16 0.077/0.073  sdhr_rc2 same fp16 0.559/0.395  shade diff fp16 0.066/0.056
+page_dewarp__linguistics_thesis_a    uv_p1 same fp16 0.076/0.071  uv_rc0 same fp16 0.075/0.071  sdhr_rc2 same fp16 0.443/0.348  shade diff fp16 0.097/0.078
+page_dewarp__linguistics_thesis_b    uv_p1 same fp16 0.075/0.071  uv_rc0 same fp16 0.074/0.071  sdhr_rc2 same fp16 1.226/0.783  shade diff fp16 0.108/0.079
+scanner_samples__cell_pic            uv_p1 same fp16 0.089/0.079  uv_rc0 same fp16 0.089/0.079  sdhr_rc2 same fp16 0.489/0.426  shade diff fp16 0.050/0.031
+scanner_samples__chart               uv_p1 same fp16 0.082/0.074  uv_rc0 same fp16 0.079/0.072  sdhr_rc2 same fp16 0.428/0.359  shade diff fp16 0.107/0.076
+scanner_samples__desk                uv_p1 same fp16 0.122/0.110  uv_rc0 same fp16 0.123/0.112  sdhr_rc2 same fp16 0.598/0.471  shade diff fp16 0.049/0.034
+scanner_samples__dollar_bill         uv_p1 same fp16 0.095/0.084  uv_rc0 same fp16 0.091/0.083  sdhr_rc2 same fp16 0.593/0.436  shade diff fp16 0.081/0.050
+scanner_samples__math_cheat_sheet    uv_p1 same fp16 0.073/0.066  uv_rc0 same fp16 0.073/0.066  sdhr_rc2 same fp16 0.386/0.331  shade diff fp16 0.099/0.081
+scanner_samples__notepad             uv_p1 same fp16 0.086/0.081  uv_rc0 same fp16 0.084/0.078  sdhr_rc2 same fp16 0.434/0.349  shade diff fp16 0.054/0.029
+scanner_samples__receipt             uv_p1 same fp16 0.099/0.092  uv_rc0 same fp16 0.089/0.082  sdhr_rc2 same fp16 0.745/0.567  shade diff fp16 0.085/0.071
+scanner_samples__tax                 uv_p1 same fp16 0.075/0.067  uv_rc0 same fp16 0.075/0.067  sdhr_rc2 same fp16 2.424/1.828  shade diff fp16 0.021/0.009
+user__page3_sideways                 uv_p1 same fp16 0.073/0.068  uv_rc0 same fp16 0.073/0.068  sdhr_rc2 same fp16 0.622/0.501  shade diff fp16 0.074/0.057
+user__projector_screen               uv_p1 same fp16 0.073/0.066  uv_rc0 same fp16 0.073/0.066  sdhr_rc2 same fp16 2.641/1.900  shade diff fp16 0.035/0.022
+
+fp32 static vs original (bit-identical required): all identical (140 runs compared)
+  shade (accelerators only, not a gate condition): 35 runs differ at the default optimisation level, max |diff| 2.38e-07 (6.1e-05 levels); bit-identical at ORT_ENABLE_BASIC unless listed above
+fp16 proxy vs fp32 original, pooled over all photos (target grid p99 < 0.25 px):
+  uv_p1     p99 0.0830 px, max 0.1219 px, worst photo max 0.1219, photos 35
+  uv_rc0    p99 0.0782 px, max 0.1232 px, worst photo max 0.1232, photos 35
+  sdhr_rc2  p99 0.9544 px, max 2.6409 px, worst photo max 2.6409, photos 35
+  shade     p99 0.0682 levels, max 0.1125 levels, worst photo max 0.1125, photos 35
+81 s
