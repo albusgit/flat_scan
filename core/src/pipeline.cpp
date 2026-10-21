@@ -229,6 +229,26 @@ inline cv::Point2d unrotate_pt(double xr, double yr, int W, int H, int rot) {
 }
 
 // the user's ignore areas (output-page fractions, rotated frame) as a mask on the stage-1 page
+// Where the line stage's map reaches past the stage-1 page (a W x H frame) by more than 2 px: CV_8U,
+// 255 there, in the output frame (turned by rot), W x H before the turn; empty if nowhere. Those
+// pixels have no page to show (the remap repeats the page's edge pixels into streaks: a curled
+// corner pulled straight brings in the margin beyond it), so the paper fill paints them.
+cv::Mat beyond_page(const GridMap& warp4, int W, int H, int rot) {
+    cv::Mat q(warp4.gh, warp4.gw, CV_8U, cv::Scalar(0));
+    int n = 0;
+    for (int i = 0; i < warp4.gh; ++i)
+        for (int j = 0; j < warp4.gw; ++j) {
+            float x = warp4.x[(size_t)i * warp4.gw + j], y = warp4.y[(size_t)i * warp4.gw + j];
+            if (x < -2 || y < -2 || x > W + 1 || y > H + 1) { q.at<uint8_t>(i, j) = 255; ++n; }
+        }
+    if (n == 0) return cv::Mat();
+    cv::Mat m;
+    cv::resize(q, m, cv::Size(warp4.gw * warp4.stride, warp4.gh * warp4.stride), 0, 0, cv::INTER_NEAREST);
+    m = m(cv::Rect(0, 0, std::min(W, m.cols), std::min(H, m.rows))).clone();
+    if (rot >= 0) cv::rotate(m, m, rot);
+    return m;
+}
+
 cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H, int rot) {
     if (rects.empty()) return cv::Mat();
     bool swap = rot == cv::ROTATE_90_CLOCKWISE || rot == cv::ROTATE_90_COUNTERCLOCKWISE;
@@ -1025,6 +1045,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     t0 = Clock::now();
     report(opt, 85, "Composing the map");
     r.final_map = compose(U, warp4, r.rot, true);
+    cv::Mat beyond = beyond_page(warp4, W, H, r.rot);
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");
     final_resample(photo, r, opt);
@@ -1077,6 +1098,12 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         pc.det.paper = m;
     }
     if (pc.ok && !pc.det.paper.empty()) r.paper = paper_alpha(pc.det.paper, pc.scale, r.render_map);
+    if (!beyond.empty() && r.page.cols > 0) {   // the margin the line stage brought in from beyond the stage-1 page
+        cv::Mat b;
+        cv::resize(beyond, b, r.page.size(), 0, 0, cv::INTER_NEAREST);
+        if (r.paper.empty()) r.paper = cv::Mat(r.page.size(), CV_8U, cv::Scalar(255));
+        r.paper.setTo(0, b);
+    }
     if (opt.erase_fingers && !r.paper.empty()) r.fingers_erased = erase_fingers(r.page, r.paper);
     // before page: perspective only, same rotation and size
     cv::Mat src = to_bgra(photo);

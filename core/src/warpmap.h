@@ -48,6 +48,10 @@ struct Samples {      // collect(): rows (along, ideal, disp)
     int n_net_kept = 0;   // bowed traces kept because the rule net marks them as a rule (a warped rule)
     // app: those extensions, [ideal, start, end] along the line (bump guard support, pipeline.cpp)
     std::vector<std::array<double, 3>> ext_h, ext_v;
+    // app: each line's trace (along, across; sorted along) and its ideal, for corner_junctions
+    struct Trace { double ideal = 0; std::vector<double> t, c; };
+    std::vector<Trace> tr_h, tr_v;
+    int n_corners = 0;   // rule ends pinned to the corner they meet (corner_junctions)
 };
 
 struct WarpDebug {
