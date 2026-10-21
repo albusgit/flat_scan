@@ -1,7 +1,12 @@
 # Desktop builds of the core for the round-4 checks (Windows / MSVC or Linux / GCC), without
 # EGL / GLES: gpu_stub.cpp reports no GPU, so the core runs its CPU paths.
 #   pagefind_cli: the page-finder port only (tools/pagefind_parity.py)
-#   pipeline_cli: the whole photo pipeline (tools/round4_check.py)
+#   pipeline_cli: the whole photo pipeline (tools/round4_check.py), the nets in-process through
+#                 core/src/infer.cpp (ONNX Runtime 1.22.0, the app's version)
+# ONNX Runtime: -DFS_ORT_ROOT=<onnxruntime-win-x64-1.22.0> (default: $ENV{FS_ORT_ROOT}, else
+# C:/Users/User/Android/ort/onnxruntime-win-x64-1.22.0 when it exists); without it the nets cannot
+# run in-process (pipeline_cli then only takes net outputs from files). Execution providers beyond
+# the CPU: -DFS_ORT_DML=ON etc. (core/CMakeLists.txt; all OFF), with an ORT package that has them.
 cmake_minimum_required(VERSION 3.18)
 project(desktop_check CXX)
 set(CMAKE_CXX_STANDARD 17)
@@ -24,8 +29,34 @@ else()
   find_package(Threads REQUIRED)
   target_link_libraries(core_nogpu PUBLIC Threads::Threads)
 endif()
+set(FS_ORT_ROOT "$ENV{FS_ORT_ROOT}" CACHE PATH "ONNX Runtime package (include/ + lib/)")
+if(NOT FS_ORT_ROOT AND WIN32 AND EXISTS C:/Users/User/Android/ort/onnxruntime-win-x64-1.22.0/include)
+  set(FS_ORT_ROOT C:/Users/User/Android/ort/onnxruntime-win-x64-1.22.0 CACHE PATH "" FORCE)
+endif()
+foreach(ep QNN XNNPACK CUDA TENSORRT DML OPENVINO COREML)
+  option(FS_ORT_${ep} "${ep} execution provider" OFF)
+endforeach()
+if(FS_ORT_ROOT)
+  find_library(FS_ORT_LIB NAMES onnxruntime PATHS ${FS_ORT_ROOT}/lib NO_DEFAULT_PATH REQUIRED)
+  target_include_directories(core_nogpu PUBLIC ${FS_ORT_ROOT}/include)
+  target_link_libraries(core_nogpu PUBLIC ${FS_ORT_LIB})
+  target_compile_definitions(core_nogpu PUBLIC FS_WITH_ORT)
+  foreach(ep QNN XNNPACK CUDA TENSORRT DML OPENVINO COREML)
+    if(FS_ORT_${ep})
+      target_compile_definitions(core_nogpu PRIVATE FS_ORT_${ep})
+    endif()
+  endforeach()
+  message(STATUS "ONNX Runtime: ${FS_ORT_ROOT}")
+else()
+  message(STATUS "ONNX Runtime: not found (no in-process nets)")
+endif()
 add_executable(pagefind_cli pagefind_cli.cpp)
 target_link_libraries(pagefind_cli PRIVATE core_nogpu)
 add_executable(pipeline_cli pipeline_cli.cpp)
 target_compile_definitions(pipeline_cli PRIVATE FS_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 target_link_libraries(pipeline_cli PRIVATE core_nogpu)
+if(FS_ORT_ROOT AND WIN32)
+  # next to the exe: Windows has an older onnxruntime.dll in System32 that would be found first
+  file(GLOB FS_ORT_DLLS ${FS_ORT_ROOT}/lib/*.dll)
+  add_custom_command(TARGET pipeline_cli POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FS_ORT_DLLS} $<TARGET_FILE_DIR:pipeline_cli>)
+endif()
