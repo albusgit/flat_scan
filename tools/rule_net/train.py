@@ -1,4 +1,4 @@
-"""Train RuleNet on pools from gen_pool.py.
+"""Train RuleNet on pools from gen_pool.py (RN_CROP, RN_BATCH: crop size and batch; RN_LR: peak learning rate).
   python train.py POOL VALPOOL OUT_DIR [ITERS] [RESUME.pt]
 Batches of 384 px crops; flips and transposes (a transposed page swaps the two masks: stage-1
 pages can be sideways, their orientation is decided later), brightness / contrast / grey jitter.
@@ -64,7 +64,7 @@ def validate(net):
 net = RuleNet()
 if resume:
     net.load_state_dict(torch.load(resume, map_location='cpu'))
-opt = torch.optim.AdamW(net.parameters(), lr=3e-3, weight_decay=1e-4)
+opt = torch.optim.AdamW(net.parameters(), lr=float(os.environ.get("RN_LR", 3e-3)), weight_decay=1e-4)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1, (i + 1) / 200) * 0.5 * (1 + math.cos(math.pi * i / iters)))
 best, t0, run = -1, time.time(), 0.0
 for it in range(iters):
