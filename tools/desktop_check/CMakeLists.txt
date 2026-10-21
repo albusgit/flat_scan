@@ -2,6 +2,8 @@
 #   pagefind_cli: the page-finder port only (tools/pagefind_parity.py)
 #   pipeline_cli: the whole photo pipeline (tools/round4_check.py), the nets in-process through
 #                 core/src/infer.cpp (ONNX Runtime 1.22.0, the app's version)
+#   page_bench:   the same steps timed with warm sessions (page_bench.cpp)
+#   net_check:    one backend's net outputs on fixed net inputs (net_check.cpp, gate_f.py)
 # GPU (the core's GLES 3.1 compute stages, core/src/gpu.cpp): -DFS_DESKTOP_GPU=
 #   OFF   (default) gpu_stub.cpp reports no GPU, so the core runs its CPU paths
 #   WGL   Windows: gpu.cpp unchanged over gpu_gl43.cpp, which implements the EGL / GLES calls on the
@@ -80,6 +82,14 @@ target_link_libraries(pagefind_cli PRIVATE core_nogpu)
 add_executable(pipeline_cli pipeline_cli.cpp)
 target_compile_definitions(pipeline_cli PRIVATE FS_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 target_link_libraries(pipeline_cli PRIVATE core_nogpu)
+# per-page timing with warm sessions, per backend and GPU stages on / off (Gate F)
+add_executable(page_bench page_bench.cpp)
+target_compile_definitions(page_bench PRIVATE FS_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../..")
+target_link_libraries(page_bench PRIVATE core_nogpu)
+# one backend's net outputs on fixed net inputs (tools/accel/net_inputs.py), for gate_f.py nets
+add_executable(net_check net_check.cpp)
+target_compile_definitions(net_check PRIVATE FS_REPO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../..")
+target_link_libraries(net_check PRIVATE core_nogpu)
 if(FS_ORT_ROOT AND WIN32)
   # next to the exe: Windows has an older onnxruntime.dll in System32 that would be found first
   file(GLOB FS_ORT_DLLS ${FS_ORT_ROOT}/lib/*.dll)
