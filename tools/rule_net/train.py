@@ -20,7 +20,7 @@ rs = np.random.default_rng(0)
 X = np.load(pool + '_img.npy', mmap_mode='r'); Y = np.load(pool + '_mask.npy', mmap_mode='r')
 VX = np.load(vpool + '_img.npy')[:, 8:392, 8:392]; VY = np.load(vpool + '_mask.npy')[:, :, 8:392, 8:392]
 N, S = X.shape[0], X.shape[1]
-C, B = 384, 12
+C, B = int(os.environ.get("RN_CROP", 384)), int(os.environ.get("RN_BATCH", 12))
 
 
 def batch():

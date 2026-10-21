@@ -805,7 +805,13 @@ void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, NetLine
                 if (d < 10) covered += o1 - o0;
             }
             Vec thv = th;
-            if (on.size() >= 2) {
+            // pieces of one rule do not overlap along; lines that do are parallel rules the mask
+            // merged at half size (a double border) and stay as they are
+            bool overlap = false;
+            for (size_t q = 0; q < on.size(); ++q)
+                for (size_t r = q + 1; r < on.size(); ++r)
+                    overlap |= std::min(A[on[q]][2], A[on[r]][2]) - std::max(A[on[q]][1], A[on[r]][1]) > 20;
+            if (on.size() >= 2 && !overlap) {
                 // one rule found as pieces (it waves too much for the straight-run search, so only its
                 // flatter stretches were found, each traced to a height of its own): one line along
                 // the whole of it, traced from its middle
