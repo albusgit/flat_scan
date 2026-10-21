@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <future>
+#include <memory>
 #include <thread>
 
 #include "gpu.h"
@@ -68,6 +70,43 @@ double page_hw_ratio(const Unroll& U) {
     };
     double w = len(0, 0, U.W - 1, 0) + len(0, U.H - 1, U.W - 1, U.H - 1), h = len(0, 0, 0, U.H - 1) + len(U.W - 1, 0, U.W - 1, U.H - 1);
     return w > 0 ? std::min(5.0, std::max(0.2, h / w)) : (double)U.H / U.W;
+}
+
+// The orientation decision's input on the orientation page op: the page stretched to its measured
+// shape (orient_true_aspect: rows > 0 = resized to that many rows, area = INTER_AREA) and the ratio
+// a turn needs. Two equal inputs on the same page give the same decision.
+struct OrientInput {
+    int rows = 0;
+    bool area = false;
+    double min_ratio = 0;
+    bool operator==(const OrientInput& o) const { return rows == o.rows && area == o.area && min_ratio == o.min_ratio; }
+};
+
+OrientInput orient_input(const cv::Mat& op, const Unroll& U, const PipelineOptions& opt) {
+    OrientInput in;
+    in.min_ratio = opt.orient_min_ratio;
+    if (opt.orient_true_aspect) {
+        // decided on the page at its own shape (a long receipt is not A4)
+        double hw = page_hw_ratio(U), k = hw * op.cols / op.rows;
+        if (std::fabs(k - 1) > 0.15) { in.rows = (int)std::lround(op.rows * k); in.area = k < 1; }
+        // a long narrow upright page (receipt, ticket) reads along its width: monospaced, widely
+        // spaced print scores as vertical text there (DocUNet 65_1: 1.7x, 65_2: 2.9x)
+        if (hw >= 1.8) in.min_ratio = 4.0;
+    }
+    return in;
+}
+
+Orientation orient_decide(cv::Mat op, const OrientInput& in, const PipelineOptions& opt) {
+    if (in.rows > 0) cv::resize(op, op, cv::Size(op.cols, in.rows), 0, 0, in.area ? cv::INTER_AREA : cv::INTER_LINEAR);
+    return decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : in.min_ratio);
+}
+
+// two homography unrolls with the same page and matrix (the same page image)
+bool same_homography(const Unroll& a, const Unroll& b) {
+    if (a.mode != GeomMode::Homography || b.mode != GeomMode::Homography || a.W != b.W || a.H != b.H) return false;
+    for (int i = 0; i < 9; ++i)
+        if (a.Minv[i] != b.Minv[i]) return false;
+    return true;
 }
 
 // stage-1 page: cv2.remap(photo, U) with U evaluated exactly per pixel, in row bands
@@ -626,10 +665,55 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
     return out;
 }
 
-PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
-    GpuStageScope gpu_stages(opt.use_gpu);   // the global stage's remap (warpmap.cpp)
+PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
+    GpuStageScope gpu_stages(opt_in.use_gpu);   // the global stage's remap (warpmap.cpp)
     PipelineResult r;
     auto t0 = Clock::now(), tall = Clock::now();
+    // flat_nets: their grids go into a copy of the options (uv_out* point into `grids`)
+    std::unique_ptr<PipelineOptions> with_grids;
+    if (opt_in.flat_nets) with_grids.reset(new PipelineOptions(opt_in));
+    const PipelineOptions& opt = with_grids ? *with_grids : opt_in;
+    const bool nets_on = with_grids && !opt.perspective_only;
+    const bool overlap = nets_on && opt.overlap_nets;
+    FlatNetGrids grids;
+    auto take_grids = [&](FlatNetGrids g) {
+        grids = std::move(g);
+        if (!grids.grid1.empty()) { with_grids->uv_out = grids.grid1.data(); with_grids->uv_crop = grids.crop1; }
+        if (!grids.grid2.empty()) { with_grids->uv_out2 = grids.grid2.data(); with_grids->uv_crop2 = grids.crop2; }
+        if (!grids.grid_pass1.empty()) { with_grids->uv_out_pass1 = grids.grid_pass1.data(); with_grids->uv_crop_pass1 = grids.crop_pass1; }
+    };
+    // the nets' corners, handed over once (net_corners is not written after that). Declared before
+    // the nets' future and that before the promise: on an exception the promise breaks first, the
+    // nets' thread ends and the future's destructor joins it while what it reads still exists.
+    std::array<cv::Point2d, 4> net_corners;
+    double nets_ms = 0;
+    std::future<FlatNetGrids> nets_fut;
+    std::promise<const std::array<cv::Point2d, 4>*> corners_promise;
+    std::shared_future<const std::array<cv::Point2d, 4>*> corners_fut = corners_promise.get_future().share();
+    bool corners_given = false;
+    auto give_corners = [&](const std::array<cv::Point2d, 4>* c) {
+        if (!nets_on || corners_given) return;
+        if (c) net_corners = *c;
+        corners_promise.set_value(c ? &net_corners : nullptr);
+        corners_given = true;
+    };
+    // a failed net leaves its slot empty (the pipeline runs without it), as a failed run_flat_nets
+    auto run_nets = [&opt, &nets_ms, corners_fut]() {
+        auto tn = Clock::now();
+        FlatNetGrids g;
+        try {
+            g = opt.flat_nets([corners_fut]() { return corners_fut.get(); });
+        } catch (const std::exception& e) {
+            LOGI("flattening nets failed: %s", e.what());
+            g = FlatNetGrids();
+        }
+        nets_ms = ms_since(tn);
+        return g;
+    };
+    if (overlap) {
+        if (opt.corners_edited) give_corners(&opt.corners);
+        nets_fut = std::async(std::launch::async, run_nets);
+    }
     report(opt, 2, "Finding the page");
     Unroll U;
     std::array<cv::Point2d, 4> corners;
@@ -637,12 +721,26 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     if (!opt.corners_edited) {
         pc = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
         r.detection = pc;
-        if (!pc.ok) { r.error = "no page found"; return r; }
+        if (!pc.ok) {
+            give_corners(nullptr);   // the nets that need corners do not run; the future's destructor waits for the rest
+            r.error = "no page found";
+            return r;
+        }
         corners = pc.pts;
     } else {
         corners = opt.corners;
     }
     r.ms.emplace_back("detect", ms_since(t0));
+    give_corners(&corners);
+    if (nets_on && !overlap) {
+        report(opt, 5, "Flattening nets");
+        take_grids(run_nets());
+        r.nets_overlap = 0;
+        r.nets_ms = nets_ms;
+        r.nets_wait_ms = 0;
+        r.nets_join_ms = ms_since(tall);
+        r.ms.emplace_back("flattening nets", nets_ms);
+    }
     bool landscape = false;
     int W = 0, H = 0;
     cv::Mat M;
@@ -691,6 +789,35 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         } else {
             r.fell_back = true;
         }
+    }
+    // overlap: while the nets run, the orientation page (the homography page of these corners) and its
+    // decision for the current unroll. Kept below when the grid check leaves the corners as they are
+    // (uv_defines_page moves them) and the page-shape test gives the same input; otherwise redone.
+    struct {
+        bool ok = false;
+        Unroll Uh;
+        cv::Mat page;
+        OrientInput in;
+        Orientation o;
+    } spec;
+    if (overlap && opt.auto_orient && !opt.orient_on_stage1) {
+        auto ts = Clock::now();
+        spec.Uh = Uh;
+        spec.page = remap_unroll(photo, Uh, opt.use_gpu);
+        spec.in = orient_input(spec.page, U, opt);
+        spec.o = orient_decide(spec.page, spec.in, opt);
+        spec.ok = true;
+        r.ms.emplace_back("orientation, beside the nets", ms_since(ts));
+    }
+    if (overlap) {
+        auto tw = Clock::now();
+        take_grids(nets_fut.get());   // run_nets catches every exception
+        r.nets_overlap = 1;
+        r.nets_ms = nets_ms;
+        r.nets_wait_ms = ms_since(tw);
+        r.nets_join_ms = ms_since(tall);
+        r.ms.emplace_back("flattening nets, beside the CPU stages", nets_ms);
+        r.ms.emplace_back("waiting for the flattening nets", r.nets_wait_ms);
     }
     // Flattening nets (app): a grid replaces the surface model / homography as stage 1 when its page
     // outline agrees with the page finder (or with corners set by hand); with two nets, the first is
@@ -793,21 +920,34 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     }
     t0 = Clock::now();
     report(opt, 20, "Unrolling the page");
-    cv::Mat stage1 = remap_unroll(photo, U, opt.use_gpu);
+    cv::Mat stage1;
+    // the homography page made beside the nets is this stage-1 page when no grid or surface replaced it
+    if (spec.ok && same_homography(U, spec.Uh)) {
+        stage1 = spec.page;
+        r.orient_page_reused = true;
+    } else {
+        stage1 = remap_unroll(photo, U, opt.use_gpu);
+    }
     r.ms.emplace_back("stage-1 page", ms_since(t0));
     if (opt.auto_orient) {
         t0 = Clock::now();
-        cv::Mat op = (opt.orient_on_stage1 || r.mode == GeomMode::Homography) ? stage1 : remap_unroll(photo, Uh, opt.use_gpu);
-        double min_ratio = opt.orient_min_ratio;
-        if (opt.orient_true_aspect) {
-            // decided on the page at its own shape (a long receipt is not A4)
-            double hw = page_hw_ratio(U), k = hw * op.cols / op.rows;
-            if (std::fabs(k - 1) > 0.15) cv::resize(op, op, cv::Size(op.cols, (int)std::lround(op.rows * k)), 0, 0, k < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
-            // a long narrow upright page (receipt, ticket) reads along its width: monospaced, widely
-            // spaced print scores as vertical text there (DocUNet 65_1: 1.7x, 65_2: 2.9x)
-            if (hw >= 1.8) min_ratio = 4.0;
+        cv::Mat op;
+        if (opt.orient_on_stage1 || r.mode == GeomMode::Homography) {
+            op = stage1;
+        } else if (spec.ok && same_homography(Uh, spec.Uh)) {
+            op = spec.page;
+            r.orient_page_reused = true;
+        } else {
+            op = remap_unroll(photo, Uh, opt.use_gpu);
         }
-        Orientation o = decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : min_ratio);
+        OrientInput in = orient_input(op, U, opt);
+        Orientation o;
+        if (spec.ok && op.data == spec.page.data && in == spec.in) {
+            o = spec.o;   // the same page, the same test: the decision made beside the nets
+            r.orient_reused = true;
+        } else {
+            o = orient_decide(op, in, opt);
+        }
         r.rot = o.rot; r.orient_sh = o.sh; r.orient_sv = o.sv; r.orient_upright = o.upright;
         r.ms.emplace_back("orientation", ms_since(t0));
     }
