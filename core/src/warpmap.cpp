@@ -1266,7 +1266,10 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
             for (const auto& e : ext_piece[li])
                 if (!std::isnan(e[0]) && !per[li].empty()) (hz ? out.ext_h : out.ext_v).push_back({per[li][0][1], e[0], e[1]});
         for (size_t li = 0; li < lines.size(); ++li)
-            if (!per[li].empty() && !traces[li].t.empty()) { traces[li].ideal = per[li][0][1]; (hz ? out.tr_h : out.tr_v).push_back(std::move(traces[li])); }
+            if (!per[li].empty() && !traces[li].t.empty()) {
+                traces[li].ideal = per[li][0][1]; traces[li].line = li;
+                (hz ? out.tr_h : out.tr_v).push_back(std::move(traces[li]));
+            }
         for (auto& r : per) rows_out.insert(rows_out.end(), r.begin(), r.end());
     }
     return out;
@@ -1590,24 +1593,24 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-// App, neural pages: a rule whose trace stops short of the rule it ends at (an L corner of a table,
-// a row ending at the table's side). The tracer drops the last px where a curled corner bends a rule
-// sharply (the median test), and the junction bridge extrapolates the trace in a straight line, so
-// the corner itself was never placed: its tip kept its curl as a hook. The corner is measured on the
-// other rule's trace instead: where that trace ends near this rule's end (an L), its end; where it
-// runs on past (a T), its point across from this rule's end, extrapolated along a parabola through
-// the last 80 px of this trace. The rule gets 3 samples there with its own ideal, so the field moves
-// the corner with the rule; the other rule, ending there too (an L), gets the same.
-// Within 40 px along and 25 px across of a trace end.
-int corner_junctions(Samples& S) {
+// App, neural pages: a rule whose trace stops short of a rule it ends at, where collect's junction
+// bridge does not join them because the other rule's found segment ends before it (a table border
+// found short and traced on into a curled corner, where the rows end). That corner was never placed
+// and the tip kept its curl as a hook. The corner is measured on the other rule's trace: where it
+// crosses this trace carried on along a parabola through its last 80 px, or its end if it stops
+// short of that (an L). The rule gets 3 samples there with its own ideal, so the field moves the
+// corner with the rule. Within 40 px along and 25 px across of the trace's end.
+int corner_junctions(Samples& S, const Lines& H, const Lines& V) {
     int n = 0;
     auto at = [](const Samples::Trace& T, double t) { return interp(t, T.t, T.c); };
     for (int hz = 1; hz >= 0; --hz) {
         auto& A = hz ? S.tr_h : S.tr_v;   // the rules whose ends are pinned here
         auto& B = hz ? S.tr_v : S.tr_h;   // the rules they end at
         auto& rows = hz ? S.h : S.v;
+        const Lines &LA = hz ? H : V, &LB = hz ? V : H;
         for (const auto& T : A) {
-            if (T.t.size() < 20) continue;
+            if (T.t.size() < 20 || T.line >= LA.size()) continue;
+            const Line& TL = LA[T.line];
             for (int end = 0; end < 2; ++end) {
                 const double te = end ? T.t.back() : T.t.front(), ce = end ? T.c.back() : T.c.front();
                 const int dir = end ? 1 : -1;
@@ -1619,24 +1622,27 @@ int corner_junctions(Samples& S) {
                 Vec pf = polyfit(ft, fc, 2);
                 double best = 1e300, bt = 0, bc = 0;
                 for (const auto& U : B) {
-                    if (U.t.size() < 20) continue;
+                    if (U.t.size() < 20 || U.line >= LB.size()) continue;
+                    // collect's junction bridge already joins T to U where U's found segment reaches T
+                    // (and U lies within T's segment); only where U's trace runs on past its segment
+                    // (a border found short, traced on into the curled corner) is the bridge missing
+                    const Line& UL = LB[U.line];
+                    if (UL[1] - 12 <= TL[0] && TL[0] <= UL[2] + 12 && TL[1] - 15 <= UL[0] && UL[0] <= TL[2] + 15) continue;
                     // U runs along this rule's across axis: U's along = this rule's across (c), U's
                     // across = this rule's along (t); its position across near this end
                     if (ce < U.t.front() - 40 || ce > U.t.back() + 40) continue;
                     double ue = at(U, std::min(std::max(ce, U.t.front()), U.t.back()));
                     double gap = (ue - te) * dir;   // how far past this end U lies (along this rule)
                     if (gap < -10 || gap > 40) continue;
-                    // the corner: U's own end if it ends here (an L), else U's point across from the
-                    // extrapolated end (a T)
-                    double ct, cc;
+                    // the corner: where U crosses this trace's parabola if U runs that far (a T, or
+                    // a row meeting the table's side), else U's own end (an L: U stops short of it)
+                    double ct = ue, cc = 0;
+                    for (int it = 0; it < 3; ++it) { cc = polyval(pf, ct); ct = at(U, std::min(std::max(cc, U.t.front()), U.t.back())); }
+                    cc = polyval(pf, ct);
                     const double uf = U.t.front(), ub = U.t.back();
-                    if (std::fabs(uf - ce) <= 40 || std::fabs(ub - ce) <= 40) {
-                        bool front = std::fabs(uf - ce) < std::fabs(ub - ce);
+                    if (cc < uf - 3 || cc > ub + 3) {
+                        bool front = std::fabs(uf - cc) < std::fabs(ub - cc);
                         cc = front ? uf : ub; ct = front ? U.c.front() : U.c.back();
-                    } else {
-                        ct = ue;
-                        for (int it = 0; it < 3; ++it) { cc = polyval(pf, ct); ct = at(U, cc); }
-                        cc = polyval(pf, ct);
                     }
                     if (std::fabs(cc - polyval(pf, ct)) > 25 || (ct - te) * dir < -10) continue;
                     double d = std::fabs(ct - te) + std::fabs(cc - ce);
@@ -1841,7 +1847,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     }
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
     d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint, PH, PV);
-    if (share_rows && faint) corner_junctions(d.S1);
+    if (share_rows && faint) corner_junctions(d.S1, d.H, d.V);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
@@ -1875,7 +1881,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         if (it == 1) {
             auto tc = Clock::now();
             d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
-            if (share_rows && faint) corner_junctions(d.S2);
+            if (share_rows && faint) corner_junctions(d.S2, d.H, d.V);
             drop(d.S2.h, true);
             drop(d.S2.v, false);
             drop_whole(d.S2.h, true);

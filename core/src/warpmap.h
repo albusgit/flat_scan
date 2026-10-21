@@ -49,7 +49,7 @@ struct Samples {      // collect(): rows (along, ideal, disp)
     // app: those extensions, [ideal, start, end] along the line (bump guard support, pipeline.cpp)
     std::vector<std::array<double, 3>> ext_h, ext_v;
     // app: each line's trace (along, across; sorted along) and its ideal, for corner_junctions
-    struct Trace { double ideal = 0; std::vector<double> t, c; };
+    struct Trace { double ideal = 0; size_t line = 0; std::vector<double> t, c; };   // line: index in H / V
     std::vector<Trace> tr_h, tr_v;
     int n_corners = 0;   // rule ends pinned to the corner they meet (corner_junctions)
 };
