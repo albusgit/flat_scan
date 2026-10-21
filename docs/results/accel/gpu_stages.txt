@@ -1,0 +1,130 @@
+Stream E: GPU image stages (GLES 3.1 compute; core/src/gpu.cpp, resample.h). Measured 2026-10-21.
+Machine: i5-14400F, RTX 5060 (driver 591.44), Windows 11; host harness build-host-win (MSVC /fp:precise,
+Mesa 26.2.4 mesa-dist-win: llvmpipe via GALLIUM_DRIVER=llvmpipe, the NVIDIA GPU via the default d3d12 driver).
+SPEED MODE: smoke only (3 DocUNet photos with the baseline nets, 2 round-4 photos). The full gate is
+`host/gpu_stage_gate.sh OUT full`, run once by the Coordinator. Timings are single runs / medians of 3-5
+on a shared machine (other agents running): treat differences below ~10 ms as noise.
+
+Stages moved (each one call, CPU fallback on any failure, byte-identical output by construction):
+  stage-1 page + uv-spread pages + orientation page: remap_cubic_gpu -> Gpu::remap_dense (exact
+    per-pixel map still made on the CPU; only the bicubic runs on the GPU). Default policy: OFF.
+  global remap (warpmap A_img; the darkness that follows stays on the CPU): remap_offset_gpu ->
+    Gpu::remap_offset (offset grid bilinear in a `precise` shader). Default policy: ON; refused on a
+    context without `precise`.
+  before page: already resample_any(use_gpu) (unchanged).
+
+== Gate E parity (llvmpipe), smoke
+-- fs_cli selftest-resample (GALLIUM_DRIVER=llvmpipe)
+cases 30, worst |diff| 0 (gate: <= 1)
+GPU stages (dense / offset remap): worst |diff| 0 (gate: 0)
+
+-- fs_cli gpu-stages, DocUNet 1_1 17_2 42_1, baseline nets (all GPU stages on)
+1_1                                  mode uvdoc      rot -1 gpu calls 4+1+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 2435 gpu 2617 ms
+17_2                                 mode uvdoc      rot -1 gpu calls 4+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 4126 gpu 4123 ms
+42_1                                 mode uvdoc      rot -1 gpu calls 4+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 1379 gpu 1680 ms
+
+stage (median over photos, ms)      CPU      GPU
+  stage1                             31.7     97.0
+  orient                            125.3    174.6
+  global_remap                       31.2     33.4
+  final                              91.8     73.1
+  before                            198.6    173.4
+  netcheck                          280.6    299.4
+  total                            2434.7   2617.3
+photos 3, not identical 0, worst |diff| 0 (gate: 0)
+
+-- fs_cli gpu-stages, round-4 photos, no nets
+dewarpnet__1_1_copy                  mode surface    rot -1 gpu calls 2+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 2016 gpu 2241 ms
+scanner_samples__receipt             mode surface    rot -1 gpu calls 2+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 2330 gpu 2473 ms
+
+stage (median over photos, ms)      CPU      GPU
+  stage1                             54.4    163.8
+  orient                            141.1    238.6
+  global_remap                       36.5     33.5
+  final                             110.7     88.3
+  before                            242.7    210.0
+  netcheck                            0.0      0.0
+  total                            2330.1   2473.5
+photos 2, not identical 0, worst |diff| 0 (gate: 0)
+
+-- CPU path (desktop_check pipeline_cli) vs docunet_bench/work/new_fold2 pixels
+1_1 identical
+17_2 identical
+42_1 identical
+photos 3 not identical 0
+
+== Timing, NVIDIA RTX 5060 through Mesa d3d12 (ms; gpu calls = dense+offset+final resample)
+-- every GPU stage on, median of 3 per photo
+GPU stages: dense on, offset on
+1_1                                  mode uvdoc      rot -1 gpu calls 4+1+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 2670 gpu 2605 ms
+17_2                                 mode uvdoc      rot -1 gpu calls 4+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 4224 gpu 4137 ms
+42_1                                 mode uvdoc      rot -1 gpu calls 4+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 1182 gpu 1171 ms
+
+stage (median over photos, ms)      CPU      GPU
+  stage1                             34.1     73.5
+  orient                            132.6    164.6
+  global_remap                       29.6     37.6
+  final                             103.9     23.7
+  before                            204.4    109.5
+  netcheck                          289.1    327.1
+  total                            2670.2   2604.6
+photos 3, not identical 0, worst |diff| 0 (gate: 0)
+
+-- the default policy (dense off, offset on), median of 3 per photo
+GPU stages: dense off, offset on
+1_1                                  mode uvdoc      rot -1 gpu calls 0+1+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 1886 gpu 1828 ms
+17_2                                 mode uvdoc      rot -1 gpu calls 0+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 2855 gpu 2822 ms
+42_1                                 mode uvdoc      rot -1 gpu calls 0+0+1 decisions = | stage1 0 | A_img 0 | darkness 0 | map 0 | page 0 | before 0 | paper 0 | total cpu 1186 gpu 1076 ms
+
+stage (median over photos, ms)      CPU      GPU
+  stage1                             21.1     21.2
+  orient                            116.7    118.1
+  global_remap                       28.7     25.7
+  final                              86.4     27.2
+  before                            152.2    104.8
+  netcheck                          248.9    247.4
+  total                            1885.8   1827.9
+photos 3, not identical 0, worst |diff| 0 (gate: 0)
+
+-- fs_cli gpu-bench (each bicubic stage alone, 1600x2263 page from DocUNet 1_1, median of 5)
+photo 1137x1521
+  final cpu                                  52.6 ms
+  final gpu                                   7.6 ms
+  final gpu: dispatch+readback                6.1 ms
+  final gpu: upload                           1.3 ms
+  global remap cpu                           39.5 ms
+  global remap gpu                           12.4 ms
+  global remap gpu: dispatch+readback         5.5 ms
+  global remap gpu: upload                    2.1 ms
+  stage1 cpu                                 21.4 ms
+  stage1 gpu                                 28.0 ms
+  stage1 gpu: BGR->BGRA                       0.7 ms
+  stage1 gpu: dispatch+readback               6.2 ms
+  stage1 gpu: upload                          5.4 ms
+all GPU outputs identical to CPU
+
+-- the same on llvmpipe (median of 3; a CPU rasteriser, for reference only)
+photo 1137x1521
+  final cpu                                  56.7 ms
+  final gpu                                  48.0 ms
+  final gpu: dispatch+readback               45.2 ms
+  final gpu: upload                           2.7 ms
+  global remap cpu                           41.2 ms
+  global remap gpu                           55.2 ms
+  global remap gpu: dispatch+readback        45.0 ms
+  global remap gpu: upload                    4.1 ms
+  stage1 cpu                                 22.3 ms
+  stage1 gpu                                 61.5 ms
+  stage1 gpu: BGR->BGRA                       0.7 ms
+  stage1 gpu: dispatch+readback              35.2 ms
+  stage1 gpu: upload                         10.2 ms
+all GPU outputs identical to CPU
+
+Reading: on this desktop the final resample (already GPU) and the global remap gain; the dense stage-1 /
+orientation bicubic loses (CPU map evaluation + 2 float maps upload > the 8-thread CPU remap), hence the
+policy default. Phone numbers: not measured (HUMAN GATE in the Stream E report).
+
+Per photo (the JSON next to each run): the global remap runs only where the global stage does (1_1 here;
+the other photos skip it and "global_remap" is the darkness alone). 1_1, d3d12: global_remap+darkness
+104.0 CPU vs 51.6 ms GPU (all on), 81.9 vs 59.0 ms (default policy); stage-1 page 21-35 ms CPU vs
+66-79 ms GPU (dense on), equal with the default policy (dense off).
