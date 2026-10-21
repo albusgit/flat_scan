@@ -14,6 +14,8 @@
 // FS_NET_DELAY_MS=n: the nets take n ms longer without CPU load (an accelerator's time). "nets" then
 // has "overlap" (mode, what was reused, the nets' and the wait's ms), and "pipeline_ms" includes them.
 // FS_IGNORE="x0,y0,x1,y1;..." (output-page fractions): areas whose lines the warp map ignores;
+// FS_GPU=1 (a build with FS_DESKTOP_GPU): the GPU image stages on (PipelineOptions::use_gpu; the
+// GPU stage policy's defaults, FS_GPU_DENSE=1 adds the dense stage); the JSON then has "gpu".
 // FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
 // Prints one JSON line: the crop-screen assessment of every page (assess_pages) and the
 // processing result of page 0 (run_photo) without user edits; OUT.jpg = the page (or "-").
@@ -35,6 +37,10 @@
 #include "cleanup.h"
 #include "nets.h"
 #include "pipeline.h"
+#ifdef FS_DESKTOP_GPU
+#include "gpu.h"
+#include "resample.h"
+#endif
 
 using namespace fs;
 
@@ -138,6 +144,15 @@ int main(int argc, char** argv) {
     }
     PipelineOptions o;
     o.use_gpu = false;
+#ifdef FS_DESKTOP_GPU
+    const bool gpu_on = std::getenv("FS_GPU") != nullptr;
+    if (gpu_on) {
+        o.use_gpu = true;
+        GpuStagePolicy gp = gpu_stage_policy();
+        if (std::getenv("FS_GPU_DENSE")) gp.dense = true;
+        set_gpu_stage_policy(gp);
+    }
+#endif
     o.seg_logits = logits;
     o.perspective_only = std::getenv("FS_PERSPECTIVE_ONLY") != nullptr;
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
@@ -365,6 +380,20 @@ int main(int argc, char** argv) {
         }
         f << "}";
     }
+#ifdef FS_DESKTOP_GPU
+    if (gpu_on) {
+        std::string s = f.str();
+        s.pop_back();
+        f.str(s);
+        f.seekp(0, std::ios_base::end);
+        const bool av = Gpu::instance().available();
+        std::string info = Gpu::instance().info();
+        for (char& c : info)
+            if (c == '"' || c == '\\') c = '\'';
+        f << ", \"gpu\": {\"available\": " << (av ? "true" : "false") << ", \"info\": \"" << info << "\", \"resample\": "
+          << (r.gpu_resample ? "true" : "false") << "}}";
+    }
+#endif
     if (inf_store) {
         // in-process nets: their timings, and run_photo's own time (which includes ShadeNet)
         std::string s = f.str();
