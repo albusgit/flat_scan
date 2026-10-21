@@ -167,7 +167,7 @@ struct PipelineResult {
     bool shadows_removed = false;     // the shading map was applied to the page
     bool shade_net = false;           // ... the shadow net's map (ShadeNet)
     bool rule_net = false;            // the rule net ran in the line stage (RuleNet)
-    int net_dropped = 0, net_added = 0, net_unclipped = 0, net_kept = 0;   // ... its effect (NetLineStats, Samples::n_net_kept)
+    int net_dropped = 0, net_added = 0, net_joined = 0, net_kept = 0;   // ... its effect (NetLineStats, Samples::n_net_kept)
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;

@@ -987,8 +987,9 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* 
     NetLineStats& st = stats ? *stats : st_local;
     const bool net = faint && PH && PV && !PH->empty() && !PV->empty();
     if (net) net_lines(H, V, *PH, *PV, st);
-    // net: an end the net sees as rule over >= 70 % of the stretch clip would cut stays (a table's
-    // side running on past the last row rule found to cross it)
+    // (a rule's end past the outermost rule found to cross it is left to extend_trace, with or without
+    // the net: keeping the found segment's length there capped the trace at the crossing rule's
+    // straight position, short of a curled corner)
     auto clip = [&](Lines& A, const Lines& B, double tol, bool hz) {
         for (auto& L : A) {
             bool any = false;
@@ -1000,12 +1001,6 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* 
                 double a = std::max(L[1], mn - tol), b = std::min(L[2], mx + tol);
                 // app: a box side whose far edge is too faint to be found keeps its length
                 if (faint && b - a < 0.5 * (L[2] - L[1])) continue;
-                if (net) {
-                    const cv::Mat& P = hz ? *PH : *PV;
-                    int r = std::max(4, (int)(L[3] / 2) + 3);
-                    if (a > L[1] + 10 && net_cover(P, hz, L[0], L[1], a, r) >= 0.7) { a = L[1]; ++st.unclipped; }
-                    if (b < L[2] - 10 && net_cover(P, hz, L[0], b, L[2], r) >= 0.7) { b = L[2]; ++st.unclipped; }
-                }
                 L[1] = a;
                 L[2] = b;
                 L[4] = L[2] - L[1];
@@ -1201,8 +1196,11 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 Lines others;   // the other lines of this direction near this one
                 for (size_t j = 0; j < lines.size(); ++j)
                     if (j != li && std::fabs(lines[j][0] - p) < 60) others.push_back(lines[j]);
-                extend_trace(D, hz, tv, cv, -1, thr, maxrun, mw, ideal, slope0, bt0, bc0, P, &others);
-                extend_trace(D, hz, tv, cv, 1, thr, maxrun, mw, ideal, slope0, ft, fc, P, &others);
+                // (not gated by the rule net: it marks a curled corner's rules less far into the
+                // corner than the ink runs, and the trace's own tests - continuous ink of the rule's
+                // width, no sharp turn - keep it off text)
+                extend_trace(D, hz, tv, cv, -1, thr, maxrun, mw, ideal, slope0, bt0, bc0, nullptr, &others);
+                extend_trace(D, hz, tv, cv, 1, thr, maxrun, mw, ideal, slope0, ft, fc, nullptr, &others);
                 if (!bt0.empty() || !ft.empty()) {
                     extended += (int)!bt0.empty() + (int)!ft.empty();
                     if (!bt0.empty()) ext_piece[li][0] = {bt0.front(), tv.front()};

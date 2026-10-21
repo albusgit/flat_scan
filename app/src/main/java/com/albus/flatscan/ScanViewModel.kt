@@ -1132,7 +1132,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
                     else "\nLine refinement: applied" + (if (info.optBoolean("spots_dropped")) " (lines left out where they overstretched the page)" else "") +
                         (info.optJSONArray("net")?.takeIf { info.optBoolean("rule_net") }?.let { a ->
-                            "\n  rule net: %d lines dropped, %d added, %d ends kept, %d bent rules kept".format(a.optInt(0), a.optInt(1), a.optInt(2), a.optInt(3))
+                            "\n  rule net: %d lines dropped, %d added, %d pieces joined, %d bent rules kept".format(a.optInt(0), a.optInt(1), a.optInt(2), a.optInt(3))
                         } ?: "")
                 edited -> "Geometry: homography (corners adjusted by hand)"
                 reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"

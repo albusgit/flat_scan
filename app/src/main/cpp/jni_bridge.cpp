@@ -540,7 +540,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
-      << ", \"rule_net\": " << (r.rule_net ? "true" : "false") << ", \"net\": [" << r.net_dropped << ", " << r.net_added << ", " << r.net_unclipped
+      << ", \"rule_net\": " << (r.rule_net ? "true" : "false") << ", \"net\": [" << r.net_dropped << ", " << r.net_added << ", " << r.net_joined
       << ", " << r.net_kept << "], \"spots_dropped\": " << (r.lines_spots_dropped ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
     f << ", \"ms\": {";

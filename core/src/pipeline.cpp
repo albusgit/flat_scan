@@ -537,6 +537,38 @@ cv::Mat extension_support(const WarpDebug& d, int gw, int gh, double s) {
                     }
             }
     }
+    // ... and where two neighbouring rules' traces both run > 4 px off their ideals the same way (a
+    // curl both rules show: rows fanning together), the band between them along that stretch; with
+    // the rule net confirming them, the curled rows are traced whole and have no extensions
+    for (int hz = 0; hz < 2; ++hz) {
+        const auto& TR = hz ? d.S2.tr_h : d.S2.tr_v;
+        std::vector<const Samples::Trace*> T;
+        for (const auto& t : TR) if (t.t.size() >= 20) T.push_back(&t);
+        std::sort(T.begin(), T.end(), [](const Samples::Trace* a, const Samples::Trace* b) { return a->ideal < b->ideal; });
+        for (size_t i = 0; i < T.size(); ++i) {
+            const auto& A = *T[i];
+            for (size_t j = i + 1; j < T.size() && T[j]->ideal - A.ideal <= 150; ++j) {
+                const auto& B = *T[j];
+                double a = std::max(A.t.front(), B.t.front()), b = std::min(A.t.back(), B.t.back());
+                if (b - a < 20 || B.ideal - A.ideal < 4) continue;
+                bool between = false;
+                for (size_t k = i + 1; k < j; ++k) between |= std::min(b, T[k]->t.back()) - std::max(a, T[k]->t.front()) >= 20;
+                if (between) continue;
+                double gap = B.ideal - A.ideal;
+                for (double t = a; t <= b; t += s) {
+                    double da = interp(t, A.t, A.c) - A.ideal, db = interp(t, B.t, B.c) - B.ideal;
+                    if (std::fabs(da) <= 4 || std::fabs(db) <= 4 || da * db <= 0) continue;
+                    int c0 = std::max(0, (int)std::floor((A.ideal - gap) / s)), c1 = (int)std::ceil((B.ideal + gap) / s);
+                    int t0 = std::max(0, (int)std::floor((t - 16) / s)), t1 = (int)std::ceil((t + 16) / s);
+                    for (int c = c0; c <= c1; ++c)
+                        for (int u = t0; u <= t1; ++u) {
+                            int r = hz ? c : u, q = hz ? u : c;
+                            if (r < gh && q < gw) m.at<uint8_t>(r, q) = 1;
+                        }
+                }
+            }
+        }
+    }
     return m;
 }
 
@@ -1068,7 +1100,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         r.lines = fitted_lines(r.warp, W, H, r.rot);
     }
     r.rule_net = !r.warp.PH.empty();
-    r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_unclipped = r.warp.net.unclipped; r.net_kept = r.warp.S2.n_net_kept;
+    r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_joined = r.warp.net.joined; r.net_kept = r.warp.S2.n_net_kept;
     r.stage1 = stage1;
     r.ms.emplace_back("warp map", ms_since(t0));
     for (auto& m : r.warp.ms) r.ms.emplace_back("  " + m.first, m.second);
@@ -1202,7 +1234,7 @@ PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {
         // an already flattened page (another method's output): the neural-page line stage and its guards
         r.final_map = neural_line_stage(scan, cv::Mat(), opt, r);
         r.rule_net = !r.warp.PH.empty();
-        r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_unclipped = r.warp.net.unclipped; r.net_kept = r.warp.S2.n_net_kept;
+        r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_joined = r.warp.net.joined; r.net_kept = r.warp.S2.n_net_kept;
     } else {
         r.final_map = unwarp_map(scan, &r.warp);
     }
