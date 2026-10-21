@@ -84,7 +84,7 @@ if (usePacks) rootProject.subprojects { if (name in qnnPacks) tasks.configureEac
 // CMake configures against the unpacked package; the merge tasks package it
 tasks.configureEach {
     if (name.startsWith("configureCMake") || name.startsWith("buildCMake") || name.startsWith("generateJsonModel") ||
-        (name.startsWith("merge") && (name.endsWith("JniLibFolders") || name.endsWith("Assets")))) dependsOn(unpackOrt)
+        (name.startsWith("merge") && (name.endsWith("JniLibFolders") || name.endsWith("Assets"))) || name.contains("lint", ignoreCase = true)) dependsOn(unpackOrt)
 }
 
 android {
@@ -113,13 +113,25 @@ android {
         }
     }
 
+    // R8 code and resource shrinking (proguard-rules.pro): the unshrunk dex was 61 MB (19 MB compressed), mostly
+    // Compose and its full icon set. Release builds always; debug with -Pminify=true (to check the rules with the
+    // debug batch mode). Release is signed with the debug key for sideloading; Play needs an upload key.
+    val minifyDebug = (project.findProperty("minify") as String?).toBoolean()
     buildTypes {
         debug {
             // the native core is numeric code; keep it optimised in debug builds too
             externalNativeBuild { cmake { arguments += listOf("-DCMAKE_BUILD_TYPE=Release") } }
+            isMinifyEnabled = minifyDebug
+            isShrinkResources = minifyDebug
+            if (minifyDebug) proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         release {
-            isMinifyEnabled = false
+            // the same native build as debug (CMake Release, not AGP's RelWithDebInfo): the same numbers
+            externalNativeBuild { cmake { arguments += listOf("-DCMAKE_BUILD_TYPE=Release") } }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     externalNativeBuild {

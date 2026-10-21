@@ -413,6 +413,7 @@ OpenCV `4.11.0` comes from Maven Central (`org.opencv:opencv`, prefab). This is 
 ```bash
 echo "sdk.dir=$ANDROID_HOME" > local.properties
 ./gradlew bundleDebug                                    # app/build/outputs/bundle/debug/app-debug.aab (bundleRelease for Play)
+./gradlew assembleRelease -PcompressLibs=true            # R8-shrunk single APK without the NPU (70 MB; debug key; no batch mode)
 ./gradlew assembleDebug                                  # one APK without the NPU libraries (the NPU falls back to the CPU)
 ./gradlew assembleDebug -PcompressLibs=true              # the same, native libraries compressed: dist/flatscan-debug.apk (89 MB)
 ./gradlew assembleDebug -Ppacks=false                    # the old single APK with every QNN library (162 MB)
@@ -423,7 +424,9 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 **Packaging: an app bundle with on-demand NPU packs.** Each phone gets only what it uses:
 
 - The base (ONNX Runtime, OpenCV, the four original models) is split by ABI, screen density and language.
-  Download for an arm64 phone: **81 MB** (`bundletool get-size total`), against 162 MB for the old single APK.
+  Download for an arm64 phone: **81 MB** (`bundletool get-size total`), against 162 MB for the old single APK;
+  **66 MB** for release builds, whose code R8 shrinks (dex 19.4 -> 4.1 MB compressed; `app/proguard-rules.pro`
+  keeps the JNI callback). The native libraries are the same bytes as in debug builds (CMake Release in both).
 - The Qualcomm NPU files are on-demand asset packs. `qnn_htp` holds libQnnHtp, libQnnHtpPrepare,
   libQnnSystem and the three fixed-shape models. `qnn_v68` .. `qnn_v79` each hold one Hexagon generation's
   skeleton and stub.
