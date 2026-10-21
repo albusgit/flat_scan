@@ -339,6 +339,107 @@ The 35 photos and DocUNet were not re-run (not in this checkout). A ~20 px hook 
 very tip of the curled corner, past the border, where no rule reaches. `pipeline_cli` prints
 `"extended"` (line ends continued, per pass).
 
+## Round 10: rule net, line-stage guards that judge straightness, curled corners
+
+### End-to-end test of the line stage (`tools/rule_net/e2e_eval.py`)
+
+Only 3 real photos of forms were at hand, so the line stage now has a synthetic end-to-end test as
+well. 40 stage-1-sized pages (1600 x 2263) are drawn with known rules by `tools/rule_net/synth.py`:
+forms, tables and text, pictures, stamps, curves, dashed lines and page edges. Each page gets the
+warps the nets leave behind (a smooth field, a curled corner, a fold, a small turn) plus shading,
+blur, noise and JPEG. The pages go through the app's line stage for flattened pages (`pipeline_cli`,
+`FS_SCAN=1 FS_SCAN_FLAT=1`), and the known rule masks go through the map it returns. A rule's
+deviation is the p95 distance of its centre line from its straight fit.
+
+| 40 synthetic pages | rules > 2 px off | p90 deviation (px) | line stage rejected | better / worse than round 9 (pages) |
+|---|---|---|---|---|
+| input (no line stage) | 33.4 % | 7.08 | - | - |
+| round 9 (`run_scan` path, no fallbacks) | 24.4 % | 7.02 | 18 | - |
+| round 10, rule net off | 14.1 % | 3.45 | 9 | 16 / 3 |
+| **round 10, rule net on (default)** | **9.0 %** | **1.83** | 11 | **20 / 1** |
+
+The net was trained on the same generator (other seeds), so the last row flatters it. On the
+user's three photos, page 1 is unchanged and the curled corner of page 2 is straight now (below).
+Page 3 is unchanged to the eye.
+
+### Line stage (`warpmap.cpp`, `pipeline.cpp`), app path
+
+- **Guards judge straightness** (`neural_line_stage`, shared by photos and flattened scans). There
+  are three candidates, tried in turn:
+  1. the line stage as before;
+  2. the same lines without every line that passes through an overstretched spot. Lines are left
+     out whole, because dropping only their samples there straightened a rule on one side of a spot
+     and not on the other;
+  3. the reference lines alone.
+
+  Each candidate must pass the distortion guard, and must also leave the rules traced by the first
+  attempt straighter than the page as it is, by 0.1 px on average (`straightness_through`: trace
+  points mapped back by inverting the 4-px map). Otherwise the page stays as the nets left it.
+- **Second pass** (`second_line_pass`): the line stage runs again on its own output and its map is
+  composed with the first. It is kept only if it passes the guard, straightens the rules it traced
+  by more than 0.1 px, and leaves the first pass's rules no less straight. The idea comes from
+  Marior and ArbDR (run again on your own output, stop on a score).
+- **Wavy rules found as pieces:**
+  - an extension stops where it meets another found piece of the same rule;
+  - `share_ideals` gives one height to pieces whose traces run on the same ink (median gap ≤ 2 px
+    over ≥ 16 px).
+
+  Before, two heights for one place tore the page.
+- **Curled corners:**
+  - `corner_junctions` pins a rule's end to the corner it meets, where the junction bridge is
+    missing because the other rule's found segment stops short of its trace;
+  - found lines within 15 px of the page border are dropped as the paper's edge (one folded the
+    correction over itself);
+  - the margin the line stage pulls in from beyond the stage-1 page is filled with paper instead
+    of repeated edge pixels;
+  - the bump guard leaves alone the band between two neighbouring rules whose traces both bend the
+    same way by more than 4 px.
+- **Lines of one direction alone are straightened.** The reference skipped the line stage unless
+  both directions had lines.
+
+### Rule net (`tools/rule_net`, `assets/models/rulenet.onnx`)
+
+A 0.25 M-parameter U-Net (517 KB, fp16 weights). It marks horizontal and vertical printed rules on
+the stage-1 page at half size. Its design:
+- a light full-resolution stem;
+- an encoder to 1/16 with dilated context and the global mean;
+- 1x15 / 15x1 depthwise "line" blocks.
+
+It was trained here on CPU on 8000 synthetic pages (`synth.py`, `gen_pool.py`, `train.py`): 3000
+iterations, then 700 at a low learning rate. Validation F1 on rule pixels is 0.935 horizontal and
+0.902 vertical. It runs in about 0.4 s at 800 x 1152 on two desktop cores; not measured on a phone.
+
+What the line stage does with it (`net_lines`):
+- **Drops** found lines and global-stage grid lines that are not marked over at least half their
+  length. On the user's sideways pages, 43 and 58 found "lines" were letter strokes.
+- **Adds** rules that only the net found, if their ink is at least as dark as a faint printed rule
+  (darkness ≥ 25). On the user's page 1 the net also marks rules on the back of the sheet and on a
+  sheet behind it, at darkness 7 - 17. Tracing those bent the page (median rule deviation
+  0.10 -> 0.59 px).
+- **Joins** pieces of one wavy rule into one line.
+- **Keeps** a bowed trace that lies on a marked rule: a warped rule, not a printed curve.
+
+Extensions are not gated by the net. It marks a curled corner's rules less far into the corner
+than the ink runs. Settings > *Table rules (neural net)* turns it off; processing details show its
+counts.
+
+### Literature
+
+No published method was found that is a classical straightening stage on top of neural
+flattening. The closest is RDGR (Jiang et al., CVPR 2022): a grid least-squares solve driven by
+line constraints. The ideas used here, and those left for later:
+- **Used:** iterate with a score-based stop (Marior, ACM MM 2022; ArbDR, TMM 2026); one height per
+  rule from its pieces (line-preserving mesh warps, e.g. He et al., SIGGRAPH 2013); allow stretch
+  where the evidence supports it (a curl seen on neighbouring rules).
+- **Left for later:** solving each rule's height jointly with the field (RDGR); a row-spacing
+  prior; robust (L1) smoothing at creases; fine-tuning the flattening net itself with an
+  axis-aligned straightness loss (AADD, AAAI 2026), which needs a GPU.
+
+### Not verified
+
+The new code has not run on a phone. Only 3 real photos were tested: real form photos (30 - 50)
+would be the better test set, and could be used to tune the net.
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.
