@@ -71,7 +71,9 @@ object NativeLib {
      * perspectiveOnly: the user turned the unwarp off (homography, no warp map).
      * ignore: areas whose lines the warp map must not use, page fractions [x0, y0, x1, y1, ...].
      * uvOut / uvCrop, uvOut2 / uvCrop2: flattening-net grids ([FlatNet.run]) for those crops of this
-     * photo (the first is preferred; the straighter stage-1 page wins), or null. uvShading:
+     * photo (the first is preferred; the straighter stage-1 page wins), or null. uvPass1 / uvCropPass1:
+     * the first pass on the whole photo whose outline gave those crops ([uvRecrop]); a grid that finds
+     * the same page is used even where the page finder disagrees. uvShading:
      * SyntheticDoc's shading map for its crop (shadow removal), or null. shadeNet: the shadow net, run
      * on the flattened page after SyntheticDoc's map, or null.
      */
@@ -79,7 +81,8 @@ object NativeLib {
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        uvOut: FloatArray?, uvCrop: IntArray?, uvOut2: FloatArray?, uvCrop2: IntArray?, uvShading: FloatArray?,
+        uvOut: FloatArray?, uvCrop: IntArray?, uvOut2: FloatArray?, uvCrop2: IntArray?,
+        uvPass1: FloatArray?, uvCropPass1: IntArray?, uvShading: FloatArray?,
         shadeNet: ShadeNetRunner?, listener: ProgressListener?,
     ): Long
 
@@ -88,6 +91,12 @@ object NativeLib {
      * sees for [corners] -> [x, y, w, h, turned, model].
      */
     @JvmStatic external fun uvCrop(width: Int, height: Int, corners: FloatArray, model: Int): IntArray
+
+    /**
+     * The re-crop for net [model]: the page outline of a first pass's [grid] (on [crop]) plus a margin,
+     * turned when that page is landscape -> [x, y, w, h, turned, model], or null.
+     */
+    @JvmStatic external fun uvRecrop(width: Int, height: Int, grid: FloatArray, crop: IntArray, model: Int): IntArray?
 
     /**
      * Flattening-net input for [crop] of [photo]: float[3 * in_h * in_w] (RGB 0..1, NCHW), or null. With the

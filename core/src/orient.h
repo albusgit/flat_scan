@@ -17,6 +17,7 @@ double upright_hebrew_score(const cv::Mat& gray);
 // 180-degree flip (round 4). min_conf: the upright cue (Hebrew-specific, near 0 on other pages)
 // must be below -min_conf to choose CW instead of CCW for a sideways page. min_conf = 0 is
 // exactly photo_pipeline.run (reference behaviour). `upright` is still reported for upright pages.
-Orientation decide_orientation(const cv::Mat& bgr_page, double min_conf = 0.0);
+// min_ratio: sideways only when the vertical text score exceeds the horizontal one by this factor.
+Orientation decide_orientation(const cv::Mat& bgr_page, double min_conf = 0.0, double min_ratio = 1.0);
 
 }  // namespace fs

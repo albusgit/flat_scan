@@ -700,7 +700,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------ pages
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
-            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7"
+            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7|pass1=1|hrfirst=2"
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
@@ -899,24 +899,35 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 nativeHandle = 0L
                 val hh = try {
                     val logits = logitsFor(p)
+                    // automatic corners: a first UVDoc pass on the whole photo finds the page; the nets then
+                    // run on its outline (a page finder that split a folded page or cut a curled one does
+                    // not decide what the nets see)
+                    val pass1: Pair<IntArray, FlatNet.Output>? = if (useUv && !po && !edited) {
+                        val frame = floatArrayOf(0f, 0f, p.width - 1f, 0f, p.width - 1f, p.height - 1f, 0f, p.height - 1f)
+                        val cr = NativeLib.uvCrop(p.width, p.height, frame, FlatNet.UVDOC)
+                        runCatching { uvNet.run(p, cr, logits, pageIndex) }.onFailure { Log.e(TAG, "first flattening pass failed", it) }
+                            .getOrNull()?.let { cr to it }
+                    } else null
                     // the flattening nets on the page's box (the core checks them against the page finder
-                    // and keeps the straighter page: UVDoc unless SyntheticDoc high-res is clearly straighter)
+                    // and keeps SyntheticDoc high-res unless it is rejected or UVDoc's rows are far straighter;
+                    // DocUNet LD 5.30, 5.76 when the straighter rows won by 0.3 deg, 6.12 with UVDoc first)
                     fun runNet(net: FlatNet): Pair<IntArray, FlatNet.Output>? {
-                        val cr = NativeLib.uvCrop(p.width, p.height, c, net.model)
+                        val cr = pass1?.let { NativeLib.uvRecrop(p.width, p.height, it.second.grid, it.first, net.model) }
+                            ?: NativeLib.uvCrop(p.width, p.height, c, net.model)
                         val out = runCatching { net.run(p, cr, logits, pageIndex) }.onFailure { Log.e(TAG, "flattening net ${net.model} failed", it) }.getOrNull()
                         return out?.let { cr to it }
                     }
                     if (useUv || shadows) viewModelScope.launch(Dispatchers.Main) { stage = "Flattening (neural nets)" }
                     val uv = if (useUv && !po && nets != 2) runNet(uvNet) else null
                     val sdGrid = if (useUv && !po && nets != 1) runNet(sdNet) else null
-                    val first = uv ?: sdGrid
-                    // the second slot: SyntheticDoc's grid next to UVDoc's
-                    val secondGrid = if (uv != null) sdGrid?.second?.grid else null
-                    val secondCrop = if (uv != null) sdGrid?.first else null
+                    val first = sdGrid ?: uv
+                    // the second slot: UVDoc's grid next to SyntheticDoc's
+                    val secondGrid = if (sdGrid != null) uv?.second?.grid else null
+                    val secondCrop = if (sdGrid != null) uv?.first else null
                     NativeLib.process(
                         p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(),
                         first?.second?.grid, first?.first, secondGrid, secondCrop,
-                        null, if (shadows) shadeNet else null,
+                        pass1?.second?.grid, pass1?.first, null, if (shadows) shadeNet else null,
                     ) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }

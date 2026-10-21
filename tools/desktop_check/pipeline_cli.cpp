@@ -85,6 +85,20 @@ int main(int argc, char** argv) {
     if (const char* st = std::getenv("FS_SOFTEN_THR")) o.max_local_rescale = std::atof(st);
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
+    // FS_FRAME_CORNERS=1: the photo's frame is the page, as if set by hand (benchmarks whose photos are
+    // cropped to the page, e.g. DocUNet); FS_NO_ORIENT=1: no 0/90/180/270 decision
+    const bool frame_corners = std::getenv("FS_FRAME_CORNERS") != nullptr;
+    if (frame_corners) {
+        o.corners_edited = true;
+        o.corners = {cv::Point2d(0, 0), cv::Point2d(img.cols - 1, 0), cv::Point2d(img.cols - 1, img.rows - 1), cv::Point2d(0, img.rows - 1)};
+    }
+    o.auto_orient = std::getenv("FS_NO_ORIENT") == nullptr;
+    o.scan_flattened = std::getenv("FS_SCAN_FLAT") != nullptr;   // with FS_SCAN=1: the input was flattened by a net
+    o.orient_true_aspect = std::getenv("FS_ORIENT_A4") == nullptr;   // FS_ORIENT_A4=1: decide on the A4-shaped page (round 7)
+    // FS_UV_MIN_AGREE=x: the page-outline agreement a net's grid needs (0: always used)
+    if (const char* ma = std::getenv("FS_UV_MIN_AGREE")) o.uv_min_agreement = o.uv_min_agreement_quad = std::atof(ma);
+    // FS_UV_PREFER=x: the text-row spread margin (deg) by which the second net must beat the first
+    if (const char* pm = std::getenv("FS_UV_PREFER")) o.uv_prefer_margin = std::atof(pm);
     // FS_ZOOM=1: the zoomed second flattening pass (uv_zoom), the repo's ONNX models run by
     // tools/shadow_net/run_onnx.py with FS_PYTHON
     if (std::getenv("FS_ZOOM")) {
@@ -147,12 +161,33 @@ int main(int argc, char** argv) {
     }
     // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
     // net input for the detected corners and exits; FS_UVOUT=Y.npz ("out": 2 x 45 x 31) uses it
-    std::vector<float> uv, uv_sh, uv2;
+    std::vector<float> uv, uv_sh, uv2, p1_store;
     if (std::getenv("FS_UVIN") || std::getenv("FS_UVOUT")) {
-        PageCorners pc = detect_corners(img, o.max_analysis_side, logits, 0);
+        PageCorners pc;
+        if (frame_corners) pc.ok = true, pc.pts = o.corners;
+        else pc = detect_corners(img, o.max_analysis_side, logits, 0);
         if (!pc.ok) { std::printf("%s, \"ok\": false, \"error\": \"no page found\"}\n", f.str().c_str()); return 0; }
         const char* um = std::getenv("FS_UVMODEL");
         o.uv_crop = uv_crop(img.size(), pc.pts, um ? std::atoi(um) : 0);
+        // FS_UVPASS1=P.npz ("out"): a first pass of net FS_UVPASS1_MODEL (default 0) on the corners' crop,
+        // or on the whole photo with FS_UVPASS1_FRAME=1; FS_UVRECROP=1: the nets' crops are the re-crop on it
+
+        bool recrop = false;
+        UvGrid g1;
+        if (const char* pp = std::getenv("FS_UVPASS1")) {
+            Npz zp = read_npz(pp);
+            const NpyArray& ap = zp.at("out");
+            p1_store.assign(ap.as<float>(), ap.as<float>() + ap.count());
+            const char* pm = std::getenv("FS_UVPASS1_MODEL");
+            std::array<cv::Point2d, 4> fr = {cv::Point2d(0, 0), cv::Point2d(img.cols - 1, 0), cv::Point2d(img.cols - 1, img.rows - 1), cv::Point2d(0, img.rows - 1)};
+            o.uv_crop_pass1 = uv_crop(img.size(), std::getenv("FS_UVPASS1_FRAME") ? fr : pc.pts, pm ? std::atoi(pm) : 0);
+            if (p1_store.size() == (size_t)uv_spec(o.uv_crop_pass1.model).output_len()) {
+                o.uv_out_pass1 = p1_store.data();
+                g1 = uv_grid(o.uv_out_pass1, o.uv_crop_pass1);
+                recrop = std::getenv("FS_UVRECROP") != nullptr && g1.ok;
+            }
+        }
+        if (recrop) o.uv_crop = uv_crop_on_grid(img.size(), g1, o.uv_crop.model);
         if (const char* in = std::getenv("FS_UVIN")) {
             cv::Mat blank;
             if (logits) {
@@ -176,6 +211,7 @@ int main(int argc, char** argv) {
             uv2.assign(a2.as<float>(), a2.as<float>() + a2.count());
             const char* um2 = std::getenv("FS_UVMODEL2");   // the second net's model (default: the other of 0 / 1)
             o.uv_crop2 = uv_crop(img.size(), pc.pts, um2 ? std::atoi(um2) : 1 - o.uv_crop.model);
+            if (recrop) o.uv_crop2 = uv_crop_on_grid(img.size(), g1, o.uv_crop2.model);
             if (uv2.size() == (size_t)uv_spec(o.uv_crop2.model).output_len()) o.uv_out2 = uv2.data();
         }
         // the shading map of whichever net has one (SyntheticDoc)
@@ -202,6 +238,8 @@ int main(int argc, char** argv) {
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
+      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
+      << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
       << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {

@@ -65,7 +65,8 @@ struct PipelineOptions {
     UvCrop uv_crop;                   // photo; null: not run
     const float* uv_out2 = nullptr;   // a second net's grid (e.g. UVDoc next to SyntheticDoc) for uv_crop2: both
     UvCrop uv_crop2;                  // are tried, the straighter stage-1 page wins (see uv_prefer_margin)
-    double uv_prefer_margin = 0.3;    // the second net is chosen only if its text-row angle spread is lower by this (deg)
+    double uv_prefer_margin = 3.0;    // the second net is chosen only if its text-row angle spread is lower by this (deg)
+                                      // (DocUNet: UVDoc's straighter rows mostly came with uneven stretch; 0.3 lost 0.45 LD)
     const float* uv_shading = nullptr;   // SyntheticDoc's shading map (3 x in_h x in_w) for uv_shading_crop
     UvCrop uv_shading_crop;
     bool remove_shadows = true;       // divide the page by the shading map
@@ -74,6 +75,15 @@ struct PipelineOptions {
     double uv_min_agreement_hr = 0.93;    // SyntheticDoc high-res (model 2): its fine grid traces a right page at >= 0.957
                                           // on the 35 photos; a wrong crop (docres__208_in) passed 0.9 at 0.914
     double uv_min_agreement_quad = 0.85;   // ... vs the corners when they were set by hand (no mask)
+    // The first pass (uv_crop_on_grid): a net's grid on a rough region whose outline gave uv_crop /
+    // uv_crop2. A grid whose outline matches it (the same page found twice, from two framings) at
+    // >= uv_min_consistency is used even when the page finder disagrees (a page finder that split a
+    // folded page, cut a curled one or lost a coloured band), down to uv_consistent_floor; the page
+    // corners and paper outline then come from the grid.
+    const float* uv_out_pass1 = nullptr;
+    UvCrop uv_crop_pass1;
+    double uv_min_consistency = 0.95;
+    double uv_consistent_floor = 0.5;
     bool line_stage = true;           // the warp map (line refinement) on top of stage 1
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
@@ -91,6 +101,7 @@ struct PipelineOptions {
     double focal_px = 0;              // full-res focal length from EXIF / camera; 0 = 0.72*max side
     bool auto_orient = true;          // decide 0/90/180/270 on the homography page
     bool orient_on_stage1 = false;    // reference-code behaviour (decide on stage 1); off = brief
+    bool orient_true_aspect = true;   // decide on the page stretched to its measured height / width (page_hw_ratio)
     double orient_min_conf = 0.2;     // sideways pages: CW only if the upright cue is below -this (it is
                                       // Hebrew-specific: ~0 on other or low-confidence pages)
     bool reference_orient = false;    // ungated decision, exactly the reference (parity tests)
@@ -116,6 +127,7 @@ struct PipelineOptions {
     int zoom_nu = 1, zoom_nv = 2;     // parts across / down: halves along the long side (quarters: 2.32 deg, two cut edges each)
     double zoom_max_worse = 0.1;      // deg of text-row spread the zoomed grid may lose and still be kept
     int shade_long_side = 512;
+    bool scan_flattened = false;      // run_scan: the input is a page another method flattened (neural-page line stage + guards)
     bool shade_after_uv = false;
 };
 
@@ -128,6 +140,8 @@ struct PipelineResult {
     std::vector<std::string> needs_manual_crop;   // quality_gate reasons (homography path when any)
     PageCorners detection;            // the automatic detection (finder info); ok = false if not run
     double uv_agreement = -1;         // UVDoc outline vs the page (IoU); -1: UVDoc not run
+    double uv_consistency = -1;       // ... vs the first pass's outline (-1: no first pass)
+    bool uv_defines_page = false;     // the grid was used over the page finder's disagreement: corners and paper from it
     int uv_model = -1;                // the net whose grid was used (UvCrop::model); -1: none
     double uv_spread[2] = {-1, -1};   // text-row angle spread of each net's stage-1 page (deg; -1: not measured)
     bool uv_rejected = false;         // UVDoc ran but disagreed with the page finder (fallback used)

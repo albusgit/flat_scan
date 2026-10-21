@@ -246,6 +246,52 @@ At Auto 70% with background cleanup 100%, the worst chroma ratio went from 0.11 
 
 The GLSL compiles (glslc), but the GPU path was not run.
 
+## Round 8: the nets find the page (DocUNet benchmark)
+
+Measured on the DocUNet benchmark (130 photos, MS-SSIM / LD / AD against flatbed scans; a Python port of
+the MATLAB scorer, checked image by image against PaperEdge's published MATLAB results). On the 20 worst
+photos the automatic mode lost 93% of its gap to "photo frame = page": the page finder split a folded
+page into a book spread, put a corner diagonally on a curled page, or missed a coloured band; or the
+nets traced the page right and were rejected for disagreeing with it. Two receipts were turned sideways.
+
+- **Two-pass nets** (`uv_crop_on_grid`, `PipelineOptions::uv_out_pass1`): with automatic corners, UVDoc
+  first runs on the whole photo (the other page of a spread hidden); both nets then run on a crop around
+  the page *it* found. A grid whose outline matches the first pass (IoU >= 0.95, the page found from two
+  framings) is used even when the page finder disagrees (down to IoU 0.5); the page corners and the
+  paper outline then come from the grid (`uv_defines_page`).
+- **Agreement**: a net is checked against the page finder's corners as well as its mask (the mask can
+  leave out a coloured band or a dark page the corners still frame).
+- **Net order**: SyntheticDoc high-res first; UVDoc when the high-res grid is rejected, or when UVDoc's
+  text rows are straighter by 3 deg or more (`uv_prefer_margin`). With a 0.3 deg margin UVDoc won 12
+  DocUNet photos and was worse on 8 of them (LD +36 on a folded receipt): its straighter rows came with
+  uneven stretching the row angles cannot see.
+- **Orientation**: decided on the page stretched to its measured shape (`page_hw_ratio`), and a long
+  narrow upright page needs 4x more vertical than horizontal text to turn (monospaced receipts).
+
+DocUNet, 128 images (document 64 left out, as the papers); our scorer reads ~0.017 high on MS-SSIM and
+~0.023 low on AD against the papers, so both scales are given:
+
+| | MS-SSIM | LD | AD | paper scale |
+|---|---|---|---|---|
+| Round 7 app, automatic | 0.550 | 8.60 | 0.287 | 0.533 / 8.60 / 0.310 |
+| High-res first only | 0.558 | 8.00 | 0.274 | |
+| **Round 8, automatic** | **0.588** | **5.30** | **0.208** | **0.571 / 5.30 / 0.231** |
+| Round 8, UVDoc chosen at a 0.3 deg margin | 0.584 | 5.76 | 0.229 | 0.567 / 5.76 / 0.252 |
+| Round 8, UVDoc first | 0.578 | 6.12 | 0.241 | |
+| Round 8, high-res net only | 0.586 | 5.54 | 0.218 | 0.569 / 5.54 / 0.241 |
+| Round 8, UVDoc only | 0.558 | 6.93 | 0.306 | |
+| SyntheticDoc high-res, official code (photos already cropped to the page) | 0.589 | 5.43 | 0.192 | 0.570 / 5.51 / 0.219 (paper) |
+| UVDoc (published outputs) | 0.560 | 6.90 | 0.294 | 0.544 / 6.83 / 0.315 (paper) |
+
+The app now scores better than the best released model on LD and MS-SSIM (AD 0.231 vs 0.219), fully
+automatic. The high-res net alone scores worse (LD 5.54): its grid is rejected on a folded index page
+(DocUNet 18-1, LD 34 vs 4.9 with UVDoc) and on two cookbook pages of our 35 photos, where UVDoc
+keeps the text rows straight (spread 5.8 -> 2.6 deg). 35 photos: text-row spread mean 1.27 -> 1.65 deg,
+table-line p90 15.9 -> 14.7 px; the spread rises on pages that now keep content round 7 cut off (the tax
+form's header), that round 7 turned sideways (the dollar bill), and on the DocUNet receipt 4-2 (1.9 ->
+4.0 deg, but LD 41.9 -> 5.5: UVDoc's straight rows sat on a folded page). App: one extra UVDoc pass
+(0.1 s on the desktop CPU).
+
 ## Build
 
 Requirements: JDK 17+, Android SDK platform 35, NDK `27.2.12479018`, CMake `3.22.1`.

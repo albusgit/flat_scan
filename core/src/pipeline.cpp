@@ -50,6 +50,26 @@ struct Unroll {
     }
 };
 
+// The page's height / width as it sits in the photo: its outline (U along the output page's
+// border) measured in photo px, opposite sides averaged (perspective shortens one and lengthens the
+// other). The output page is A4-shaped whatever the paper; a receipt squeezed to A4 has rows closer
+// than its letters, which reads as sideways text.
+double page_hw_ratio(const Unroll& U) {
+    auto len = [&](int x0, int y0, int x1, int y1) {
+        const int n = 64;
+        double L = 0;
+        cv::Point2f a = U.at(x0, y0);
+        for (int k = 1; k <= n; ++k) {
+            cv::Point2f b = U.at((int)std::lround(x0 + (x1 - x0) * (double)k / n), (int)std::lround(y0 + (y1 - y0) * (double)k / n));
+            L += cv::norm(b - a);
+            a = b;
+        }
+        return L;
+    };
+    double w = len(0, 0, U.W - 1, 0) + len(0, U.H - 1, U.W - 1, U.H - 1), h = len(0, 0, 0, U.H - 1) + len(U.W - 1, 0, U.W - 1, U.H - 1);
+    return w > 0 ? std::min(5.0, std::max(0.2, h / w)) : (double)U.H / U.W;
+}
+
 // stage-1 page: cv2.remap(photo, U) with U evaluated exactly per pixel, in row bands
 cv::Mat remap_unroll(const cv::Mat& photo, const Unroll& U) {
     cv::Mat out(U.H, U.W, photo.type());
@@ -620,19 +640,28 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         corners = opt.corners;
     }
     r.ms.emplace_back("detect", ms_since(t0));
-    cv::Point2d wv = corners[1] - corners[0], hv = corners[3] - corners[0];
-    bool landscape = std::sqrt(wv.x * wv.x + wv.y * wv.y) > std::sqrt(hv.x * hv.x + hv.y * hv.y);
-    int W = opt.out_w, H = (int)std::lround(opt.out_w * 297.0 / 210.0);
-    if (landscape) std::swap(W, H);
-    U.W = W; U.H = H;
-    // homography from the 4 corners (always: v8 path and the orientation page)
-    std::vector<cv::Point2f> srcq, dstq = {{0, 0}, {(float)(W - 1), 0}, {(float)(W - 1), (float)(H - 1)}, {0, (float)(H - 1)}};
-    for (auto& c : corners) srcq.emplace_back((float)c.x, (float)c.y);
-    cv::Mat M = cv::getPerspectiveTransform(srcq, dstq), Mi;
-    cv::invert(M, Mi, cv::DECOMP_LU);
-    Unroll Uh = U;
-    Uh.mode = GeomMode::Homography;
-    for (int i = 0; i < 9; ++i) Uh.Minv[i] = Mi.at<double>(i / 3, i % 3);
+    bool landscape = false;
+    int W = 0, H = 0;
+    cv::Mat M;
+    Unroll Uh;
+    // page size and the homography from the 4 corners (always: v8 path and the orientation page)
+    auto set_corners = [&](const std::array<cv::Point2d, 4>& c) {
+        corners = c;
+        cv::Point2d wv = corners[1] - corners[0], hv = corners[3] - corners[0];
+        landscape = std::sqrt(wv.x * wv.x + wv.y * wv.y) > std::sqrt(hv.x * hv.x + hv.y * hv.y);
+        W = opt.out_w; H = (int)std::lround(opt.out_w * 297.0 / 210.0);
+        if (landscape) std::swap(W, H);
+        std::vector<cv::Point2f> srcq, dstq = {{0, 0}, {(float)(W - 1), 0}, {(float)(W - 1), (float)(H - 1)}, {0, (float)(H - 1)}};
+        for (auto& q : corners) srcq.emplace_back((float)q.x, (float)q.y);
+        cv::Mat Mi;
+        M = cv::getPerspectiveTransform(srcq, dstq);
+        cv::invert(M, Mi, cv::DECOMP_LU);
+        Uh = Unroll();
+        Uh.W = W; Uh.H = H;
+        Uh.mode = GeomMode::Homography;
+        for (int i = 0; i < 9; ++i) Uh.Minv[i] = Mi.at<double>(i / 3, i % 3);
+    };
+    set_corners(corners);
     r.mode = GeomMode::Homography;
     U = Uh;
     if (!opt.corners_edited) {
@@ -661,15 +690,18 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         }
     }
     // Flattening nets (app): a grid replaces the surface model / homography as stage 1 when its page
-    // outline agrees with the page finder (or with corners set by hand); with two nets, the one whose
-    // stage-1 page has the straighter text rows wins. The line stage still runs on top.
+    // outline agrees with the page finder (or with corners set by hand); with two nets, the first is
+    // kept unless the second's stage-1 page has far straighter text rows (uv_prefer_margin). The line
+    // stage still runs on top.
     if (opt.uv_out && !opt.perspective_only) {
         auto t_uv = Clock::now();
         const bool use_mask = !opt.corners_edited && pc.ok && !pc.det.paper.empty();
         const double need = use_mask ? opt.uv_min_agreement : opt.uv_min_agreement_quad;
-        struct Cand { UvGrid g; double agree = 0; int model = 0; };
+        struct Cand { UvGrid g; double agree = 0, consist = -1; int model = 0; bool own = false; };
         std::vector<Cand> ok;
         double best_agree = 0;
+        UvGrid pass1;
+        if (opt.uv_out_pass1 && !opt.corners_edited) pass1 = uv_grid(opt.uv_out_pass1, opt.uv_crop_pass1);
         for (int k = 0; k < 2; ++k) {
             const float* out = k == 0 ? opt.uv_out : opt.uv_out2;
             if (!out) continue;
@@ -677,11 +709,22 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
             Cand c;
             c.g = uv_grid(out, crop);
             c.model = crop.model;
-            c.agree = use_mask ? uv_agreement(c.g, pc.det.paper, pc.scale) : uv_agreement(c.g, corners, photo.size());
+            // the page finder's mask can miss a coloured band or a dark page its corners still frame
+            c.agree = uv_agreement(c.g, corners, photo.size());
+            if (use_mask) c.agree = std::max(c.agree, uv_agreement(c.g, pc.det.paper, pc.scale));
             best_agree = std::max(best_agree, c.agree);
-            if (c.g.ok && c.g.turned == landscape && c.agree >= (c.model == 2 && use_mask ? opt.uv_min_agreement_hr : need)) ok.push_back(std::move(c));
+            if (!c.g.ok) continue;
+            bool by_finder = c.g.turned == landscape && c.agree >= (c.model == 2 && use_mask ? opt.uv_min_agreement_hr : need);
+            if (pass1.ok) c.consist = uv_agreement(c.g, pass1);
+            c.own = !by_finder && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor;
+            if (by_finder || c.own) ok.push_back(std::move(c));
         }
         r.uv_agreement = best_agree;
+        // grids that define the page themselves: one page frame for all candidates
+        bool any_finder = false;
+        for (const auto& c : ok) any_finder |= !c.own;
+        if (!ok.empty() && !any_finder) set_corners(uv_corners(ok[0].g));
+        ok.erase(std::remove_if(ok.begin(), ok.end(), [&](const Cand& c) { return c.g.turned != landscape; }), ok.end());
         if (!ok.empty()) {
             size_t pick = 0;
             if (ok.size() == 2) {
@@ -698,6 +741,11 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
                 }
                 if (r.uv_spread[0] >= 0 && r.uv_spread[1] >= 0 && r.uv_spread[1] < r.uv_spread[0] - opt.uv_prefer_margin) pick = 1;
             }
+            if (ok[pick].own) {
+                set_corners(uv_corners(ok[pick].g));
+                r.uv_defines_page = true;
+            }
+            r.uv_consistency = ok[pick].consist;
             U = Uh;
             U.mode = GeomMode::Neural;
             U.uv = std::move(ok[pick].g);
@@ -747,7 +795,16 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
     if (opt.auto_orient) {
         t0 = Clock::now();
         cv::Mat op = (opt.orient_on_stage1 || r.mode == GeomMode::Homography) ? stage1 : remap_unroll(photo, Uh);
-        Orientation o = decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf);
+        double min_ratio = 1.0;
+        if (opt.orient_true_aspect) {
+            // decided on the page at its own shape (a long receipt is not A4)
+            double hw = page_hw_ratio(U), k = hw * op.cols / op.rows;
+            if (std::fabs(k - 1) > 0.15) cv::resize(op, op, cv::Size(op.cols, (int)std::lround(op.rows * k)), 0, 0, k < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+            // a long narrow upright page (receipt, ticket) reads along its width: monospaced, widely
+            // spaced print scores as vertical text there (DocUNet 65_1: 1.7x, 65_2: 2.9x)
+            if (hw >= 1.8) min_ratio = 4.0;
+        }
+        Orientation o = decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : min_ratio);
         r.rot = o.rot; r.orient_sh = o.sh; r.orient_sv = o.sv; r.orient_upright = o.upright;
         r.ms.emplace_back("orientation", ms_since(t0));
     }
@@ -839,6 +896,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt) {
         for (int k = 0; k < 4 && pd.ok; ++k) worst = std::max(worst, cv::norm(pd.pts[k] - corners[k]));
         if (pd.ok && worst < 0.03 * diag) pc = pd;
     }
+    if (r.uv_defines_page && pc.ok && !pc.det.paper.empty()) {
+        // the page finder's outline was overruled: the grid's outline is the paper
+        cv::Mat m = cv::Mat::zeros(pc.det.paper.size(), CV_8U);
+        std::vector<cv::Point> poly;
+        for (const auto& p : U.uv.outline()) poly.emplace_back((int)std::lround(p.x * pc.scale * 4), (int)std::lround(p.y * pc.scale * 4));
+        cv::fillPoly(m, std::vector<std::vector<cv::Point>>{poly}, cv::Scalar(255), cv::LINE_8, 2);
+        pc.det.paper = m;
+    }
     if (pc.ok && !pc.det.paper.empty()) r.paper = paper_alpha(pc.det.paper, pc.scale, r.render_map);
     if (opt.erase_fingers && !r.paper.empty()) r.fingers_erased = erase_fingers(r.page, r.paper);
     // before page: perspective only, same rotation and size
@@ -904,7 +969,20 @@ PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {
     PipelineResult r;
     auto t0 = Clock::now();
     report(opt, 5, "Tracing lines and solving the warp map");
-    r.final_map = unwarp_map(scan, &r.warp);
+    if (opt.scan_flattened) {
+        // an already flattened page (another method's output): the neural-page line stage and its guards
+        r.final_map = unwarp_map(scan, &r.warp, nullptr, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges);
+        double frac = 0, p99 = local_distortion(r.warp, &frac);
+        r.line_distortion = p99;
+        if (p99 > opt.max_line_distortion || frac > opt.max_line_distortion_frac) {
+            r.final_map = identity_grid(scan.cols, scan.rows);
+            r.lines_rejected = true;
+        } else if (opt.max_local_rescale > 0) {
+            r.bumps_faded = soften_bumps(r.final_map, opt.max_local_rescale);
+        }
+    } else {
+        r.final_map = unwarp_map(scan, &r.warp);
+    }
     r.ms.emplace_back("warp map", ms_since(t0));
     for (auto& m : r.warp.ms) r.ms.emplace_back("  " + m.first, m.second);
     report(opt, 90, "Resampling");

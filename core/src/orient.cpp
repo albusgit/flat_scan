@@ -131,12 +131,12 @@ double upright_hebrew_score(const cv::Mat& gray) {
     return gag + 0.35 * header;
 }
 
-Orientation decide_orientation(const cv::Mat& page, double min_conf) {
+Orientation decide_orientation(const cv::Mat& page, double min_conf, double min_ratio) {
     Orientation o;
     cv::Mat g1;
     cv::cvtColor(page, g1, page.channels() == 4 ? cv::COLOR_BGRA2GRAY : cv::COLOR_BGR2GRAY);
     o.sh = text_axis_score(g1, &o.sv);
-    if (o.sv > o.sh) {
+    if (o.sv > o.sh * min_ratio) {
         cv::Mat ccw;
         cv::rotate(g1, ccw, cv::ROTATE_90_COUNTERCLOCKWISE);
         o.upright = upright_hebrew_score(ccw);

@@ -335,6 +335,22 @@ JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvCrop(JNIEnv* env
     return a;
 }
 
+// the re-crop for net `model` on a first pass's grid (uv_crop_on_grid): -> [x, y, w, h, turned, model], or null
+JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_uvRecrop(JNIEnv* env, jclass, jint w, jint h, jfloatArray grid,
+                                                                      jintArray crop, jint model) {
+    UvCrop c;
+    if (!read_uv_crop(env, crop, c)) return nullptr;
+    std::vector<float> g = read_floats_exact(env, grid, uv_spec(c.model).output_len());
+    if (g.empty()) return nullptr;
+    UvGrid ug = uv_grid(g.data(), c);
+    if (!ug.ok) return nullptr;
+    UvCrop u = uv_crop_on_grid(cv::Size(w, h), ug, model);
+    jint o[6] = {u.box.x, u.box.y, u.box.width, u.box.height, u.turned ? 1 : 0, u.model};
+    jintArray a = env->NewIntArray(6);
+    env->SetIntArrayRegion(a, 0, 6, o);
+    return a;
+}
+
 // flattening-net input for a crop: float[3 * in_h * in_w] (RGB 0..1, NCHW), or null. With the page finder's
 // logits, the other page of a book spread (not pageIndex) is hidden from the net.
 JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_uvInput(JNIEnv* env, jclass, jobject bmp, jintArray crop,
@@ -391,7 +407,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jfloatArray uv_out, jintArray uv_crop_a, jfloatArray uv_out2,
-                                                                  jintArray uv_crop2_a, jfloatArray uv_shading, jobject shade_net,
+                                                                  jintArray uv_crop2_a, jfloatArray uv_pass1, jintArray uv_crop_pass1_a,
+                                                                  jfloatArray uv_shading, jobject shade_net,
                                                                   jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
@@ -425,6 +442,11 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     if (uv.empty() && !uv2.empty()) { std::swap(uv, uv2); std::swap(c1, c2); }
     if (!uv.empty()) { o.uv_out = uv.data(); o.uv_crop = c1; }
     if (!uv2.empty()) { o.uv_out2 = uv2.data(); o.uv_crop2 = c2; }
+    // the first pass on the whole photo whose outline gave the crops (uv_crop_on_grid)
+    std::vector<float> p1;
+    UvCrop cp;
+    if (read_uv_crop(env, uv_crop_pass1_a, cp)) p1 = read_floats_exact(env, uv_pass1, uv_spec(cp.model).output_len());
+    if (!p1.empty()) { o.uv_out_pass1 = p1.data(); o.uv_crop_pass1 = cp; }
     for (const UvCrop* c : {&c1, &c2}) {
         if (c->model != 1 || !shading.empty()) continue;
         if ((c == &c1 && !has1) || (c == &c2 && !has2)) continue;

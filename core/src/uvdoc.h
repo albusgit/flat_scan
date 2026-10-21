@@ -90,5 +90,14 @@ UvGrid uv_zoom(const cv::Mat& photo_bgr, const UvGrid& g, int model, const UvNet
 double uv_agreement(const UvGrid& g, const cv::Mat& mask, double scale);
 // the same against the corner quad (no mask: corners set by hand)
 double uv_agreement(const UvGrid& g, const std::array<cv::Point2d, 4>& quad, cv::Size photo);
+// IoU of two grids' outlines (the same page found twice: another crop or another net)
+double uv_agreement(const UvGrid& a, const UvGrid& b);
+
+// The page's corners along a grid, TL, TR, BR, BL of the output page (landscape when turned), photo px.
+std::array<cv::Point2d, 4> uv_corners(const UvGrid& g);
+// The re-crop: the net's own page outline (inside the photo) plus the 6% margin, turned when that
+// page is landscape. A first pass on a rough region (the whole photo, or a doubtful page finder crop)
+// gives the second pass the page framed as in training, whatever the page finder made of it.
+UvCrop uv_crop_on_grid(cv::Size photo, const UvGrid& g, int model);
 
 }  // namespace fs

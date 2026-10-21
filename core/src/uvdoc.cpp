@@ -199,6 +199,35 @@ cv::Point2d grid_pt(const UvGrid& g, double gx, double gy) {
     return p00 * ((1 - a) * (1 - b)) + p01 * (a * (1 - b)) + p10 * ((1 - a) * b) + p11 * (a * b);
 }
 
+}  // namespace
+
+double uv_agreement(const UvGrid& a, const UvGrid& b) {
+    if (!a.ok || !b.ok) return 0.0;
+    return poly_iou(a.outline(), b.outline());
+}
+
+std::array<cv::Point2d, 4> uv_corners(const UvGrid& g) {
+    const size_t tl = 0, tr = (size_t)g.gw - 1, br = g.pts.size() - 1, bl = (size_t)(g.gh - 1) * g.gw;
+    // turned: the net saw the photo turned clockwise, so its top-right is the page's top-left
+    if (g.turned) return {g.pts[tr], g.pts[br], g.pts[bl], g.pts[tl]};
+    return {g.pts[tl], g.pts[tr], g.pts[br], g.pts[bl]};
+}
+
+UvCrop uv_crop_on_grid(cv::Size photo, const UvGrid& g, int model) {
+    double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+    for (const auto& p : g.outline()) {
+        double x = std::min(std::max((double)p.x, 0.0), photo.width - 1.0), y = std::min(std::max((double)p.y, 0.0), photo.height - 1.0);
+        x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
+    }
+    std::array<cv::Point2d, 4> c = {cv::Point2d(x0, y0), cv::Point2d(x1, y0), cv::Point2d(x1, y1), cv::Point2d(x0, y1)};
+    UvCrop u = uv_crop(photo, c, model);
+    std::array<cv::Point2d, 4> k = uv_corners(g);
+    u.turned = (cv::norm(k[1] - k[0]) + cv::norm(k[2] - k[3])) > (cv::norm(k[3] - k[0]) + cv::norm(k[2] - k[1]));
+    return u;
+}
+
+namespace {
+
 double smooth01(double t) {
     t = std::min(1.0, std::max(0.0, t));
     return t * t * (3 - 2 * t);
