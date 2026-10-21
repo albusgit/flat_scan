@@ -312,6 +312,11 @@ struct Inference::Impl {
                 OrtCUDAProviderOptionsV2* o = nullptr;
                 Ort::ThrowOnError(api.CreateCUDAProviderOptions(&o));
                 std::unique_ptr<OrtCUDAProviderOptionsV2, void (*)(OrtCUDAProviderOptionsV2*)> hold(o, api.ReleaseCUDAProviderOptions);
+                // fp32 convolutions and matmuls: ORT's default TF32 (Ampere and later) moves SyntheticDoc-HR's
+                // grid by p99 0.50 px of the page (RTX 5060, 5 photos), over Gate A's 0.25 px
+                const char* k[] = {"use_tf32"};
+                const char* v[] = {"0"};
+                Ort::ThrowOnError(api.UpdateCUDAProviderOptions(o, k, v, 1));
                 so.AppendExecutionProvider_CUDA_V2(*o);
                 return true;
             }
