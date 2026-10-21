@@ -295,6 +295,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     synchronized(netsLock) {
                         val stage = { s: String -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s }; Unit }
                         ensureQnn(Accel.AUTO, stage)
+                        ensureLiteRt(Accel.AUTO, stage)
                         val stored = runAutoBenchmark(stage)
                         if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
                         formatBench(stored)
@@ -337,6 +338,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun ensureNets(stage: (String) -> Unit): Accel.Plan = synchronized(netsLock) {
         ensureQnn(settings.acceleration, stage)
+        ensureLiteRt(settings.acceleration, stage)
         if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
             stage("Choosing the acceleration (once per phone and app version)")
             runAutoBenchmark(stage)
@@ -361,6 +363,23 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * The LiteRT GPU runtime and models ([LiteRtPacks]) before nets run on the GPU: for the GPU setting, and
+     * for Auto before its benchmark (so that the GPU is a candidate), on any phone. A failed fetch leaves the
+     * nets on the CPU; [LiteRtPacks.status] says why (processing details, Settings).
+     */
+    private fun ensureLiteRt(setting: String, stage: (String) -> Unit) {
+        val wants = setting == Accel.AUTO || Accel.fixed(setting)?.let { Accel.usesLiteRt(it) } == true || LiteRtPacks.force
+        if (!wants || LiteRtPacks.loaded) return
+        if (LiteRtPacks.ensure(getApplication(), stage)) {
+            // the groups are remade with the LiteRT runtime (NativeLib.loadLiteRt); an Auto benchmark made
+            // without it (no GPU candidate) runs again
+            val cand = runCatching { JSONObject(settings.autoChoice ?: "").optString("candidates") }.getOrDefault("")
+            if (setting == Accel.AUTO && "gpu" !in cand.split(',')) settings.autoChoice = null
+            configureNets(netPlan)
+        }
+    }
+
     /** Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice]. */
     private fun runAutoBenchmark(stage: (String) -> Unit): JSONObject {
         val cand = Accel.candidates()
@@ -379,6 +398,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         sb.append("FlatScan ${BuildConfigInfo.VERSION} acceleration benchmark (measured on this device, ${stored.optString("at")})\n")
         sb.append("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, SoC: ${stored.optString("soc")}\n")
         sb.append("ONNX Runtime ${NetEnv.ortVersion}; providers: ${NetEnv.providers.joinToString(", ")}; candidates: ${stored.optString("candidates").ifEmpty { "none" }}\n")
+        sb.append("NPU packs: ${QnnPacks.status}; LiteRT GPU pack: ${LiteRtPacks.status}\n")
         if (!b.optBoolean("ok")) sb.append("FAILED: ").append(b.optString("error")).append("\n")
         val tol = b.optJSONObject("tolerance")
         if (tol != null) sb.append("Tolerance vs CPU: grids p99 <= %.2f px, max <= %.1f px (1600 x 2263 page); shadow net p99 <= %.1f, max <= %.1f levels\n".format(
@@ -529,6 +549,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (pageExt != ".jpg" && pageExt != ".png") error("ext must be .jpg or .png")
         val plan = synchronized(netsLock) {
             ensureQnn(if (staticModels) Accel.NPU else setting) { status("Batch $set: $it") }
+            ensureLiteRt(setting) { status("Batch $set: $it") }
             val pl = Accel.fixed(setting) ?: (Accel.autoPlan(settings.autoChoice)
                 ?: run { runAutoBenchmark { status("Batch $set: $it") }; Accel.autoPlan(settings.autoChoice) } ?: Accel.fixed(Accel.CPU)!!)
             configureNets(pl, staticModels)

@@ -321,7 +321,7 @@ struct NetGroup {
     std::string pref;             // backend names, comma separated ("" or "cpu": CPU only)
     std::mutex mu;
     std::set<int> used;           // nets that have run on this Inference (the first run creates the session)
-    int gen = 0;                  // g_qnn_gen when it was made
+    int gen = 0;                  // g_pack_gen when it was made
     bool first_use(NetId n) {
         std::lock_guard<std::mutex> lk(mu);
         return used.insert((int)n).second;
@@ -336,10 +336,11 @@ std::string g_cache_dir;          // QNN context binaries (noBackupFilesDir/qnn_
 int g_threads = 0;
 bool g_static_models = false;     // the CPU loads the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1)
 std::string g_qnn_dir;            // the QNN libraries (the qnn_htp pack's lib/, loadQnn); empty: not loaded
-std::string g_pack_models;        // the static models (the qnn_htp pack's models/); empty: from the APK's assets
-int g_qnn_gen = 0;                // bumped by loadQnn: groups made before it are remade
+std::string g_litert_dir;         // the LiteRT runtime + GPU delegate (the litert_gpu pack's lib/, loadLiteRt); empty: not loaded
+std::vector<std::string> g_pack_models;  // the packs' model folders (qnn_htp's static models, litert_gpu's .tflite), searched first
+int g_pack_gen = 0;               // bumped by loadQnn / loadLiteRt: groups made before it are remade
 
-// assets/models/<file>, or empty (missing: that net or backend is unavailable)
+// <a pack's model folder>/<file>, else assets/models/<file>, or empty (missing: that net or backend is unavailable)
 std::vector<uint8_t> load_model(std::string file) {
     AAssetManager* mgr;
     {
@@ -349,13 +350,13 @@ std::vector<uint8_t> load_model(std::string file) {
         if (g_static_models && file == "syntheticdoc_hr.onnx") file = "syntheticdoc_hr_static.onnx";
     }
     std::vector<uint8_t> v;
-    std::string pack;
+    std::vector<std::string> packs;
     {
         std::lock_guard<std::mutex> lk(g_nets_mu);
-        pack = g_pack_models;
+        packs = g_pack_models;
     }
-    // the static models come from the qnn_htp pack (not in the base APK with the packs)
-    if (!pack.empty()) {
+    // the static models come from the qnn_htp pack, the GPU's from litert_gpu (neither is in the base APK with the packs)
+    for (const auto& pack : packs) {
         std::ifstream f(pack + "/" + file, std::ios::binary);
         if (f) {
             v.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
@@ -389,8 +390,9 @@ std::shared_ptr<NetGroup> make_group(const std::string& pref) {
     c.cache_dir = g_cache_dir;
     c.threads = g_threads;
     c.qnn_dir = g_qnn_dir;
+    c.litert_dir = g_litert_dir;
     g->inf = Inference::create(c);
-    g->gen = g_qnn_gen;
+    g->gen = g_pack_gen;
     return g;
 }
 
@@ -501,7 +503,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     g_threads = threads;
     g_static_models = static_models;
     auto set = [&](std::shared_ptr<NetGroup>& slot, const std::string& pref) {
-        if (!slot || slot->pref != pref || !same || slot->gen != g_qnn_gen) slot = make_group(pref);
+        if (!slot || slot->pref != pref || !same || slot->gen != g_pack_gen) slot = make_group(pref);
     };
     set(g_finder, pf);
     set(g_flat, fl);
@@ -551,12 +553,43 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_loadQnn(JNIEnv* env,
     if (ok) {
         std::lock_guard<std::mutex> lk(g_nets_mu);
         g_qnn_dir = lib;
-        g_pack_models = models;
-        ++g_qnn_gen;
+        if (std::find(g_pack_models.begin(), g_pack_models.end(), models) == g_pack_models.end()) g_pack_models.push_back(models);
+        ++g_pack_gen;
     }
     LOGI("loadQnn: %s, loaded %zu of %zu%s%s", ok ? "ok" : "failed", loaded.size(), order.size(), err.empty() ? "" : ", ", err.c_str());
     f << "{\"ok\": " << (ok ? "true" : "false") << ", \"loaded\": " << json_strings(loaded) << ", \"adsp_library_path\": \"" << escape(adsp)
       << "\", \"error\": \"" << escape(err) << "\"}";
+    return env->NewStringUTF(f.str().c_str());
+}
+
+// The LiteRT runtime from the litert_gpu pack (LiteRtPacks in Packs.kt): lib_dir has libtensorflowlite_jni
+// and libtensorflowlite_gpu_jni, loaded here by path (the core's own dlopen of them from InferConfig.litert_dir
+// then finds them already loaded); models_dir: the GPU models (load_model). The groups made before are
+// remade on their next configureNets. JSON {"ok", "loaded": [...], "error"}.
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_loadLiteRt(JNIEnv* env, jclass, jstring lib_dir, jstring models_dir) {
+    const std::string lib = jstr(env, lib_dir), models = jstr(env, models_dir);
+    const std::vector<std::string> order = {lib + "/libtensorflowlite_jni.so", lib + "/libtensorflowlite_gpu_jni.so"};
+    std::vector<std::string> loaded;
+    std::string err;
+    for (const auto& path : order) {
+        if (dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
+            loaded.push_back(path.substr(path.find_last_of('/') + 1));
+        } else {
+            const char* e = dlerror();
+            err += (err.empty() ? "" : "; ") + std::string(e ? e : path.c_str());
+        }
+    }
+    // both or no GPU backend: the delegate is useless without the runtime and the reverse
+    const bool ok = loaded.size() == order.size();
+    if (ok) {
+        std::lock_guard<std::mutex> lk(g_nets_mu);
+        g_litert_dir = lib;
+        if (std::find(g_pack_models.begin(), g_pack_models.end(), models) == g_pack_models.end()) g_pack_models.push_back(models);
+        ++g_pack_gen;
+    }
+    LOGI("loadLiteRt: %s, loaded %zu of %zu%s%s", ok ? "ok" : "failed", loaded.size(), order.size(), err.empty() ? "" : ", ", err.c_str());
+    std::ostringstream f;
+    f << "{\"ok\": " << (ok ? "true" : "false") << ", \"loaded\": " << json_strings(loaded) << ", \"error\": \"" << escape(err) << "\"}";
     return env->NewStringUTF(f.str().c_str());
 }
 
@@ -1102,6 +1135,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             c.cache_dir = g_cache_dir;
             c.threads = g_threads;
             c.qnn_dir = g_qnn_dir;
+            c.litert_dir = g_litert_dir;
             return Inference::create(c);
         };
         // the inputs, from CPU runs as automatic processing makes them
