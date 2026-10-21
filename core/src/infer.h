@@ -3,7 +3,8 @@
 // model; CPU (ORT's default EP, fp32) is always the last resort. Any EP creation or run failure
 // moves that net to the next backend; run() returns false only when the CPU run fails too, and
 // the caller then falls back exactly as without the net. Builds without ONNX Runtime (FS_WITH_ORT
-// undefined) compile a stub whose run() always returns false.
+// undefined) compile a stub whose run() always returns false. LiteRtGpu is not an ORT provider: the
+// .tflite models on LiteRT's GPU delegate in fp32, its libraries loaded at run time from litert_dir.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -13,14 +14,15 @@
 
 namespace fs {
 enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet };
-enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML };
+enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu };
 struct InferConfig {
     std::function<std::vector<uint8_t>(const std::string& file)> load;  // model bytes (Android: AAssetManager)
     std::vector<Backend> preference;   // tried in order per net; CPU is always appended last
-    std::string cache_dir;             // compiled-model cache (QNN context binaries)
+    std::string cache_dir;             // compiled-model cache (QNN context binaries, LiteRT GPU kernels)
     bool fp16 = true;                  // accelerators only; CPU stays fp32
     int threads = 0;                   // 0: ORT default
     std::string qnn_dir;               // folder of libQnnHtp.so (Android: the qnn_htp asset pack); empty: the library path
+    std::string litert_dir;          // folder of libtensorflowlite_jni.so + libtensorflowlite_gpu_jni.so (Android: the litert_gpu pack); empty: no LiteRT
 };
 struct Tensor { std::vector<int64_t> shape; std::vector<float> data; };
 class Inference {

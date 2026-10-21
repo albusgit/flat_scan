@@ -3,11 +3,7 @@ package com.albus.flatscan
 import android.content.Context
 import android.os.Build
 import android.util.Log
-import com.google.android.gms.tasks.Tasks
-import com.google.android.play.core.assetpacks.AssetPackManagerFactory
-import com.google.android.play.core.assetpacks.model.AssetPackStatus
 import java.io.File
-import java.util.concurrent.TimeUnit
 
 /**
  * The Qualcomm NPU libraries as on-demand asset packs (app/build.gradle.kts): qnn_htp (libQnnHtp,
@@ -18,7 +14,8 @@ import java.util.concurrent.TimeUnit
  *  * Play Asset Delivery (Play Store installs, and `bundletool install-apks` of a --local-testing build);
  *  * a universal APK (bundletool --mode=universal) carries the packs' assets inside the APK: they are
  *    copied once to files/qnn (the DSP and dlopen need real files).
- * Without either, the NPU is unavailable and its nets run on the CPU, as on any other phone.
+ * Without either, the NPU is unavailable and its nets run on the CPU, as on any other phone. The fetching
+ * itself is [PackFetch] (Packs.kt), shared with the LiteRT GPU pack ([LiteRtPacks]).
  */
 object QnnPacks {
     private const val TAG = "FlatScan"
@@ -85,55 +82,16 @@ object QnnPacks {
     }
 
     private fun fromPlay(context: Context, stage: (String) -> Unit): Dirs? = runCatching {
-        val m = AssetPackManagerFactory.getInstance(context)
         val want = packs()
-        fun located() = want.associateWith { m.getPackLocation(it)?.assetsPath() }
-        var loc = located()
-        if (loc.values.any { it == null }) {
-            stage("Downloading the NPU libraries")
-            Tasks.await(m.fetch(want), 30, TimeUnit.SECONDS)
-            val until = System.nanoTime() + TimeUnit.MINUTES.toNanos(10)
-            while (true) {
-                val st = Tasks.await(m.getPackStates(want), 30, TimeUnit.SECONDS)
-                val states = want.map { st.packStates()[it] }
-                val total = states.sumOf { it?.totalBytesToDownload() ?: 0L }
-                val got = states.sumOf { it?.bytesDownloaded() ?: 0L }
-                if (states.any { it == null }) error("unknown pack in ${st.packStates().keys}")
-                val bad = states.firstOrNull { it!!.status() == AssetPackStatus.FAILED || it.status() == AssetPackStatus.CANCELED }
-                if (bad != null) error("pack ${bad.name()}: status ${bad.status()}, error ${bad.errorCode()}")
-                if (states.all { it!!.status() == AssetPackStatus.COMPLETED }) break
-                if (System.nanoTime() > until) error("download timed out")
-                if (states.any { it!!.status() == AssetPackStatus.WAITING_FOR_WIFI || it.status() == AssetPackStatus.REQUIRES_USER_CONFIRMATION }) {
-                    error("the download is waiting for Wi-Fi or the user's confirmation")
-                }
-                stage("Downloading the NPU libraries: ${if (total > 0) 100 * got / total else 0}%")
-                Thread.sleep(500)
-            }
-            loc = located()
-        }
-        if (loc.values.any { it == null }) error("packs missing after the download")
-        val root = File(loc.getValue(COMMON)!!, "qnn")
-        Dirs(File(root, "lib"), File(root, "models"), want.drop(1).map { File(File(loc.getValue(it)!!, "qnn"), it.removePrefix("qnn_")) }, "Play")
+        val loc = PackFetch.fromPlay(context, want, "the NPU libraries", stage)
+        val root = File(loc.getValue(COMMON), "qnn")
+        Dirs(File(root, "lib"), File(root, "models"), want.drop(1).map { File(File(loc.getValue(it), "qnn"), it.removePrefix("qnn_")) }, "Play")
     }.onFailure { status = "Play Asset Delivery: ${it.message}"; Log.i(TAG, "qnn packs from Play: $it") }.getOrNull()
 
     // a universal APK: the packs' assets are in the APK; copied once to files/qnn (versioned by the app's update time)
     private fun fromApk(context: Context, stage: (String) -> Unit): Dirs? = runCatching {
-        val am = context.assets
-        val names = am.list("qnn")?.toList().orEmpty()
-        if ("lib" !in names) error("not in this APK either (an APK built with assembleDebug has no NPU libraries)")
-        val out = File(context.filesDir, "qnn")
-        val stamp = File(out, ".stamp")
-        val want = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime.toString()
-        if (!stamp.isFile || stamp.readText() != want) {
-            stage("Unpacking the NPU libraries")
-            out.deleteRecursively()
-            for (dir in names) {
-                for (f in am.list("qnn/$dir").orEmpty()) {
-                    File(out, "$dir/$f").also { it.parentFile?.mkdirs() }.outputStream().use { o -> am.open("qnn/$dir/$f").use { it.copyTo(o) } }
-                }
-            }
-            stamp.writeText(want)
-        }
+        val out = PackFetch.fromApk(context, "qnn", "lib", "not in this APK either (an APK built with assembleDebug has no NPU libraries)",
+            "the NPU libraries", stage)
         val gens = (generation?.let { listOf(it) } ?: GENERATIONS).map { File(out, it) }.filter { it.isDirectory }
         Dirs(File(out, "lib"), File(out, "models"), gens, "APK")
     }.onFailure { status = "$status; APK: ${it.message}"; Log.i(TAG, "qnn packs from the APK: $it") }.getOrNull()

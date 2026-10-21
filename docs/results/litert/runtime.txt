@@ -1,0 +1,125 @@
+LiteRT GPU backend, C++ runtime stream (core/src/infer.cpp Backend::LiteRtGpu): measured facts, and the phone run
+==============================================================================================================
+2026-10-21, litert/runtime on claude/android-document-scanner-fkka2i ba245e8. Speed mode: builds and emulator smoke
+checks only; no phone, no benchmark, no DocUNet scoring. Every number below was measured on this machine or its
+emulator; no phone number is reported.
+
+LiteRT runtime (contract C3)
+- com.google.ai.edge.litert:litert:1.4.0 and litert-gpu:1.4.0 exist on google() (dl.google.com/android/maven2;
+  the newest 1.x is 1.4.2, the newest release 2.3.0). Downloaded to C:/Users/User/Android/litert/litert-1.4.0/ and
+  litert-gpu-1.4.0/ (AAR + POM; unpacked in x/):
+    litert-1.4.0.aar      sha256 54b567572cb2d1295571c785198f87597809cbf22d6cb8acfeac23869041887d  8,264,240 B
+    litert-gpu-1.4.0.aar  sha256 48f69a7809d82bdcc4d10d401a786c4124dc7932be6b1255eea806cd25f03274  4,116,036 B
+  jni/ ABIs: arm64-v8a, armeabi-v7a, x86, x86_64. TfLiteVersion() of the library: "2.20.0-dev0+selfbuilt".
+- llvm-nm -D (NDK 27.2), arm64-v8a and x86_64 alike:
+    libtensorflowlite_jni.so exports the TFLite C API (TfLiteModelCreate/Delete, TfLiteInterpreterOptions*,
+      TfLiteInterpreterCreate/Delete/AllocateTensors/Invoke/ModifyGraphWithDelegate/Get{Input,Output}Tensor*,
+      TfLiteTensor*, TfLiteVersion), the opaque-context API (TfLiteOpaqueContextGetExecutionPlan,
+      ...GetNodeAndRegistration, TfLiteOperatorGetBuiltInCode) and TfLiteXNNPackDelegateCreate/Delete.
+    libtensorflowlite_gpu_jni.so exports TfLiteGpuDelegateOptionsV2Default, TfLiteGpuDelegateV2Create,
+      TfLiteGpuDelegateV2CreateAsync, TfLiteGpuDelegateV2Delete (plus the Java JNI entry points).
+  llvm-readelf -d NEEDED: jni: libm libdl liblog libc; gpu: libGLESv3 libEGL libdl libm liblog libc (no libc++_shared,
+  no dependency between the two). TfLiteGpuDelegateOptionsV2 is 56 bytes in the header and in the library
+  (TfLiteGpuDelegateOptionsV2Default writes 56 bytes; GPU delegate built as a classic TfLiteDelegate with Prepare,
+  flags 4 = kTfLiteDelegateFlagsPerOperatorProfiling; not AllowDynamicTensors).
+- Headers vendored (unchanged, Apache-2.0): core/third_party/litert/ (README.md has the AAR paths and hashes).
+
+What was built (owned files: core/src/infer.{h,cpp}, core/src/nets.cpp backend_name / parse_backends,
+core/third_party/litert/**, tools/litert_check/**; plus one include line in core/CMakeLists.txt, see deviations)
+- infer.h: Backend::LiteRtGpu last in the enum; InferConfig::litert_dir after qnn_dir (contract C1).
+  nets.cpp: backend_name(LiteRtGpu) = "gpu"; parse_backends takes "gpu" and "litert".
+- infer.cpp (compiled in on Android / Linux when the vendored headers are on the include path, via __has_include;
+  Windows and builds without them: "LiteRtGpu is not compiled into this build", the net moves on):
+  * libtensorflowlite_jni.so then libtensorflowlite_gpu_jni.so dlopen'ed from litert_dir (RTLD_NOW|RTLD_LOCAL),
+    every function resolved once per folder with dlsym (types from the vendored headers), never unloaded; a folder
+    that fails is tried again later. No link-time dependency.
+  * models through cfg.load: uvdoc_static.tflite, syntheticdoc_hr_static.tflite, shadenet_<H>x<W>.tflite (512x352 is
+    the one shipped); no .onnx fallback; the page finder never on this backend. One interpreter per net and input
+    shape. Input float32 NHWC [N,H,W,C] checked against run()'s NCHW shape; NCHW -> NHWC in, every 4-D output
+    NHWC -> NCHW out (shape [N,C,H,W]); other outputs copied as they are; all float32 or no session.
+  * GPU delegate options: is_precision_loss_allowed 0, inference_priority1/2/3 MAX_PRECISION / MIN_LATENCY /
+    MIN_MEMORY_USAGE (fp32 compute), inference_preference SUSTAINED_SPEED, max_delegated_partitions 1; with a
+    cache_dir, ENABLE_SERIALIZATION into cache_dir with model_token fs_<model sha256[:16]>_<sha256(SoC|build
+    fingerprint|LiteRT version|fp32)[:8]> (the OpenCL backend serialises; a delegation that fails with the cache is
+    retried once without it).
+  * whole graph or nothing: the interpreter is made without delegates, then TfLiteInterpreterModifyGraphWithDelegate
+    gets a copy of the GPU delegate whose Prepare wraps the delegate's own and then reads the execution plan
+    (TfLiteContext::GetExecutionPlan / GetNodeAndRegistration; the opaque API for an opaque-built delegate): exactly
+    one node, a kTfLiteBuiltinDelegate kernel, else it returns an error, the interpreter restores its plan and the
+    net moves to the next backend ("the GPU delegate takes only part of the graph (N nodes -> K, some on the CPU)").
+  * one LiteRT thread per Inference: every interpreter is created, run and deleted there (the delegate's OpenGL ES
+    backend binds its EGL context to the thread that applied it); nets on the GPU run one at a time. The per-NetId
+    lock of run() is unchanged.
+  * failures as the other backends: any failure (libraries, model, delegate, partial graph, Invoke) -> the net drops
+    to the next backend, CPU last; the interpreter's error reports are collected into the logged reason.
+    last_ms: input conversion + Invoke + output conversion, measured on the LiteRT thread (queue wait excluded).
+  * OpenCL guard: LiteRT 1.4.0's GPU delegate runs its OpenCL lookup in every Prepare (also with GL_ONLY):
+    libOpenCL.so, libOpenCL-pixel.so, libOpenCL-car.so by dlopen, else libvndksupport's android_load_sphal_library;
+    when all fail it appends dlerror() to a std::string, but the sphal function has consumed dlerror() (it logs it),
+    so strlen(NULL) segfaults (disassembly of libtensorflowlite_gpu_jni.so x86_64 at 0x1f58a2..0x1f58cd, the strings
+    "Failed to load OpenCL library with dlopen: " / ". Trying ICD loader."; reproduced on the emulator with the
+    delegate alone, scratch lrt_probe.cpp, before any of this code). infer.cpp repeats that lookup first
+    (opencl_found); no OpenCL library -> no delegate, the net stays on the next backend. So an OpenGL-ES-only phone
+    gets no LiteRT GPU (no crash); see open issues.
+- CPU / ORT paths: the ORT code is textually unchanged (a LiteRT branch before it in make_session and run(); the
+  session key changes only for LiteRtGpu).
+
+Checks run
+- NDK 27.2 (clang, -Wall -Wno-sign-compare -ffp-contract=off): tools/litert_check builds for x86_64 and arm64-v8a with
+  no warnings. infer.cpp -fsyntax-only for aarch64 with the app's defines (FS_WITH_ORT FS_ORT_QNN FS_ORT_NNAPI
+  FS_ORT_XNNPACK) with and without the vendored include dir, and without FS_WITH_ORT: clean. (No Gradle build of the
+  app was run.)
+- Desktop (MSVC 14.50, tools/desktop_check, ORT 1.22.0 win-x64): builds; infer.cpp and nets.cpp without warnings.
+  net_check --backend gpu on a random UVDoc input (1x3x712x488) and ShadeNet input (1x3x512x352): "LiteRT_GPU
+  unavailable: LiteRtGpu is not compiled into this build", ran on cpu; outputs byte-identical (cmp) to
+  --backend cpu, and to the base build's net_check.exe (ba245e8) --backend cpu. "litert" parses too.
+- Emulator, AVD fs35 (Android 15, x86_64), x86_64 litert_check, heavy lock held for each session:
+  GPU modes tried: -gpu host (GLES 3.1 through "Android Emulator OpenGL ES Translator (NVIDIA GeForce RTX 5060)"),
+  -gpu swiftshader_indirect (GLES 3.0), -gpu angle_indirect (GLES 3.0). None has OpenCL (no libOpenCL*).
+  None ran the GPU delegate:
+    without OpenCL: "no OpenCL library (LiteRT 1.4.0's GPU delegate can crash looking for one)" -> cpu, no crash
+      (before the guard: SIGSEGV in strlen inside libtensorflowlite_gpu_jni.so).
+    with tools/litert_check/opencl_stub.cpp (an OpenCL without platforms) on LD_LIBRARY_PATH: "Replacing 7 out of 7
+      node(s) with delegate (TfLiteGpuDelegateV2) node, yielding 1 partitions"; "clGetPlatformIDs returned -1001;
+      Falling back to OpenGL; TfLiteGpuDelegate Init: [GL_INVALID_ENUM] ... glGetBufferParameteri64v in
+      tflite/delegates/gpu/gl/gl_buffer.cc:51" on all three modes -> cpu (clean fallback, reason logged; also the
+      kernel-cache attempt then the retry without it).
+  So the first real GPU run is the phone (HUMAN GATE below).
+  XNNPACK standing in for the GPU delegate (FS_LITERT_TEST_XNNPACK=1, litert_check's build only), -gpu host, a tiny
+  UVDoc-shaped test net (Conv 16x16/16 + ReLU + Conv 3x3 + Tanh, fp16 weights, NHWC tflite from TF 2.19.1 and the
+  same weights as an NCHW ONNX; scratch make_tiny.py), synthetic input:
+    full graph: 7 of 7 nodes in one partition, ran on the LiteRtGpu path; output 1x2x45x31,
+      |LiteRT - ORT CPU| max 3.99e-4, p99 3.25e-4, mean 1.05e-4 (fp16 weights; TF CPU vs ORT on the desktop: max
+      5.6e-4 on another input). An NCHW / NHWC mistake would show as O(1) differences.
+    with a CUMSUM added (no XNNPACK kernel): "8 nodes -> 3, some on the CPU" -> refused -> cpu.
+    the real models of the models stream (snapshot 18:29 of fs_lrt_models, uncommitted: uvdoc_static.tflite sha256
+      9529c902..., syntheticdoc_hr_static.tflite 50b3c012..., shadenet_512x352.tflite b83d24ee...): I/O as contract
+      C2 ([1,712,488,3] -> [1,45,31,2], [1,1440,1024,3] -> [1,121,177,2], [1,512,352,3] -> [1,512,352,3]); XNNPACK takes
+      only part of each (MIRROR_PAD and others), so all three were refused as partial (154 -> 8, 161 -> 128, 90 -> 18
+      nodes) and ran on the CPU. This says nothing about the GPU delegate's coverage.
+  Missing library folder: "cannot load .../libtensorflowlite_jni.so: dlopen failed ..." -> cpu. litert_dir empty:
+  "no LiteRT libraries (InferConfig::litert_dir not set)" -> cpu.
+- Not a LiteRT issue, seen on the way: a command-line program that links ONNX Runtime 1.22.0 aborts at exit() on
+  Android ("FORTIFY: pthread_mutex_lock called on a destroyed mutex", in libonnxruntime.so's __cxa_finalize), with the
+  CPU alone too. litert_check ends with _Exit. The app never exits that way.
+
+HUMAN GATE: the first GPU run, on the Galaxy S24 FE (Exynos 2400e, Xclipse 940) or any Mali / Adreno phone
+1. Build: tools/litert_check/README.md for ABI arm64-v8a (ORT: onnxruntime-android-1.22.0.aar unpacked).
+2. adb shell mkdir -p /data/local/tmp/lrt/lib /data/local/tmp/lrt/models /data/local/tmp/lrt/cache, then push
+   build/arm64-v8a/litert_check and ORT jni/arm64-v8a/libonnxruntime.so to /data/local/tmp/lrt/;
+   C:/Users/User/Android/litert/litert-1.4.0/x/jni/arm64-v8a/libtensorflowlite_jni.so and
+   litert-gpu-1.4.0/x/jni/arm64-v8a/libtensorflowlite_gpu_jni.so to lib/; the three .tflite of
+   app/src/main/litert/models/ and uvdoc.onnx, syntheticdoc_hr.onnx, shadenet.onnx of app/src/main/assets/models/
+   to models/. adb shell chmod 755 /data/local/tmp/lrt/litert_check
+3. adb shell ls /vendor/lib64/libOpenCL.so /system/vendor/lib64/libOpenCL.so   (OpenCL present? record it)
+4. For NET in uvdoc synthdoc_hr shadenet:
+     adb logcat -c
+     adb shell "cd /data/local/tmp/lrt && LD_LIBRARY_PATH=. ./litert_check lib models NET --runs 10 --cache cache; echo exit \$?"
+     adb logcat -d -s flatscan tflite
+   then the same command again (the second run loads the serialised kernels from cache/).
+5. Record per net: "gpu side ran on gpu" or the logcat reason; first and median ms (both runs); max / p99 |gpu - cpu|;
+   the logcat "Replacing N out of N node(s) ... 1 partitions" and "Initialized OpenCL-based API" / "OpenGL-based API".
+   Pass: ran on gpu for all three; the differences then go to the accuracy gate the integrator applies (the
+   accelerator gate of docs/accel: p99 0.25 px of the page grid), which this program does not judge.
+   A shell process differs from the app in its linker namespace (OpenCL lookup); the app run (app stream) is the
+   final check.

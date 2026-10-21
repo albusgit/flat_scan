@@ -10,11 +10,15 @@ import java.io.File
  * runs on the CPU for the rest of the app's life). CPU is the default: an accelerated path changes the
  * nets' outputs within the tolerances of jni_bridge.cpp (benchBackends) and is opt-in.
  *  * [AUTO]: on first use per (SoC, app version) the self-test photo's nets run on the CPU and on every
- *    accelerator in [candidates] (QNN only); per group the fastest backend whose outputs match the CPU's
- *    within the tolerances is kept ([Settings.autoChoice]), SyntheticDoc high-res judged on its own;
+ *    accelerator in [candidates] (QNN, the LiteRT GPU); per group the fastest backend whose outputs match the
+ *    CPU's within the tolerances is kept ([Settings.autoChoice]), SyntheticDoc high-res judged on its own;
  *  * [NPU]: Qualcomm QNN HTP (fp16) for UVDoc and the shadow net. SyntheticDoc high-res stays on the
  *    CPU: its fp16 grid missed the accelerator tolerance (Gate A's fp16 stand-in: p99 0.95 px against
  *    0.25 px; UVDoc 0.08 px). Auto still tries it on QNN and keeps it there only where it passes;
+ *  * [GPU]: the LiteRT (TensorFlow Lite) GPU delegate in full precision (fp32 compute, fp16-stored weights)
+ *    for UVDoc, SyntheticDoc high-res and the shadow net, on any phone's GPU (Mali, Adreno, Xclipse). Its
+ *    runtime and models are the on-demand pack litert_gpu ([LiteRtPacks]); without them, or for a net the
+ *    delegate cannot take, the CPU runs it;
  *  * [NNAPI]: Android NNAPI (fp16) for the same nets; not in the QNN build's ONNX Runtime (arm64-v8a
  *    built with -Port=qnn, the default), where it falls back to the CPU. Not offered in Settings
  *    ([CHOICES]): on the x86_64 emulator ORT 1.22.0's NNAPI and XNNPACK EPs aborted the process inside
@@ -27,12 +31,14 @@ object Accel {
     const val CPU = "cpu"
     const val NPU = "npu"
     const val NNAPI = "nnapi"
+    const val GPU = "gpu"
     /** NPU only in a build whose ONNX Runtime has QNN (-Port=qnn); the default build has no NPU for now. */
     val CHOICES: List<Pair<String, String>> by lazy {
         listOfNotNull(
             AUTO to "Auto: the fastest backend whose results match the CPU",
             CPU to "CPU (reference results)",
             (NPU to "NPU (Qualcomm QNN)").takeIf { NetEnv.has("QNNExecutionProvider") },
+            GPU to "GPU (LiteRT)",
         )
     }
 
@@ -55,21 +61,27 @@ object Accel {
         CPU -> Plan(CPU, "", "", "", "")
         NPU -> Plan(NPU, "", "qnn", "", "qnn")
         NNAPI -> Plan(NNAPI, "", "nnapi", "", "nnapi")
+        GPU -> Plan(GPU, "", "gpu", "gpu", "gpu")
         else -> null
     }
 
     /**
-     * Auto's candidates (backend names for benchBackends): QNN when this ONNX Runtime build has it. Not
+     * Auto's candidates (backend names for benchBackends): QNN when this ONNX Runtime build has it and its
+     * packs are loaded, the LiteRT GPU when its pack is loaded ([LiteRtPacks], fetched on any phone). Not
      * NNAPI or XNNPACK: on the x86_64 emulator both aborted the process inside ORT 1.22.0's Run
      * (std::terminate in libonnxruntime.so on uvdoc_static, nnapi-reference / XNNPACK), which no CPU
      * fallback can catch; NNAPI in Auto is PLAN Stream G (not started).
      */
     fun candidates(): String = listOfNotNull(
         "qnn".takeIf { NetEnv.has("QNNExecutionProvider") && QnnPacks.loaded },
+        "gpu".takeIf { LiteRtPacks.loaded },
     ).joinToString(",")
 
     /** Whether [plan] puts a net on QNN (its libraries then come from the asset packs first). */
     fun usesQnn(plan: Plan): Boolean = listOf(plan.finder, plan.flat, plan.hr, plan.shade).any { "qnn" in it }
+
+    /** Whether [plan] puts a net on the LiteRT GPU (its runtime then comes from the litert_gpu pack first). */
+    fun usesLiteRt(plan: Plan): Boolean = listOf(plan.finder, plan.flat, plan.hr, plan.shade).any { b -> b.split(',').any { it == "gpu" || it == "litert" } }
 
     /** The plan of a stored Auto benchmark ([Settings.autoChoice]) if it was made on this SoC and app version. */
     fun autoPlan(stored: String?): Plan? {
@@ -109,6 +121,7 @@ object NetEnv {
     /** The processing details' / self-test's device facts; backend: the groups' backends. */
     fun toJson(plan: Accel.Plan): JSONObject = JSONObject().put("soc", soc).put("backend", plan.summary()).put("acceleration", plan.toJson())
         .put("ort", ortVersion).put("ort_providers", providers.joinToString(", ")).put("qnn_packs", QnnPacks.status)
+        .put("litert_pack", LiteRtPacks.status)
         .put("cores", Runtime.getRuntime().availableProcessors())
         .put("device", "${Build.MANUFACTURER} ${Build.MODEL}").put("api", Build.VERSION.SDK_INT)
 }

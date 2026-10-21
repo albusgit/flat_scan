@@ -8,6 +8,9 @@ target_compile_features(flatscan_core PUBLIC cxx_std_17)
 # No FMA contraction: the ports reproduce numpy/OpenCV float arithmetic step by step,
 # and x86 and ARM must round identically.
 target_compile_options(flatscan_core PRIVATE -ffp-contract=off -Wall -Wno-sign-compare)
+# LiteRT's TFLite C API and GPU delegate headers (1.4.0, Apache-2.0) for infer.cpp's LiteRtGpu backend,
+# whose libraries are loaded at run time (InferConfig::litert_dir); infer.cpp compiles it on Android / Linux
+target_include_directories(flatscan_core PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party/litert/include)
 
 # ONNX Runtime for the nets (infer.cpp). FS_ORT_ROOT: an unpacked release (include/, lib/) or the
 # headers/ and jni/<ABI>/ of an onnxruntime-android(-qnn) AAR. Unset: infer.cpp is a stub whose runs
