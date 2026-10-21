@@ -177,7 +177,7 @@ cv::Vec3f bgr_of(const cv::Vec3f& lab) {
     for (int c = 0; c < 3; ++c) v[c] = std::min(255.f, std::max(0.f, v[c] * 255.f));
     return v;
 }
-inline float chroma(const cv::Vec3f& lab) { return std::hypot(lab[1], lab[2]); }
+inline float chroma(const cv::Vec3f& lab) { return hypot_xy(lab[1], lab[2]); }
 inline float lum8(const uint8_t* p) { return 0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]; }
 
 struct Region {
@@ -404,7 +404,7 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
                 cv::Vec3f c = ql.at<cv::Vec3f>(y, x);
                 // a colour (a, b off the paper's), or clearly darker than the paper; a slightly
                 // darker paper (a shadow left at strength < 100%) is neither
-                double dab = std::hypot(c[1] - paper[1], c[2] - paper[2]);
+                double dab = hypot_xy(c[1] - paper[1], c[2] - paper[2]);
                 bool coloured = c[0] > 35.f && (dab >= 6.0 || (cv::norm(cv::Vec3d(c) - paper) >= 8.0 && c[0] < paper[0] - 10.0));
                 col.at<uint8_t>(y, x) = coloured && takenq.at<uint8_t>(y, x) < 64 ? 255 : 0;
             }
@@ -465,7 +465,7 @@ cv::Mat solid_colors(const cv::Mat& img, const std::vector<Rect01>& protect, Sol
     for (size_t c = 0; c < cl.size(); ++c) {
         // a cluster is filled only if it clearly differs from paper (dE >= 5); else pure white
         bool coloured = cv::norm(cl[c].lab - paper) >= 5.0 &&
-                        !(cl[c].lab[0] >= paper[0] - 1.0 && std::hypot(cl[c].lab[1], cl[c].lab[2]) < 5.0);   // whiter than paper
+                        !(cl[c].lab[0] >= paper[0] - 1.0 && hypot_xy(cl[c].lab[1], cl[c].lab[2]) < 5.0);   // whiter than paper
         ncl += coloured;
         for (int k : cl[c].mem) {
             regs[k].cluster = (int)c;

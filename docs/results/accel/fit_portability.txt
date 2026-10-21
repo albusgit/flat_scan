@@ -1,0 +1,71 @@
+Surface-fit residual (fit_median_px) desktop vs Android: cause and measurements, 2026-10-21 (accel/fit)
+=====================================================================================================
+Question: the crop-screen surface fit residual differed between the desktop MSVC build and the Android
+x86_64 emulator build (DocUNet 17_2 11.96 vs 12.78 px, 1_1 1.72895 vs 1.72896) while nets and pages were
+identical. It feeds quality_gate (> 15 px: "surface fit residual" reason -> crop screen warning and
+force_homography) and the stage-1 choice (analysis-px median <= surface_fallback_px 3.0 -> surface model,
+else homography; a flattening-net grid replaces stage 1 whenever it is accepted).
+
+Tool: tools/fit_probe (fit_probe.cpp traces the page finder stages, the detection, solvePnP and the
+10 coarse fits as hex floats; --list runs assess_pages over a photo list). Built with MSVC (desktop), NDK
+clang x86_64 (run on the fs35 emulator) and NDK clang arm64 (run on the same emulator through its
+ndk_translation; not a real phone). libm_probe / hyp_test / exp_test / gb_test: one function each.
+Inputs for every build: the same photos and the same page-finder logits (Gate B's Python ORT 1.22.0
+reference), so only the core and OpenCV differ.
+
+1. Where the builds part (17_2, first diverging value)
+   - std::hypot: MSVC's equals sqrt(x*x + y*y) (0 of 2M inputs differ; float: (float)sqrt in double);
+     bionic's rounds differently on 12 % (x86_64) / 6 % (arm64) of inputs. Used in resample_closed
+     (page outline arc length) and 15 more places.
+   - std::exp(float) (page finder sigmoid): MSVC 527, bionic 4078 of 58M floats differ from
+     (float)exp((double)x), which is identical on all three builds.
+   - cv::GaussianBlur of the float64 outline coordinates (refine_contour, Size(1, 0), sigma 4): desktop
+     OpenCV = k0 x0 + sum kj (x-j + xj) without FMA; OpenCV's Android x86_64 and arm64 builds fuse it into
+     FMAs (93 of 300 values differ). This was the first divergence of the refined outline -> corners.
+   - After those three: x86_64 corners and side points are bit-identical to the desktop (166/166 pages).
+     The next divergence is cv::solvePnP(SOLVEPNP_IPPE) inside OpenCV (rvec0 differs in the last bits),
+     then libm in the fit itself (std::cos / sin / pow in the bend profile: MSVC pow(0.3, 3) =
+     0.026999999999999996, bionic 0.027; cv::Rodrigues; std::log1p in lsq.cpp).
+   - arm64 also differs upstream in OpenCV's NEON code: cv::resize INTER_AREA (8U photo), GaussianBlur
+     (8U), resize INTER_CUBIC (float logits) all differ from the desktop's (the x86_64 build matches the
+     desktop there). arm64 libm differs from x86_64 bionic too (pow, exp, log).
+   - The fit is chaotic on many photos: with bit-identical corners (x86_64) a 1e-15 relative difference
+     in the initial pose sends the coarse multi-start to other local minima (17_2: start 2 cost 1833.8 vs
+     1934.1; final 11.96 vs 17.04 px; bend coefficients 5..25 rad, p90 residual 160 px).
+
+2. Change (accel/fit, desktop-neutral by construction and measured)
+   - nputil.h hypot_xy (double: sqrt(x*x + y*y); float: in double) replaces std::hypot in cleanup.cpp,
+     corners.cpp, overlay.cpp, pagefind.cpp, pipeline.cpp, solid.cpp.
+   - pagefind.cpp: the sigmoid as (float)std::exp(-(double)q); gauss_col64 (the desktop arithmetic
+     written out, OpenCV's bit-exact kernel, BORDER_REFLECT_101) replaces GaussianBlur of the column.
+   Desktop before (accel/main 7174198, exported) vs after, gate_b.py new + cmp, nets in-process:
+     35 photos (ShadeNet on): photos with any difference 0 of 35 (logits, p1, rc0, rc2, page, JSON)
+     DocUNet 130: photos with any difference 0 of 130
+     fit_probe --list (165 photos, 166 pages): fit residual, corners, reasons identical 166/166
+   So DocUNet metrics are unchanged (no re-score needed).
+
+3. Desktop vs Android after the change (fit_probe --list, 165 photos = 35 + 130 DocUNet, 166 pages)
+                                 corners identical   residual identical   |diff| median  >0.1 px  >1 px
+   x86_64 emulator  before              8                  0                   -            -        -
+   x86_64 emulator  after             166                  0               8.3e-6 px       28       13
+   arm64 (translated) before            3                  0                   -            -        -
+   arm64 (translated) after            20                  0               6.6e-6 px       25        8
+   Quality-gate reason changes vs the desktop (15 px rule):
+     x86_64 before: 62_2 (20 -> 19 px, reason kept); after: 17_2 gains "surface fit residual 17 px"
+       (it already had "corner outside the photo"), 43_1 loses its "15 px" reason (desktop 15.02,
+       Android 14.07), 62_2 20 -> 18 px (kept)
+     arm64 before: 43_1 loses it, 62_2 20 -> 21 px; after: 62_2 20 -> 19 px (kept)
+   3 px stage-1 rule (DocUNet, analysis px = full px there), photos on the other side than the desktop:
+     x86_64 before 3, after 6; arm64 before 5, after 2 (of 130)
+   In every desktop run above all 165 photos end in mode "uvdoc" (the net grid replaces stage 1), so
+   these flips changed no page here; they change the crop-screen reason list and the geometry used when
+   no grid is accepted (nets off, or every grid rejected).
+
+4. Not done, and why
+   - Bit-identical fits across builds would need a portable initial pose (own IPPE or a quantised one),
+     own Rodrigues, portable cos / sin / pow / log1p in surface.cpp / lsq.cpp (all of which change the
+     desktop outputs: MSVC's libm cannot be reproduced portably), AND on arm64 replacing OpenCV's NEON
+     resize / blur in the detection path. Even then the residual of a fit like 17_2 stays a coin toss
+     under any 1-ulp change of its input, on one build too.
+   - Not measured: a real arm64 phone (only ndk_translation), the nets' own arm64 differences (the
+     same logits were fed to every build), photos where no grid is accepted.
