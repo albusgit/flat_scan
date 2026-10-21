@@ -1,0 +1,59 @@
+Stream C (Android integration), steps 2-5: measured facts and how to run what needs a phone
+==========================================================================================
+2026-10-21, accel/c2 on accel/main 7dc7ce0. Speed mode: builds plus one emulator smoke; no phone.
+
+What changed (app/** only)
+- app/build.gradle.kts: unpackOrt extracts the AARs (they ship no prefab) into app/build/ort/<flavour>
+  (headers/, jni/<ABI>/, the FS_ORT_ROOT layout of core/CMakeLists.txt); CMake gets
+  -DFS_ORT_ROOT=... -DFS_ORT_QNN=ON -DFS_ORT_NNAPI=ON -DFS_ORT_XNNPACK=ON, so libflatscan links
+  libonnxruntime.so and core/src/infer.cpp + nets.cpp run the nets. The Java ORT dependency is gone.
+    arm64-v8a: com.microsoft.onnxruntime:onnxruntime-android-qnn:1.22.0 (QNN EP; no NNAPI EP) plus
+               com.qualcomm.qti:qnn-runtime:2.33.0 libQnnHtp, libQnnHtpPrepare, libQnnSystem and the
+               HTP V68/V69/V73/V75/V79 skel + stub libraries (DSP and GPU backends left out)
+    other ABIs (x86_64 emulator): com.microsoft.onnxruntime:onnxruntime-android:1.22.0 (NNAPI, XNNPACK)
+  -Port=plain: onnxruntime-android on arm64 too (no Qualcomm libraries). -PqnnHtp=V73,V75: fewer HTP generations.
+- jni_bridge.cpp: configureNets (one Inference per group: page finder / flattening nets / shadow net),
+  ortInfo, pageFinder, process (runs run_flat_nets + ShadeNet itself), benchBackends (Auto), batchPhoto
+  (debug batch mode, pipeline_cli's JSON). Assets via AAssetManager; QNN cache noBackupFilesDir/qnn_cache.
+- Kotlin: FlatNet.kt, PageFinder.kt, ShadeNet.kt, ShadeNetRunner and NetTiming.kt deleted; Acceleration.kt
+  (Accel plans, NetEnv), Settings > Acceleration (Auto / CPU / NPU (QNN) / NNAPI (experimental); default CPU),
+  Auto benchmark per (SoC, app version), batch mode (debug builds, adb intent).
+
+APK size (debug, measured from the APK entries; baseline = accel/main 7dc7ce0 built with the same flags)
+                         compressed in APK      installed (uncompressed native libs)
+  arm64-v8a libs         +41,146,099 B          +110,139,792 B
+  x86_64 libs            +42,029 B              +64,064 B
+  other entries          +108,421 B (QNN LICENSE.pdf + NOTICE.txt in assets/licenses, dex)
+  arm64-only APK file    162,426,884 B (accel/main: 121,170,280 B), i.e. +41.26 MB
+  Of the arm64 growth: libQnnHtpPrepare.so 22,954,780 B compressed (51,782,664 installed); HTP V68+V69 skel/stub
+  6,118,744 B (17,334,952 installed; -PqnnHtp=V73,V75,V79 drops them); libonnxruntime4j_jni.so (26 KB) gone.
+  Native libs are compressed and extracted at install (useLegacyPackaging), which the DSP needs: it loads the
+  HTP skel library from the app's native library directory (ADSP_LIBRARY_PATH is set to it at start).
+
+QNN licence (qnn-runtime-2.33.0.aar LICENSE.pdf, "AI Stack License", Qualcomm Technologies, Inc.)
+- Grant 1(iv): "distribute and sublicense the Software solely in object code format and as incorporated in
+  Your software application"; not on a standalone basis. So shipping the libraries inside the APK is allowed.
+- Conditions: no reverse engineering; keep copyright / proprietary notices; do not remove or alter the Notice
+  File (NOTICE.txt: shipped as assets/licenses/qnn-runtime-2.33.0-NOTICE.txt with the LICENSE.pdf); export
+  control; indemnification of QTI for distributed apps; the licence is revocable; prohibited / high-risk use
+  cases (a document scanner is neither). Accepting it is the owner's decision (HUMAN GATE: licence).
+- ONNX Runtime itself: MIT.
+
+Emulator smoke (x86_64 AVD fs35, Android 35, -read-only; heavy lock held; Acceleration=CPU)
+- APK with -Pabis=arm64-v8a,x86_64 installs, the app starts (no crash), the batch mode runs.
+- Batch mode, DocUNet 1_1 and 17_2: 2 ok in 33 s on the emulator (17_2 23.8 s incl. session creation, 1_1 9.3 s).
+- gate_b.py cmp docunet <Gate B reference du_ref, Python ORT 1.22.0> <emulator output> --only 1_1,17_2
+  --images docunet_bench/work/new_fold2:
+    logits, p1, rc0, rc2: same (bit for bit) on both; page: same; vs new_fold2: same.
+    json: differs only in assess[].fit_median_px / fit_median_full_px: 1_1 1.72895 vs 1.72896,
+    17_2 11.9626 vs 12.7768 (desktop MSVC vs Android x86_64 clang). The nets and the pages are identical.
+
+Commands (Git Bash; export MSYS_NO_PATHCONV=1 for adb device paths)
+- Build: JAVA_HOME=/c/Users/User/Android/jdk17 ./gradlew assembleDebug [-Pabis=arm64-v8a,x86_64] [-Port=plain]
+- Inputs for the batch mode go into the app's internal storage (files adb pushes into Android/data are not
+  readable by the app):  adb exec-in run-as com.albus.flatscan sh -c "mkdir -p files/batch/SET && cat > files/batch/SET/NAME.png" < LOCAL.png
+- Start (debug builds; -S: fresh start, an intent to a running app only brings it to the front):
+  adb shell am start -S -n com.albus.flatscan/.MainActivity --es batch SET --es accel cpu|npu|nnapi|auto
+      [--es out NAME] [--ez shade true|false] [--es ext .jpg|.png] [--ez static_models true] [--es only a,b]
+  Finished when /sdcard/Android/data/com.albus.flatscan/files/batch_out/OUT/done.txt exists (OUT default SET_ACCEL);
+  a second start with the same OUT resumes (photos with a JSON are skipped). Pull: adb pull .../batch_out/OUT DIR.
