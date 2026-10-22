@@ -20,7 +20,8 @@
 //   XNNPACK  FS_ORT_XNNPACK fp32
 //   CUDA, TensorRT, DirectML, OpenVINO, CoreML: FS_ORT_CUDA, FS_ORT_TENSORRT, FS_ORT_DML,
 //                           FS_ORT_OPENVINO, FS_ORT_COREML (desktop / Apple builds with a matching ORT package)
-// The page finder never runs on QNN or NNAPI (PLAN: 34 NNAPI partitions; kept on the CPU).
+// The page finder never runs on QNN or NNAPI (PLAN: 34 NNAPI partitions; kept on the CPU). The rule net
+// (rulenet.onnx, any page size) has no fixed-shape model: never on QNN / NNAPI either.
 #include "infer.h"
 
 #include <algorithm>
@@ -96,11 +97,12 @@ const char* net_str(NetId n) {
         case NetId::UVDoc: return "uvdoc";
         case NetId::SynthDocHR: return "syntheticdoc_hr";
         case NetId::ShadeNet: return "shadenet";
+        case NetId::RuleNet: return "rulenet";
     }
     return "?";
 }
 
-constexpr int N_NETS = 4;
+constexpr int N_NETS = 5;
 
 }  // namespace
 
@@ -247,8 +249,8 @@ struct Inference::Impl {
                 try { bytes = cfg.load(file); } catch (...) { bytes.clear(); }
                 if (!bytes.empty()) return bytes;
             }
-            // QNN / NNAPI cannot run the dynamic-shape ShadeNet as one graph: no static model, no accelerator
-            if (net == NetId::ShadeNet && (b == Backend::QNN_HTP || b == Backend::NNAPI)) return {};
+            // QNN / NNAPI cannot run the dynamic-shape ShadeNet or rule net as one graph: no static model, no accelerator
+            if ((net == NetId::ShadeNet || net == NetId::RuleNet) && (b == Backend::QNN_HTP || b == Backend::NNAPI)) return {};
         }
         file = std::string(net_str(net)) + ".onnx";
         try { bytes = cfg.load(file); } catch (...) { bytes.clear(); }

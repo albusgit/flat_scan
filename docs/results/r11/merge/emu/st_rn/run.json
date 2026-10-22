@@ -1,0 +1,26 @@
+{
+ "soc": "AOSP ranchu",
+ "backend": "page finder cpu, UVDoc cpu, SyntheticDoc high-res cpu, shadow net cpu",
+ "acceleration": {
+  "setting": "cpu",
+  "finder": "cpu",
+  "flat": "cpu",
+  "hr": "cpu",
+  "shade": "cpu",
+  "note": ""
+ },
+ "ort": "1.22.0",
+ "ort_providers": "NnapiExecutionProvider, XnnpackExecutionProvider, CPUExecutionProvider",
+ "qnn_packs": "not needed yet",
+ "cores": 4,
+ "device": "Google sdk_gphone64_x86_64",
+ "api": 35,
+ "set": "selftest",
+ "photos": 1,
+ "shade": false,
+ "rule_net": true,
+ "ext": ".png",
+ "static_models": false,
+ "app": "0.1.0",
+ "started": "2026-10-21 21:41:54"
+}

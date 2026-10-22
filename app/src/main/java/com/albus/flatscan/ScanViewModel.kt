@@ -444,7 +444,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val detectMs = msSince(td)
             val c = FloatArray(8) { i -> if (i % 2 == 0) pg.corners[i / 2].x else pg.corners[i / 2].y }
             val h = NativeLib.process(
-                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, null,
+                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, null,
             )
             val pageMs = msSince(t0)
             val info = if (h != 0L) JSONObject(NativeLib.info(h)).also { NativeLib.release(h) } else null
@@ -497,16 +497,16 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * (device, backends, options), times_phone.txt (wall ms per photo) and, when finished, done.txt.
      * Photos whose JSON exists are skipped, so a stopped run resumes. [accel]: an [Accel] setting for this
      * run (default: the current one); [shade]: the shadow net (default on, off for SET "docunet", as
-     * gate_b.py); [ext]: ".jpg" or ".png" (default ".png" for "docunet", else ".jpg"); [staticModels]: the
+     * gate_b.py); [rules]: the rule net (default: Settings > Table rules); [ext]: ".jpg" or ".png" (default ".png" for "docunet", else ".jpg"); [staticModels]: the
      * CPU runs the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1); [only]: comma-separated names.
      */
-    fun runBatch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?) {
+    fun runBatch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?, rules: Boolean? = null) {
         if (batchRunning) return
         batchRunning = true
         batchStatus = "Batch $set: starting"
         viewModelScope.launch {
             val msg = withContext(Dispatchers.Default) {
-                runCatching { batch(set, out, accel, shade, ext, staticModels, only) }
+                runCatching { batch(set, out, accel, shade, ext, staticModels, only, rules) }
                     .getOrElse { Log.e(TAG, "batch failed", it); "Batch $set FAILED: ${it.message ?: it}" }
             }
             Log.i(TAG, msg)
@@ -515,7 +515,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun batch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?): String {
+    private fun batch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?, rules: Boolean?): String {
         fun status(t: String) { viewModelScope.launch(Dispatchers.Main) { batchStatus = t } }
         val root = getApplication<Application>().getExternalFilesDir(null) ?: error("no external files directory")
         val inDir = File(getApplication<Application>().filesDir, "batch/$set").takeIf { it.isDirectory } ?: File(root, "batch/$set")
@@ -525,6 +525,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (photos.isEmpty()) error("no images in ${inDir.absolutePath}")
         val setting = accel?.lowercase() ?: settings.acceleration
         val doShade = shade ?: (set != "docunet")
+        val doRules = rules ?: settings.ruleNet
         val pageExt = ext ?: if (set == "docunet") ".png" else ".jpg"
         if (pageExt != ".jpg" && pageExt != ".png") error("ext must be .jpg or .png")
         val plan = synchronized(netsLock) {
@@ -536,7 +537,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         val outDir = File(root, "batch_out/" + (out ?: "${set}_$setting")).apply { mkdirs() }
         File(outDir, "done.txt").delete()
-        File(outDir, "run.json").writeText(NetEnv.toJson(plan).put("set", set).put("photos", photos.size).put("shade", doShade)
+        File(outDir, "run.json").writeText(NetEnv.toJson(plan).put("set", set).put("photos", photos.size).put("shade", doShade).put("rule_net", doRules)
             .put("ext", pageExt).put("static_models", staticModels).put("app", BuildConfigInfo.VERSION)
             .put("started", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())).toString(1))
         val timesFile = File(outDir, "times_phone.txt")
@@ -550,7 +551,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 if (File(outDir, "$name.json").exists()) continue
                 status("Batch $set (${plan.summary()}): ${i + 1} of ${photos.size}, $name")
                 val t = System.nanoTime()
-                val line = NativeLib.batchPhoto(f.absolutePath, File(outDir, name).absolutePath, pageExt, doShade)
+                val line = NativeLib.batchPhoto(f.absolutePath, File(outDir, name).absolutePath, pageExt, doShade, doRules)
                 val ms = msSince(t)
                 val good = runCatching { JSONObject(line).optBoolean("ok") }.getOrDefault(false)
                 done++
@@ -618,7 +619,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         val w = n.optJSONObject("wall_ms")
         for ((key, label) in listOf("detect" to "Detection (core)", "flattening_nets" to "Flattening nets (wall)",
-            "process" to "Processing incl. shadow net", "page" to "Page total")) {
+            "process" to "Processing incl. shadow, rule nets", "page" to "Page total")) {
             val o = w?.optJSONObject(key) ?: continue
             sb.append("%-28s %6d / %6d\n".format(label, o.optInt("median"), o.optInt("p95")))
         }
@@ -1041,7 +1042,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------ pages
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
-            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=7|pass1=1|hrfirst=2|fold=1" +
+            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=9|rulenet=" + settings.ruleNet + "|pass1=1|hrfirst=2|fold=1" +
             currentPlan().let { if (it.cpuOnly) "" else "|accel=${it.key()}" }
 
     /**
@@ -1225,6 +1226,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val useUv = settings.uvDoc
         val nets = settings.flatNets
         val shadows = settings.neuralShadows
+        val rules = settings.ruleNet
         val focal = focalPx
         recropBackup = null
         screen = Screen.Processing
@@ -1248,7 +1250,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     val finder = if (logits != null) finderTiming(p) else null
                     accel = { j -> j.put("accel", accelJson(j.optJSONObject("accel"), finder, reused, plan)) }
                     NativeLib.process(
-                        p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows,
+                        p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules,
                     ) { pct, s ->
                         viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                     }
@@ -1465,7 +1467,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                             "\nNets compared: text-row spread %.2f / %.2f deg".format(a.optDouble(0), a.optDouble(1)) else ""
                     } ?: "") +
                     if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
-                    else "\nLine refinement: applied"
+                    else "\nLine refinement: applied" + (if (info.optBoolean("spots_dropped")) " (lines left out where they overstretched the page)" else "") +
+                        (info.optJSONArray("net")?.takeIf { info.optBoolean("rule_net") }?.let { a ->
+                            "\n  rule net: %d lines dropped, %d added, %d pieces joined, %d bent rules kept".format(a.optInt(0), a.optInt(1), a.optInt(2), a.optInt(3))
+                        } ?: "")
                 edited -> "Geometry: homography (corners adjusted by hand)"
                 reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"
                 info.optBoolean("uv_rejected") && mode == "surface" ->
@@ -1841,7 +1846,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         /** The nets in pipeline order: key in the "accel" JSON (processing details, self-test) -> label. */
         val NET_LABELS = listOf(
             "page_finder" to "Page finder", "uvdoc_pass1" to "UVDoc pass 1 (whole photo)", "uvdoc" to "UVDoc",
-            "synthdoc_hr" to "SyntheticDoc high-res", "shadenet" to "Shadow net",
+            "synthdoc_hr" to "SyntheticDoc high-res", "shadenet" to "Shadow net", "rulenet" to "Rule net",
         )
     }
 }

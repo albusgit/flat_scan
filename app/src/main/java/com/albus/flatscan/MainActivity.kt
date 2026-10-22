@@ -52,7 +52,7 @@ class MainActivity : ComponentActivity() {
      * `adb shell am start -S -n com.albus.flatscan/.MainActivity --es batch s35 --es accel cpu` (-S: a fresh
      * start; to a running app the intent only brings it to the front); extras: batch
      * (the folder under files/batch), out, accel (auto, cpu, npu, nnapi), shade (--ez), ext (.jpg / .png),
-     * static_models (--ez), only (comma-separated names), qnn_packs (--ez: fetch the NPU packs on any phone,
+     * static_models (--ez), rules (--ez: the rule net; default Settings > Table rules), only (comma-separated names), qnn_packs (--ez: fetch the NPU packs on any phone,
      * to check their delivery on an emulator).
      */
     private fun startBatch(i: Intent?) {
@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
         vm.runBatch(
             set, i.getStringExtra("out"), i.getStringExtra("accel"), if (i.hasExtra("shade")) i.getBooleanExtra("shade", true) else null,
             i.getStringExtra("ext"), i.getBooleanExtra("static_models", false), i.getStringExtra("only"),
+            if (i.hasExtra("rules")) i.getBooleanExtra("rules", true) else null,
         )
         vm.open(Screen.Settings)
     }

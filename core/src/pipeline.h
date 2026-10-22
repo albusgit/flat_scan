@@ -109,6 +109,7 @@ struct PipelineOptions {
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
     bool colour_edges = true;         // neural pages: long straight boundaries between colour areas are lines too (warpmap colour_edges)
+    bool second_line_pass = true;     // neural pages: the line stage again on its own output, kept if the rules come out straighter
     bool faint_lines = true;          // also find and trace printed rules too pale for the darkness-45 threshold (warpmap faint_rules)
     bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
     double max_local_rescale = 0.35;  // neural pages: line corrections that rescale a spot by more than this are faded out there (0: off;
@@ -142,6 +143,11 @@ struct PipelineOptions {
     // (brighten only). Empty / false: not run. Runs after SyntheticDoc's map when both are given
     // and shade_after_uv; otherwise it replaces it.
     std::function<bool(std::vector<float>& io, int w, int h)> shade_net;
+    // The rule net (RuleNet, tools/rule_net): called in the line stage with the stage-1 page at half
+    // size (planar BGR in [0, 1], 3 x h x w, sides multiples of 32), it replaces the buffer with
+    // 2 x h x w rule probabilities [horizontal, vertical] (RuleNetFn). Empty / false: the line stage
+    // finds rules from the darkness map alone.
+    RuleNetFn rule_net;
     // The flattening nets for the zoomed second pass (uv_zoom): net(model, io) replaces the net's
     // input with its grid. Empty: no zoomed pass.
     UvNetFn uv_net;
@@ -179,10 +185,16 @@ struct PipelineResult {
     double nets_join_ms = -1;         // ... run_photo's start to the grids in hand
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
+    bool lines_spots_dropped = false; // ... too large at first: kept without the lines through the overstretched spots
+    double second_pass[3] = {-1, -1, -1};   // ... the second pass: its distortion, its rules' deviation before / after (px)
+    bool second_pass_kept = false;
+    double line_straightness[2] = {-1, -1};    // ... the traced rules' mean p95 deviation (px): on the page as it is / through the kept map
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it
     bool shadows_removed = false;     // the shading map was applied to the page
     bool shade_net = false;           // ... the shadow net's map (ShadeNet)
+    bool rule_net = false;            // the rule net ran in the line stage (RuleNet)
+    int net_dropped = 0, net_added = 0, net_joined = 0, net_kept = 0;   // ... its effect (NetLineStats, Samples::n_net_kept)
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;
