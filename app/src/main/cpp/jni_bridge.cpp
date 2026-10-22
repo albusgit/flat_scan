@@ -85,7 +85,6 @@ struct Session {
         if (scr_built) return;
         scr_page = descreen(result.page);
         scr_pp = page_params(scr_page, use_gpu);
-        scr_pp.screen = true;
         scr_built = true;
     }
     // the page (and its params) a render with `scr` uses

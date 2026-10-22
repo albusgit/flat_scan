@@ -691,7 +691,7 @@ bool Gpu::background_quarter(const cv::Mat& img, cv::Mat& bg4) {
 
 bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float strength, const Adjust& adj, cv::Mat& out) {
     if (!available()) return false;
-    Curve c = filter_curve(f, p.sigma, p.ink, p.screen);
+    Curve c = filter_curve(f, p.sigma, p.ink);
     if (c.kind == 0 && adj.identity()) return false;
     if (p.paper.type() != CV_32FC4 || p.tint.type() != CV_32F || p.paper.size() != p.tint.size()) return false;
     AdjustK ak = adjust_constants(adj, c.specks);

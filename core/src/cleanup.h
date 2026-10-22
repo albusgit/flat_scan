@@ -77,7 +77,6 @@ struct PageParams {
     float wb[3] = {1, 1, 1};  // per-channel paper colour / paper luminance
     float sigma = 0.02f;      // paper noise of luma(v)
     float ink = 0.3f;         // median luma(v) of ink on paper (Scan's black point)
-    bool screen = false;      // the page was descreened (screen mode): Scan's black point is deeper (glowing screen black)
     int page_w = 0, page_h = 0;
     bool gpu_background = false;
     double ms = 0;
@@ -94,17 +93,17 @@ struct Curve {
     float speck_bg = 1;       // speck removal only where the local background bgv >= speck_bg
     bool gray = false, specks = false;
 };
-Curve filter_curve(Filter f, float sigma, float ink = 0.3f, bool screen = false);
+Curve filter_curve(Filter f, float sigma, float ink = 0.3f);
 
 // Scan constants (defaults are the shipped values; the desktop tools override them for tuning)
 struct ScanTune {
-    float wp_k = 2.5f;        // white point 1 - wp_k sigma (as Auto color)
+    float wp_k = 2.5f;        // white point 1 - min(wp_k sigma, wp_cap) (as Auto color, capped)
+    float wp_cap = 1.f;       // largest white-point drop (noisy pages: faint print near the paper level)
     float gamma = 1.0f;       // luminance curve exponent
     float black_k = 0.5f;     // black point = black_k x the page's ink level ...
     float black_max = 0.2f;   // ... at most this
     float sharpen = 1.2f;     // unsharp amount at strength 1
     float sharpen_sigma = 1.0f;   // px at page size
-    float black_k_screen = 0.8f, black_max_screen = 0.35f;   // screen mode: a screen's black glows
 };
 ScanTune& scan_tune();
 
