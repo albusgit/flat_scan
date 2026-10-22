@@ -47,7 +47,8 @@
 //                           are serialised into cache_dir (OpenCL backend), keyed by the model's SHA-256,
 //                           the SoC, the build and the LiteRT version; no OpenCL library on the device:
 //                           no delegate (opencl_found)
-// The page finder never runs on QNN, NNAPI or the LiteRT GPU (PLAN: 34 NNAPI partitions; kept on the CPU).
+// The page finder never runs on QNN, NNAPI or the LiteRT GPU (PLAN: 34 NNAPI partitions; kept on the CPU). The rule
+// net (rulenet.onnx / rulenet.tflite, any page size) has no fixed-shape model: never on QNN / NNAPI / the GPU either.
 #include "infer.h"
 
 #include <algorithm>
@@ -153,11 +154,12 @@ const char* net_str(NetId n) {
         case NetId::UVDoc: return "uvdoc";
         case NetId::SynthDocHR: return "syntheticdoc_hr";
         case NetId::ShadeNet: return "shadenet";
+        case NetId::RuleNet: return "rulenet";
     }
     return "?";
 }
 
-constexpr int N_NETS = 4;
+constexpr int N_NETS = 5;
 
 }  // namespace
 
@@ -928,7 +930,7 @@ struct Inference::Impl {
     std::array<Slot, N_NETS> slots;
 
     static bool accelerator_allowed(NetId net, Backend b) {
-        return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
+        return !((net == NetId::PageFinder || net == NetId::RuleNet) && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
     }
 
     // LiteRT CPU threads: InferConfig::threads, else min(cores, 4)
@@ -967,6 +969,7 @@ struct Inference::Impl {
             else if (net == NetId::UVDoc) load("uvdoc_static.tflite");
             else if (net == NetId::SynthDocHR) load("syntheticdoc_hr_static.tflite");
             else if (net == NetId::ShadeNet && !load("shadenet.tflite") && !shade_static.empty()) load(shade_static + ".tflite");
+            else if (net == NetId::RuleNet) load("rulenet.tflite");
             return bytes;
         }
         if (b != Backend::CPU) {
@@ -978,9 +981,9 @@ struct Inference::Impl {
                 try { bytes = cfg.load(file); } catch (...) { bytes.clear(); }
                 if (!bytes.empty()) return bytes;
             }
-            // QNN / NNAPI cannot run the dynamic-shape ShadeNet as one graph: no static model, no accelerator
-            if (net == NetId::ShadeNet && (b == Backend::QNN_HTP || b == Backend::NNAPI)) {
-                if (per_shape) *per_shape = true;
+            // QNN / NNAPI cannot run the dynamic-shape ShadeNet or rule net as one graph: no static model, no accelerator
+            if ((net == NetId::ShadeNet || net == NetId::RuleNet) && (b == Backend::QNN_HTP || b == Backend::NNAPI)) {
+                if (per_shape) *per_shape = net == NetId::ShadeNet;
                 return {};
             }
         }

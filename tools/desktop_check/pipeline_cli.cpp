@@ -16,6 +16,8 @@
 // FS_IGNORE="x0,y0,x1,y1;..." (output-page fractions): areas whose lines the warp map ignores;
 // FS_GPU=1 (a build with FS_DESKTOP_GPU): the GPU image stages on (PipelineOptions::use_gpu; the
 // GPU stage policy's defaults, FS_GPU_DENSE=1 adds the dense stage); the JSON then has "gpu".
+// FS_RULE_NET=1 | MODEL.onnx: the rule net in the line stage, in-process as the other nets (JSON "nets" has "rulenet");
+// FS_RULE_NET_PY=1 with it: through tools/shadow_net/run_onnx.py and FS_PYTHON instead (Round 10's way).
 // FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
 // Prints one JSON line: the crop-screen assessment of every page (assess_pages) and the
 // processing result of page 0 (run_photo) without user edits; OUT.jpg = the page (or "-").
@@ -32,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "npz.h"
 #include "cleanup.h"
@@ -66,6 +69,17 @@ static std::vector<uint8_t> read_file(const std::string& path) {
 using Clock = std::chrono::steady_clock;
 static double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// a command line for std::system: cmd /c on Windows needs the whole line quoted once more
+static std::string shell_line(const std::string& py, const std::string& script, const std::vector<std::string>& args) {
+    std::string c = "\"" + py + "\" -I \"" + script + "\"";
+    for (const auto& a : args) c += " \"" + a + "\"";
+#ifdef _WIN32
+    return "\"" + c + "\"";
+#else
+    return c;
+#endif
+}
+
 int main(int argc, char** argv) {
     // --backend B (anywhere): the inference backends, as FS_BACKEND
     std::string backend_arg = std::getenv("FS_BACKEND") ? std::getenv("FS_BACKEND") : "cpu";
@@ -82,13 +96,17 @@ int main(int argc, char** argv) {
     std::unique_ptr<Inference> inf_store;
     const std::string models = std::getenv("FS_MODELS") ? std::getenv("FS_MODELS") : std::string(FS_REPO_DIR) + "/app/src/main/assets/models";
     const char* shade_model = std::getenv("FS_SHADE_NET");
+    // FS_RULE_NET: "1" the repo's rulenet.onnx, else a model file
+    const char* rule_model = std::getenv("FS_RULE_NET");
+    const std::string rule_file = rule_model && std::string(rule_model) != "1" ? rule_model : "";
     auto inference = [&]() -> Inference& {
         if (!inf_store) {
             InferConfig cfg;
             if (!parse_backends(backend_arg, cfg.preference)) std::fprintf(stderr, "unknown backend in \"%s\"; using cpu\n", backend_arg.c_str());
             // FS_SHADE_NET=MODEL.onnx is the CPU ShadeNet model
             std::string shade = shade_model ? shade_model : "";
-            cfg.load = [models, shade](const std::string& file) {
+            cfg.load = [models, shade, rule_file](const std::string& file) {
+                if (file == "rulenet.onnx" && !rule_file.empty()) return read_file(rule_file);
                 return read_file(file == "shadenet.onnx" && !shade.empty() ? shade : models + "/" + file);
             };
             if (const char* t = std::getenv("FS_ORT_THREADS")) cfg.threads = std::atoi(t);
@@ -158,6 +176,7 @@ int main(int argc, char** argv) {
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
     o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
+    o.second_line_pass = std::getenv("FS_NO_SECOND") == nullptr;
     o.robust_solve = std::getenv("FS_NO_ROBUST") == nullptr;
     o.colour_edges = std::getenv("FS_NO_EDGES") == nullptr;
     if (const char* md = std::getenv("FS_MAX_DIST")) o.max_line_distortion = std::atof(md), o.max_line_distortion_frac = 1;
@@ -196,6 +215,38 @@ int main(int argc, char** argv) {
         o.shade_net = shade_net_fn(inference(), &shade_ms);
         o.shade_after_uv = std::getenv("FS_SHADE_AFTER") != nullptr;
         if (const char* ls = std::getenv("FS_SHADE_LS")) o.shade_long_side = std::atoi(ls);
+    }
+    // FS_RULE_NET=1 | MODEL.onnx: the rule net (PipelineOptions::rule_net), in-process (nets.cpp
+    // rule_net_fn; MODEL.onnx replaces the repo's rulenet.onnx). FS_RULE_NET_PY=1: run by
+    // tools/shadow_net/run_onnx.py with FS_PYTHON instead, as Round 10 did (raw float32 files next to
+    // OUT), to compare the two runtimes.
+    double rule_ms = 0;
+    int rule_calls = 0;
+    if (rule_model) {
+        if (std::getenv("FS_RULE_NET_PY")) {
+            std::string model = rule_file.empty() ? models + "/rulenet.onnx" : rule_file;
+            std::string py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
+            std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
+            std::string fin = base + ".rnin.f32", fout = base + ".rnout.f32";
+            std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
+            o.rule_net = [=](std::vector<float>& io, int w, int h) {
+                { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
+                std::string cmd = shell_line(py, script, {model, fin, fout, std::to_string(w), std::to_string(h)});
+                if (std::system(cmd.c_str()) != 0) return false;
+                io.assign((size_t)2 * w * h, 0.f);
+                std::ifstream f(fout, std::ios::binary);
+                f.read((char*)io.data(), io.size() * 4);
+                bool ok = (size_t)f.gcount() == io.size() * 4;
+                std::remove(fin.c_str()); std::remove(fout.c_str());
+                return ok;
+            };
+        } else {
+            RuleNetFn net = rule_net_fn(inference(), &rule_ms);
+            o.rule_net = [net, &rule_calls](std::vector<float>& io, int w, int h) {
+                ++rule_calls;
+                return net(io, w, h);
+            };
+        }
     }
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
@@ -331,6 +382,11 @@ int main(int argc, char** argv) {
         net_json << net_sep() << "\"shadenet\": {\"ok\": " << (r.shade_net ? "true" : "false") << ", \"backend\": \""
                  << backend_name(inf.backend(NetId::ShadeNet)) << "\", \"ms\": " << num(shade_ms) << "}";
     }
+    if (o.rule_net && rule_calls > 0) {
+        Inference& inf = inference();
+        net_json << net_sep() << "\"rulenet\": {\"ok\": " << (r.rule_net ? "true" : "false") << ", \"backend\": \""
+                 << backend_name(inf.backend(NetId::RuleNet)) << "\", \"ms\": " << num(rule_ms) << ", \"calls\": " << rule_calls << "}";
+    }
     f << ", \"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << r.error << "\", \"mode\": \""
       << geom_mode_name(r.mode) << "\", \"fit_median_full_px\": "
       << num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1) << ", \"needs_manual_crop\": " << strs(r.needs_manual_crop)
@@ -339,7 +395,9 @@ int main(int argc, char** argv) {
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
-      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": [" << num(r.second_pass[0]) << ", " << num(r.second_pass[1]) << ", " << num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0) << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
+      << ", \"net\": [" << r.warp.net.dropped << ", " << r.warp.net.added << ", " << r.warp.net.joined << ", " << r.warp.S2.n_net_kept << "], \"spots_dropped\": "
+      << (r.lines_spots_dropped ? "true" : "false") << ", \"straightness\": [" << num(r.line_straightness[0]) << ", " << num(r.line_straightness[1]) << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;
@@ -419,6 +477,18 @@ int main(int argc, char** argv) {
             t << "V " << L[0] << " " << L[1] << " " << L[2] << " " << L[3] << " " << L[4] << "\n";
         }
         cv::imwrite(p + "_segs.jpg", v, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // PREFIX_rules.jpg: the rule net's probabilities over the stage-1 page (red horizontal, blue vertical)
+        if (!r.warp.PH.empty() && r.warp.PH.size() == r.stage1.size()) {
+            cv::Mat rv = r.stage1.clone();
+            for (int y = 0; y < rv.rows; ++y)
+                for (int x = 0; x < rv.cols; ++x) {
+                    float a = r.warp.PH.at<float>(y, x), b = r.warp.PV.at<float>(y, x);
+                    cv::Vec3b& q = rv.at<cv::Vec3b>(y, x);
+                    if (a > 0.5f) q = {0, 0, 255};
+                    if (b > 0.5f) q = {255, 0, 0};
+                }
+            cv::imwrite(p + "_rules.jpg", rv, {cv::IMWRITE_JPEG_QUALITY, 85});
+        }
         // PREFIX_det.png: |det J - 1| of the line stage per 8-px cell (x 1000, 0.2 = 200), stage-1 size / 8
         const fs::Field &Fx = r.warp.Fx, &Fy = r.warp.Fy;
         if (Fx.gw > 3 && Fx.gh > 3) {
@@ -432,6 +502,28 @@ int main(int argc, char** argv) {
                 }
             cv::imwrite(p + "_det.png", dm);
         }
+    }
+    // FS_DUMP_SAMPLES=P.npz: the line stage's fine-pass samples ("h", "v": n x 3, along / ideal / disp) and
+    // its found lines ("H", "V": n x 5), stage-1 frame after the global stage
+    if (const char* ds = std::getenv("FS_DUMP_SAMPLES"); ds && r.ok) {
+        auto rows = [](const std::vector<std::array<double, 3>>& a) {
+            std::vector<float> f;
+            for (const auto& q : a) for (double v : q) f.push_back((float)v);
+            return f;
+        };
+        auto lines = [](const Lines& a) {
+            std::vector<float> f;
+            for (const auto& q : a) for (double v : q) f.push_back((float)v);
+            return f;
+        };
+        std::vector<float> h = rows(r.warp.S2.h), v = rows(r.warp.S2.v), H = lines(r.warp.H), V = lines(r.warp.V);
+        write_npz(ds, {{"h", NpyArray::f32({h.size() / 3, 3}, h.data())}, {"v", NpyArray::f32({v.size() / 3, 3}, v.data())},
+                       {"H", NpyArray::f32({H.size() / 5, 5}, H.data())}, {"V", NpyArray::f32({V.size() / 5, 5}, V.data())}});
+    }
+    // FS_DUMP_MAP=P.npz: the final backward map on its 4-px grid ("x", "y": gh x gw, photo / scan px)
+    if (const char* dm = std::getenv("FS_DUMP_MAP"); dm && r.ok) {
+        const GridMap& g = r.final_map;
+        write_npz(dm, {{"x", NpyArray::f32({(size_t)g.gh, (size_t)g.gw}, g.x.data())}, {"y", NpyArray::f32({(size_t)g.gh, (size_t)g.gw}, g.y.data())}});
     }
     if (r.ok && std::string(argv[2]) != "-") {
         cv::Mat bgr;

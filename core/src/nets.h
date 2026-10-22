@@ -6,7 +6,8 @@
 //    of a book spread hidden); UVDoc and SyntheticDoc high-res then run on the re-crop around the
 //    page that pass found (uv_crop_on_grid), or on the corners' crop (uv_crop) without one. The
 //    high-res grid fills the first slot, UVDoc's the second (run_photo prefers the first);
-//  * ShadeNet: PipelineOptions::shade_net through Inference.
+//  * ShadeNet: PipelineOptions::shade_net through Inference;
+//  * the rule net (RuleNet, tools/rule_net, rulenet.onnx): PipelineOptions::rule_net through Inference.
 // Every net failure leaves its slot empty, as before: the pipeline then runs without that net.
 #pragma once
 #include <opencv2/core.hpp>
@@ -73,6 +74,9 @@ FlatNetsFn flat_nets_fn(const cv::Mat& photo_bgr, const NetsRequest& rq, Inferen
 // PipelineOptions::shade_net: ShadeNet on the planar BGR page (3 x h x w), replaced by its shading map.
 // ms (optional): accumulates the run time.
 std::function<bool(std::vector<float>&, int, int)> shade_net_fn(Inference& inf, double* ms = nullptr);
+// PipelineOptions::rule_net: the rule net on the half-size stage-1 page (planar BGR [0, 1], 3 x h x w,
+// sides multiples of 32), replaced by its 2 x h x w rule probabilities. ms (optional): accumulates the run time.
+RuleNetFn rule_net_fn(Inference& inf, double* ms = nullptr);
 // PipelineOptions::uv_net (the zoomed pass): model 0 UVDoc, 2 SyntheticDoc high-res.
 UvNetFn uv_net_fn(Inference& inf);
 

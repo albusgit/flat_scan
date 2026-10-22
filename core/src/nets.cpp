@@ -195,6 +195,23 @@ std::function<bool(std::vector<float>&, int, int)> shade_net_fn(Inference& inf, 
     };
 }
 
+RuleNetFn rule_net_fn(Inference& inf, double* ms) {
+    return [&inf, ms](std::vector<float>& io, int w, int h) {
+        if (w <= 0 || h <= 0 || io.size() != (size_t)3 * w * h) return false;
+        Tensor x{{1, 3, h, w}, io};
+        std::vector<Tensor> y;
+        std::string err;
+        if (!inf.run(NetId::RuleNet, x, y, &err)) {
+            LOGI("rule net: %s", err.c_str());
+            return false;
+        }
+        if (y.empty() || y[0].data.size() != (size_t)2 * w * h) return false;
+        io = std::move(y[0].data);
+        if (ms) *ms += inf.last_ms(NetId::RuleNet);
+        return true;
+    };
+}
+
 UvNetFn uv_net_fn(Inference& inf) {
     return [&inf](int model, std::vector<float>& io) {
         if (model != 0 && model != 2) return false;   // the standard SyntheticDoc model (1) is no longer shipped

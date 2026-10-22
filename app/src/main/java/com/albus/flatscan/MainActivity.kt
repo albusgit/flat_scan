@@ -52,8 +52,9 @@ class MainActivity : ComponentActivity() {
      * `adb shell am start -S -n com.albus.flatscan/.MainActivity --es batch s35 --es accel cpu` (-S: a fresh
      * start; to a running app the intent only brings it to the front); extras: batch
      * (the folder under files/batch), out, accel (auto, cpu, gpu), shade (--ez), ext (.jpg / .png),
-     * static_models (--ez, no effect now), only (comma-separated names). `--ez selftest true` instead: the
-     * self-test (one run), its report written to files/batch_out/selftest_report.txt (external files).
+     * static_models (--ez, no effect now), rules (--ez: the rule net; default Settings > Table rules), only
+     * (comma-separated names). `--ez selftest true` instead: the self-test (one run), its report written to
+     * files/batch_out/selftest_report.txt (external files).
      */
     private fun startBatch(i: Intent?) {
         if (i == null || applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
@@ -66,6 +67,7 @@ class MainActivity : ComponentActivity() {
         vm.runBatch(
             set, i.getStringExtra("out"), i.getStringExtra("accel"), if (i.hasExtra("shade")) i.getBooleanExtra("shade", true) else null,
             i.getStringExtra("ext"), i.getBooleanExtra("static_models", false), i.getStringExtra("only"),
+            if (i.hasExtra("rules")) i.getBooleanExtra("rules", true) else null,
         )
         vm.open(Screen.Settings)
     }

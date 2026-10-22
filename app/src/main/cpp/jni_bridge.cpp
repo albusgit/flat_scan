@@ -314,7 +314,8 @@ struct Progress {
 // and the .tflite models in the APK). One Inference per
 // group of nets, so that Settings > Acceleration (or Auto's choice) can give each group its own
 // backends: the page finder, UVDoc (both passes), SyntheticDoc high-res (its own group: its fp16 grid
-// misses the accelerator tolerance where UVDoc's meets it, Gate A) and the shadow net. An Inference keeps its sessions for the
+// misses the accelerator tolerance where UVDoc's meets it, Gate A), the shadow net and the rule net (CPU
+// only: no fixed-shape model, not in Settings > Acceleration). An Inference keeps its sessions for the
 // life of the process and moves a net to its next backend (CPU last) on any failure, so a net that
 // failed on an accelerator stays on the CPU until the next configureNets with other backends.
 struct NetGroup {
@@ -329,7 +330,7 @@ struct NetGroup {
 };
 
 std::mutex g_nets_mu;             // guards everything below
-std::shared_ptr<NetGroup> g_finder, g_flat, g_hr, g_shade;
+std::shared_ptr<NetGroup> g_finder, g_flat, g_hr, g_shade, g_rule;
 jobject g_assets = nullptr;       // global reference: keeps the AAssetManager alive
 AAssetManager* g_mgr = nullptr;
 std::string g_cache_dir;          // compiled-model cache (the LiteRT GPU's serialised kernels)
@@ -410,17 +411,18 @@ std::string run_shape(const std::string& run_name) {
     return shape_str({1, 3, sp.in_h, sp.in_w});
 }
 
-// the shadow net through Inference (nets.cpp shade_net_fn) with its timing
-struct ShadeRun {
+// the shadow net or the rule net through Inference (nets.cpp shade_net_fn, rule_net_fn) with its timing
+struct NetCall {
     std::shared_ptr<NetGroup> g;
+    NetId id = NetId::ShadeNet;
     double run_ms = 0, total_ms = 0;
     int calls = 0;
     bool first = false, ok = false;
     std::string shape;
     std::function<bool(std::vector<float>&, int, int)> fn() {
-        auto net = shade_net_fn(*g->inf, &run_ms);
+        auto net = id == NetId::RuleNet ? rule_net_fn(*g->inf, &run_ms) : shade_net_fn(*g->inf, &run_ms);
         return [this, net](std::vector<float>& io, int w, int h) {
-            if (calls++ == 0) first = g->first_use(NetId::ShadeNet);
+            if (calls++ == 0) first = g->first_use(id);
             auto t0 = Clock::now();
             bool r = net(io, w, h);
             total_ms += ms_since(t0);
@@ -429,7 +431,7 @@ struct ShadeRun {
             return r;
         };
     }
-    std::string entry() const { return net_entry(ok, run_ms, total_ms, first, g->inf->backend(NetId::ShadeNet), shape, calls); }
+    std::string entry() const { return net_entry(ok, run_ms, total_ms, first, g->inf->backend(id), shape, calls); }
 };
 
 // Gate A's grid measure (tools/accel/compare_outputs.py grid_px): a grid point's move between grids a
@@ -489,6 +491,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     set(g_flat, fl);
     set(g_hr, hs);
     set(g_shade, sh);
+    set(g_rule, "");
 }
 
 // JSON: {"cpu" (the CPU runtime and version), "litert" (LiteRT's version), "gpu" (the LiteRT GPU delegate can be
@@ -565,13 +568,15 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, 
 }
 
 // flatten: Settings > neural flattening (the flattening nets run unless perspectiveOnly); flatNets:
-// 0 both, 1 UVDoc only, 2 SyntheticDoc high-res only; shadows: the shadow net. The nets run here,
+// 0 both, 1 UVDoc only, 2 SyntheticDoc high-res only; shadows: the shadow net; rules: the rule net in the
+// line stage (Settings > Table rules). The nets run here,
 // through the groups' Inference (core/src/nets.cpp, as the Kotlin FlatNet / ShadeNet calls did).
 JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, jclass, jobject bmp, jfloatArray corners,
                                                                   jboolean edited, jfloat focal_px, jboolean auto_orient,
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
-                                                                  jboolean flatten, jint flat_nets, jboolean shadows, jobject listener) {
+                                                                  jboolean flatten, jint flat_nets, jboolean shadows, jboolean rules,
+                                                                  jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -618,11 +623,18 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
     }
     // the shadow net, after SyntheticDoc's grid (as with the Kotlin ShadeNet)
-    ShadeRun shade;
+    NetCall shade;
     if (shadows) {
         shade.g = group(g_shade);
         o.shade_after_uv = true;
         o.shade_net = shade.fn();
+    }
+    // the rule net, in the line stage on the run_photo thread (PipelineOptions::rule_net)
+    NetCall rule;
+    rule.id = NetId::RuleNet;
+    if (rules) {
+        rule.g = group(g_rule);
+        o.rule_net = rule.fn();
     }
     o.progress = [&](int pct, const char* stage) { progress(pct, stage); };
     auto t1 = Clock::now();
@@ -648,6 +660,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         acc << (acc.tellp() > 0 ? ", " : "") << "\"" << net_key(n.name) << "\": " << net_entry(n.ok, n.ms, n.total_ms, first, n.backend, run_shape(n.name));
     }
     if (shade.calls > 0) acc << (acc.tellp() > 0 ? ", " : "") << "\"shadenet\": " << shade.entry();
+    if (rule.calls > 0) acc << (acc.tellp() > 0 ? ", " : "") << "\"rulenet\": " << rule.entry();
     std::ostringstream a;
     a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(std::max(0.0, r.nets_ms)) << ", \"nets_overlap\": " << r.nets_overlap
       << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"process_ms\": " << std::lround(ms_since(t1));
@@ -672,7 +685,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
-      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false");
+      << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
+      << ", \"rule_net\": " << (r.rule_net ? "true" : "false") << ", \"net\": [" << r.net_dropped << ", " << r.net_added << ", " << r.net_joined
+      << ", " << r.net_kept << "], \"spots_dropped\": " << (r.lines_spots_dropped ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
     if (!s->accel.empty()) f << ", \"accel\": {" << s->accel << "}";
     f << ", \"ms\": {";
@@ -1168,7 +1183,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
 
 // ---- debug batch mode (ScanViewModel.runBatch): one photo file exactly as tools/desktop_check/pipeline_cli
 // runs it with the nets in-process (`FS_NETS=1 FS_NET_DUMP=OUT pipeline_cli PHOTO OUT.ext net`, with
-// shade: FS_SHADE_NET + FS_SHADE_AFTER), on the groups' backends: the same JSON line (returned, and
+// shade: FS_SHADE_NET + FS_SHADE_AFTER; rules: FS_RULE_NET=1), on the groups' backends: the same JSON line (returned, and
 // written to OUT.json), the page (OUT + ext: JPEG q85, or PNG) and the nets' outputs (OUT_logits.npz,
 // _p1.npz, _rc0.npz, _rc2.npz), so tools/desktop_check/gate_b.py cmp and the DocUNet scorer read a phone's
 // run like a desktop one. CPU image stages (use_gpu off), automatic corners, as pipeline_cli.
@@ -1186,7 +1201,7 @@ static std::string cli_strs(const std::vector<std::string>& v) {
 }
 
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* env, jclass, jstring photo_path, jstring out_base, jstring page_ext,
-                                                                      jboolean shade) {
+                                                                      jboolean shade, jboolean rules) {
     const std::string photo = jstr(env, photo_path), out = jstr(env, out_base), ext = jstr(env, page_ext);
     std::ostringstream f;
     try {
@@ -1224,11 +1239,17 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
         o.use_gpu = false;
         o.seg_logits = logits;
         o.zoom_pass = false;
-        ShadeRun sr;
+        NetCall sr;
         if (shade) {
             sr.g = group(g_shade);
             o.shade_net = sr.fn();
             o.shade_after_uv = true;
+        }
+        NetCall rr;
+        rr.id = NetId::RuleNet;
+        if (rules) {
+            rr.g = group(g_rule);
+            o.rule_net = rr.fn();
         }
         // the flattening nets as the app runs them (FS_NETS=1): inside run_photo, beside its CPU stages,
         // on its detection's corners
@@ -1268,6 +1289,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
             if (o.shade_net)
                 net_json << net_sep() << "\"shadenet\": {\"ok\": " << (r.shade_net ? "true" : "false") << ", \"backend\": \""
                          << backend_name(sr.g->inf->backend(NetId::ShadeNet)) << "\", \"ms\": " << cli_num(sr.run_ms) << "}";
+            if (o.rule_net && rr.calls > 0)
+                net_json << net_sep() << "\"rulenet\": {\"ok\": " << (r.rule_net ? "true" : "false") << ", \"backend\": \""
+                         << backend_name(rr.g->inf->backend(NetId::RuleNet)) << "\", \"ms\": " << cli_num(rr.run_ms) << ", \"calls\": " << rr.calls << "}";
             // the processing result: pipeline_cli's fields, in its order and format
             f << ", \"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << r.error << "\", \"mode\": \"" << geom_mode_name(r.mode)
               << "\", \"fit_median_full_px\": " << cli_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
@@ -1280,7 +1304,12 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
               << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"orient\": [" << cli_num(r.orient_sh) << ", "
               << cli_num(r.orient_sv) << ", " << cli_num(r.orient_upright) << "]" << ", \"uv_spread\": [" << cli_num(r.uv_spread[0]) << ", "
               << cli_num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed
-              << ", " << r.warp.S2.n_bowed << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", "
+              << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": ["
+              << cli_num(r.second_pass[0]) << ", " << cli_num(r.second_pass[1]) << ", " << cli_num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0)
+              << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
+              << ", \"net\": [" << r.warp.net.dropped << ", " << r.warp.net.added << ", " << r.warp.net.joined << ", " << r.warp.S2.n_net_kept
+              << "], \"spots_dropped\": " << (r.lines_spots_dropped ? "true" : "false") << ", \"straightness\": [" << cli_num(r.line_straightness[0])
+              << ", " << cli_num(r.line_straightness[1]) << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", "
               << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted
               << ", \"bumps_faded\": " << cli_num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << cli_num(r.uv_zoom_spread[0])
               << ", " << cli_num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]";

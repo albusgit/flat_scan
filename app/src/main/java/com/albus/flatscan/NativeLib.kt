@@ -89,14 +89,15 @@ object NativeLib {
      * flatten: the flattening nets (UVDoc on the whole photo with automatic corners, then UVDoc and
      * SyntheticDoc high-res on the page it found; core/src/nets.cpp) unless perspectiveOnly; flatNets:
      * 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc high-res only. shadows: the shadow
-     * net on the flattened page. The nets run on [configureNets]' backends; their timings and backends
+     * net on the flattened page. rules: the rule net (rulenet.onnx, Settings > Table rules) in the line
+     * refinement, on the CPU. The nets run on [configureNets]' backends; their timings and backends
      * are in [info]'s "accel".
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        flatten: Boolean, flatNets: Int, shadows: Boolean, listener: ProgressListener?,
+        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, listener: ProgressListener?,
     ): Long
 
     /**
@@ -178,5 +179,5 @@ object NativeLib {
      * returned JSON line), the page [outBase] + [pageExt] (".jpg" q85 or ".png") and the nets' outputs
      * ([outBase]_logits.npz, _p1.npz, _rc0.npz, _rc2.npz).
      */
-    @JvmStatic external fun batchPhoto(photoPath: String, outBase: String, pageExt: String, shade: Boolean): String
+    @JvmStatic external fun batchPhoto(photoPath: String, outBase: String, pageExt: String, shade: Boolean, rules: Boolean): String
 }
