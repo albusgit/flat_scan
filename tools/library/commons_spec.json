@@ -1,0 +1,38 @@
+{
+  "screens": {
+    "cats": ["Category:Computer screens", "Category:Monitors", "Category:Television screens", "Category:Subpixel rendering",
+             "Category:Moiré patterns", "Category:Laptops in use", "Category:Smartphones in use"],
+    "depth": 2,
+    "search": ["computer screen photo", "monitor screen text", "laptop screen", "smartphone screen", "LCD screen closeup",
+               "screen moire", "display pixels macro", "CRT monitor screen", "tablet screen", "e-reader screen",
+               "screen showing website", "screen showing text", "computer display office", "TV screen photo", "phone display"],
+    "search_limit": 150,
+    "max": 400
+  },
+  "receipts_tickets": {
+    "cats": ["Category:Receipts", "Category:Invoices", "Category:Bus tickets", "Category:Parking tickets", "Category:Boarding passes",
+             "Category:Tickets"],
+    "depth": 2,
+    "search": ["receipt", "cash register receipt", "invoice", "kassenbon", "ticket paper", "bill paper restaurant", "parking ticket", "train ticket"],
+    "search_limit": 150,
+    "max": 350
+  },
+  "colour_docs": {
+    "cats": ["Category:Brochures", "Category:Highlighters", "Category:Sticky notes", "Category:Colored paper", "Category:Highlighted text",
+             "Category:Flyers", "Category:Menus", "Category:Certificates"],
+    "depth": 2,
+    "search": ["highlighted text page", "highlighter book", "magazine page photo", "restaurant menu", "flyer", "leaflet", "brochure page",
+               "form filled", "stamped document", "rubber stamp document", "certificate photo", "map paper folded", "textbook page",
+               "coloured paper document", "poster paper", "notebook handwriting"],
+    "search_limit": 150,
+    "max": 400
+  },
+  "pages_lighting": {
+    "cats": ["Category:Open books"],
+    "depth": 1,
+    "search": ["book page shadow", "reading book sunlight", "document on desk", "letter paper photo", "open book page", "newspaper page photo",
+               "page under lamp", "handwritten letter", "paper document table"],
+    "search_limit": 150,
+    "max": 350
+  }
+}
