@@ -5,42 +5,32 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Settings > Acceleration (docs/accel/PLAN.md, Stream C step 4): the backends each group of nets tries
- * ([NativeLib.configureNets]; the CPU is always the last resort, and a net that fails on an accelerator
- * runs on the CPU for the rest of the app's life). CPU is the default: an accelerated path changes the
- * nets' outputs within the tolerances of jni_bridge.cpp (benchBackends) and is opt-in.
- *  * [AUTO]: on first use per (SoC, app version) the self-test photo's nets run on the CPU and on every
- *    accelerator in [candidates] (QNN, the LiteRT GPU); per group the fastest backend whose outputs match the
- *    CPU's within the tolerances is kept ([Settings.autoChoice]), SyntheticDoc high-res judged on its own;
- *  * [NPU]: Qualcomm QNN HTP (fp16) for UVDoc and the shadow net. SyntheticDoc high-res stays on the
- *    CPU: its fp16 grid missed the accelerator tolerance (Gate A's fp16 stand-in: p99 0.95 px against
- *    0.25 px; UVDoc 0.08 px). Auto still tries it on QNN and keeps it there only where it passes;
- *  * [GPU]: the LiteRT (TensorFlow Lite) GPU delegate in full precision (fp32 compute, fp16-stored weights)
- *    for UVDoc, SyntheticDoc high-res and the shadow net, on any phone's GPU (Mali, Adreno, Xclipse). Its
- *    runtime and models are the on-demand pack litert_gpu ([LiteRtPacks]); without them, or for a net the
- *    delegate cannot take, the CPU runs it;
- *  * [NNAPI]: Android NNAPI (fp16) for the same nets; not in the QNN build's ONNX Runtime (arm64-v8a
- *    built with -Port=qnn, the default), where it falls back to the CPU. Not offered in Settings
- *    ([CHOICES]): on the x86_64 emulator ORT 1.22.0's NNAPI and XNNPACK EPs aborted the process inside
- *    Run (std::terminate, which no CPU fallback can catch). The debug batch mode still takes it
- *    (`--es accel nnapi`), for checking it on a device (PLAN Stream G).
- * The page finder always runs on the CPU (PLAN: 34 NNAPI partitions).
+ * Settings > Acceleration: the backends each group of nets tries ([NativeLib.configureNets]). Every net runs
+ * on LiteRT (the TensorFlow Lite runtime, in the APK with its .tflite models): its CPU kernels are the
+ * reference and always the last resort, and a net that fails on the GPU runs on the CPU for the rest of the
+ * app's life. The app never depends on the GPU.
+ *  * [AUTO] (the default): on first use per (SoC, app version, candidates) the self-test photo's nets run on
+ *    the CPU and on the GPU when this phone can try it ([candidates]: the GPU delegate's library loads and the
+ *    phone has an OpenCL library); per group the fastest backend whose outputs match the CPU's within the
+ *    tolerances is kept ([Settings.autoChoice]), SyntheticDoc high-res judged on its own. A phone without
+ *    OpenCL gets the CPU at once, without a benchmark;
+ *  * [CPU]: LiteRT's CPU kernels (fp32; XNNPACK where it takes the ops) for every net;
+ *  * [GPU]: the LiteRT GPU delegate in full precision (fp32 compute, fp16-stored weights) for UVDoc,
+ *    SyntheticDoc high-res and the shadow net on any phone with OpenCL (Mali, Adreno, Xclipse), without the
+ *    CPU comparison of Auto; a net the delegate cannot take (or a shadow-net page shape without a GPU model)
+ *    runs on the CPU.
+ * The page finder always runs on the CPU (PLAN: 34 NNAPI partitions). The Qualcomm NPU (ONNX Runtime QNN) and
+ * NNAPI left the app with ONNX Runtime in Round 11 (docs/results/r11/runtime.md).
  */
 object Accel {
     const val AUTO = "auto"
     const val CPU = "cpu"
-    const val NPU = "npu"
-    const val NNAPI = "nnapi"
     const val GPU = "gpu"
-    /** NPU only in a build whose ONNX Runtime has QNN (-Port=qnn); the default build has no NPU for now. */
-    val CHOICES: List<Pair<String, String>> by lazy {
-        listOfNotNull(
-            AUTO to "Auto: the fastest backend whose results match the CPU",
-            CPU to "CPU (reference results)",
-            (NPU to "NPU (Qualcomm QNN)").takeIf { NetEnv.has("QNNExecutionProvider") },
-            GPU to "GPU (LiteRT)",
-        )
-    }
+    val CHOICES: List<Pair<String, String>> = listOf(
+        AUTO to "Auto: the fastest backend whose results match the CPU",
+        CPU to "CPU (reference results)",
+        GPU to "GPU (LiteRT)",
+    )
 
     /**
      * The backends of each group of nets, comma separated ("" = CPU only): [finder] the page finder,
@@ -59,39 +49,26 @@ object Accel {
     /** The plan of a fixed setting; null for [AUTO] (its plan comes from the stored benchmark). */
     fun fixed(setting: String): Plan? = when (setting) {
         CPU -> Plan(CPU, "", "", "", "")
-        NPU -> Plan(NPU, "", "qnn", "", "qnn")
-        NNAPI -> Plan(NNAPI, "", "nnapi", "", "nnapi")
         GPU -> Plan(GPU, "", "gpu", "gpu", "gpu")
         else -> null
     }
 
+    /** Auto's candidates (backend names for benchBackends): the LiteRT GPU where this phone can try it. */
+    fun candidates(): String = if (NetEnv.gpuAvailable) "gpu" else ""
+
     /**
-     * Auto's candidates (backend names for benchBackends): QNN when this ONNX Runtime build has it and its
-     * packs are loaded, the LiteRT GPU when its pack is loaded ([LiteRtPacks], fetched on any phone). Not
-     * NNAPI or XNNPACK: on the x86_64 emulator both aborted the process inside ORT 1.22.0's Run
-     * (std::terminate in libonnxruntime.so on uvdoc_static, nnapi-reference / XNNPACK), which no CPU
-     * fallback can catch; NNAPI in Auto is PLAN Stream G (not started).
+     * The plan of a stored Auto benchmark ([Settings.autoChoice]) if it was made on this SoC and app version
+     * with today's candidates.
      */
-    fun candidates(): String = listOfNotNull(
-        "qnn".takeIf { NetEnv.has("QNNExecutionProvider") && QnnPacks.loaded },
-        "gpu".takeIf { LiteRtPacks.loaded },
-    ).joinToString(",")
-
-    /** Whether [plan] puts a net on QNN (its libraries then come from the asset packs first). */
-    fun usesQnn(plan: Plan): Boolean = listOf(plan.finder, plan.flat, plan.hr, plan.shade).any { "qnn" in it }
-
-    /** Whether [plan] puts a net on the LiteRT GPU (its runtime then comes from the litert_gpu pack first). */
-    fun usesLiteRt(plan: Plan): Boolean = listOf(plan.finder, plan.flat, plan.hr, plan.shade).any { b -> b.split(',').any { it == "gpu" || it == "litert" } }
-
-    /** The plan of a stored Auto benchmark ([Settings.autoChoice]) if it was made on this SoC and app version. */
     fun autoPlan(stored: String?): Plan? {
         val j = stored?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
         if (j.optString("soc") != NetEnv.soc || j.optString("app") != BuildConfigInfo.VERSION) return null
+        if (j.optString("candidates") != candidates()) return null
         val c = j.optJSONObject("bench")?.optJSONObject("choice") ?: return null
         fun b(k: String) = c.optString(k, "cpu").let { if (it == "cpu") "" else it }
         // a benchmark from before SyntheticDoc high-res had its own group has no "hr": run it again
         if (!c.has("hr")) return null
-        return Plan(AUTO, b("finder"), b("flat"), b("hr"), b("shade"), "benchmarked ${j.optString("at")}")
+        return Plan(AUTO, b("finder"), b("flat"), b("hr"), b("shade"), j.optString("note").ifEmpty { "benchmarked ${j.optString("at")}" })
     }
 }
 
@@ -108,20 +85,20 @@ object NetEnv {
         }
     }
 
-    private val ort: JSONObject by lazy { runCatching { JSONObject(NativeLib.ortInfo()) }.getOrDefault(JSONObject()) }
+    private val rt: JSONObject by lazy { runCatching { JSONObject(NativeLib.runtimeInfo()) }.getOrDefault(JSONObject()) }
 
-    /** The ONNX Runtime linked into libflatscan. */
-    val ortVersion: String get() = ort.optString("ort", "unknown")
+    /** The nets' CPU runtime ("LiteRT 2.20.0-dev0+selfbuilt": LiteRT 1.4.0's libraries). */
+    val runtime: String get() = rt.optString("cpu", "unknown")
 
-    /** Execution providers this ONNX Runtime build has (QNNExecutionProvider, NnapiExecutionProvider, ...). */
-    val providers: List<String> by lazy { ort.optJSONArray("providers")?.let { a -> List(a.length()) { a.optString(it) } } ?: emptyList() }
+    /** Whether the LiteRT GPU delegate can be tried here (its library loads and the phone has an OpenCL library). */
+    val gpuAvailable: Boolean get() = rt.optBoolean("gpu", false)
 
-    fun has(provider: String) = provider in providers
+    /** Why not, when [gpuAvailable] is false. */
+    val gpuWhy: String get() = rt.optString("gpu_why")
 
     /** The processing details' / self-test's device facts; backend: the groups' backends. */
     fun toJson(plan: Accel.Plan): JSONObject = JSONObject().put("soc", soc).put("backend", plan.summary()).put("acceleration", plan.toJson())
-        .put("ort", ortVersion).put("ort_providers", providers.joinToString(", ")).put("qnn_packs", QnnPacks.status)
-        .put("litert_pack", LiteRtPacks.status)
+        .put("runtime", runtime).put("gpu", if (gpuAvailable) "available" else "unavailable: $gpuWhy")
         .put("cores", Runtime.getRuntime().availableProcessors())
         .put("device", "${Build.MANUFACTURER} ${Build.MODEL}").put("api", Build.VERSION.SDK_INT)
 }

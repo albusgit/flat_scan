@@ -1,12 +1,23 @@
-"""LiteRT (TFLite) copies of the fixed-shape nets for the LiteRT GPU delegate (contract C2).
+"""LiteRT (TFLite) copies of the nets: the GPU delegate's fixed-shape models (contract C2) and the LiteRT CPU path's.
 
   python tools/litert/convert.py [OUT_DIR] [--work DIR] [NAME ...]
       OUT_DIR default app/src/main/litert/models; --work default a temp folder (deleted afterwards)
-      NAME: uvdoc, sdhr, shade (default all)
-      -> uvdoc_static.tflite, syntheticdoc_hr_static.tflite, shadenet_512x352.tflite, and NAME.analyzer.txt
-         (tf.lite.experimental.Analyzer, gpu_compatibility=True) in the work folder
+      NAME: uvdoc, sdhr, shade, finder, rule (default all; rule only when its source exists)
+      --rulenet PATH: the rule net's ONNX file (default app/src/main/assets/models/rulenet.onnx)
+      -> uvdoc_static.tflite, syntheticdoc_hr_static.tflite, shadenet_512x352.tflite (GPU and CPU: fixed input),
+         shadenet.tflite (with shade: the CPU's ShadeNet for any input size, any_hw()), pagefinder.tflite (finder:
+         CPU only, fp32 weights, keep_fp32()), rulenet.tflite (rule: the rule net, CPU only, any input size:
+         rulenet.onnx made static at 512 x 352 (tools/accel/prepare_models.py make_static), converted as ShadeNet,
+         then any_hw(); the static intermediate stays in the work folder), and NAME.analyzer.txt (tf.lite.experimental.Analyzer,
+         gpu_compatibility=True) in the work folder
+      The files are byte-identical when re-made by the full run (no NAME): onnx2tf's tensor names carry a counter
+      of the models made in the process, so a run of fewer nets gives the same graphs and numbers under other names.
 Run it with C:/Users/User/Android/litert_venv (tensorflow 2.19.1, onnx2tf 1.28.8: docs/results/litert/models.txt).
-Sources: the static ONNX files of app/src/main/assets/models (tools/accel/prepare_models.py).
+Sources: the static ONNX files of app/src/main/assets/models (tools/accel/prepare_models.py), and pagefinder.onnx.
+The app's loader (core/src/infer.cpp) runs shadenet.tflite after TfLiteInterpreterResizeInputTensor to the page's
+[1, 512, W, 3], rulenet.tflite likewise to [1, H, W, 3] (the half-size page padded to multiples of 32: core/src
+warpmap.cpp rule_probs); every other file at its fixed input. Swapping a model (e.g. a quantised one): a file of the same name,
+float32 NHWC input and output of the same shapes.
 
 Steps per net:
   1. fp32 copy of the ONNX graph: each fp16 weight's Cast -> fp32 node becomes an fp32 initializer. Exact (fp16
@@ -48,7 +59,19 @@ OUT = os.path.join(REPO, 'app', 'src', 'main', 'litert', 'models')
 # (name, ONNX source, .tflite, NHWC input shape, NHWC output shape)
 NETS = [('uvdoc', 'uvdoc_static.onnx', 'uvdoc_static.tflite', [1, 712, 488, 3], [1, 45, 31, 2]),
         ('sdhr', 'syntheticdoc_hr_static.onnx', 'syntheticdoc_hr_static.tflite', [1, 1440, 1024, 3], [1, 121, 177, 2]),
-        ('shade', 'shadenet_512x352.onnx', 'shadenet_512x352.tflite', [1, 512, 352, 3], [1, 512, 352, 3])]
+        ('shade', 'shadenet_512x352.onnx', 'shadenet_512x352.tflite', [1, 512, 352, 3], [1, 512, 352, 3]),
+        # the page finder: LiteRT CPU only (it never runs on the GPU), fp32 weights as in the ONNX file
+        ('finder', 'pagefinder.onnx', 'pagefinder.tflite', [1, 256, 256, 3], [1, 256, 256, 2])]
+# ShadeNet at any input size (LiteRT CPU): made from shadenet_512x352.tflite by any_hw() after 'shade'
+SHADE_ANY = 'shadenet.tflite'
+# the sizes the pipeline feeds it (core/src/pipeline.cpp apply_shade_net: portrait, long side 512, W a multiple of 32)
+SHADE_WIDTHS = list(range(32, 513, 32))
+# the rule net (Round 10, tools/rule_net): dynamic h, w in its ONNX file; converted at RULE_HW, then any size
+RULE_SRC = os.path.join(SRC, 'rulenet.onnx')
+RULE_HW = [512, 352]
+RULE_OUT = 'rulenet.tflite'
+# sizes check_any runs it at (H, W): the half-size pages of rule_probs are multiples of 32 in both
+RULE_SIZES = [(32, 32), (64, 96), (512, 352), (352, 512), (1152, 800), (800, 1152), (1024, 1024), (1440, 1024), (96, 1440)]
 # onnx2tf runs a sample inference on this file when it is in the working folder (else it downloads one)
 SAMPLE = 'calibration_image_sample_data_20x128x128x3_float32.npy'
 
@@ -305,8 +328,217 @@ def gpu_ops(path):
     return bad
 
 
-def check(path, want_in, want_out):
-    """Contract C2 I/O, the GPU op check, no fp16-compute hint. Returns (summary lines, analyzer text)."""
+def keep_fp32(path, dst, m):
+    """The page finder: onnx2tf's fp32 .tflite as it is (its weights are fp32 in the ONNX file: no fp16 storage,
+    nothing to rewrite for the GPU, which never runs it), the output named as in the ONNX graph. Checks that every
+    CONV_2D / DEPTHWISE_CONV_2D filter is bit for bit an ONNX Conv weight (transposed), or for a Conv in front of a
+    HardSigmoid the fp32 product weight x alpha (TF folds the gate's scale into the filter; ~1 ulp, the order of
+    ONNX Runtime's own fusions). Returns a summary line."""
+    from tensorflow.lite.python import schema_py_generated as s
+    from tensorflow.lite.tools import flatbuffer_utils as fu
+    tm = fu.read_model(path)
+    g = tm.subgraphs[0]
+    code = [c.builtinCode for c in tm.operatorCodes]
+    B = s.BuiltinOperator
+    w, scaled = {}, {}
+    init = {i.name: numpy_helper.to_array(i) for i in m.graph.initializer}
+    users = {}
+    for nd in m.graph.node:
+        for i in nd.input:
+            users.setdefault(i, []).append(nd)
+    for nd in m.graph.node:
+        if nd.op_type != 'Conv':
+            continue
+        a = init[nd.input[1]]
+        w.setdefault(a.shape, []).append(a)
+        # a Conv feeding a HardSigmoid (the squeeze-excite gates): the converter folds alpha into the filter
+        hs = [u for u in users.get(nd.output[0], []) if u.op_type == 'HardSigmoid']
+        if len(hs) == 1:
+            alpha = next((x.f for x in hs[0].attribute if x.name == 'alpha'), 0.2)
+            scaled.setdefault(a.shape, []).append((a * np.float32(alpha)).astype(np.float32))
+    n = n_scaled = 0
+    for o in g.operators:
+        if code[o.opcodeIndex] not in (B.CONV_2D, B.DEPTHWISE_CONV_2D):
+            continue
+        t = g.tensors[o.inputs[1]]
+        f = np.frombuffer(bytes(tm.buffers[t.buffer].data), np.float32).reshape([int(v) for v in t.shape])
+        # CONV_2D OHWI <- ONNX OIHW; DEPTHWISE_CONV_2D 1HWC <- ONNX C1HW
+        cand = f.transpose(0, 3, 1, 2) if code[o.opcodeIndex] == B.CONV_2D else f.transpose(3, 0, 1, 2)
+        if any(np.array_equal(cand, a) for a in w.get(cand.shape, [])):
+            n += 1
+        elif any(np.array_equal(cand, a) for a in scaled.get(cand.shape, [])):
+            n_scaled += 1
+        else:
+            raise SystemExit(f'{t.name}: filter not bit for bit an ONNX weight')
+    g.tensors[g.outputs[0]].name = m.graph.output[0].name.encode()
+    fu.write_model(tm, dst)
+    return (f'fp32 as converted: {n} conv filters bit for bit the ONNX weights, {n_scaled} bit for bit the fp32 '
+            f'product ONNX weight x HardSigmoid alpha (the converter folds the gate scale 1/6 into the conv before it)')
+
+
+def any_hw(path, dst):
+    """ShadeNet at any input size on LiteRT's CPU kernels: shadenet_512x352.tflite (the same fp16 weights and ops)
+    with each resize's constant output size replaced by the size of the tensor it is concatenated with (the skip
+    connection, or the input for the last two): SHAPE -> STRIDED_SLICE [1:3] of that tensor. The input / output
+    shape signature becomes [1, -1, -1, C]; after TfLiteInterpreterResizeInputTensor to [1, H, W, 3] (H, W multiples
+    of 32) and AllocateTensors every op re-derives its shapes (no RESHAPE or other shape constant is left in the
+    graph). The GPU keeps the static file: its delegate does not take SHAPE / STRIDED_SLICE. Returns a summary."""
+    from tensorflow.lite.python import schema_py_generated as s
+    from tensorflow.lite.tools import flatbuffer_utils as fu
+    m = fu.read_model(path)
+    g = m.subgraphs[0]
+    B = s.BuiltinOperator
+    code = [c.builtinCode for c in m.operatorCodes]
+
+    def opcode(op, version):
+        for i, c in enumerate(m.operatorCodes):
+            if c.builtinCode == op:
+                return i
+        c = s.OperatorCodeT()
+        c.builtinCode = c.deprecatedBuiltinCode = op
+        c.version = version
+        m.operatorCodes.append(c)
+        return len(m.operatorCodes) - 1
+
+    def add_tensor(name, shape, ttype, data=None):
+        b = s.BufferT()
+        if data is not None:
+            b.data = np.frombuffer(data.tobytes(), np.uint8)
+        m.buffers.append(b)
+        t = s.TensorT()
+        t.name, t.shape, t.type, t.buffer = name, np.array(shape, np.int32), ttype, len(m.buffers) - 1
+        g.tensors.append(t)
+        return len(g.tensors) - 1
+
+    shape_op, slice_op = opcode(B.SHAPE, 1), opcode(B.STRIDED_SLICE, 1)
+    made = {o.outputs[0]: code[o.opcodeIndex] for o in g.operators}
+    users = {}
+    for k, o in enumerate(g.operators):
+        for i in o.inputs:
+            users.setdefault(i, []).append(k)
+
+    def hw(t):
+        return [int(v) for v in g.tensors[t].shape[1:3]]
+
+    resizes = (B.RESIZE_BILINEAR, B.RESIZE_NEAREST_NEIGHBOR)
+    sizes, new_ops = {}, []   # reference tensor -> its [H, W] tensor
+    begin = add_tensor(b'any_hw_begin', [1], s.TensorType.INT32, np.array([1], np.int32))
+    end = add_tensor(b'any_hw_end', [1], s.TensorType.INT32, np.array([3], np.int32))
+    stride = add_tensor(b'any_hw_stride', [1], s.TensorType.INT32, np.array([1], np.int32))
+    n = 0
+    for o in g.operators:
+        if code[o.opcodeIndex] not in resizes:
+            new_ops.append(o)
+            continue
+        y = o.outputs[0]
+        cat = [g.operators[k] for k in users.get(y, []) if code[g.operators[k].opcodeIndex] == B.CONCATENATION]
+        refs = [i for c in cat for i in c.inputs if i != y and made.get(i) not in resizes and hw(i) == hw(y)]
+        if len(cat) != 1 or not refs:
+            raise SystemExit(f'resize {g.tensors[y].name}: no concatenated tensor of its size')
+        ref = refs[0]
+        if ref not in sizes:
+            sh = add_tensor(g.tensors[ref].name + b'_shape', [4], s.TensorType.INT32)
+            p = s.OperatorT()
+            p.opcodeIndex, p.inputs, p.outputs = shape_op, [ref], [sh]
+            p.builtinOptionsType = s.BuiltinOptions.ShapeOptions
+            p.builtinOptions = s.ShapeOptionsT()
+            p.builtinOptions.outType = s.TensorType.INT32
+            sz = add_tensor(g.tensors[ref].name + b'_hw', [2], s.TensorType.INT32)
+            q = s.OperatorT()
+            q.opcodeIndex, q.inputs, q.outputs = slice_op, [sh, begin, end, stride], [sz]
+            q.builtinOptionsType = s.BuiltinOptions.StridedSliceOptions
+            q.builtinOptions = s.StridedSliceOptionsT()
+            new_ops += [p, q]
+            sizes[ref] = sz
+        o.inputs[1] = sizes[ref]
+        new_ops.append(o)
+        n += 1
+    g.operators = new_ops
+    for t in (g.inputs[0], g.outputs[0]):
+        g.tensors[t].shapeSignature = np.array([1, -1, -1, int(g.tensors[t].shape[3])], np.int32)
+    # the constant sizes no op reads any more
+    read = {i for o in g.operators for i in o.inputs}
+    for i, t in enumerate(g.tensors):
+        if i not in read and i not in g.outputs and t.type == s.TensorType.INT32 and m.buffers[t.buffer].data is not None:
+            m.buffers[t.buffer].data = None
+    fu.write_model(m, dst)
+    return f'{n} resize sizes from {len(sizes)} SHAPE -> STRIDED_SLICE pairs, input / output signature [1, -1, -1, C]'
+
+
+def check_any(path, ref_path=None, sizes=None, gpu_note='the GPU runs shadenet_512x352.tflite'):
+    """An any-size file (shadenet.tflite, rulenet.tflite): runs at every size the pipeline feeds (sizes: (H, W) list,
+    default 512 x SHADE_WIDTHS), and at the static file's size gives its output bit for bit (the same graph
+    otherwise). ref_path default shadenet_512x352.tflite next to path. Returns summary lines."""
+    from ai_edge_litert.interpreter import Interpreter
+    ref_path = ref_path or os.path.join(os.path.dirname(path), 'shadenet_512x352.tflite')
+    sizes = sizes or [(512, w) for w in SHADE_WIDTHS]
+    it = Interpreter(model_path=path)
+    ref = Interpreter(model_path=ref_path)
+    ref.allocate_tensors()
+    rin = ref.get_input_details()[0]
+    rh, rw = int(rin['shape'][1]), int(rin['shape'][2])
+    i0 = it.get_input_details()[0]
+    c_out = int(ref.get_output_details()[0]['shape'][3])
+    rng = np.random.default_rng(1)
+    ok = []
+    for h, w in sorted(set(sizes) | {(rh, rw)}):
+        it.resize_tensor_input(i0['index'], [1, h, w, 3], strict=True)
+        it.allocate_tensors()
+        x = np.ascontiguousarray(rng.random((1, h, w, 3), dtype=np.float32))
+        it.set_tensor(i0['index'], x)
+        it.invoke()
+        y = it.get_tensor(it.get_output_details()[0]['index'])
+        if list(y.shape) != [1, h, w, c_out] or not np.isfinite(y).all():
+            raise SystemExit(f'{path}: {h} x {w} gives {list(y.shape)}')
+        if (h, w) == (rh, rw):
+            ref.set_tensor(rin['index'], x)
+            ref.invoke()
+            if not np.array_equal(y, ref.get_tensor(ref.get_output_details()[0]['index'])):
+                raise SystemExit(f'{path}: {h} x {w} differs from {os.path.basename(ref_path)}')
+        ok.append(f'{h}x{w}')
+    ops = {}
+    for o in it._get_ops_details():
+        ops[o['op_name']] = ops.get(o['op_name'], 0) + 1
+    bad = gpu_ops(path)
+    return [f'in {i0["name"]} signature {list(map(int, i0["shape_signature"]))}; runs at {", ".join(ok)}; '
+            f'{rh} x {rw} bit for bit {os.path.basename(ref_path)}',
+            'ops ' + ', '.join(f'{k} {v}' for k, v in ops.items()),
+            f'GPU op check (information only: {gpu_note}): {len(bad)} problems' + (f', e.g. {bad[0]}' if bad else '')]
+
+
+def convert_rule(src, work, out):
+    """rulenet.tflite: the rule net made static at RULE_HW (make_static: shape arithmetic folded, the global
+    branch's Expand as a Mul by ones), converted and rewritten as the other nets (fp16 weights + DEQUANTIZE), then
+    any_hw(). CPU only: the GPU form is a by-product (the static intermediate in work, not shipped)."""
+    import onnx2tf
+    sys.path.insert(0, os.path.join(REPO, 'tools', 'accel'))
+    from prepare_models import make_static
+    m = onnx.load(src)
+    iname = m.graph.input[0].name
+    make_static(m, {iname: [1, 3] + RULE_HW}, log=lambda *a: None)
+    st = os.path.join(work, 'rule_static.onnx')
+    onnx.save(m, st)
+    m, w16 = fp32_onnx(st)
+    f32 = os.path.join(work, 'rule_fp32.onnx')
+    onnx.save(m, f32)
+    onnx2tf.convert(input_onnx_file_path=f32, output_folder_path=os.path.join(work, 'rule'),
+                    copy_onnx_input_output_names_to_tflite=True, non_verbose=True)
+    tfl32 = os.path.join(work, 'rule', 'rule_fp32_float32.tflite')
+    static = os.path.join(work, 'rulenet_%dx%d.tflite' % tuple(RULE_HW))
+    summary = rewrite(tfl32, static, bn_convs(m, w16), m.graph.output[0].name)
+    lines, text = check(static, [1] + RULE_HW + [3], [1] + RULE_HW + [2], gpu=False)
+    print(f'rule net {src}: static {RULE_HW[0]} x {RULE_HW[1]} {os.path.getsize(static)} bytes; {summary}')
+    for s in lines:
+        print('  ' + s, flush=True)
+    path = os.path.join(out, RULE_OUT)
+    summary = any_hw(static, path)
+    print(f'{RULE_OUT}: {os.path.getsize(path)} bytes; {summary}')
+    for s in check_any(path, static, RULE_SIZES, 'CPU only'):
+        print('  ' + s, flush=True)
+
+
+def check(path, want_in, want_out, gpu=True):
+    """Contract C2 I/O, the GPU op check (gpu), no fp16-compute hint. Returns (summary lines, analyzer text)."""
     import tensorflow as tf
     from ai_edge_litert.interpreter import Interpreter
     from tensorflow.lite.tools import flatbuffer_utils as fu
@@ -318,7 +550,7 @@ def check(path, want_in, want_out):
     ops = {}
     for o in it._get_ops_details():
         ops[o['op_name']] = ops.get(o['op_name'], 0) + 1
-    bad = gpu_ops(path)
+    bad = gpu_ops(path) if gpu else []
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         tf.lite.experimental.Analyzer.analyze(model_path=path, gpu_compatibility=True)
@@ -329,7 +561,8 @@ def check(path, want_in, want_out):
              f'out {outs[0]["name"]} {list(map(int, outs[0]["shape"]))} {outs[0]["dtype"].__name__}'
              f'{"" if io_ok else "  NOT AS CONTRACT C2"}',
              'ops ' + ', '.join(f'{k} {v}' for k, v in ops.items()),
-             'GPU op check: ' + ('every op in a form the GPU delegate takes' if not bad else '; '.join(bad)),
+             'GPU op check: ' + ('not run (CPU only)' if not gpu else
+                                 'every op in a form the GPU delegate takes' if not bad else '; '.join(bad)),
              'analyzer (gpu_compatibility=True): ' + ' / '.join(verdict),
              'metadata ' + ', '.join(meta)]
     if not io_ok or bad or 'reduced_precision_support' in meta:
@@ -345,8 +578,14 @@ def main():
         k = args.index('--work')
         work = os.path.abspath(args[k + 1])
         del args[k:k + 2]
-    out = os.path.abspath(args[0]) if args and args[0] not in [n[0] for n in NETS] else OUT
-    names = [a for a in args if a in [n[0] for n in NETS]] or [n[0] for n in NETS]
+    rule_src = RULE_SRC
+    if '--rulenet' in args:
+        k = args.index('--rulenet')
+        rule_src = os.path.abspath(args[k + 1])
+        del args[k:k + 2]
+    known = [n[0] for n in NETS] + ['rule']
+    out = os.path.abspath(args[0]) if args and args[0] not in known else OUT
+    names = [a for a in args if a in known] or [n[0] for n in NETS] + (['rule'] if os.path.exists(rule_src) else [])
     keep_work = work is not None
     work = work or tempfile.mkdtemp(prefix='litert_convert_')
     os.makedirs(work, exist_ok=True)
@@ -370,13 +609,25 @@ def main():
                             copy_onnx_input_output_names_to_tflite=True, non_verbose=True)
             tfl32 = os.path.join(work, name, name + '_fp32_float32.tflite')
             path = os.path.join(out, dst)
-            summary = rewrite(tfl32, path, bn_convs(m, w16), m.graph.output[0].name)
-            lines, text = check(path, want_in, want_out)
+            if name == 'finder':
+                summary = keep_fp32(tfl32, path, m)
+                lines, text = check(path, want_in, want_out, gpu=False)
+            else:
+                summary = rewrite(tfl32, path, bn_convs(m, w16), m.graph.output[0].name)
+                lines, text = check(path, want_in, want_out)
             with open(os.path.join(work, name + '.analyzer.txt'), 'w') as fh:
                 fh.write(text)
             print(f'{dst}: {os.path.getsize(path)} bytes; {summary}')
             for s in lines:
                 print('  ' + s, flush=True)
+            if name == 'shade':
+                any_path = os.path.join(out, SHADE_ANY)
+                summary = any_hw(path, any_path)
+                print(f'{SHADE_ANY}: {os.path.getsize(any_path)} bytes; {summary}')
+                for s in check_any(any_path):
+                    print('  ' + s, flush=True)
+        if 'rule' in names:
+            convert_rule(rule_src, work, out)
     finally:
         os.chdir(cwd)
         if not keep_work:

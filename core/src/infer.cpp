@@ -1,5 +1,20 @@
-// ONNX Runtime inference for the page nets (infer.h). Built with FS_WITH_ORT (core/CMakeLists.txt:
-// FS_ORT_ROOT); without it every run() fails and the caller takes its no-net path.
+// Inference for the page nets (infer.h) on ONNX Runtime (FS_WITH_ORT, core/CMakeLists.txt: FS_ORT_ROOT;
+// the desktop builds) or on LiteRT (FS_LITERT: Android / Linux with core/third_party/litert/include; the
+// app). Without either every run() fails and the caller takes its no-net path.
+//
+// The CPU backend is the build's CPU runtime:
+//   * with ONNX Runtime (desktop: tools/desktop_check, the benchmarks): ORT's default CPU EP on the .onnx
+//     models, as described below; LiteRT (if compiled in) then serves only LiteRtGpu;
+//   * without it (the Android app since Round 11): LiteRT's CPU kernels (with the default XNNPACK delegate
+//     taking the ops it supports) on the .tflite models (tools/litert/convert.py, float32 NHWC input and
+//     outputs, converted here from / to run()'s NCHW tensors): `pagefinder.tflite`, `uvdoc_static.tflite`,
+//     `syntheticdoc_hr_static.tflite` and `shadenet.tflite` (dynamic H x W: the interpreter's input is
+//     resized to each page's shape; without that file `shadenet_<H>x<W>.tflite`). One interpreter per net,
+//     on the caller's thread, InferConfig::threads threads (0: min(cores, 4)). libtensorflowlite_jni.so is
+//     dlopen'ed from litert_dir (empty: by name, the APK's lib/).
+// An accelerator whose model exists only per input shape (ShadeNet's static models on QNN, NNAPI and the
+// LiteRT GPU) runs another shape on the next backend for that call only, and stays the net's backend for
+// the shapes it has.
 //
 // Per net, the backends are tried in InferConfig::preference order with CPU appended last. A
 // backend whose execution provider cannot be created (not compiled in, not in this ORT build, no
@@ -27,7 +42,8 @@
 //                           from / to the NCHW tensors of run()) on LiteRT's GPU delegate in fp32 (no
 //                           precision loss, MAX_PRECISION first), the whole graph or no session (as QNN);
 //                           libtensorflowlite_jni.so and libtensorflowlite_gpu_jni.so (LiteRT 1.4.0) are
-//                           dlopen'ed from litert_dir, no link-time dependency; the compiled GPU kernels
+//                           dlopen'ed from litert_dir (empty: by name), no link-time dependency; the
+//                           GPU library only when a net first asks for the GPU; the compiled GPU kernels
 //                           are serialised into cache_dir (OpenCL backend), keyed by the model's SHA-256,
 //                           the SoC, the build and the LiteRT version; no OpenCL library on the device:
 //                           no delegate (opencl_found)
@@ -42,11 +58,13 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 #include "log.h"
 
 #ifdef FS_WITH_ORT
 #include <onnxruntime_cxx_api.h>
+#endif
 #if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>
 #endif
@@ -59,7 +77,6 @@
 #define FS_LITERT 1
 #endif
 #endif
-#endif
 
 #ifdef FS_LITERT
 #include <condition_variable>
@@ -67,7 +84,6 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
-#include <thread>
 
 #include "tflite/builtin_ops.h"
 #include "tflite/c/c_api.h"
@@ -80,7 +96,7 @@
 namespace fs {
 
 
-#ifndef FS_WITH_ORT
+#if !defined(FS_WITH_ORT) && !defined(FS_LITERT)
 
 struct Inference::Impl {
     InferConfig cfg;
@@ -97,14 +113,21 @@ std::unique_ptr<Inference> Inference::create(const InferConfig& cfg) {
 
 bool Inference::run(NetId, const Tensor&, std::vector<Tensor>& out, std::string* err) {
     out.clear();
-    if (err) *err = "no inference backend in this build (FS_WITH_ORT not set)";
+    if (err) *err = "no inference backend in this build (neither FS_WITH_ORT nor LiteRT)";
     return false;
 }
 
 Backend Inference::backend(NetId) const { return Backend::CPU; }
 double Inference::last_ms(NetId) const { return 0.0; }
 
-#else  // FS_WITH_ORT
+RuntimeInfo runtime_info(const std::string&) {
+    RuntimeInfo r;
+    r.cpu = "none";
+    r.gpu_why = "no LiteRT in this build";
+    return r;
+}
+
+#else  // FS_WITH_ORT || FS_LITERT
 
 namespace {
 
@@ -142,11 +165,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+#ifdef FS_WITH_ORT
+constexpr bool kCpuOnLiteRt = false;
 Ort::Env& ort_env() {
     // never destroyed: sessions held in static objects may outlive any other order of teardown
     static Ort::Env* env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "flatscan");
     return *env;
 }
+#else
+// no ONNX Runtime: the CPU backend is LiteRT's CPU kernels
+constexpr bool kCpuOnLiteRt = true;
+#endif
 
 #if defined(FS_ORT_QNN) || defined(FS_LITERT)
 // SHA-256 (FIPS 180-4), for the compiled-model cache key
@@ -244,14 +273,8 @@ bool file_bytes(const std::string& path, std::vector<uint8_t>& out) {
 
 #ifdef FS_LITERT
 // LiteRT's TFLite C API (libtensorflowlite_jni.so) and GPU delegate (libtensorflowlite_gpu_jni.so),
-// resolved once per folder and never unloaded.
-#define FS_LRT_CORE(X)                                                                                                                  \
-    X(TfLiteVersion) X(TfLiteModelCreate) X(TfLiteModelDelete) X(TfLiteInterpreterOptionsCreate) X(TfLiteInterpreterOptionsDelete)    \
-    X(TfLiteInterpreterOptionsSetErrorReporter) X(TfLiteInterpreterCreate) X(TfLiteInterpreterDelete)                                 \
-    X(TfLiteInterpreterModifyGraphWithDelegate) X(TfLiteInterpreterAllocateTensors) X(TfLiteInterpreterInvoke)                        \
-    X(TfLiteInterpreterGetInputTensorCount) X(TfLiteInterpreterGetInputTensor) X(TfLiteInterpreterGetOutputTensorCount)               \
-    X(TfLiteInterpreterGetOutputTensor) X(TfLiteTensorType) X(TfLiteTensorNumDims) X(TfLiteTensorDim) X(TfLiteTensorByteSize)         \
-    X(TfLiteTensorData) X(TfLiteOpaqueContextGetExecutionPlan) X(TfLiteOpaqueContextGetNodeAndRegistration) X(TfLiteOperatorGetBuiltInCode)
+// resolved once per folder and never unloaded; the GPU library only when a net first asks for the GPU.
+#define FS_LRT_CORE(X)                                                                                                                      X(TfLiteVersion) X(TfLiteModelCreate) X(TfLiteModelDelete) X(TfLiteInterpreterOptionsCreate) X(TfLiteInterpreterOptionsDelete)        X(TfLiteInterpreterOptionsSetErrorReporter) X(TfLiteInterpreterOptionsSetNumThreads) X(TfLiteInterpreterCreate)                       X(TfLiteInterpreterDelete) X(TfLiteInterpreterModifyGraphWithDelegate) X(TfLiteInterpreterResizeInputTensor)                          X(TfLiteInterpreterAllocateTensors) X(TfLiteInterpreterInvoke) X(TfLiteInterpreterGetInputTensorCount)                                X(TfLiteInterpreterGetInputTensor) X(TfLiteInterpreterGetOutputTensorCount) X(TfLiteInterpreterGetOutputTensor) X(TfLiteTensorType)     X(TfLiteTensorNumDims) X(TfLiteTensorDim) X(TfLiteTensorByteSize) X(TfLiteTensorData) X(TfLiteOpaqueContextGetExecutionPlan)          X(TfLiteOpaqueContextGetNodeAndRegistration) X(TfLiteOperatorGetBuiltInCode)
 #define FS_LRT_GPU(X) X(TfLiteGpuDelegateV2Create) X(TfLiteGpuDelegateV2Delete)
 #define FS_LRT_DECL(f) decltype(&::f) f = nullptr;
 struct LrtApi {
@@ -263,48 +286,82 @@ struct LrtApi {
     struct GpuOptions { TfLiteGpuDelegateOptionsV2 o; unsigned char spare[128]; };
     GpuOptions (*GpuOptionsDefault)() = nullptr;
     std::string version;
+    std::string dir;
+    bool gpu = false;                     // the GPU functions above are set
 };
 #undef FS_LRT_DECL
 
-// The API from dir (C3: libtensorflowlite_jni.so first, then libtensorflowlite_gpu_jni.so), or null with
-// why. A folder that failed is tried again next time (the app may fetch the pack later).
-const LrtApi* litert_api(const std::string& dir, std::string& why) {
+std::mutex& litert_mu() {
     static std::mutex mu;
+    return mu;
+}
+
+// dir/name, or name alone (the library path: the APK's lib/ on Android) for an empty dir
+std::string litert_path(const std::string& dir, const char* name) { return dir.empty() ? std::string(name) : dir + "/" + name; }
+
+// The runtime from dir (libtensorflowlite_jni.so), or null with why. A folder that failed is tried again
+// next time.
+const LrtApi* litert_api(const std::string& dir, std::string& why) {
     static std::map<std::string, std::unique_ptr<LrtApi>> loaded;
-    std::lock_guard<std::mutex> lk(mu);
+    std::lock_guard<std::mutex> lk(litert_mu());
     auto it = loaded.find(dir);
     if (it != loaded.end()) return it->second.get();
-    const char* libs[2] = {"libtensorflowlite_jni.so", "libtensorflowlite_gpu_jni.so"};
-    void* h[2] = {nullptr, nullptr};
+    const char* lib = "libtensorflowlite_jni.so";
+    const std::string p = litert_path(dir, lib);
+    void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
     std::string err;
-    for (int i = 0; i < 2 && err.empty(); ++i) {
-        const std::string p = dir + "/" + libs[i];
-        if (!(h[i] = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL))) {
-            const char* e = dlerror();
-            err = "cannot load " + p + ": " + (e ? e : "?");
-        }
+    if (!h) {
+        const char* e = dlerror();
+        err = "cannot load " + p + ": " + (e ? e : "?");
     }
     auto api = std::make_unique<LrtApi>();
-#define FS_LRT_SYM(lib, f) \
-    if (err.empty() && !(api->f = reinterpret_cast<decltype(api->f)>(dlsym(h[lib], #f)))) err = std::string(libs[lib]) + " has no " #f;
-#define FS_LRT_SYM0(f) FS_LRT_SYM(0, f)
-#define FS_LRT_SYM1(f) FS_LRT_SYM(1, f)
-    FS_LRT_CORE(FS_LRT_SYM0)
-    FS_LRT_GPU(FS_LRT_SYM1)
-#undef FS_LRT_SYM0
-#undef FS_LRT_SYM1
+#define FS_LRT_SYM(f)     if (err.empty() && !(api->f = reinterpret_cast<decltype(api->f)>(dlsym(h, #f)))) err = std::string(lib) + " has no " #f;
+    FS_LRT_CORE(FS_LRT_SYM)
 #undef FS_LRT_SYM
-    if (err.empty() && !(api->GpuOptionsDefault = reinterpret_cast<decltype(api->GpuOptionsDefault)>(dlsym(h[1], "TfLiteGpuDelegateOptionsV2Default"))))
-        err = std::string(libs[1]) + " has no TfLiteGpuDelegateOptionsV2Default";
-    if (err.empty()) api->version = api->TfLiteVersion();
     if (!err.empty()) {
-        for (void* p : h)
-            if (p) dlclose(p);
+        if (h) dlclose(h);
         why = err;
         return nullptr;
     }
-    LOGI("infer: LiteRT %s from %s", api->version.c_str(), dir.c_str());
+    api->version = api->TfLiteVersion();
+    api->dir = dir;
+    LOGI("infer: LiteRT %s from %s", api->version.c_str(), dir.empty() ? "the library path" : dir.c_str());
     return loaded.emplace(dir, std::move(api)).first->second.get();
+}
+
+// The GPU delegate's library (libtensorflowlite_gpu_jni.so, from the runtime's folder) into api; false
+// with why. Tried again on the next call when it fails.
+bool litert_gpu(const LrtApi& c_api, std::string& why) {
+    std::lock_guard<std::mutex> lk(litert_mu());
+    LrtApi& api = const_cast<LrtApi&>(c_api);   // the map owns it; only the GPU fields change, under the lock
+    if (api.gpu) return true;
+    const char* lib = "libtensorflowlite_gpu_jni.so";
+    const std::string p = litert_path(api.dir, lib);
+    void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* e = dlerror();
+        why = "cannot load " + p + ": " + (e ? e : "?");
+        return false;
+    }
+    std::string err;
+    decltype(api.TfLiteGpuDelegateV2Create) create = nullptr;
+    decltype(api.TfLiteGpuDelegateV2Delete) del = nullptr;
+    decltype(api.GpuOptionsDefault) defaults = nullptr;
+    if (!(create = reinterpret_cast<decltype(create)>(dlsym(h, "TfLiteGpuDelegateV2Create")))) err = std::string(lib) + " has no TfLiteGpuDelegateV2Create";
+    else if (!(del = reinterpret_cast<decltype(del)>(dlsym(h, "TfLiteGpuDelegateV2Delete")))) err = std::string(lib) + " has no TfLiteGpuDelegateV2Delete";
+    else if (!(defaults = reinterpret_cast<decltype(defaults)>(dlsym(h, "TfLiteGpuDelegateOptionsV2Default"))))
+        err = std::string(lib) + " has no TfLiteGpuDelegateOptionsV2Default";
+    if (!err.empty()) {
+        dlclose(h);
+        why = err;
+        return false;
+    }
+    api.TfLiteGpuDelegateV2Create = create;
+    api.TfLiteGpuDelegateV2Delete = del;
+    api.GpuOptionsDefault = defaults;
+    api.gpu = true;
+    LOGI("infer: LiteRT GPU delegate from %s", api.dir.empty() ? "the library path" : api.dir.c_str());
+    return true;
 }
 
 // The LiteRT thread of one Inference: the GPU delegate's OpenGL backend binds its EGL context to the
@@ -649,30 +706,27 @@ void nhwc_to_nchw(const float* src, float* dst, int64_t n, int64_t h, int64_t w,
         }
 }
 
-// One run on the LiteRT thread: the input in, Invoke, the outputs out (4-D ones back to NCHW); ms as
-// ORT's runs are timed (input, run, outputs).
-bool litert_run(LrtSession& s, const Tensor& in, std::vector<Tensor>& out, double& ms, std::string& why) {
-    const LrtApi& api = *s.api;
+// One run of interp: run()'s NCHW input into its float32 NHWC input tensor (shapes checked by the caller:
+// the byte sizes are checked here), Invoke, every output out (4-D ones back to NCHW); ms as ORT's runs are
+// timed (input, run, outputs).
+bool lrt_invoke(const LrtApi& api, TfLiteInterpreter* interp, std::string& log, const Tensor& in, std::vector<Tensor>& out, double& ms,
+                std::string& why) {
     auto t0 = Clock::now();
-    if (in.shape != s.in_shape) {
-        why = "input shape differs from the session's";
-        return false;
-    }
-    TfLiteTensor* x = api.TfLiteInterpreterGetInputTensor(s.interp, 0);
+    TfLiteTensor* x = api.TfLiteInterpreterGetInputTensor(interp, 0);
     float* xd = static_cast<float*>(api.TfLiteTensorData(x));
     if (!xd || api.TfLiteTensorByteSize(x) != in.data.size() * sizeof(float)) {
         why = "input tensor size";
         return false;
     }
     nchw_to_nhwc(in.data.data(), xd, in.shape[0], in.shape[1], in.shape[2], in.shape[3]);
-    s.log.clear();
-    if (api.TfLiteInterpreterInvoke(s.interp) != kTfLiteOk) {
-        why = "Invoke failed" + (s.log.empty() ? std::string() : ": " + s.log);
+    log.clear();
+    if (api.TfLiteInterpreterInvoke(interp) != kTfLiteOk) {
+        why = "Invoke failed" + (log.empty() ? std::string() : ": " + log);
         return false;
     }
-    out.resize(api.TfLiteInterpreterGetOutputTensorCount(s.interp));
+    out.resize(api.TfLiteInterpreterGetOutputTensorCount(interp));
     for (size_t i = 0; i < out.size(); ++i) {
-        const TfLiteTensor* y = api.TfLiteInterpreterGetOutputTensor(s.interp, (int32_t)i);
+        const TfLiteTensor* y = api.TfLiteInterpreterGetOutputTensor(interp, (int32_t)i);
         const float* yd = static_cast<const float*>(api.TfLiteTensorData(y));
         std::vector<int64_t> dims;
         size_t count = 1;
@@ -698,19 +752,121 @@ bool litert_run(LrtSession& s, const Tensor& in, std::vector<Tensor>& out, doubl
     ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     return true;
 }
+
+// One run on the LiteRT thread (GPU sessions: fixed input shape)
+bool litert_run(LrtSession& s, const Tensor& in, std::vector<Tensor>& out, double& ms, std::string& why) {
+    if (in.shape != s.in_shape) {
+        why = "input shape differs from the session's";
+        return false;
+    }
+    return lrt_invoke(*s.api, s.interp, s.log, in, out, ms, why);
+}
+
+// One net's interpreter on LiteRT's CPU kernels (the CPU backend of a build without ONNX Runtime). The
+// interpreter applies LiteRT's default XNNPACK delegate itself (the ops it supports; the rest on the
+// built-in kernels). Used under the net's Slot lock, on the caller's thread.
+struct LrtCpu {
+    const LrtApi* api = nullptr;
+    std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it)
+    TfLiteModel* model = nullptr;
+    TfLiteInterpreterOptions* opts = nullptr;
+    TfLiteInterpreter* interp = nullptr;
+    std::vector<int64_t> in_shape;        // NCHW of the allocated input tensor
+    std::string log;                     // the interpreter's error reports since the last call
+    ~LrtCpu() {
+        if (interp) api->TfLiteInterpreterDelete(interp);
+        if (opts) api->TfLiteInterpreterOptionsDelete(opts);
+        if (model) api->TfLiteModelDelete(model);
+    }
+};
+
+// NCHW of s's float32 NHWC input tensor, or empty
+std::vector<int64_t> lrt_input_nchw(const LrtApi& api, TfLiteInterpreter* interp) {
+    const TfLiteTensor* x = api.TfLiteInterpreterGetInputTensor(interp, 0);
+    if (!x || api.TfLiteTensorType(x) != kTfLiteFloat32 || api.TfLiteTensorNumDims(x) != 4) return {};
+    return {api.TfLiteTensorDim(x, 0), api.TfLiteTensorDim(x, 3), api.TfLiteTensorDim(x, 1), api.TfLiteTensorDim(x, 2)};
+}
+
+bool lrt_cpu_open(LrtCpu& s, int threads, std::string& why) {
+    const LrtApi& api = *s.api;
+    if (!(s.model = api.TfLiteModelCreate(s.bytes.data(), s.bytes.size()))) {
+        why = "not a TFLite model";
+        return false;
+    }
+    if (!(s.opts = api.TfLiteInterpreterOptionsCreate())) {
+        why = "TfLiteInterpreterOptionsCreate failed";
+        return false;
+    }
+    api.TfLiteInterpreterOptionsSetNumThreads(s.opts, threads);
+    api.TfLiteInterpreterOptionsSetErrorReporter(s.opts, litert_report, &s.log);
+    if (!(s.interp = api.TfLiteInterpreterCreate(s.model, s.opts))) {
+        why = "TfLiteInterpreterCreate failed: " + s.log;
+        return false;
+    }
+    if (api.TfLiteInterpreterGetInputTensorCount(s.interp) != 1 || api.TfLiteInterpreterGetOutputTensorCount(s.interp) < 1) {
+        why = "unexpected model signature";
+        return false;
+    }
+    if (api.TfLiteInterpreterAllocateTensors(s.interp) != kTfLiteOk) {
+        why = "AllocateTensors failed: " + s.log;
+        return false;
+    }
+    s.in_shape = lrt_input_nchw(api, s.interp);
+    if (s.in_shape.empty()) {
+        why = "input is not float32 4-D (NHWC)";
+        return false;
+    }
+    for (int32_t i = 0; i < api.TfLiteInterpreterGetOutputTensorCount(s.interp); ++i)
+        if (api.TfLiteTensorType(api.TfLiteInterpreterGetOutputTensor(s.interp, i)) != kTfLiteFloat32) {
+            why = "output is not float32";
+            return false;
+        }
+    return true;
+}
+
+// run() on the CPU interpreter: an input of another shape resizes the interpreter's input first (models with
+// a dynamic H x W, ShadeNet's; a fixed-shape model then fails in AllocateTensors, and this input fails)
+bool lrt_cpu_run(LrtCpu& s, const Tensor& in, std::vector<Tensor>& out, double& ms, std::string& why) {
+    const LrtApi& api = *s.api;
+    if (in.shape.size() != 4) {
+        why = "LiteRT models take a 4-D input";
+        return false;
+    }
+    if (in.shape != s.in_shape) {
+        const int dims[4] = {(int)in.shape[0], (int)in.shape[2], (int)in.shape[3], (int)in.shape[1]};
+        s.log.clear();
+        s.in_shape.clear();
+        if (api.TfLiteInterpreterResizeInputTensor(s.interp, 0, dims, 4) != kTfLiteOk || api.TfLiteInterpreterAllocateTensors(s.interp) != kTfLiteOk) {
+            why = "cannot resize the input to NHWC [" + std::to_string(dims[0]) + "," + std::to_string(dims[1]) + "," + std::to_string(dims[2]) + "," +
+                  std::to_string(dims[3]) + "]" + (s.log.empty() ? std::string() : ": " + s.log);
+            return false;
+        }
+        s.in_shape = lrt_input_nchw(api, s.interp);
+        if (s.in_shape != in.shape) {
+            why = "input shape after the resize differs";
+            s.in_shape.clear();
+            return false;
+        }
+    }
+    return lrt_invoke(api, s.interp, s.log, in, out, ms, why);
+}
 #endif  // FS_LITERT
 
 struct Sess {
+#ifdef FS_WITH_ORT
     std::unique_ptr<Ort::Session> s;
     std::string in_name;
     std::vector<std::string> out_names;
+#endif
 #ifdef FS_LITERT
     std::unique_ptr<LrtNet> lrt;          // LiteRtGpu: the interpreter instead of s
+    std::unique_ptr<LrtCpu> lcpu;         // CPU on LiteRT (builds without ONNX Runtime)
 #endif
 };
 
 // One net: its sessions on the current backend (ShadeNet on an accelerator: one per fixed input
-// shape, as the static models are per width; otherwise key {}), where it is in the backend order.
+// shape, as the static models are per width; otherwise key {}; the CPU's session under key {} too while
+// an accelerator lacks a shape), where it is in the backend order.
 struct Slot {
     std::mutex mu;
     size_t pos = 0;                   // index into Impl::order of the backend in use / to try
@@ -727,7 +883,7 @@ struct Inference::Impl {
     std::vector<Backend> order;       // preference without repeats, CPU last
 #ifdef FS_LITERT
     mutable std::mutex lrt_mu;
-    mutable std::shared_ptr<LrtThread> lrt_thread;   // started with the first LiteRT session
+    mutable std::shared_ptr<LrtThread> lrt_thread;   // started with the first LiteRT GPU session
 #endif
     std::array<Slot, N_NETS> slots;
 
@@ -735,19 +891,42 @@ struct Inference::Impl {
         return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
     }
 
-    // model bytes for net on backend b and an input of shape `shape`; file: the name used
-    std::vector<uint8_t> model_bytes(NetId net, Backend b, const std::vector<int64_t>& shape, std::string& file) const {
+    // LiteRT CPU threads: InferConfig::threads, else min(cores, 4)
+    int cpu_threads() const {
+        if (cfg.threads > 0) return cfg.threads;
+        const unsigned n = std::thread::hardware_concurrency();
+        return n == 0 ? 4 : (int)std::min(4u, n);
+    }
+
+    // model bytes for net on backend b and an input of shape `shape`; file: the name used; per_shape: the
+    // file named is the model of this input shape only (a missing one leaves the other shapes on b)
+    std::vector<uint8_t> model_bytes(NetId net, Backend b, const std::vector<int64_t>& shape, std::string& file, bool* per_shape = nullptr) const {
+        if (per_shape) *per_shape = false;
         if (!cfg.load) return {};
         std::vector<uint8_t> bytes;
+        auto load = [&](const std::string& f) {
+            file = f;
+            try { bytes = cfg.load(f); } catch (...) { bytes.clear(); }
+            return !bytes.empty();
+        };
+        const std::string shade_static =
+            shape.size() == 4 ? "shadenet_" + std::to_string(shape[2]) + "x" + std::to_string(shape[3]) : std::string();
         if (b == Backend::LiteRtGpu) {
-            // LiteRT: only the converted fixed-shape models (C2), the page finder has none
-            if (net == NetId::UVDoc) file = "uvdoc_static.tflite";
-            else if (net == NetId::SynthDocHR) file = "syntheticdoc_hr_static.tflite";
-            else if (net == NetId::ShadeNet && shape.size() == 4) file = "shadenet_" + std::to_string(shape[2]) + "x" + std::to_string(shape[3]) + ".tflite";
-            else file.clear();
-            if (!file.empty()) {
-                try { bytes = cfg.load(file); } catch (...) { bytes.clear(); }
-            }
+            // LiteRT GPU: only the converted fixed-shape models (C2), the page finder has none
+            if (net == NetId::UVDoc) load("uvdoc_static.tflite");
+            else if (net == NetId::SynthDocHR) load("syntheticdoc_hr_static.tflite");
+            else if (net == NetId::ShadeNet && !shade_static.empty()) {
+                if (per_shape) *per_shape = true;
+                load(shade_static + ".tflite");
+            } else file.clear();
+            return bytes;
+        }
+        if (b == Backend::CPU && kCpuOnLiteRt) {
+            // LiteRT CPU: every net; ShadeNet's dynamic-shape model, else its model of this shape
+            if (net == NetId::PageFinder) load("pagefinder.tflite");
+            else if (net == NetId::UVDoc) load("uvdoc_static.tflite");
+            else if (net == NetId::SynthDocHR) load("syntheticdoc_hr_static.tflite");
+            else if (net == NetId::ShadeNet && !load("shadenet.tflite") && !shade_static.empty()) load(shade_static + ".tflite");
             return bytes;
         }
         if (b != Backend::CPU) {
@@ -760,13 +939,17 @@ struct Inference::Impl {
                 if (!bytes.empty()) return bytes;
             }
             // QNN / NNAPI cannot run the dynamic-shape ShadeNet as one graph: no static model, no accelerator
-            if (net == NetId::ShadeNet && (b == Backend::QNN_HTP || b == Backend::NNAPI)) return {};
+            if (net == NetId::ShadeNet && (b == Backend::QNN_HTP || b == Backend::NNAPI)) {
+                if (per_shape) *per_shape = true;
+                return {};
+            }
         }
         file = std::string(net_str(net)) + ".onnx";
         try { bytes = cfg.load(file); } catch (...) { bytes.clear(); }
         return bytes;
     }
 
+#ifdef FS_WITH_ORT
     // Adds backend b's execution provider to `so`; false (with why) when this build or device lacks it.
     bool add_ep(Ort::SessionOptions& so, Backend b, std::string& why) const {
         switch (b) {
@@ -891,35 +1074,42 @@ struct Inference::Impl {
         why = std::string(backend_str(b)) + " is not compiled into this build";
         return false;
     }
+#endif  // FS_WITH_ORT
 
-    // A LiteRT GPU session for net and the NCHW input shape `shape`, or false with why.
-    bool make_litert(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why) const {
+    // A LiteRT GPU session for net and the NCHW input shape `shape`, or false with why (per_shape: no model
+    // for this shape only).
+    bool make_litert(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape) const {
 #ifdef FS_LITERT
-        if (cfg.litert_dir.empty()) {
-            why = "no LiteRT libraries (InferConfig::litert_dir not set)";
-            return false;
-        }
         const LrtApi* api = litert_api(cfg.litert_dir, why);
         if (!api) return false;
         if (shape.size() != 4) {
             why = "LiteRT models take a 4-D input";
             return false;
         }
+        bool need_cl = true;
+#ifdef FS_LITERT_TEST_XNNPACK
+        need_cl = !std::getenv("FS_LITERT_TEST_XNNPACK");
+#endif
+        // no OpenCL library: no delegate, and its library is not even loaded
+        if (need_cl && !opencl_found()) {
+            why = "no OpenCL library (LiteRT 1.4.0's GPU delegate can crash looking for one: opencl_found)";
+            return false;
+        }
+        if (!litert_gpu(*api, why)) return false;
         std::string file;
         auto s = std::make_unique<LrtSession>();
         s->api = api;
-        s->bytes = model_bytes(net, Backend::LiteRtGpu, shape, file);
+        s->bytes = model_bytes(net, Backend::LiteRtGpu, shape, file, &per_shape);
         if (s->bytes.empty()) {
             why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
             return false;
         }
+        per_shape = false;
         s->in_shape = shape;
         s->cache_dir = cfg.cache_dir;
         s->token = litert_token(*api, s->bytes);
-        bool need_cl = true;
 #ifdef FS_LITERT_TEST_XNNPACK
         s->lib_dir = cfg.litert_dir;
-        need_cl = !std::getenv("FS_LITERT_TEST_XNNPACK");
 #endif
         std::shared_ptr<LrtThread> th;
         try {
@@ -930,10 +1120,6 @@ struct Inference::Impl {
             }
             auto t0 = Clock::now();
             bool ok = false;
-            if (need_cl && !opencl_found()) {
-                why = "no OpenCL library (LiteRT 1.4.0's GPU delegate can crash looking for one: opencl_found)";
-                return false;
-            }
             // a kernel cache that cannot be written fails the delegation: then once more without it
             const bool cache = !s->cache_dir.empty();
             th->run([&] {
@@ -964,20 +1150,55 @@ struct Inference::Impl {
         (void)net;
         (void)shape;
         (void)out;
+        (void)per_shape;
         why = "LiteRtGpu is not compiled into this build";
         return false;
 #endif
     }
 
-    // A session for net on backend b, or false with why.
-    bool make_session(NetId net, Backend b, const std::vector<int64_t>& shape, Sess& out, std::string& why) const {
-        if (b == Backend::LiteRtGpu) return make_litert(net, shape, out, why);
+    // The CPU session on LiteRT's CPU kernels (builds without ONNX Runtime), or false with why.
+    bool make_litert_cpu(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why) const {
+#ifdef FS_LITERT
+        const LrtApi* api = litert_api(cfg.litert_dir, why);
+        if (!api) return false;
         std::string file;
-        std::vector<uint8_t> bytes = model_bytes(net, b, shape, file);
+        auto s = std::make_unique<LrtCpu>();
+        s->api = api;
+        s->bytes = model_bytes(net, Backend::CPU, shape, file);
+        if (s->bytes.empty()) {
+            why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
+            return false;
+        }
+        auto t0 = Clock::now();
+        const int threads = cpu_threads();
+        if (!lrt_cpu_open(*s, threads, why)) return false;
+        LOGI("infer: %s on CPU (%s, LiteRT %s, %d threads) ready in %.0f ms", net_str(net), file.c_str(), api->version.c_str(), threads,
+             std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        out = Sess();
+        out.lcpu = std::move(s);
+        return true;
+#else
+        (void)net;
+        (void)shape;
+        (void)out;
+        why = "LiteRT is not compiled into this build";
+        return false;
+#endif
+    }
+
+    // A session for net on backend b, or false with why (per_shape: no model for this input shape only).
+    bool make_session(NetId net, Backend b, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape) const {
+        per_shape = false;
+        if (b == Backend::LiteRtGpu) return make_litert(net, shape, out, why, per_shape);
+        if (b == Backend::CPU && kCpuOnLiteRt) return make_litert_cpu(net, shape, out, why);
+#ifdef FS_WITH_ORT
+        std::string file;
+        std::vector<uint8_t> bytes = model_bytes(net, b, shape, file, &per_shape);
         if (bytes.empty()) {
             why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
             return false;
         }
+        per_shape = false;
         auto t0 = Clock::now();
         try {
             Ort::SessionOptions so;
@@ -1031,6 +1252,12 @@ struct Inference::Impl {
         }
         out = Sess();
         return false;
+#else
+        (void)shape;
+        (void)out;
+        why = std::string(backend_str(b)) + " is not compiled into this build (no ONNX Runtime)";
+        return false;
+#endif
     }
 };
 
@@ -1058,32 +1285,49 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
         return false;
     }
     std::string why;
-    while (S.pos < I.order.size()) {
-        const Backend b = I.order[S.pos];
+    // at: the backend tried; S.pos moves on only when the net's backend fails for good (a missing model of one
+    // input shape skips that backend for this call only)
+    size_t at = S.pos;
+    // the backend at `at` fails for every input: the net moves on to the next one for good
+    auto drop = [&]() {
+        if (at == S.pos) {
+            S.sess.clear();
+            S.pos = at + 1;
+        }
+        ++at;
+    };
+    while (at < I.order.size()) {
+        const Backend b = I.order[at];
         const bool cpu = b == Backend::CPU;
-        if (!cpu && !Impl::accelerator_allowed(net, b)) { ++S.pos; continue; }
+        if (!cpu && !Impl::accelerator_allowed(net, b)) {
+            if (at == S.pos) ++S.pos;
+            ++at;
+            continue;
+        }
         if (cpu && S.cpu_failed) break;
-        // ShadeNet's fixed-shape models on accelerators (every LiteRT interpreter): one session per input shape
+        // ShadeNet's fixed-shape models on accelerators (every LiteRT GPU interpreter): one session per input shape
         std::vector<int64_t> key = (!cpu && (net == NetId::ShadeNet || b == Backend::LiteRtGpu)) ? in.shape : std::vector<int64_t>();
         auto it = S.sess.find(key);
         if (it == S.sess.end()) {
             Sess s;
-            if (!I.make_session(net, b, key, s, why)) {
-                LOGI("infer: %s: %s unavailable: %s", net_str(net), backend_str(b), why.c_str());
+            bool per_shape = false;
+            if (!I.make_session(net, b, key, s, why, per_shape)) {
+                LOGI("infer: %s: %s unavailable%s: %s", net_str(net), backend_str(b), per_shape ? " for this input shape" : "", why.c_str());
                 if (cpu) { S.cpu_failed = true; break; }
-                S.sess.clear();
-                ++S.pos;
+                if (per_shape) { ++at; continue; }
+                drop();
                 continue;
             }
             it = S.sess.emplace(key, std::move(s)).first;
         }
         Sess& s = it->second;
 #ifdef FS_LITERT
-        if (s.lrt) {
+        if (s.lrt || s.lcpu) {
             double ms = 0;
             bool ok = false;
             try {
-                s.lrt->th->run([&] { ok = litert_run(*s.lrt->s, in, out, ms, why); });
+                if (s.lrt) s.lrt->th->run([&] { ok = litert_run(*s.lrt->s, in, out, ms, why); });
+                else ok = lrt_cpu_run(*s.lcpu, in, out, ms, why);
             } catch (const std::exception& e) {
                 ok = false;
                 why = e.what();
@@ -1095,11 +1339,12 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
             }
             out.clear();
             LOGI("infer: %s on %s failed: %s", net_str(net), backend_str(b), why.c_str());
-            S.sess.clear();
-            ++S.pos;
+            if (cpu) break;   // the CPU session stays; this input failed
+            drop();
             continue;
         }
 #endif
+#ifdef FS_WITH_ORT
         try {
             auto t0 = Clock::now();
             Ort::MemoryInfo mi = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -1123,11 +1368,13 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
         } catch (const std::exception& e) {
             why = e.what();
         }
+#else
+        why = "no session";
+#endif
         out.clear();
         LOGI("infer: %s on %s failed: %s", net_str(net), backend_str(b), why.c_str());
         if (cpu) break;   // the CPU session stays; this input failed
-        S.sess.clear();
-        ++S.pos;
+        drop();
     }
     if (err) *err = why.empty() ? "no backend could run the net" : why;
     return false;
@@ -1145,6 +1392,27 @@ double Inference::last_ms(NetId net) const {
     return S.ms;
 }
 
-#endif  // FS_WITH_ORT
+RuntimeInfo runtime_info(const std::string& litert_dir) {
+    RuntimeInfo r;
+#ifdef FS_WITH_ORT
+    r.cpu = std::string("ONNX Runtime ") + Ort::GetVersionString();
+#endif
+#ifdef FS_LITERT
+    std::string why;
+    const LrtApi* api = litert_api(litert_dir, why);
+    r.litert = api ? api->version : "unavailable: " + why;
+    if (kCpuOnLiteRt) r.cpu = api ? "LiteRT " + api->version : "LiteRT unavailable: " + why;
+    if (!api) r.gpu_why = why;
+    else if (!opencl_found()) r.gpu_why = "no OpenCL library";
+    else if (!litert_gpu(*api, r.gpu_why)) {
+    } else r.gpu = true;
+#else
+    (void)litert_dir;
+    r.gpu_why = "no LiteRT in this build";
+#endif
+    return r;
+}
+
+#endif  // FS_WITH_ORT || FS_LITERT
 
 }  // namespace fs
