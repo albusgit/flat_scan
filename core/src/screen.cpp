@@ -8,7 +8,7 @@
 
 namespace fs {
 
-const float kScreenThreshold = 2.4f;   // docs/results/r11/filters.md: no paper page of 217 at or above it
+const float kScreenThreshold = 2.5f;   // docs/results/r11/filters.md: no paper page of 171 (+ the 34 real pages) at or above it
 
 namespace {
 
@@ -95,9 +95,6 @@ ScreenInfo detect_screen(const cv::Mat& page) {
     // tile, and resampled small images carry their own periodic patterns
     const int n = 512;
     if (std::min(h, w) < 1024) return si;
-    cv::Mat bgr, ycc;
-    cv::cvtColor(page, bgr, cv::COLOR_BGRA2BGR);
-    cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
     cv::Mat win;
     cv::createHanningWindow(win, cv::Size(n, n), CV_32F);
     std::vector<float> sc, sy;
@@ -105,7 +102,9 @@ ScreenInfo detect_screen(const cv::Mat& page) {
     for (double fyr : fr)
         for (double fxr : fr) {
             int y0 = std::min(std::max(0, (int)(h * fyr) - n / 2), h - n), x0 = std::min(std::max(0, (int)(w * fxr) - n / 2), w - n);
-            cv::Mat tile = ycc(cv::Rect(x0, y0, n, n)), ch[3];
+            cv::Mat tb, tile, ch[3];   // only the tiles are converted
+            cv::cvtColor(page(cv::Rect(x0, y0, n, n)), tb, cv::COLOR_BGRA2BGR);
+            cv::cvtColor(tb, tile, cv::COLOR_BGR2YCrCb);
             cv::split(tile, ch);
             float best_c = 0.f, best_y = 0.f;
             for (int c = 1; c < 3; ++c) {   // Cr, Cb (the luminance is not used)
@@ -146,36 +145,32 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
     cv::cvtColor(f, ycc, cv::COLOR_BGR2YCrCb);
     std::vector<cv::Mat> ch;
     cv::split(ycc, ch);
-    // 1. notch filter on an optimal DFT size (the page reflected into the padding)
+    // 1. notch filter of the luminance on an optimal DFT size (the page reflected into the padding);
+    //    the colour of the pattern is left to the chroma step
     int H = cv::getOptimalDFTSize(h), W = cv::getOptimalDFTSize(w);
-    std::vector<cv::Mat> spec(3);
-    std::vector<double> means(3);
-    for (int c = 0; c < 3; ++c) {
-        means[c] = cv::mean(ch[c])[0];
-        cv::Mat p;
-        cv::copyMakeBorder(ch[c] - means[c], p, 0, H - h, 0, W - w, cv::BORDER_REFLECT);
-        cv::dft(p, spec[c], cv::DFT_COMPLEX_OUTPUT);
-    }
+    const double mean_y = cv::mean(ch[0])[0];
     // The peaks are found on the background only: text (strong local contrast, dilated) is replaced
     // by the smooth surroundings, so the harmonics of regular text (monospaced code, terminal
-    // rows) are not taken for the screen's pattern, which covers the background too.
+    // rows) are not taken for the screen's pattern, which covers the background too. (Smoothing
+    // at 1/4 size: sigma 6 and 8 px.)
+    auto smooth4 = [&](const cv::Mat& a, double sigma) {
+        cv::Mat q, o;
+        cv::resize(a, q, cv::Size(std::max(1, w / 4), std::max(1, h / 4)), 0, 0, cv::INTER_AREA);
+        cv::GaussianBlur(q, q, cv::Size(0, 0), sigma / 4);
+        cv::resize(q, o, cv::Size(w, h), 0, 0, cv::INTER_LINEAR);
+        return o;
+    };
     cv::Mat mag, planes[2];
     {
-        cv::Mat sm, txt, wgt, fill, Yb;
-        cv::GaussianBlur(ch[0], sm, cv::Size(0, 0), 6.0);
-        cv::Mat dev = cv::abs(ch[0] - sm);
+        cv::Mat dev = cv::abs(ch[0] - smooth4(ch[0], 6.0)), txt, keep, wgt;
         txt = dev > tn.text_contrast;
         cv::dilate(txt, txt, cv::Mat::ones(7, 7, CV_8U));
-        cv::Mat keep;
         cv::bitwise_not(txt, keep);
         keep.convertTo(wgt, CV_32F, 1.0 / 255);
-        cv::Mat num, den;
-        cv::GaussianBlur(ch[0].mul(wgt), num, cv::Size(0, 0), 8.0);
-        cv::GaussianBlur(wgt, den, cv::Size(0, 0), 8.0);
-        fill = num / (den + 1e-3f);
-        Yb = ch[0].mul(wgt) + fill.mul(1.f - wgt);
+        cv::Mat fill = smooth4(ch[0].mul(wgt), 8.0) / (smooth4(wgt, 8.0) + 1e-3f);
+        cv::Mat Yb = ch[0].mul(wgt) + fill.mul(1.f - wgt);
         cv::Mat p, Fb;
-        cv::copyMakeBorder(Yb - means[0], p, 0, H - h, 0, W - w, cv::BORDER_REFLECT);
+        cv::copyMakeBorder(Yb - mean_y, p, 0, H - h, 0, W - w, cv::BORDER_REFLECT);
         cv::dft(p, Fb, cv::DFT_COMPLEX_OUTPUT);
         cv::split(Fb, planes);
     }
@@ -209,30 +204,13 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
         cv::GaussianBlur(mk, mk, cv::Size(0, 0), 1.5);
         cv::Mat M = 1.f - cv::min(mk * 1.5f, 1.f);
         fftshift(M, true);
-        cv::Mat M2;
+        cv::Mat M2, p, spec, back;
         cv::merge(std::vector<cv::Mat>{M, M}, M2);
-        std::vector<cv::Mat> notched(3);
-        for (int c = 0; c < 3; ++c) {
-            cv::Mat back;
-            cv::multiply(spec[c], M2, spec[c]);
-            cv::dft(spec[c], back, cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_REAL_OUTPUT);
-            notched[c] = back(cv::Rect(0, 0, w, h)) + means[c];
-        }
-        // Where the removed pattern is not in the photo, the notch would add it (a peak that is
-        // only in some areas - the harmonics of monospaced text, a pattern in one picture - is
-        // cancelled everywhere, so flat areas get its negative as waves). The notch is kept where
-        // the local energy of the removed part d is covered by the photo's own fine detail
-        // (high-pass, sigma 3 px): w = smoothstep(0.6, 1.0, rms(hp) / rms(d)), both over sigma 8 px.
-        cv::Mat d = ch[0] - notched[0], hp, ed, eh, gate;
-        cv::GaussianBlur(ch[0], hp, cv::Size(0, 0), 3.0);
-        hp = ch[0] - hp;
-        cv::GaussianBlur(d.mul(d), ed, cv::Size(0, 0), 8.0);
-        cv::GaussianBlur(hp.mul(hp), eh, cv::Size(0, 0), 8.0);
-        cv::sqrt(eh / (ed + 1e-3f), gate);
-        gate = cv::min(cv::max((gate - tn.gate0) / (tn.gate1 - tn.gate0), 0.f), 1.f);
-        gate = gate.mul(gate).mul(3.f - 2.f * gate);
-        if (st) st->gated = 1.0 - cv::mean(gate)[0];
-        for (int c = 0; c < 3; ++c) ch[c] = ch[c] + gate.mul(notched[c] - ch[c]);
+        cv::copyMakeBorder(ch[0] - mean_y, p, 0, H - h, 0, W - w, cv::BORDER_REFLECT);
+        cv::dft(p, spec, cv::DFT_COMPLEX_OUTPUT);
+        cv::multiply(spec, M2, spec);
+        cv::dft(spec, back, cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_REAL_OUTPUT);
+        ch[0] = back(cv::Rect(0, 0, w, h)) + mean_y;
     }
     // 2. chroma guided by the luminance
     if (tn.chroma_r > 0)

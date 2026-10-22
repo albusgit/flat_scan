@@ -13,9 +13,10 @@
 //   max(Cr, Cb). A screen if score >= kScreenThreshold (screen.cpp; measured on paper and screen
 //   sets in docs/results/r11/filters.md).
 // descreen: removes what the screen added, before the filters run:
-//   1. notch filter: periodic peaks of the luminance spectrum (log magnitude > 2.0 above its 21 x 21
-//      median, periods below 12 px) are cut from every channel (soft Gaussian notches) - the pixel
-//      grid, subpixel stripes and their aliases;
+//   1. notch filter of the luminance: periodic peaks of the spectrum of the page's BACKGROUND (text
+//      with a local contrast above 40 levels masked out and filled in, so the harmonics of regular
+//      text are not taken for a pattern; log magnitude > 2.0 above its 21 x 21 median, 4.0 on the two
+//      axes, periods below 12 px) are cut (soft Gaussian notches) - pixel grid, stripes, aliases;
 //   2. chroma: Cr and Cb are replaced by a guided filter of themselves with the luminance as guide
 //      (radius 8 px, eps 20^2): colour that follows the content's edges stays, colour moire that has
 //      no luminance edge of its own is averaged away.
@@ -39,7 +40,6 @@ ScreenInfo detect_screen(const cv::Mat& page_bgra);
 
 struct DescreenStats {
     int peaks = 0;            // spectral peaks notched
-    double gated = 0;         // fraction of the page where the notch was turned off (gate)
     double ms = 0;
 };
 // Descreen constants (defaults shipped; desktop tools override them for tuning)
@@ -50,7 +50,6 @@ struct DescreenTune {
     float min_period = 12.f;  // notch: only periods below this (px)
     int chroma_r = 8;         // guided chroma: radius (0 = off)
     float chroma_eps = 20.f;  // guided chroma: eps (levels)
-    float gate0 = 0.6f, gate1 = 1.0f;   // notch gate: rms(high-pass) / rms(removed) from gate0 (off) to gate1 (on)
 };
 DescreenTune& descreen_tune();
 // Returns a new BGRA page (same size).
