@@ -454,6 +454,52 @@ line constraints. The ideas used here, and those left for later:
 The new code has not run on a phone. Only 3 real photos were tested: real form photos (30 - 50)
 would be the better test set, and could be used to tune the net.
 
+## Round 11: LiteRT is the runtime, a smaller app, screen photos, more editing
+
+Reports, with how each number was measured: `docs/results/r11/<stream>.md`. Nothing here has run on a phone.
+
+### Runtime and size (`runtime.md`)
+
+- **LiteRT 1.4.0 is the app's only runtime**: the CPU (builtin kernels + XNNPACK) by default, the GPU delegate
+  (OpenCL) where the phone has one, with a fallback to the CPU. ONNX Runtime, QNN and the NPU packs are out of the
+  Android build (ORT stays in the desktop harness, `FS_WITH_ORT`). The CPU fallback stays on purpose: the GPU
+  delegate has never run on a real GPU, and the emulator (and many phones) have no OpenCL.
+- Parity with ORT (emulator, x86_64): net outputs within 4.2e-5; pages differ on <= 1.09 % of pixels by <= 15
+  levels. Time per page 15.0 s (LiteRT) vs 16.1 s (ORT) on the emulator.
+- **Slim OpenCV** (`tools/opencv_min/build_opencv_min.sh`, static 4.11.0 with only the modules the core uses, the
+  AAR's HALs and dispatch): native libraries 16.3 -> 5.9 MB.
+- **Play download per arm64 phone: 54.8 MB** (bundletool get-size; 66.4 MB before, 81 MB before R8). Release APK
+  67.1 MB.
+- **Int8 weights** (`modelsize.md`, GPTQ, `tools/litert/ship.py`): the nets shrink 39.1 -> 21.6 MB with text-row
+  straightness unchanged on 34 real photos. **Not shipped**: DocUNet and the phone GPU were not checked with them.
+
+### Image (`filters.md`, `merge.md`, `rulenet.md`, `flatnet.md`)
+
+- **Screen photo mode** (Off / On / Auto; editor chip "Screen photo"): `detect_screen` finds the moiré peaks in
+  the chroma spectrum, `descreen` notches the luminance and filters the chroma guided by it. 0 false positives on
+  171 paper pages; finds 43 of 120 screen photos (7 of 48 real ones); dE 23.4 -> 16.1 on synthetic screen photos.
+  CPU only, 0.7 - 0.9 s per page (desktop).
+- **New "Scan" filter**: a choice, not the default (it whitened pale colour areas on 9 of 34 real pages). The
+  existing filters are byte-identical at their defaults.
+- **Rule net in the C++ core** (Round 10 merged): DocUNet LD 5.122 with it, 5.050 without (composed, 128
+  photos). Rule net v2 (new generator, retrained on the GPU) was not better than v1: v1 stays.
+- **Flattening net fine-tune** (SyntheticDoc-HR on WarpDoc with pseudo ground truth): net only, DIR300 LD 7.12
+  -> 4.47 (300 pages), but **worse end to end on DocUNet** (130-page mean LD 5.73 -> 7.04): not shipped. Tools
+  in `tools/flatnet`.
+
+### Test library (`library.md`)
+
+`E:\fs_datasets` (`MANIFEST.md`, sources and licences): DIR300 (300 photos), DocReal (200), WarpDoc (1020),
+UVDoc benchmark (50), Inv3DReal (360), and Wikimedia Commons screens and colour pages; harness
+`tools/library/run_library.py`. DocUNet stays the test set (never trained or tuned on).
+
+### UI (`ui.md`)
+
+Page look (brightness, contrast, saturation, warmth), page shape (A4, as photographed, Letter, ID card), undo /
+redo, a compare split view, apply to all pages, export options (paper size, margins, quality), rename, drag to
+reorder, the camera torch and a gallery button, processing progress, a landscape layout. Defaults give
+byte-identical pages; every feature was driven on the emulator without a crash.
+
 ## Acceleration: nets on the NPU / GPU, CPU stages beside the nets, more image stages on the GPU
 
 The nets now run inside the C++ core (`core/src/infer.*`, `core/src/nets.*`) on ONNX Runtime **1.22.0**
