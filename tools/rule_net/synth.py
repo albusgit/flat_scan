@@ -21,13 +21,20 @@ import math, random, sys
 import numpy as np, cv2
 from PIL import Image, ImageDraw, ImageFont
 
+import os
 FONT_DIRS = '/usr/share/fonts/truetype/'
-FONTS = [FONT_DIRS + f for f in (
-    'dejavu/DejaVuSans.ttf', 'dejavu/DejaVuSans-Bold.ttf',
-    'liberation/LiberationSans-Regular.ttf', 'liberation/LiberationSans-Bold.ttf', 'liberation/LiberationSerif-Regular.ttf',
-    'liberation/LiberationSerif-Bold.ttf', 'liberation/LiberationMono-Regular.ttf',
-    'freefont/FreeSans.ttf', 'freefont/FreeSansBold.ttf', 'freefont/FreeSerif.ttf', 'freefont/FreeSerifBold.ttf',
-    'freefont/FreeMono.ttf', 'freefont/FreeMonoBold.ttf')]   # all with Hebrew glyphs (DejaVu Serif / Mono have none)
+if os.path.isdir(FONT_DIRS + 'dejavu'):
+    FONTS = [FONT_DIRS + f for f in (
+        'dejavu/DejaVuSans.ttf', 'dejavu/DejaVuSans-Bold.ttf',
+        'liberation/LiberationSans-Regular.ttf', 'liberation/LiberationSans-Bold.ttf', 'liberation/LiberationSerif-Regular.ttf',
+        'liberation/LiberationSerif-Bold.ttf', 'liberation/LiberationMono-Regular.ttf',
+        'freefont/FreeSans.ttf', 'freefont/FreeSansBold.ttf', 'freefont/FreeSerif.ttf', 'freefont/FreeSerifBold.ttf',
+        'freefont/FreeMono.ttf', 'freefont/FreeMonoBold.ttf')]   # all with Hebrew glyphs (DejaVu Serif / Mono have none)
+else:   # Windows (round 11): fonts with Hebrew glyphs; 1, 3, 8, 10 are bold (headings)
+    FONTS = ['C:/Windows/Fonts/' + f for f in (
+        'arial.ttf', 'arialbd.ttf', 'calibri.ttf', 'calibrib.ttf', 'times.ttf', 'timesbd.ttf', 'cour.ttf',
+        'tahoma.ttf', 'tahomabd.ttf', 'david.ttf', 'davidbd.ttf', 'frank.ttf', 'courbd.ttf', 'gisha.ttf',
+        'mriam.ttf', 'segoeui.ttf', 'micross.ttf', 'rod.ttf')]
 _font_cache = {}
 HEB = 'אבגדהוזחטיכלמנסעפצקרשתךםןףץ'
 LAT = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -329,6 +336,8 @@ def negatives(pg):
         sl = (slice(y0, y0 + ph), slice(x0, x0 + pw))
         pg.ink[sl] = tex[:pg.ink[sl].shape[0], :pg.ink[sl].shape[1]]
         pg.mh[sl] = 0; pg.mv[sl] = 0   # the picture covers the rules under it
+        if hasattr(pg, 'edge_rect'):   # round 11 (synth2): a picture's straight sides
+            pg.edge_rect(x0, y0, x0 + pw, y0 + ph)
 
 
 def standalone_rules(pg):
@@ -367,8 +376,8 @@ def standalone_rules(pg):
             pg.paint(m, pg.colour())
 
 
-def layout(rng, h, w):
-    pg = Page(rng, h, w)
+def layout(rng, h, w, page_cls=None):
+    pg = (page_cls or Page)(rng, h, w)
     # blocks stacked down the page: tables, paragraphs; sometimes two columns
     y = rng.uniform(-0.3, 0.05) * h
     while y < h:
