@@ -274,7 +274,7 @@ bool file_bytes(const std::string& path, std::vector<uint8_t>& out) {
 #ifdef FS_LITERT
 // LiteRT's TFLite C API (libtensorflowlite_jni.so) and GPU delegate (libtensorflowlite_gpu_jni.so),
 // resolved once per folder and never unloaded; the GPU library only when a net first asks for the GPU.
-#define FS_LRT_CORE(X)                                                                                                                      X(TfLiteVersion) X(TfLiteModelCreate) X(TfLiteModelDelete) X(TfLiteInterpreterOptionsCreate) X(TfLiteInterpreterOptionsDelete)        X(TfLiteInterpreterOptionsSetErrorReporter) X(TfLiteInterpreterOptionsSetNumThreads) X(TfLiteInterpreterCreate)                       X(TfLiteInterpreterDelete) X(TfLiteInterpreterModifyGraphWithDelegate) X(TfLiteInterpreterResizeInputTensor)                          X(TfLiteInterpreterAllocateTensors) X(TfLiteInterpreterInvoke) X(TfLiteInterpreterGetInputTensorCount)                                X(TfLiteInterpreterGetInputTensor) X(TfLiteInterpreterGetOutputTensorCount) X(TfLiteInterpreterGetOutputTensor) X(TfLiteTensorType)     X(TfLiteTensorNumDims) X(TfLiteTensorDim) X(TfLiteTensorByteSize) X(TfLiteTensorData) X(TfLiteOpaqueContextGetExecutionPlan)          X(TfLiteOpaqueContextGetNodeAndRegistration) X(TfLiteOperatorGetBuiltInCode)
+#define FS_LRT_CORE(X)                                                                                                                      X(TfLiteVersion) X(TfLiteModelCreate) X(TfLiteModelDelete) X(TfLiteInterpreterOptionsCreate) X(TfLiteInterpreterOptionsDelete)        X(TfLiteInterpreterOptionsSetErrorReporter) X(TfLiteInterpreterOptionsSetNumThreads) X(TfLiteInterpreterCreate)                       X(TfLiteInterpreterDelete) X(TfLiteInterpreterModifyGraphWithDelegate) X(TfLiteInterpreterResizeInputTensor)                          X(TfLiteInterpreterAllocateTensors) X(TfLiteInterpreterInvoke) X(TfLiteInterpreterGetInputTensorCount)                                X(TfLiteInterpreterGetInputTensor) X(TfLiteInterpreterGetOutputTensorCount) X(TfLiteInterpreterGetOutputTensor) X(TfLiteTensorType)     X(TfLiteTensorNumDims) X(TfLiteTensorDim) X(TfLiteTensorByteSize) X(TfLiteTensorData) X(TfLiteOpaqueContextGetExecutionPlan)          X(TfLiteOpaqueContextGetNodeAndRegistration) X(TfLiteOperatorGetBuiltInCode) X(TfLiteInterpreterOptionsAddDelegate)
 #define FS_LRT_GPU(X) X(TfLiteGpuDelegateV2Create) X(TfLiteGpuDelegateV2Delete)
 #define FS_LRT_DECL(f) decltype(&::f) f = nullptr;
 struct LrtApi {
@@ -285,6 +285,14 @@ struct LrtApi {
     // past ours, and TfLiteGpuDelegateV2Create then reads its own defaults for them
     struct GpuOptions { TfLiteGpuDelegateOptionsV2 o; unsigned char spare[128]; };
     GpuOptions (*GpuOptionsDefault)() = nullptr;
+    // LiteRT's XNNPACK delegate (in libtensorflowlite_jni.so; no vendored header): the options struct is read
+    // the same way as the GPU's, with room to spare; num_threads is its first field in every version. The C
+    // API's TfLiteInterpreterCreate does not apply it by itself (measured on the emulator: built-in kernels
+    // only, 2.5-4x slower than ONNX Runtime), so the CPU interpreters get it explicitly.
+    struct XnnOptions { int32_t num_threads; uint32_t flags; unsigned char spare[256]; };
+    XnnOptions (*XnnOptionsDefault)() = nullptr;
+    TfLiteDelegate* (*XnnCreate)(const XnnOptions*) = nullptr;
+    void (*XnnDelete)(TfLiteDelegate*) = nullptr;
     std::string version;
     std::string dir;
     bool gpu = false;                     // the GPU functions above are set
@@ -323,6 +331,10 @@ const LrtApi* litert_api(const std::string& dir, std::string& why) {
         why = err;
         return nullptr;
     }
+    api->XnnOptionsDefault = reinterpret_cast<decltype(api->XnnOptionsDefault)>(dlsym(h, "TfLiteXNNPackDelegateOptionsDefault"));
+    api->XnnCreate = reinterpret_cast<decltype(api->XnnCreate)>(dlsym(h, "TfLiteXNNPackDelegateCreate"));
+    api->XnnDelete = reinterpret_cast<decltype(api->XnnDelete)>(dlsym(h, "TfLiteXNNPackDelegateDelete"));
+    if (!api->XnnOptionsDefault || !api->XnnCreate || !api->XnnDelete) api->XnnCreate = nullptr;   // then built-in kernels only
     api->version = api->TfLiteVersion();
     api->dir = dir;
     LOGI("infer: LiteRT %s from %s", api->version.c_str(), dir.empty() ? "the library path" : dir.c_str());
@@ -762,20 +774,32 @@ bool litert_run(LrtSession& s, const Tensor& in, std::vector<Tensor>& out, doubl
     return lrt_invoke(*s.api, s.interp, s.log, in, out, ms, why);
 }
 
-// One net's interpreter on LiteRT's CPU kernels (the CPU backend of a build without ONNX Runtime). The
-// interpreter applies LiteRT's default XNNPACK delegate itself (the ops it supports; the rest on the
-// built-in kernels). Used under the net's Slot lock, on the caller's thread.
+// One net's interpreter on LiteRT's CPU (the CPU backend of a build without ONNX Runtime): the XNNPACK
+// delegate (fp32) takes the ops it supports, the built-in kernels the rest. Should XNNPACK fail on a model or
+// an input shape, the interpreter is made again without it. Used under the net's Slot lock, on the caller's
+// thread.
 struct LrtCpu {
     const LrtApi* api = nullptr;
     std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it)
     TfLiteModel* model = nullptr;
     TfLiteInterpreterOptions* opts = nullptr;
     TfLiteInterpreter* interp = nullptr;
+    TfLiteDelegate* xnn = nullptr;        // outlives the interpreter
+    bool use_xnn = true;
+    int threads = 1;
     std::vector<int64_t> in_shape;        // NCHW of the allocated input tensor
     std::string log;                     // the interpreter's error reports since the last call
-    ~LrtCpu() {
+    void close() {
         if (interp) api->TfLiteInterpreterDelete(interp);
         if (opts) api->TfLiteInterpreterOptionsDelete(opts);
+        if (xnn) api->XnnDelete(xnn);
+        interp = nullptr;
+        opts = nullptr;
+        xnn = nullptr;
+        in_shape.clear();
+    }
+    ~LrtCpu() {
+        close();
         if (model) api->TfLiteModelDelete(model);
     }
 };
@@ -787,9 +811,11 @@ std::vector<int64_t> lrt_input_nchw(const LrtApi& api, TfLiteInterpreter* interp
     return {api.TfLiteTensorDim(x, 0), api.TfLiteTensorDim(x, 3), api.TfLiteTensorDim(x, 1), api.TfLiteTensorDim(x, 2)};
 }
 
-bool lrt_cpu_open(LrtCpu& s, int threads, std::string& why) {
+bool lrt_cpu_open(LrtCpu& s, std::string& why) {
     const LrtApi& api = *s.api;
-    if (!(s.model = api.TfLiteModelCreate(s.bytes.data(), s.bytes.size()))) {
+    s.close();
+    s.log.clear();
+    if (!s.model && !(s.model = api.TfLiteModelCreate(s.bytes.data(), s.bytes.size()))) {
         why = "not a TFLite model";
         return false;
     }
@@ -797,8 +823,13 @@ bool lrt_cpu_open(LrtCpu& s, int threads, std::string& why) {
         why = "TfLiteInterpreterOptionsCreate failed";
         return false;
     }
-    api.TfLiteInterpreterOptionsSetNumThreads(s.opts, threads);
+    api.TfLiteInterpreterOptionsSetNumThreads(s.opts, s.threads);
     api.TfLiteInterpreterOptionsSetErrorReporter(s.opts, litert_report, &s.log);
+    if (s.use_xnn && api.XnnCreate) {
+        LrtApi::XnnOptions xo = api.XnnOptionsDefault();
+        xo.num_threads = s.threads;
+        if ((s.xnn = api.XnnCreate(&xo))) api.TfLiteInterpreterOptionsAddDelegate(s.opts, reinterpret_cast<TfLiteOpaqueDelegate*>(s.xnn));
+    }
     if (!(s.interp = api.TfLiteInterpreterCreate(s.model, s.opts))) {
         why = "TfLiteInterpreterCreate failed: " + s.log;
         return false;
@@ -836,7 +867,16 @@ bool lrt_cpu_run(LrtCpu& s, const Tensor& in, std::vector<Tensor>& out, double& 
         const int dims[4] = {(int)in.shape[0], (int)in.shape[2], (int)in.shape[3], (int)in.shape[1]};
         s.log.clear();
         s.in_shape.clear();
-        if (api.TfLiteInterpreterResizeInputTensor(s.interp, 0, dims, 4) != kTfLiteOk || api.TfLiteInterpreterAllocateTensors(s.interp) != kTfLiteOk) {
+        bool ok = api.TfLiteInterpreterResizeInputTensor(s.interp, 0, dims, 4) == kTfLiteOk && api.TfLiteInterpreterAllocateTensors(s.interp) == kTfLiteOk;
+        if (!ok && s.use_xnn) {
+            // XNNPACK could not take the new shape: the interpreter without it, at that shape
+            LOGI("infer: LiteRT CPU: resize with XNNPACK failed (%s); without XNNPACK", s.log.c_str());
+            s.use_xnn = false;
+            std::string w;
+            ok = lrt_cpu_open(s, w) && api.TfLiteInterpreterResizeInputTensor(s.interp, 0, dims, 4) == kTfLiteOk &&
+                 api.TfLiteInterpreterAllocateTensors(s.interp) == kTfLiteOk;
+        }
+        if (!ok) {
             why = "cannot resize the input to NHWC [" + std::to_string(dims[0]) + "," + std::to_string(dims[1]) + "," + std::to_string(dims[2]) + "," +
                   std::to_string(dims[3]) + "]" + (s.log.empty() ? std::string() : ": " + s.log);
             return false;
@@ -1170,10 +1210,15 @@ struct Inference::Impl {
             return false;
         }
         auto t0 = Clock::now();
-        const int threads = cpu_threads();
-        if (!lrt_cpu_open(*s, threads, why)) return false;
-        LOGI("infer: %s on CPU (%s, LiteRT %s, %d threads) ready in %.0f ms", net_str(net), file.c_str(), api->version.c_str(), threads,
-             std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        s->threads = cpu_threads();
+        if (!lrt_cpu_open(*s, why)) {
+            // XNNPACK refused the model: the built-in kernels alone
+            LOGI("infer: %s: LiteRT CPU with XNNPACK failed (%s); without XNNPACK", net_str(net), why.c_str());
+            s->use_xnn = false;
+            if (!lrt_cpu_open(*s, why)) return false;
+        }
+        LOGI("infer: %s on CPU (%s, LiteRT %s, %s, %d threads) ready in %.0f ms", net_str(net), file.c_str(), api->version.c_str(),
+             s->xnn ? "XNNPACK" : "built-in kernels", s->threads, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         out = Sess();
         out.lcpu = std::move(s);
         return true;
