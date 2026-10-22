@@ -64,7 +64,8 @@
 
 namespace fs {
 
-enum class Filter : int { Original = 0, Lighten = 1, AutoColor = 2, Grayscale = 3, HighContrast = 4, BlackWhite = 5 };
+enum class Filter : int { Original = 0, Lighten = 1, AutoColor = 2, Grayscale = 3, HighContrast = 4, BlackWhite = 5, Scan = 6 };
+const int kFilterCount = 7;
 const char* filter_name(Filter f);
 
 struct PageParams {
@@ -75,6 +76,7 @@ struct PageParams {
     cv::Mat tint;             // CV_32F, quarter grid: light-colour weight 0..1 (white point, cleanup, specks)
     float wb[3] = {1, 1, 1};  // per-channel paper colour / paper luminance
     float sigma = 0.02f;      // paper noise of luma(v)
+    float ink = 0.3f;         // median luma(v) of ink on paper (Scan's black point)
     int page_w = 0, page_h = 0;
     bool gpu_background = false;
     double ms = 0;
@@ -82,13 +84,27 @@ struct PageParams {
 
 // Curve constants for a filter (shared by the CPU and GPU code).
 struct Curve {
-    int kind = 0;             // 0 original, 1 lighten, 2 power curve, 3 black & white
+    int kind = 0;             // 0 original, 1 lighten, 2 power curve, 3 black & white, 4 scan
     float wp = 1, gamma = 1;
+    float black = 0;          // Scan: black point of the luminance curve
+    float wp_base = 1;        // Scan: white point of its base (strength 0), the Lighten curve
+    float sharpen = 0;        // Scan: unsharp amount at strength 1 (applied after the curve, cleanup.cpp sharpen_luma)
     float wp_tint = 1;        // B&W white point where the local background is tinted (< 0.97)
     float speck_bg = 1;       // speck removal only where the local background bgv >= speck_bg
     bool gray = false, specks = false;
 };
-Curve filter_curve(Filter f, float sigma);
+Curve filter_curve(Filter f, float sigma, float ink = 0.3f);
+
+// Scan constants (defaults are the shipped values; the desktop tools override them for tuning)
+struct ScanTune {
+    float wp_k = 2.5f;        // white point 1 - wp_k sigma (as Auto color)
+    float gamma = 1.1f;       // luminance curve exponent
+    float black_k = 0.5f;     // black point = black_k x the page's ink level ...
+    float black_max = 0.2f;   // ... at most this
+    float sharpen = 0.8f;     // unsharp amount at strength 1
+    float sharpen_sigma = 1.0f;   // px at page size
+};
+ScanTune& scan_tune();
 
 // User adjustments (defaults: identity).
 struct Adjust {
@@ -132,6 +148,9 @@ cv::Mat apply_paper(const cv::Mat& page_bgra, const cv::Mat& paper, const PagePa
 // CPU filter. img may be a downscaled copy of the page (live thumbnails): its pixels are
 // mapped to page coordinates for the illumination lookup. Specks are only removed at full size.
 cv::Mat filter_cpu(const cv::Mat& img_bgra, const PageParams& p, Filter f, float strength, const Adjust& adj = Adjust());
+// The CPU stages after the per-pixel curve, for both paths (Scan: sharpen_luma). In place.
+void post_filter(cv::Mat& out_bgra, const PageParams& p, const Curve& c, float strength);
+void sharpen_luma(cv::Mat& bgra, float amount, float sigma);
 
 struct RenderStats {
     bool gpu_filter = false;

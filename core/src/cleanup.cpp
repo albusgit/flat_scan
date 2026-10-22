@@ -309,11 +309,17 @@ const char* filter_name(Filter f) {
         case Filter::Grayscale: return "Grayscale";
         case Filter::HighContrast: return "High contrast";
         case Filter::BlackWhite: return "Black & white";
+        case Filter::Scan: return "Scan";
     }
     return "?";
 }
 
-Curve filter_curve(Filter f, float sigma) {
+ScanTune& scan_tune() {
+    static ScanTune t;
+    return t;
+}
+
+Curve filter_curve(Filter f, float sigma, float ink) {
     Curve c;
     switch (f) {
         case Filter::Original: c.kind = 0; break;
@@ -324,6 +330,16 @@ Curve filter_curve(Filter f, float sigma) {
         // on tinted cells (noisier than white paper) the white point drops to 0.92 so their texture
         // does not turn into speckle; faint strokes (~0.85) still map to visible grey
         case Filter::BlackWhite: c.kind = 3; c.wp = 1.f - 3.f * sigma; c.wp_tint = std::min(c.wp, 0.92f); c.gamma = 2.5f; c.gray = true; c.specks = true; break;
+        // Scan: lighting flattened at any strength (its base is Lighten), then a luminance curve
+        // from a black point under the page's own ink level to the white point; colours are scaled
+        // with their luminance, so hue and saturation are kept (cleanup.h)
+        case Filter::Scan: {
+            const ScanTune& t = scan_tune();
+            c.kind = 4; c.wp = 1.f - t.wp_k * sigma; c.wp_base = 1.f - 1.5f * sigma; c.gamma = t.gamma;
+            c.black = std::min(t.black_max, std::max(0.f, t.black_k * ink));
+            c.sharpen = t.sharpen; c.specks = true;
+            break;
+        }
     }
     // specks are removed where the local background renders white: at or above the white point
     // in the tone curves; anywhere outside pictures in B&W (it maps the local background to white)
@@ -377,6 +393,16 @@ static inline void paper_at(const cv::Mat& P, float px, float py, float* o) {
 
 static inline void normalise(const uint8_t* q, const float* P, float* v) {
     for (int c = 0; c < 3; ++c) v[c] = (float)q[c] / std::max(P[c], 1.f);
+}
+
+// ink on paper: a paper sample within 2 quarter px (text sits on paper, between the samples)
+static inline bool dens_paper(const cv::Mat& mask, int i, int j) {
+    for (int di = -2; di <= 2; di += 2)
+        for (int dj = -2; dj <= 2; dj += 2) {
+            int ii = std::min(std::max(i + di, 0), mask.rows - 1), jj = std::min(std::max(j + dj, 0), mask.cols - 1);
+            if (mask.at<float>(ii, jj) > 0) return true;
+        }
+    return false;
 }
 
 static const float kInk = 0.55f;   // normalised luminance below which a pixel counts as ink
@@ -480,6 +506,23 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
             for (float& q : v) q = std::fabs(q - med);
             std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
             p.sigma = std::min(0.05f, std::max(0.008f, 1.4826f * v[v.size() / 2]));
+        }
+    }
+    // ink level (Scan's black point): median luma(v) of ink pixels (below kInk) on paper
+    {
+        std::vector<float> v;
+        for (int y = 1; y < page.rows; y += 3)
+            for (int x = 1; x < page.cols; x += 3) {
+                int i = std::min(y / 4, mask.rows - 1), j = std::min(x / 4, mask.cols - 1);
+                float vv[3], P[3];
+                paper_at(p.paper, (float)x, (float)y, P);
+                normalise(page.ptr<uint8_t>(y) + 4 * x, P, vv);
+                float l = luma(vv[0], vv[1], vv[2]);
+                if (l < 0.55f && dens_paper(mask, i, j)) v.push_back(l);
+            }
+        if (v.size() > 200) {
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            p.ink = v[v.size() / 2];
         }
     }
     // local background of the normalised page (B&W reference), quarter grid
@@ -648,9 +691,39 @@ static inline void adjust_px(const AdjustK& k, float* t, float tint) {
     }
 }
 
+// Scan (kind 4), mirrored by kToneCS in gpu.cpp. v: the normalised pixel (paper ~ 1), l = luma(v),
+// tint: light-colour weight, pic: picture weight, s: strength. Output t (0..1) per channel:
+//   base  the Lighten curve min(v / wb, 1) (lighting flattened, paper white, ink untouched)
+//   enh   luminance curve f(l) = ((l - bk) / (wp - bk))^gamma (1 above wp), bk = black x (1 - pic)
+//         (pictures keep their shadows), applied by scaling the pixel: v x f(l) / l keeps hue and
+//         saturation; near white (l from wp - 2 sigma.. wp) a near-neutral pixel (chroma below
+//         kScanC0 -> kScanC1) fades to neutral f(l) except on light colours (tint), so paper noise and
+//         colour casts turn white and pastels stay
+//   t     base + s (enh - base)
+static const float kScanC0 = 0.04f, kScanC1 = 0.10f;   // Scan: chroma (max - min of v) of the neutral fade-out
+static inline void scan_px(const Curve& c, const float* v, float l, float tint, float pic, float s, float* t) {
+    const float wpe = c.wp + (1.f - c.wp) * tint, wbe = c.wp_base + (1.f - c.wp_base) * tint;
+    const float bk = c.black * (1.f - pic);
+    float f = l >= wpe ? 1.f : std::pow(std::min(std::max((l - bk) / (wpe - bk), 0.f), 1.f), c.gamma);
+    float h = f / std::max(l, 1e-3f);
+    float e[3], mx = 0.f;
+    for (int k = 0; k < 3; ++k) e[k] = v[k] * h, mx = std::max(mx, e[k]);
+    if (mx > 1.f)
+        for (int k = 0; k < 3; ++k) e[k] /= mx;
+    float band = std::max(0.02f, 2.f * (1.f - c.wp) / 2.5f);   // 2 sigma
+    // ... only near-neutral pixels: a light colour that the tint weight missed keeps its colour
+    float ch = std::max({v[0], v[1], v[2]}) - std::min({v[0], v[1], v[2]});
+    float wn = smoothstep(wpe - band, wpe, l) * (1.f - tint) * (1.f - smoothstep(kScanC0, kScanC1, ch));
+    for (int k = 0; k < 3; ++k) {
+        float en = e[k] + (f - e[k]) * wn;
+        float b = std::min(v[k] / wbe, 1.f);
+        t[k] = b + s * (en - b);
+    }
+}
+
 cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, const Adjust& adj) {
     if (f == Filter::Original && adj.identity()) return img.clone();
-    Curve c = filter_curve(f, p.sigma);
+    Curve c = filter_curve(f, p.sigma, p.ink);
     AdjustK ak = adjust_constants(adj, c.specks);
     bool full = img.cols == p.page_w && img.rows == p.page_h;
     float sx = (float)p.page_w / img.cols, sy = (float)p.page_h / img.rows;
@@ -670,7 +743,10 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, c
                 float l = luma(v[0], v[1], v[2]);
                 float b = std::max(illum_at(p.bgv, px, py), 0.05f), w = 0.f;
                 tint = illum_at(p.tint, px, py);
-                if (c.kind == 3) {
+                if (c.kind == 4) {
+                    w = illum_at(p.pic, px, py);
+                    scan_px(c, v, l, tint, w, s, t);
+                } else if (c.kind == 3) {
                     float r = l / b;
                     float wp = b < 0.97f ? c.wp_tint : c.wp;
                     float u = std::min(std::max((r - 0.5f) / (wp - 0.5f), 0.f), 1.f);
@@ -704,13 +780,49 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, c
             adjust_px(ak, t, tint);
             if (c.gray) t[0] = t[1] = t[2] = luma(t[0], t[1], t[2]);
             uint8_t* o = out.ptr<uint8_t>(y) + 4 * x;
+            const float se = c.kind == 4 ? 1.f : s;   // Scan applies the strength inside its curve
             for (int k = 0; k < 3; ++k) {
                 float orig = (float)q[k];
-                o[k] = (uint8_t)std::lrint(std::min(255.f, std::max(0.f, orig + s * (t[k] * 255.f - orig))));
+                o[k] = (uint8_t)std::lrint(std::min(255.f, std::max(0.f, orig + se * (t[k] * 255.f - orig))));
             }
             o[3] = 255;
         }
+    post_filter(out, p, c, s);
     return out;
+}
+
+void post_filter(cv::Mat& out, const PageParams& p, const Curve& c, float s) {
+    if (c.kind != 4 || c.sharpen <= 0.f || s <= 0.f) return;
+    float sigma = scan_tune().sharpen_sigma * (float)out.cols / (float)std::max(1, p.page_w);
+    if (sigma < 0.4f) return;   // small thumbnails: nothing to sharpen at this scale
+    sharpen_luma(out, c.sharpen * s, sigma);
+}
+
+// Unsharp mask of the luminance, limited to the 3x3 range of the pixel's neighbours (no overshoot
+// beyond the darkest / lightest neighbour: no halos, no white rims around text on colour); the
+// luminance change is added to every channel, so the chroma is unchanged.
+void sharpen_luma(cv::Mat& bgra, float amount, float sigma) {
+    CV_Assert(bgra.type() == CV_8UC4);
+    cv::Mat L(bgra.size(), CV_32F);
+    for (int y = 0; y < bgra.rows; ++y) {
+        const uint8_t* q = bgra.ptr<uint8_t>(y);
+        float* l = L.ptr<float>(y);
+        for (int x = 0; x < bgra.cols; ++x, q += 4) l[x] = luma(q[0], q[1], q[2]);
+    }
+    cv::Mat B, mn, mx;
+    cv::GaussianBlur(L, B, cv::Size(0, 0), sigma, sigma, cv::BORDER_REPLICATE);
+    cv::erode(L, mn, cv::Mat::ones(3, 3, CV_8U), cv::Point(-1, -1), 1, cv::BORDER_REPLICATE);
+    cv::dilate(L, mx, cv::Mat::ones(3, 3, CV_8U), cv::Point(-1, -1), 1, cv::BORDER_REPLICATE);
+    for (int y = 0; y < bgra.rows; ++y) {
+        uint8_t* q = bgra.ptr<uint8_t>(y);
+        const float *l = L.ptr<float>(y), *b = B.ptr<float>(y), *lo = mn.ptr<float>(y), *hi = mx.ptr<float>(y);
+        for (int x = 0; x < bgra.cols; ++x, q += 4) {
+            float l2 = std::min(hi[x], std::max(lo[x], l[x] + amount * (l[x] - b[x])));
+            float d = l2 - l[x];
+            if (d == 0.f) continue;
+            for (int k = 0; k < 3; ++k) q[k] = (uint8_t)std::lrint(std::min(255.f, std::max(0.f, (float)q[k] + d)));
+        }
+    }
 }
 
 cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams& p, Filter f, float strength, bool solid,
@@ -744,6 +856,7 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
     bool trivial = ff == Filter::Original && rp.adj.identity();
     s.gpu_filter = !trivial && use_gpu && Gpu::instance().filter(src, p, ff, strength, rp.adj, out);
     if (!s.gpu_filter) out = filter_cpu(src, p, ff, strength, rp.adj);
+    else post_filter(out, p, filter_curve(ff, p.sigma, p.ink), strength);   // CPU stages after the GPU curve (Scan's sharpening)
     s.ms_filter = ms_since(t0);
     if (sol) {
         t0 = std::chrono::steady_clock::now();

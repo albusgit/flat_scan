@@ -505,7 +505,9 @@ layout(std430, binding = 1) writeonly buffer Dst { uint px[]; };
 uniform ivec2 uOut;
 uniform int uRow0;
 uniform int uRows;
-uniform int uKind;        // 0 original (adjustments only), 1 lighten, 2 power curve, 3 black & white
+uniform int uKind;        // 0 original (adjustments only), 1 lighten, 2 power curve, 3 black & white, 4 scan
+uniform float uBlack0;    // scan: black point (Curve::black)
+uniform float uWpBase;    // scan: white point of its Lighten base
 uniform int uLevels;      // levels: t = clamp((t - uBlack) * uInvRange, 0, 1)^uInvGamma
 uniform float uBlack;
 uniform float uInvRange;
@@ -572,7 +574,24 @@ void main() {
         float l = luma(v);
         float b = max(bgvAt(x, y), 0.05), w = 0.0;
         tint = tintAt(x, y);
-        if (uKind == 3) {
+        if (uKind == 4) {   // scan_px in cleanup.cpp
+            w = picAt(x, y);
+            float wpe = uWp + (1.0 - uWp) * tint, wbe = uWpBase + (1.0 - uWpBase) * tint;
+            float bk = uBlack0 * (1.0 - w);
+            float f = l >= wpe ? 1.0 : pow(clamp((l - bk) / (wpe - bk), 0.0, 1.0), uGamma);
+            float h = f / max(l, 1e-3);
+            vec3 e = v * h;
+            float mx = max(e.r, max(e.g, e.b));
+            if (mx > 1.0) e = e / mx;
+            float band = max(0.02, 2.0 * (1.0 - uWp) / 2.5);
+            float sm = clamp((l - (wpe - band)) / band, 0.0, 1.0);
+            float ch = max(v.r, max(v.g, v.b)) - min(v.r, min(v.g, v.b));
+            float sc = clamp((ch - 0.04) / (0.10 - 0.04), 0.0, 1.0);
+            float wn = sm * sm * (3.0 - 2.0 * sm) * (1.0 - tint) * (1.0 - sc * sc * (3.0 - 2.0 * sc));
+            vec3 en = e + (vec3(f) - e) * wn;
+            vec3 bb = min(v / wbe, vec3(1.0));
+            t = bb + uStrength * (en - bb);
+        } else if (uKind == 3) {
             float wp = b < 0.97 ? uWpTint : uWp;
             float u = clamp((l / b - 0.5) / (wp - 0.5), 0.0, 1.0);
             float tr = pow(u, uGamma);
@@ -607,7 +626,8 @@ void main() {
         t = t + (vec3(1.0) - t) * w;
     }
     if (uGray != 0) t = vec3(luma(t));
-    vec3 o = clamp(q + uStrength * (t * 255.0 - q), 0.0, 255.0);
+    float se = uKind == 4 ? 1.0 : uStrength;   // scan applies the strength inside its curve
+    vec3 o = clamp(q + se * (t * 255.0 - q), 0.0, 255.0);
     uvec3 ou = uvec3(roundEven(o));
     px[r * uOut.x + x] = ou.r | (ou.g << 8) | (ou.b << 16) | (255u << 24);
 }
@@ -671,7 +691,7 @@ bool Gpu::background_quarter(const cv::Mat& img, cv::Mat& bg4) {
 
 bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float strength, const Adjust& adj, cv::Mat& out) {
     if (!available()) return false;
-    Curve c = filter_curve(f, p.sigma);
+    Curve c = filter_curve(f, p.sigma, p.ink);
     if (c.kind == 0 && adj.identity()) return false;
     if (p.paper.type() != CV_32FC4 || p.tint.type() != CV_32F || p.paper.size() != p.tint.size()) return false;
     AdjustK ak = adjust_constants(adj, c.specks);
@@ -712,6 +732,8 @@ bool Gpu::filter(const cv::Mat& img, const PageParams& p, Filter f, float streng
     glUniform1f(glGetUniformLocation(prog_tone_, "uWp"), c.wp);
     glUniform1f(glGetUniformLocation(prog_tone_, "uGamma"), c.gamma);
     glUniform1f(glGetUniformLocation(prog_tone_, "uWpTint"), c.wp_tint);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uBlack0"), c.black);
+    glUniform1f(glGetUniformLocation(prog_tone_, "uWpBase"), c.wp_base);
     set_i(prog_tone_, "uGray", c.gray ? 1 : 0);
     set_i(prog_tone_, "uSpecks", c.specks ? 1 : 0);
     set_i(prog_tone_, "uLevels", ak.levels ? 1 : 0);
