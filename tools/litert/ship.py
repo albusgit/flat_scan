@@ -132,7 +132,7 @@ def parity(net, src, files, inputs, names, say):
             rs = per[k]
             if not rs:
                 continue
-            what = 'int8 file vs its sim ONNX' if k == 'sim' else f'{k} file vs reference'
+            what = {'sim': 'sim ONNX vs int8 file', 'int8_xnnpack': 'int8 file on XNNPACK vs ref'}.get(k, f'{k} file vs reference')
             if tag == 'pf':
                 w = min(rs, key=lambda t: t[1]['iou'])
                 say(f'    {what:28s} mask IoU min {w[1]["iou"]:.4f} ({w[0]}), gutter F1 min '
@@ -175,7 +175,7 @@ def main():
     final = os.path.join(out, stem + '.tflite')
     if opts['--weights'] == 'int8':
         qm = quantize.load_qmap(opts['--qmap'])
-        r = quantize.tflite_int8(fp16, final, keep=tuple(keep), onnx_src=st, qmap=qm, strict=gpu)
+        r = quantize.tflite_int8(fp16, final, keep=tuple(keep), onnx_src=st, qmap=qm, strict=gpu, no_fp16=True)
         if r['unmatched']:
             say(f'  {len(r["unmatched"])} filters changed by onnx2tf (no ONNX weight with their values): rounded to nearest, '
                 'not in the sim ONNX (the parity below measures the .tflite itself)')
@@ -197,7 +197,7 @@ def main():
     if opts['--inputs'] and opts['--names']:
         if 'sim' in files:
             # sim vs int8: reorder so int8 runs first
-            files = {'fp16': files['fp16'], 'int8': files['int8'], 'sim': files['sim']}
+            files = {'fp16': files['fp16'], 'int8': files['int8'], 'int8_xnnpack': files['int8'] + '#xnn', 'sim': files['sim']}
         parity(net, src, files, opts['--inputs'], opts['--names'].split(','), say)
     rep.close()
     if not opts['--work']:

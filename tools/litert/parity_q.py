@@ -39,12 +39,13 @@ def run(path, x):
         else:
             # tensorflow's interpreter: its Windows build applies the XNNPACK delegate (the phone's CPU path);
             # ai-edge-litert 2.1.2's Windows wheel runs the builtin kernels (10x slower here, same fp32 math)
-            if os.environ.get('PARITY_LITERT'):
-                from ai_edge_litert.interpreter import Interpreter
-            else:
-                import tensorflow as tf
-                Interpreter = tf.lite.Interpreter
-            it = Interpreter(model_path=path, num_threads=THREADS)
+            # MODEL#xnn: with tensorflow's default XNNPACK delegate; else its builtin kernels (exact fp32: 5e-7 off
+            # ONNX Runtime). tensorflow 2.19.1's XNNPACK gives wrong outputs / NaN on files with fp16 weights
+            # (docs/results/r11/modelsize.md), so the fp16 files are compared on the builtin kernels.
+            import tensorflow as tf
+            kw = {} if path.endswith('#xnn') else {
+                'experimental_op_resolver_type': tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES}
+            it = tf.lite.Interpreter(model_path=path.split('#')[0], num_threads=THREADS, **kw)
             it.allocate_tensors()
             _cache[path] = it
     m = _cache[path]

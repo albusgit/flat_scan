@@ -91,7 +91,7 @@ def onnx_conv_weights(path):
     return out
 
 
-def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), onnx_src=None, qmap=None, strict=True):
+def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), onnx_src=None, qmap=None, strict=True, no_fp16=False):
     """Rewrites src (fp16 filters behind DEQUANTIZE) with int8 filters; returns a summary dict.
     onnx_src: the ONNX file the .tflite was made from; each filter is matched to its ONNX Conv weight by value
     (OIHW -> OHWI for CONV_2D, -> 1 x KH x KW x C for DEPTHWISE_CONV_2D), so that keep (ONNX Conv node name
@@ -103,7 +103,9 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
     B, T = s.BuiltinOperator, s.TensorType
     code = [c.builtinCode for c in m.operatorCodes]
     # filter input index and the channel axis of the filter tensor per op
-    filt = {B.CONV_2D: (1, 0), B.DEPTHWISE_CONV_2D: (1, 3), B.TRANSPOSE_CONV: (1, 0), B.FULLY_CONNECTED: (1, 0)}
+    # DEPTHWISE_CONV_2D filters stay fp16: with an int8 DEQUANTIZE, tensorflow 2.19.1's XNNPACK "failed to delegate
+    # DEPTHWISE_CONV_2D" (measured on the page finder) and they are small (KH x KW x C values)
+    filt = {B.CONV_2D: (1, 0), B.TRANSPOSE_CONV: (1, 0), B.FULLY_CONNECTED: (1, 0)}
     made = {o.outputs[0]: o for o in g.operators}
     users = {}
     for o in g.operators:
@@ -114,7 +116,7 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
         if c.builtinCode == B.DEQUANTIZE:
             dq_op = i
     done, drop = {}, set()
-    n_q = n_keep = v_q = v_keep = n_gptq = n_bias = 0
+    n_q = n_keep = v_q = v_keep = n_gptq = n_bias = n_fp32 = 0
     ows = onnx_conv_weights(onnx_src) if onnx_src else []
     matched, kept, unmatched = [], [], []
     for o in g.operators:
@@ -236,6 +238,27 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
             ordered.append(o)
         ordered.extend(by_out.values())
         g.operators = ordered
+    if no_fp16:
+        # every fp16 DEQUANTIZE left (kept filters, biases, slopes) -> an fp32 constant, so that no fp16 weight reaches
+        # XNNPACK's fp16-weight path: tensorflow 2.19.1's XNNPACK gave wrong outputs (UVDoc, max |d| 0.99) or NaN
+        # (SD-HR, ShadeNet) on the fp16-weight files and "failed to delegate" the page finder's depthwise convs
+        # (measured on the desktop; the builtin kernels match ONNX Runtime to 5e-7)
+        code3 = [c.builtinCode for c in m.operatorCodes]
+        repl = {}
+        for o in g.operators:
+            if code3[o.opcodeIndex] == B.DEQUANTIZE and g.tensors[o.inputs[0]].type == T.FLOAT16:
+                bt = g.tensors[o.inputs[0]]
+                bv = np.frombuffer(bytes(m.buffers[bt.buffer].data), np.float16).astype(np.float32)
+                buf = s.BufferT()
+                buf.data = np.frombuffer(bv.tobytes(), np.uint8)
+                m.buffers.append(buf)
+                nt = s.TensorT()
+                nt.name, nt.shape, nt.type, nt.buffer = bt.name + b'_fp32', np.array(bt.shape, np.int32), T.FLOAT32, len(m.buffers) - 1
+                g.tensors.append(nt)
+                repl[o.outputs[0]] = len(g.tensors) - 1
+        for o in g.operators:
+            o.inputs = [repl.get(i, i) for i in o.inputs]
+        n_fp32 = len(repl)
     read = {i for o in g.operators for i in o.inputs} | set(g.outputs)
     code2 = [c.builtinCode for c in m.operatorCodes]
     g.operators = [o for o in g.operators if not (code2[o.opcodeIndex] == B.DEQUANTIZE and o.outputs[0] not in read)]
@@ -243,7 +266,7 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
         if i not in {j for o in g.operators for j in list(o.inputs) + list(o.outputs)} and i not in g.outputs                 and m.buffers[t.buffer].data is not None:
             m.buffers[t.buffer].data = None
     fu.write_model(m, dst)
-    return dict(unmatched=unmatched, fp32_biases=n_bias, quantized=n_q, quantized_values=v_q, from_qmap=n_gptq, kept_fp16=n_keep, kept_values=v_keep,
+    return dict(fp16_to_fp32=n_fp32, unmatched=unmatched, fp32_biases=n_bias, quantized=n_q, quantized_values=v_q, from_qmap=n_gptq, kept_fp16=n_keep, kept_values=v_keep,
                 kept=kept, bytes=os.path.getsize(dst))
 
 
@@ -285,6 +308,8 @@ def onnx_sim(src, dst, per_tensor=False, min_size=4096, keep=(), qmap=None):
         if any(k in n.name for k in keep):
             continue
         if n.op_type == 'Conv' and len(n.input) > 1:
+            if next((a.i for a in n.attribute if a.name == 'group'), 1) != 1:
+                continue   # grouped / depthwise: fp16 (tflite_int8 leaves DEPTHWISE_CONV_2D filters fp16)
             want.setdefault(n.input[1], 0)
         elif n.op_type == 'ConvTranspose' and len(n.input) > 1:
             group = next((a.i for a in n.attribute if a.name == 'group'), 1)
@@ -393,7 +418,7 @@ def main():
         keep = tuple(x for x in (opt('--keep', '') or '').split(',') if x)
         onnx_src = opt('--onnx')
         qm = load_qmap(opt('--qmap'))
-        print(tflite_int8(a[0], a[1], form, per_tensor, min_size, keep, onnx_src, qm))
+        print(tflite_int8(a[0], a[1], form, per_tensor, min_size, keep, onnx_src, qm, no_fp16=flag('--no-fp16')))
     elif cmd == 'sim':
         keep = tuple(x for x in (opt('--keep', '') or '').split(',') if x)
         print(onnx_sim(a[0], a[1], per_tensor, min_size, keep, load_qmap(opt('--qmap'))))
