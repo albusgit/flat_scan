@@ -8,7 +8,7 @@
 
 namespace fs {
 
-const float kScreenThreshold = 1.8f;
+const float kScreenThreshold = 2.4f;   // docs/results/r11/filters.md: no paper page of 217 at or above it
 
 namespace {
 

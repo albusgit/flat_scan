@@ -76,7 +76,9 @@ struct Session {
         scr_small.clear();
         small.clear();
     }
+    // Original always shows the page as photographed (and flattened)
     bool screen_on(const RenderParams& rp) const {
+        if (rp.filter == Filter::Original) return false;
         return rp.screen == ScreenMode::On || (rp.screen == ScreenMode::Auto && screen.screen);
     }
     void ensure_screen() {   // called with mu held

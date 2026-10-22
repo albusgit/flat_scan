@@ -17,7 +17,7 @@
 //      median, periods below 12 px) are cut from every channel (soft Gaussian notches) - the pixel
 //      grid, subpixel stripes and their aliases;
 //   2. chroma: Cr and Cb are replaced by a guided filter of themselves with the luminance as guide
-//      (radius 8 px, eps 40^2): colour that follows the content's edges stays, colour moire that has
+//      (radius 8 px, eps 20^2): colour that follows the content's edges stays, colour moire that has
 //      no luminance edge of its own is averaged away.
 //   The filters then flatten the screen's glow and bands like paper lighting (page_params).
 #pragma once
@@ -46,7 +46,7 @@ struct DescreenTune {
     float peak_thr = 2.0f;    // notch: log magnitude above the 21 x 21 median
     float min_period = 12.f;  // notch: only periods below this (px)
     int chroma_r = 8;         // guided chroma: radius (0 = off)
-    float chroma_eps = 40.f;  // guided chroma: eps (levels)
+    float chroma_eps = 20.f;  // guided chroma: eps (levels)
 };
 DescreenTune& descreen_tune();
 // Returns a new BGRA page (same size).
