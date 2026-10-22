@@ -3,6 +3,8 @@ package com.albus.flatscan.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -236,7 +239,10 @@ private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
             }
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(if (n == 1) "1 page" else "$n pages", style = MaterialTheme.typography.titleMedium)
+                val ctx = androidx.compose.ui.platform.LocalContext.current
+                val name = remember(n, version) { com.albus.flatscan.DocumentName.get(ctx) }
+                if (name != null) Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                Text(if (n == 1) "1 page" else "$n pages", style = if (name != null) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium)
                 Text(
                     if (vm.hasSession) vm.params.filter.label else "Tap to open",
                     style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = muted,
@@ -249,20 +255,50 @@ private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
 
 @Composable
 fun ProcessingScreen(vm: ScanViewModel) {
+    val photo = vm.photoDisplay
+    // the bar moves smoothly between the core's progress steps
+    val shown by animateFloatAsState(vm.progress, animationSpec = tween(400), label = "progress")
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(32.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("Processing", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(24.dp))
+        if (photo != null) {
+            // the photo being flattened, a scan line down to the progress: it moves only when the core
+            // reports a step (no endless animation competing with processing on slow phones)
+            val img = remember(photo) { photo.asImageBitmap() }
+            val y = shown
+            val accent = MaterialTheme.colorScheme.primary
+            Box(
+                Modifier.heightIn(max = 300.dp).aspectRatio(photo.width.toFloat() / photo.height.coerceAtLeast(1))
+                    .clip(RoundedCornerShape(16.dp)),
+            ) {
+                Image(img, null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().alpha(0.55f))
+                Canvas(Modifier.fillMaxSize()) {
+                    val yy = size.height * y
+                    drawRect(
+                        androidx.compose.ui.graphics.Brush.verticalGradient(
+                            listOf(Color.Transparent, accent.copy(alpha = 0.35f)), startY = yy - 60.dp.toPx(), endY = yy,
+                        ),
+                        topLeft = Offset(0f, yy - 60.dp.toPx()), size = androidx.compose.ui.geometry.Size(size.width, 60.dp.toPx()),
+                    )
+                    drawLine(accent, Offset(0f, yy), Offset(size.width, yy), strokeWidth = 3.dp.toPx())
+                }
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+        Text(if (photo == null) "Opening the page" else "Flattening the page", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(20.dp))
         LinearProgressIndicator(
-            progress = { vm.progress },
+            progress = { shown },
             trackColor = MaterialTheme.colorScheme.outlineVariant, gapSize = 0.dp, drawStopIndicator = {},
             modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
         )
-        Spacer(Modifier.height(16.dp))
-        Text(vm.stage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(14.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(vm.stage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, modifier = Modifier.weight(1f))
+            Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 

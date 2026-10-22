@@ -6,10 +6,12 @@ import android.hardware.camera2.CameraCharacteristics
 import android.net.Uri
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -22,6 +24,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
@@ -29,6 +34,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.outlined.Collections
+import androidx.compose.material.icons.outlined.FlashOff
+import androidx.compose.material.icons.outlined.FlashOn
+import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -92,6 +103,9 @@ private fun CameraPreview(vm: ScanViewModel) {
     }
     var busy by remember { mutableStateOf(false) }
     var focalMmPerLongSide by remember { mutableFloatStateOf(0f) }
+    var camera by remember { mutableStateOf<Camera?>(null) }
+    var torch by remember { mutableStateOf(false) }
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
     val previewView = remember { PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FIT_CENTER } }
     DisposableEffect(Unit) {
         val future = ProcessCameraProvider.getInstance(ctx)
@@ -100,9 +114,10 @@ private fun CameraPreview(vm: ScanViewModel) {
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
             try {
                 provider.unbindAll()
-                val camera = provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+                val cam = provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+                camera = cam
                 // focal length per pixel of the long side, from the camera's own data (EXIF is preferred if present)
-                val info = Camera2CameraInfo.from(camera.cameraInfo)
+                val info = Camera2CameraInfo.from(cam.cameraInfo)
                 val f = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
                 val size = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
                 if (f != null && size != null) focalMmPerLongSide = f / max(size.width, size.height)
@@ -115,11 +130,46 @@ private fun CameraPreview(vm: ScanViewModel) {
     }
     Box(Modifier.fillMaxSize().background(Editor.Ground)) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
-        IconButton(onClick = { vm.back() }, modifier = Modifier.safeDrawingPadding().padding(8.dp)) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Editor.Text)
+        Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Editor.Text) }
+            Box(Modifier.weight(1f))
+            // the torch for dim rooms (a flash would glare on glossy paper)
+            val hasTorch = camera?.cameraInfo?.hasFlashUnit() == true
+            if (hasTorch) {
+                IconButton(onClick = {
+                    torch = !torch
+                    camera?.cameraControl?.enableTorch(torch)
+                }) { Icon(if (torch) Icons.Outlined.FlashOn else Icons.Outlined.FlashOff, if (torch) "Torch off" else "Torch on", tint = Editor.Text) }
+            }
+        }
+        // gallery import on the left, the document's pages on the right of the shutter
+        Row(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding().padding(bottom = 40.dp, start = 28.dp, end = 28.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(
+                onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                enabled = !busy, modifier = Modifier.size(56.dp).background(Editor.Panel.copy(alpha = 0.7f), CircleShape),
+            ) { Icon(Icons.Outlined.PhotoLibrary, "Import from gallery", tint = Editor.Text) }
+            Box(Modifier.weight(1f))
+            Box(Modifier.size(80.dp))
+            Box(Modifier.weight(1f))
+            val n = vm.pages.size
+            if (n > 0) {
+                IconButton(
+                    onClick = { vm.open(com.albus.flatscan.Screen.Pages) }, enabled = !busy,
+                    modifier = Modifier.size(56.dp).background(Editor.Panel.copy(alpha = 0.7f), CircleShape),
+                ) {
+                    BadgedBox(badge = { Badge(containerColor = Editor.Accent, contentColor = Editor.Ground) { Text("$n") } }) {
+                        Icon(Icons.Outlined.Collections, if (n == 1) "The document: 1 page" else "The document: $n pages", tint = Editor.Text)
+                    }
+                }
+            } else {
+                Box(Modifier.size(56.dp))
+            }
         }
         Box(
-            Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 32.dp).size(80.dp)
+            Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 28.dp).size(80.dp)
                 .border(4.dp, Color.White, CircleShape).padding(8.dp).background(Color.White, CircleShape)
                 .semantics { contentDescription = "Take photo" }
                 .clickable(enabled = !busy) {

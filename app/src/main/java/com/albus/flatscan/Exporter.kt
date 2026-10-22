@@ -3,6 +3,7 @@ package com.albus.flatscan
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Paint
 import android.graphics.Rect
@@ -12,24 +13,58 @@ import android.provider.DocumentsContract
 import androidx.core.content.FileProvider
 import java.io.File
 import java.io.OutputStream
+import kotlin.math.abs
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 enum class ExportFormat(val mime: String, val ext: String) { JPG("image/jpeg", "jpg"), PDF("application/pdf", "pdf") }
 
 /** Writes the pages of a document (their rendered out.jpg files, in order). Call off the main thread. */
 object Exporter {
-    /** One A4 page per scan (portrait or landscape to match it); the image fills the page. */
-    fun writePdf(pages: List<File>, out: OutputStream) {
+    /**
+     * One PDF page per scan ([o]: paper size, margin, image resolution; portrait or landscape to match
+     * the page). The image keeps its proportions, centred in the margins; an image within 1% of the
+     * box's shape fills it exactly (the default A4 page: what earlier versions wrote).
+     */
+    fun writePdf(pages: List<File>, out: OutputStream, o: PdfOptions = PdfOptions()) {
         val doc = PdfDocument()
         try {
             val paint = Paint(Paint.FILTER_BITMAP_FLAG)
             pages.forEachIndexed { i, f ->
                 // one decoded page in memory at a time
-                val bmp = BitmapFactory.decodeFile(f.absolutePath) ?: error("cannot read $f")
+                var bmp = BitmapFactory.decodeFile(f.absolutePath) ?: error("cannot read $f")
                 val landscape = bmp.width > bmp.height
-                val pw = if (landscape) 842 else 595
-                val ph = if (landscape) 595 else 842
+                val (pw, ph) = when (o.pageSize) {
+                    PdfPageSize.Fit -> {
+                        // the page's own shape, its long side as long as A4's
+                        val long = 842.0
+                        if (landscape) long.toInt() to (long * bmp.height / bmp.width).roundToInt().coerceAtLeast(1)
+                        else (long * bmp.width / bmp.height).roundToInt().coerceAtLeast(1) to long.toInt()
+                    }
+                    else -> if (landscape) o.pageSize.hPt to o.pageSize.wPt else o.pageSize.wPt to o.pageSize.hPt
+                }
+                val m = if (o.pageSize == PdfPageSize.Fit) 0 else o.margin.pt
+                val bw = (pw - 2 * m).coerceAtLeast(1)
+                val bh = (ph - 2 * m).coerceAtLeast(1)
+                val k = min(bw.toDouble() / bmp.width, bh.toDouble() / bmp.height)
+                val dst = if (abs(bmp.width.toDouble() / bmp.height / (bw.toDouble() / bh) - 1) < 0.01) Rect(m, m, m + bw, m + bh)
+                else {
+                    val dw = (bmp.width * k).roundToInt()
+                    val dh = (bmp.height * k).roundToInt()
+                    Rect((pw - dw) / 2, (ph - dh) / 2, (pw - dw) / 2 + dw, (ph - dh) / 2 + dh)
+                }
+                if (o.imageSize.maxDpi > 0) {
+                    // at most maxDpi on the PDF page (72 pt per inch)
+                    val wpx = (dst.width() / 72.0 * o.imageSize.maxDpi).roundToInt()
+                    if (wpx in 1 until bmp.width) {
+                        val hpx = (bmp.height.toDouble() * wpx / bmp.width).roundToInt().coerceAtLeast(1)
+                        val small = Bitmap.createScaledBitmap(bmp, wpx, hpx, true)
+                        bmp.recycle()
+                        bmp = small
+                    }
+                }
                 val page = doc.startPage(PdfDocument.PageInfo.Builder(pw, ph, i + 1).create())
-                page.canvas.drawBitmap(bmp, null, Rect(0, 0, pw, ph), paint)
+                page.canvas.drawBitmap(bmp, null, dst, paint)
                 doc.finishPage(page)
                 bmp.recycle()
             }
@@ -39,8 +74,8 @@ object Exporter {
         }
     }
 
-    fun savePdf(ctx: Context, pages: List<File>, uri: Uri) {
-        ctx.contentResolver.openOutputStream(uri)?.use { writePdf(pages, it) } ?: error("cannot open $uri")
+    fun savePdf(ctx: Context, pages: List<File>, uri: Uri, o: PdfOptions = PdfOptions()) {
+        ctx.contentResolver.openOutputStream(uri)?.use { writePdf(pages, it, o) } ?: error("cannot open $uri")
     }
 
     /** A single page to a file the user created. */
@@ -69,11 +104,11 @@ object Exporter {
     }
 
     /** Builds the share intent: one PDF, or the JPGs (ACTION_SEND for one, ACTION_SEND_MULTIPLE for several). */
-    fun shareIntent(ctx: Context, pages: List<File>, format: ExportFormat, baseName: String): Intent {
+    fun shareIntent(ctx: Context, pages: List<File>, format: ExportFormat, baseName: String, o: PdfOptions = PdfOptions()): Intent {
         val dir = File(ctx.cacheDir, "shared").apply { mkdirs() }
         dir.listFiles()?.forEach { it.delete() }
         val files = when (format) {
-            ExportFormat.PDF -> listOf(File(dir, "$baseName.pdf").also { f -> f.outputStream().buffered().use { writePdf(pages, it) } })
+            ExportFormat.PDF -> listOf(File(dir, "$baseName.pdf").also { f -> f.outputStream().buffered().use { writePdf(pages, it, o) } })
             ExportFormat.JPG -> pages.mapIndexed { i, src ->
                 val name = if (pages.size == 1) "$baseName.jpg" else "$baseName - ${i + 1}.jpg"
                 File(dir, name).also { src.copyTo(it, overwrite = true) }

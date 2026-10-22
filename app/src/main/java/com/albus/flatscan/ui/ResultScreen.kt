@@ -11,7 +11,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -40,7 +43,11 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.automirrored.outlined.Redo
+import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.outlined.AutoFixHigh
+import androidx.compose.material.icons.outlined.Compare
+import androidx.compose.material.icons.outlined.DoneAll
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.GridView
@@ -69,8 +76,13 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -117,7 +129,13 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     val exporter = rememberExportActions(vm)
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
     val viewer = remember(vm.currentId, vm.rotation) { ViewerState() }
+    // before / after split (null: off)
+    var compare by remember(vm.currentId) { mutableStateOf<Float?>(null) }
     val p = vm.params
+    val look = vm.look
+    val colorFilter = remember(look) { look.composeFilter() }
+    // the page as it will be exported (PageLook shape): same width, its own height
+    val shownHeight = look.targetHw(vm.pageWidth, vm.pageHeight)?.let { (vm.pageWidth * it).roundToInt() } ?: vm.pageHeight
     // protect areas only matter (and are only drawn) while Solid colors is in effect
     val mode = when {
         tool == AreaMode.Protect && !(p.solid && p.filter != FilterKind.BlackWhite) -> AreaMode.None
@@ -131,7 +149,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
     BackHandler(enabled = mode != AreaMode.None) { closeTool() }
 
-    Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
+    val topBar: @Composable () -> Unit = {
         Row(
             Modifier.fillMaxWidth().height(64.dp).padding(start = 8.dp, end = 12.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -201,10 +219,12 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 else Text("Save", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp))
             }
         }
-        Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp)) {
+    }
+    val viewerBox: @Composable (Modifier) -> Unit = { boxModifier ->
+        Box(boxModifier.padding(horizontal = 8.dp, vertical = 8.dp)) {
             PageViewer(
                 page = vm.page, before = vm.before, overlay = if (vm.showWrinkles) vm.overlay else null,
-                pageWidth = vm.pageWidth, pageHeight = vm.pageHeight, rotation = vm.rotation,
+                pageWidth = vm.pageWidth, pageHeight = shownHeight, rotation = vm.rotation,
                 areas = when (mode) {
                     AreaMode.Lines -> if (vm.perspectiveOnly) emptyList() else vm.ignore
                     AreaMode.Erase -> vm.erase
@@ -228,8 +248,11 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     }
                 },
                 modifier = Modifier.fillMaxSize(),
+                colorFilter = colorFilter,
+                compare = if (mode == AreaMode.None) compare else null,
+                onCompare = { compare = it },
             )
-            if (mode == AreaMode.None && vm.showHoldHint && vm.page != null) {
+            if (mode == AreaMode.None && vm.showHoldHint && vm.page != null && compare == null) {
                 Text(
                     "Press and hold to see the original",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
@@ -238,38 +261,97 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                         .padding(horizontal = 14.dp, vertical = 7.dp),
                 )
             }
-            if (vm.rendering) {
-                CircularProgressIndicator(Modifier.align(Alignment.TopEnd).padding(12.dp).size(22.dp), strokeWidth = 2.5.dp, color = Editor.Accent)
+            // undo / redo of every edit that does not re-run the geometry (filters, adjust, rotate, areas)
+            AnimatedVisibility(
+                visible = mode == AreaMode.None && (vm.history.canUndo || vm.history.canRedo),
+                enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopStart),
+            ) {
+                Row(Modifier.padding(4.dp).background(Editor.Panel.copy(alpha = 0.88f), RoundedCornerShape(24.dp))) {
+                    IconButton(onClick = { vm.undo() }, enabled = vm.history.canUndo) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
+                    IconButton(onClick = { vm.redo() }, enabled = vm.history.canRedo) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
+                }
+            }
+            Row(Modifier.align(Alignment.TopEnd).padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (vm.rendering) {
+                    CircularProgressIndicator(Modifier.padding(8.dp).size(22.dp), strokeWidth = 2.5.dp, color = Editor.Accent)
+                }
+                if (mode == AreaMode.None && vm.page != null) {
+                    val on = compare != null
+                    IconButton(
+                        onClick = { compare = if (on) null else 0.5f },
+                        modifier = Modifier.background(if (on) Editor.Accent.copy(alpha = 0.9f) else Editor.Panel.copy(alpha = 0.88f), CircleShape),
+                    ) {
+                        Icon(Icons.Outlined.Compare, if (on) "Stop comparing" else "Compare with the original", tint = if (on) Editor.Ground else Editor.Text)
+                    }
+                }
+            }
+            if (compare != null && mode == AreaMode.None) {
+                Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CompareLabel("Original")
+                    CompareLabel("Cleaned")
+                }
             }
         }
-        if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
+    }
+    val panel: @Composable ColumnScope.() -> Unit = {
+        if (mode == AreaMode.Protect) {
+            ProtectPanel(vm, onDone = { tool = AreaMode.None })
+        } else if (mode == AreaMode.Lines) {
+            LinesPanel(vm, onClose = closeTool)
+        } else if (mode == AreaMode.Erase) {
+            ErasePanel(vm, onDone = { tool = AreaMode.None })
+        } else if (vm.adjustOpen) {
+            AdjustPanel(vm)
+        } else {
+            FilterPanel(
+                vm, onProtect = { tool = AreaMode.Protect }, onErase = { tool = AreaMode.Erase },
+                onAddPage = {
+                    if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    else vm.startCamera()
+                },
+            )
+        }
+    }
+    val dock: @Composable () -> Unit = {
+        ToolDock(vm, linesOpen = mode == AreaMode.Lines, onLines = { if (mode == AreaMode.Lines) closeTool() else tool = AreaMode.Lines }, onTab = closeTool)
+    }
 
-        // the editor panel: the tool of the selected tab over the tool dock
-        Column(Modifier.fillMaxWidth().clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding()) {
-            if (mode == AreaMode.Protect) {
-                ProtectPanel(vm, onDone = { tool = AreaMode.None })
-            } else if (mode == AreaMode.Lines) {
-                LinesPanel(vm, onClose = closeTool)
-            } else if (mode == AreaMode.Erase) {
-                ErasePanel(vm, onDone = { tool = AreaMode.None })
-            } else if (vm.adjustOpen) {
-                AdjustPanel(vm)
-            } else {
-                FilterPanel(
-                    vm, onProtect = { tool = AreaMode.Protect }, onErase = { tool = AreaMode.Erase },
-                    onAddPage = {
-                        if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                        else vm.startCamera()
-                    },
-                )
+    BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
+        // landscape phones and tablets: the panel beside the page (below it, the page would get a sliver)
+        val wide = maxWidth > maxHeight && maxWidth >= 600.dp
+        if (wide) {
+            Column(Modifier.fillMaxSize()) {
+                topBar()
+                Row(Modifier.weight(1f).fillMaxWidth()) {
+                    Column(Modifier.weight(1f).fillMaxHeight()) {
+                        viewerBox(Modifier.weight(1f).fillMaxWidth())
+                        if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
+                    }
+                    Column(
+                        Modifier.width(400.dp).fillMaxHeight().padding(end = 8.dp)
+                            .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)).background(Editor.Panel).navigationBarsPadding(),
+                    ) {
+                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { panel() }
+                        dock()
+                    }
+                }
             }
-            ToolDock(vm, linesOpen = mode == AreaMode.Lines, onLines = { if (mode == AreaMode.Lines) closeTool() else tool = AreaMode.Lines }, onTab = closeTool)
+        } else {
+            Column(Modifier.fillMaxSize()) {
+                topBar()
+                viewerBox(Modifier.weight(1f).fillMaxWidth())
+                if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
+                // the editor panel: the tool of the selected tab over the tool dock
+                Column(Modifier.fillMaxWidth().clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding()) {
+                    panel()
+                    dock()
+                }
+            }
         }
     }
 
     if (sheet != Sheet.None) {
-        val share = sheet == Sheet.Share
-        ExportSheet(share, vm.pages.size, onPick = { if (share) exporter.share(it) else exporter.save(it) }, onDismiss = { sheet = Sheet.None })
+        ExportSheet(sheet == Sheet.Share, vm.pages.size, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = Sheet.None })
     }
     if (showDetails) {
         AlertDialog(
@@ -329,7 +411,7 @@ private fun EditorChip(
 ) {
     val shape = RoundedCornerShape(18.dp)
     Row(
-        Modifier.height(36.dp).clip(shape)
+        Modifier.minimumInteractiveComponentSize().height(36.dp).clip(shape)
             .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
             .border(1.dp, if (selected) Editor.Accent else Editor.Outline, shape)
             .selectable(selected, enabled = enabled, role = role, onClick = onClick)
@@ -348,6 +430,7 @@ private fun EditorChip(
 @Composable
 private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () -> Unit, onAddPage: () -> Unit) {
     val p = vm.params
+    val thumbFilter = remember(vm.look) { vm.look.composeFilter() }
     Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
         val enabled = p.filter != FilterKind.Original
         Text(p.filter.label, style = MaterialTheme.typography.titleSmall, maxLines = 1, modifier = Modifier.widthIn(min = 86.dp))
@@ -371,7 +454,8 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
         items(FilterKind.entries) { f ->
             val selected = f == p.filter
             Column(
-                Modifier.width(66.dp).clip(RoundedCornerShape(10.dp))
+                // wide enough for "High contrast" (66 dp cut it to "High")
+                Modifier.width(80.dp).clip(RoundedCornerShape(10.dp))
                     .selectable(selected, role = Role.RadioButton) { vm.selectFilter(f) },
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
@@ -383,7 +467,7 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
                     contentAlignment = Alignment.Center,
                 ) {
                     val t = vm.thumbs[f]
-                    if (t != null) PageThumb(t, vm.rotation, Modifier.fillMaxSize())
+                    if (t != null) PageThumb(t, vm.rotation, Modifier.fillMaxSize(), hw = vm.look.targetHw(vm.pageWidth, vm.pageHeight), colorFilter = thumbFilter)
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -409,6 +493,13 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
         }
         val ne = vm.erase.size / 4
         EditorChip(if (ne > 0) "Erased ($ne)" else "Erase", onClick = onErase, icon = Icons.Outlined.AutoFixHigh)
+        if (vm.pages.size > 1) {
+            // the filter, strength and adjustments of this page on every page of the document
+            EditorChip(
+                if (vm.applyingAll) "Applying..." else "Apply to all ${vm.pages.size} pages", onClick = { vm.applyToAllPages() },
+                icon = Icons.Outlined.DoneAll, enabled = !vm.applyingAll && vm.page != null,
+            )
+        }
         if (vm.pending.isNotEmpty()) {
             EditorChip("Next page (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
         } else {
@@ -533,34 +624,6 @@ private fun LegendDot(color: Color, label: String) {
 }
 
 @Composable
-private fun AdjustPanel(vm: ScanViewModel) {
-    val p = vm.params
-    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 4.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Adjust", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
-            TextButton(onClick = { vm.resetAdjustments() }) { Text("Reset") }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Background cleanup", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-            Text("${(p.bgCleanup * 100).roundToInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold), color = Editor.Muted)
-        }
-        Text("Removes grey specks and shading on white paper", style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 2.dp))
-        Slider(
-            value = p.bgCleanup, onValueChange = { vm.setBgCleanup(it) }, colors = editorSliderColors(),
-            modifier = Modifier.semantics { contentDescription = "Background cleanup" },
-        )
-        Row(Modifier.padding(top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Levels", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-            Text(
-                "Black ${(p.black * 100).roundToInt()} · Mid ${"%.2f".format(Locale.US, p.gamma)} · White ${(p.white * 100).roundToInt()}",
-                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = Editor.Muted,
-            )
-        }
-        LevelsEditor(vm.histogram, p.black, p.white, p.gamma, onChange = { b, w, g -> vm.setLevels(b, w, g) })
-    }
-}
-
-@Composable
 private fun editorSliderColors() = SliderDefaults.colors(
     thumbColor = Editor.Accent, activeTrackColor = Editor.Accent, inactiveTrackColor = Editor.Outline,
     disabledThumbColor = Editor.Muted, disabledActiveTrackColor = Editor.Muted.copy(alpha = 0.5f), disabledInactiveTrackColor = Editor.Divider,
@@ -580,6 +643,14 @@ private fun WrinkleLegend(maxPx: Float, ready: Boolean) {
             Text(if (ready) formatPx(maxPx) else "", style = MaterialTheme.typography.labelSmall)
         }
     }
+}
+
+@Composable
+private fun CompareLabel(text: String) {
+    Text(
+        text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
+        modifier = Modifier.background(Editor.Panel.copy(alpha = 0.85f), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 7.dp),
+    )
 }
 
 private fun formatPx(v: Float): String = if (v < 10f) "%.1f px".format(v) else "${v.roundToInt()} px"

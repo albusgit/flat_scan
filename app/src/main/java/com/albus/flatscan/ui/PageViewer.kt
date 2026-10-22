@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.PathEffect
@@ -26,6 +27,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
@@ -54,7 +56,7 @@ class ViewerState {
 private const val MAX_ZOOM = 6f
 private const val DOUBLE_TAP_ZOOM = 2.5f
 
-private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Idle }
+private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Split, Idle }
 
 /**
  * Maps page pixels to the screen: the page (turned [rotation] clockwise quarter turns) is fitted
@@ -96,10 +98,10 @@ private class PageGeometry(val pw: Int, val ph: Int, val rotation: Int, val box:
 }
 
 /** Draws [image] stretched over the page rectangle (page pixel coordinates). */
-private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int) {
+private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int, colorFilter: ColorFilter? = null) {
     drawImage(
         image, srcOffset = IntOffset.Zero, srcSize = IntSize(image.width, image.height),
-        dstOffset = IntOffset.Zero, dstSize = IntSize(pw, ph), filterQuality = FilterQuality.Medium,
+        dstOffset = IntOffset.Zero, dstSize = IntSize(pw, ph), filterQuality = FilterQuality.Medium, colorFilter = colorFilter,
     )
 }
 
@@ -116,7 +118,11 @@ private val EraseColor = Color(0xFFF2B84B)
  * (page fractions x0, y0, x1, y1 ...) are drawn, a one-finger drag draws a new one ([onRect],
  * page fractions) and a tap is reported to [onTap] (page fractions and the index of the line of
  * [lines] under the finger, or -1). In [AreaMode.Lines] the unwarp's [lines] (NativeLib.lines
- * layout) are drawn; a line whose middle is in an area is drawn as ignored.
+ * layout) are drawn; a line whose middle is in an area is drawn as ignored. [pageHeight] may differ
+ * from the bitmap's (PageLook shape): the bitmap is stretched over the page. [colorFilter] (PageLook
+ * colours) applies to the cleaned page only. [compare] (0..1, the split across the page): the
+ * original on the left of the split, the cleaned page on the right; a one-finger drag moves it
+ * ([onCompare]).
  */
 @Composable
 fun PageViewer(
@@ -134,6 +140,9 @@ fun PageViewer(
     onRect: (Float, Float, Float, Float) -> Unit,
     onTap: (Float, Float, Int) -> Unit,
     modifier: Modifier = Modifier,
+    colorFilter: ColorFilter? = null,
+    compare: Float? = null,
+    onCompare: (Float) -> Unit = {},
 ) {
     val protectMode = areaMode != AreaMode.None
     val pageImg = remember(page) { page?.asImageBitmap() }
@@ -148,11 +157,21 @@ fun PageViewer(
     val geomNow = { PageGeometry(pageWidth, pageHeight, rotation, box, state.scale, state.pan) }
     val geometry by rememberUpdatedState(geomNow)
     val protecting by rememberUpdatedState(protectMode)
+    val comparing by rememberUpdatedState(compare != null && !protectMode)
+    val splitTo by rememberUpdatedState(onCompare)
     val hold by rememberUpdatedState(onHold)
     val rect by rememberUpdatedState(onRect)
     val tap by rememberUpdatedState(onTap)
     val shownLines by rememberUpdatedState(if (areaMode == AreaMode.Lines) lines else FloatArray(0))
     val outline = androidx.compose.material3.MaterialTheme.colorScheme.primary
+
+    // the split as a fraction across the page on screen
+    fun splitAt(x: Float): Float {
+        val g = geometry()
+        val w = g.rw * g.k
+        val left = g.center.x + state.pan.x - w / 2
+        return if (w <= 0f) 0.5f else ((x - left) / w).coerceIn(0f, 1f)
+    }
 
     fun zoomBy(factor: Float, centroid: Offset, panDelta: Offset) {
         val g = geometry()
@@ -179,7 +198,7 @@ fun PageViewer(
                     var lastTime = down.uptimeMillis
                     var mode = Mode.Pending
                     while (true) {
-                        val ev: PointerEvent? = if (mode == Mode.Pending && !protecting) {
+                        val ev: PointerEvent? = if (mode == Mode.Pending && !protecting && !comparing) {
                             val remaining = longPress - (lastTime - down.uptimeMillis)
                             withTimeoutOrNull(max(1L, remaining)) { awaitPointerEvent() }
                         } else {
@@ -210,6 +229,10 @@ fun PageViewer(
                         when (mode) {
                             Mode.Pending -> if ((ch.position - start).getDistance() > slop) {
                                 mode = when {
+                                    comparing -> {
+                                        splitTo(splitAt(ch.position.x))
+                                        Mode.Split
+                                    }
                                     protecting -> {
                                         drawFrom = geometry().toPage(start)
                                         drawTo = geometry().toPage(ch.position)
@@ -229,6 +252,10 @@ fun PageViewer(
                                 drawTo = geometry().toPage(ch.position)
                                 ch.consume()
                             }
+                            Mode.Split -> {
+                                splitTo(splitAt(ch.position.x))
+                                ch.consume()
+                            }
                             Mode.Hold, Mode.Idle -> {}
                         }
                     }
@@ -245,7 +272,9 @@ fun PageViewer(
                             }
                             drawFrom = null
                         }
-                        Mode.Pending -> if (protecting) {
+                        Mode.Pending -> if (comparing) {
+                            splitTo(splitAt(start.x))
+                        } else if (protecting) {
                             // a tap while editing areas: the line under the finger (24 dp), if any
                             val g = geometry()
                             val q = g.toPage(start)
@@ -291,7 +320,7 @@ fun PageViewer(
         }
         with(g) {
             inPage {
-                drawPageImage(shown, pageWidth, pageHeight)
+                drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null)
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
@@ -337,6 +366,28 @@ fun PageViewer(
                     }
                 }
             }
+            val split = compare
+            if (split != null && !protectMode && !holding && beforeImg != null) {
+                // the original on the left of the split, a divider with a round handle
+                val x = pageTl.x + pageSize.width * split
+                clipRect(left = pageTl.x, top = pageTl.y, right = x, bottom = pageTl.y + pageSize.height) {
+                    inPage { drawPageImage(beforeImg, pageWidth, pageHeight) }
+                }
+                val top = maxOf(pageTl.y, 0f)
+                val bottom = minOf(pageTl.y + pageSize.height, size.height)
+                drawLine(Color.Black.copy(alpha = 0.35f), Offset(x, top), Offset(x, bottom), strokeWidth = 4.dp.toPx())
+                drawLine(Color.White, Offset(x, top), Offset(x, bottom), strokeWidth = 2.dp.toPx())
+                val c = Offset(x, (top + bottom) / 2)
+                drawCircle(Color.Black.copy(alpha = 0.3f), radius = 17.dp.toPx(), center = c + Offset(0f, 1.dp.toPx()))
+                drawCircle(Color.White, radius = 16.dp.toPx(), center = c)
+                val a = 5.dp.toPx()
+                val ink = Color(0xFF17181B)
+                // two small arrows: drag sideways
+                drawLine(ink, c + Offset(-a * 1.6f, 0f), c + Offset(-a * 0.6f, -a), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+                drawLine(ink, c + Offset(-a * 1.6f, 0f), c + Offset(-a * 0.6f, a), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+                drawLine(ink, c + Offset(a * 1.6f, 0f), c + Offset(a * 0.6f, -a), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+                drawLine(ink, c + Offset(a * 1.6f, 0f), c + Offset(a * 0.6f, a), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+            }
         }
     }
 }
@@ -358,13 +409,17 @@ private fun segmentDistance(p: Offset, a: Offset, b: Offset): Float {
     return (p - (a + ab * t)).getDistance()
 }
 
-/** A small page preview (filter strip): [image] turned [rotation] quarter turns, fitted. */
+/**
+ * A small page preview (filter strip): [image] turned [rotation] quarter turns, fitted; [hw] (height
+ * / width, PageLook shape) stretches it, [colorFilter] tints it as the page.
+ */
 @Composable
-fun PageThumb(image: Bitmap?, rotation: Int, modifier: Modifier = Modifier) {
+fun PageThumb(image: Bitmap?, rotation: Int, modifier: Modifier = Modifier, hw: Float? = null, colorFilter: ColorFilter? = null) {
     val img = remember(image) { image?.asImageBitmap() }
     Canvas(modifier) {
         val i = img ?: return@Canvas
-        val g = PageGeometry(i.width, i.height, rotation, size, 1f, Offset.Zero)
-        with(g) { inPage { drawPageImage(i, i.width, i.height) } }
+        val h = if (hw != null) (i.width * hw).toInt().coerceAtLeast(1) else i.height
+        val g = PageGeometry(i.width, h, rotation, size, 1f, Offset.Zero)
+        with(g) { inPage { drawPageImage(i, i.width, h, colorFilter) } }
     }
 }
