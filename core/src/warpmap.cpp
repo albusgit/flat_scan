@@ -2,6 +2,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -481,9 +482,42 @@ bool touches(const Line& seg, const Lines& perp, double tol, int need = 2) {
     return ok >= need;
 }
 
+// share of a segment's length where the darkness Df within th/2 + 2 px of its own position (the
+// median of the darkest rows across +-8 px) reaches half the segment's median peak: a printed rule
+// is continuous, a row of text closed into a segment has gaps between letters and words. On the
+// darkness map, not the ink mask: at the faint-rule threshold (25) a text row's letters merge.
+double ink_cover(const cv::Mat& Df, bool hz, const Line& s) {
+    int a = std::max(0, (int)s[1]), p = (int)std::lround(s[0]), n_c = hz ? Df.rows : Df.cols;
+    int b = std::min((int)s[2], (hz ? Df.cols : Df.rows) - 1);
+    if (b < a) return 0;
+    auto at = [&](int along, int across) { return across >= 0 && across < n_c ? (hz ? Df.at<float>(across, along) : Df.at<float>(along, across)) : 0.f; };
+    std::vector<int> rows;
+    for (int k = a; k <= b; ++k) {
+        int best = p;
+        for (int q = p - 8; q <= p + 8; ++q)
+            if (at(k, q) > at(k, best)) best = q;
+        rows.push_back(best);
+    }
+    std::nth_element(rows.begin(), rows.begin() + rows.size() / 2, rows.end());
+    int c = rows[rows.size() / 2], e = (int)(s[3] / 2 + 2);
+    Vec peak;
+    for (int k = a; k <= b; ++k) {
+        float m = 0;
+        for (int q = c - e; q <= c + e; ++q) m = std::max(m, at(k, q));
+        peak.push_back(m);
+    }
+    Vec sorted_peak = peak;
+    double half = 0.5 * median(sorted_peak);
+    int hit = 0;
+    for (double m : peak) hit += m >= half;
+    return (double)hit / peak.size();
+}
+
 // one_end (app): a segment of >= 45 px touching a perpendicular line at one end also counts - box
-// sides whose other edge is printed too faintly to be found (text strokes are shorter)
-Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp, bool one_end = false) {
+// sides whose other edge is printed too faintly to be found (text strokes are shorter). It must be
+// continuous ink (ink_cover >= 0.9): right-aligned text rows end at their column's rule and passed
+// as rules (a Hebrew form: 55 of them), and their traces tore the page beside the rule
+Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp, bool one_end = false, const cv::Mat* Df = nullptr) {
     Lines segs = segments(ink, hz, 35, 35), add;
     for (const auto& s : segs) {
         if (s[4] >= 150 && !one_end) continue;   // the long pass has it (unless it leans: app)
@@ -491,7 +525,7 @@ Lines short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const 
         for (const auto& o : long_segs)
             if (std::fabs(o[0] - s[0]) < 12 && s[1] <= o[2] + 10 && s[2] >= o[1] - 10) { dup = true; break; }
         if (dup) continue;
-        if (touches(s, perp, 7) || (one_end && s[4] >= 45 && touches(s, perp, 7, 1))) add.push_back(s);
+        if (touches(s, perp, 7) || (one_end && s[4] >= 45 && touches(s, perp, 7, 1) && (!Df || ink_cover(*Df, hz, s) >= 0.9))) add.push_back(s);
     }
     return add;
 }
@@ -703,6 +737,186 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
     return keep;
 }
 
+// ------------------------------------------------------------------ rule net (app)
+// the net's highest rule probability within +-r px across the line at (along k, across c)
+inline float prob_at(const cv::Mat& P, bool hz, long k, double c, int r) {
+    const int n_a = hz ? P.cols : P.rows, n_c = hz ? P.rows : P.cols;
+    if (k < 0 || k >= n_a) return 0.f;
+    long c0 = std::max(0L, (long)std::lround(c) - r), c1 = std::min((long)n_c - 1, (long)std::lround(c) + r);
+    float m = 0.f;
+    for (long q = c0; q <= c1; ++q) m = std::max(m, hz ? P.at<float>((int)q, (int)k) : P.at<float>((int)k, (int)q));
+    return m;
+}
+
+// share of the stretch [a, b] along a line at pos (every 2 px) the net marks as a rule of the
+// line's direction (probability >= 0.5 within +-r px)
+double net_cover(const cv::Mat& P, bool hz, double pos, double a, double b, int r) {
+    long n = 0, hit = 0;
+    for (long k = pyint(a); k <= pyint(b); k += 2, ++n) hit += prob_at(P, hz, k, pos, r) >= 0.5f;
+    return n ? (double)hit / n : 0.0;
+}
+
+// share of a trace's samples (every 4th) that sit on a rule the net marks
+double trace_on_rule(const cv::Mat& P, bool hz, const Vec& tv, const Vec& cv) {
+    long n = 0, hit = 0;
+    for (size_t i = 0; i < tv.size(); i += 4, ++n) hit += prob_at(P, hz, pyint(tv[i]), cv[i], 2) >= 0.5f;
+    return n ? (double)hit / n : 0.0;
+}
+
+// App, with the rule net (probabilities PH / PV on the page, CV_32F): the found segments are kept
+// only where the net marks them as rules over at least half their length - text rows set against
+// a rule, letter strokes, a picture's or colour block's edge, the paper's own edge are not - and
+// the net's own rules are added where no segment was found (pale rules under the threshold, rules
+// bent too far for the straight-run search: >= 80 px along, <= 14 px thick; the tracer then
+// follows the ink) if their ink is at least as dark as a faint printed rule; found pieces of one such
+// rule are joined into one line. A rule the net sees
+// on past a found segment's end is left to extend_trace.
+void net_lines(Lines& H, Lines& V, const cv::Mat& PH, const cv::Mat& PV, const cv::Mat& D, NetLineStats& st) {
+    for (int hz = 1; hz >= 0; --hz) {
+        Lines& A = hz ? H : V;
+        const cv::Mat& P = hz ? PH : PV;
+        Lines keep;
+        for (const auto& L : A) {
+            if (net_cover(P, hz, L[0], L[1], L[2], std::max(4, (int)(L[3] / 2) + 3)) >= 0.5) keep.push_back(L);
+            else ++st.dropped;
+        }
+        A.swap(keep);
+        cv::Mat bin = P > 0.5f, lab, sts, cen;
+        int n = cv::connectedComponentsWithStats(bin, lab, sts, cen, 8);
+        for (int i = 1; i < n; ++i) {
+            int x = sts.at<int>(i, 0), y = sts.at<int>(i, 1), w = sts.at<int>(i, 2), h = sts.at<int>(i, 3);
+            int along = hz ? w : h, a0 = hz ? x : y;
+            if (along < 80) continue;
+            std::vector<double> cs(along, 0.0), cnt(along, 0.0);   // centre across, pixel count, per position along
+            for (int r = 0; r < h; ++r)
+                for (int c = 0; c < w; ++c)
+                    if (lab.at<int>(y + r, x + c) == i) {
+                        int k = hz ? c : r;
+                        cs[k] += hz ? y + r : x + c; cnt[k] += 1;
+                    }
+            Vec th;
+            for (int k = 0; k < along; ++k)
+                if (cnt[k] > 0) th.push_back(cnt[k]);
+            if (th.empty() || median(th) > 14) continue;
+            auto centre = [&](int k) {   // nearest position along with pixels
+                for (int d = 0; d < along; ++d) {
+                    if (k + d < along && cnt[k + d] > 0) return cs[k + d] / cnt[k + d];
+                    if (k - d >= 0 && cnt[k - d] > 0) return cs[k - d] / cnt[k - d];
+                }
+                return 0.0;
+            };
+            // the found lines on this rule: overlapping it along, within 6 px of its centre there
+            std::vector<size_t> on;
+            double covered = 0;
+            for (size_t j = 0; j < A.size(); ++j) {
+                const Line& L = A[j];
+                double o0 = std::max(L[1], (double)a0), o1 = std::min(L[2], (double)(a0 + along - 1));
+                if (o1 <= o0) continue;
+                double d = std::fabs(L[0] - centre((int)((o0 + o1) / 2) - a0));
+                if (d < 6) on.push_back(j);
+                if (d < 10) covered += o1 - o0;
+            }
+            Vec thv = th;
+            // pieces of one rule do not overlap along; lines that do are parallel rules the mask
+            // merged at half size (a double border) and stay as they are
+            bool overlap = false;
+            for (size_t q = 0; q < on.size(); ++q)
+                for (size_t r = q + 1; r < on.size(); ++r)
+                    overlap |= std::min(A[on[q]][2], A[on[r]][2]) - std::max(A[on[q]][1], A[on[r]][1]) > 20;
+            if (on.size() >= 2 && !overlap) {
+                // one rule found as pieces (it waves too much for the straight-run search, so only its
+                // flatter stretches were found, each traced to a height of its own): one line along
+                // the whole of it, traced from its middle
+                double lo = a0, hi = a0 + along - 1;
+                for (size_t j : on) { lo = std::min(lo, A[j][1]); hi = std::max(hi, A[j][2]); }
+                Line J{centre(std::min(along - 1, std::max(0, (int)((lo + hi) / 2) - a0))), lo, hi, median(thv), hi - lo};
+                for (size_t q = on.size(); q-- > 0;) A.erase(A.begin() + (long)on[q]);
+                A.push_back(J);
+                st.joined += (int)on.size();
+                continue;
+            }
+            if (covered > 0.3 * along) continue;
+            // as dark as a faint printed rule (median peak darkness >= 25, the faint-rule threshold):
+            // the net also marks rules printed on the back of the sheet or on a sheet behind it, seen
+            // through the paper at darkness 7 - 17, whose traces are too noisy to straighten by
+            Vec pk;
+            for (int k = 0; k < along; k += 4) {
+                if (cnt[k] <= 0) continue;
+                float m = 0;
+                int c = (int)std::lround(cs[k] / cnt[k]);
+                for (int q = c - 3; q <= c + 3; ++q) {
+                    int r = hz ? q : a0 + k, cc = hz ? a0 + k : q;
+                    if (r >= 0 && cc >= 0 && r < D.rows && cc < D.cols) m = std::max(m, D.at<float>(r, cc));
+                }
+                pk.push_back(m);
+            }
+            if (pk.empty() || median(pk) < 25) { ++st.too_faint; continue; }
+            A.push_back({centre(along / 2), (double)a0, (double)(a0 + along - 1), median(thv), (double)along});
+            ++st.added;
+        }
+    }
+}
+
+// App, neural pages: follows a rule's ink on past the end of its trace (dir +1 / -1). A rule is cut
+// where the found rules crossing it end (clip in get_lines, trace_bounds): a table's outer side runs
+// on past the last row rule found to cross it (short last rows, a header bent at a curled corner),
+// and row rules run on into a curled corner whose border was not found. The page there stayed bent.
+// 1 px a step; the guess is the line through the last 30 hits; a hit is a run within 2 px of it,
+// as wide as the rule (chain_trace's band). Stops after 6 missed steps in a row (a crossing rule is
+// one wide run, a miss), at the image edge, 40 px off the rule's ideal, or where the trace turns
+// more than ~11 deg off the rule's own direction (a rounded corner turning into its side; the last
+// 10 px of the turn are dropped). Kept if it runs >= 30 px with hits on >= 70 % of it.
+// With the rule net (P), a hit must also lie on a rule it marks (probability >= 0.3): the ink beside
+// a rule's end (a text row, a picture) is not followed.
+// It stops where it reaches another found line of its direction (within 8 px across, inside its
+// stretch +-5 px): that is another piece of the rule (or a parallel rule), with a trace and an ideal of
+// its own; running over it set two heights for one place and tore the page between them (a wavy
+// table found as short pieces). share_ideals joins the pieces instead.
+void extend_trace(const DView& D, bool hz, const Vec& tv, const Vec& cv, int dir, double thr, long maxrun, double mw, double ideal,
+                  double slope0, Vec& et, Vec& ec, const cv::Mat* P = nullptr, const Lines* others = nullptr) {
+    et.clear(); ec.clear();
+    const long n_a = hz ? D.cols : D.rows, n_c = hz ? D.rows : D.cols;
+    std::vector<double> ht, hc;   // hits, the trace's own end first
+    for (size_t i = 0; i < tv.size(); ++i) {
+        size_t q = dir > 0 ? tv.size() - 1 - i : i;
+        if (std::fabs(tv[q] - (dir > 0 ? tv.back() : tv.front())) > 40) break;
+        ht.insert(ht.begin(), tv[q]); hc.insert(hc.begin(), cv[q]);
+    }
+    if (ht.size() < 8) return;
+    const double start = dir > 0 ? tv.back() : tv.front();
+    long miss = 0;
+    double sl = slope0;
+    for (long k = pyint(start) + dir; 0 <= k && k < n_a && miss <= 6; k += dir) {
+        size_t m0 = ht.size() > 30 ? ht.size() - 30 : 0, m = ht.size() - m0;
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (size_t i = m0; i < ht.size(); ++i) { sx += ht[i]; sy += hc[i]; sxx += ht[i] * ht[i]; sxy += ht[i] * hc[i]; }
+        double den = m * sxx - sx * sx;
+        sl = den != 0.0 ? (m * sxy - sx * sy) / den : sl;
+        double guess = den != 0.0 ? (sy - sl * sx) / m + sl * k : sy / m, v, ww;
+        if (std::fabs(sl - slope0) > 0.2 || std::fabs(guess - ideal) > 40) break;
+        if (others) {
+            bool met = false;
+            for (const auto& O : *others) met |= k >= O[1] - 5 && k <= O[2] + 5 && std::fabs(guess - O[0]) < 8;
+            if (met) break;
+        }
+        measure(D, hz, k, guess, 4, thr, maxrun, n_c, v, ww);
+        if (!std::isnan(v) && std::fabs(v - guess) < 2 && ww >= 0.6 * mw && ww <= 1.7 * mw + 1 && (!P || prob_at(*P, hz, k, v, 2) >= 0.3f)) {
+            ht.push_back((double)k); hc.push_back(v);
+            et.push_back((double)k); ec.push_back(v);
+            miss = 0;
+        } else {
+            ++miss;
+        }
+    }
+    if (std::fabs(sl - slope0) > 0.2) {
+        double cut = et.empty() ? 0 : et.back() - dir * 10.0;
+        while (!et.empty() && (dir > 0 ? et.back() > cut : et.back() < cut)) { et.pop_back(); ec.pop_back(); }
+    }
+    double run = et.empty() ? 0 : std::fabs(et.back() - start);
+    if (run < 30 || (double)et.size() < 0.7 * run) { et.clear(); ec.clear(); return; }
+    if (dir < 0) { std::reverse(et.begin(), et.end()); std::reverse(ec.begin(), ec.end()); }
+}
+
 // free_ext (app): how far a trace may run past an end with no perpendicular rule to meet; there it
 // only walks into what lies beside the line (a chart's dotted gridline into the text next to it)
 void trace_bounds(const Line& L, const Lines& perp, double lo, double hi, double& a2, double& b2, double ext = 200, double pad = 6,
@@ -756,7 +970,7 @@ cv::Mat darkness_fast(const cv::Mat& img) {
     return D;
 }
 
-void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
+void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* PH, const cv::Mat* PV, NetLineStats* stats) {
     cv::Mat ink = D > 45.f;   // 0 / 255
     cv::Mat ink_h = ink, ink_v = ink;
     if (faint) {   // app: faint printed rules too (faint_rules)
@@ -771,10 +985,10 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     }
     H = segments(ink_h, true);
     V = segments(ink_v, false);
-    Lines Vs = short_segments(ink_v, false, V, H, faint);
+    Lines Vs = short_segments(ink_v, false, V, H, faint, &D);
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
-    Lines Hs = short_segments(ink_h, true, H, HV, faint);
+    Lines Hs = short_segments(ink_h, true, H, HV, faint, &D);
     Lines Hc, Vc;
     if (faint) corner_pairs(ink_h, ink_v, H, V, Hs, Vs, Hc, Vc);
     Lines h2 = H; h2.insert(h2.end(), Hs.begin(), Hs.end());
@@ -785,7 +999,24 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
     // follows the rule and drops the tilted piece (share_ideals still gives them one height)
     H.insert(H.end(), Hc.begin(), Hc.end());
     V.insert(V.end(), Vc.begin(), Vc.end());
-    auto clip = [faint](Lines& A, const Lines& B, double tol) {
+    // app: a "rule" within 15 px of the page's own border is the paper's edge or its shadow (the
+    // nets' crop ends at the paper); straightening it pinned the field there and folded a curled
+    // corner's correction over itself beside it (colour_edges leaves the outer 25 px out likewise)
+    if (faint) {
+        auto inner = [&](Lines& A, int n) {
+            A.erase(std::remove_if(A.begin(), A.end(), [&](const Line& L) { return L[0] < 15 || L[0] > n - 16; }), A.end());
+        };
+        inner(H, D.rows);
+        inner(V, D.cols);
+    }
+    NetLineStats st_local;
+    NetLineStats& st = stats ? *stats : st_local;
+    const bool net = faint && PH && PV && !PH->empty() && !PV->empty();
+    if (net) net_lines(H, V, *PH, *PV, D, st);
+    // (a rule's end past the outermost rule found to cross it is left to extend_trace, with or without
+    // the net: keeping the found segment's length there capped the trace at the crossing rule's
+    // straight position, short of a curled corner)
+    auto clip = [&](Lines& A, const Lines& B, double tol, bool hz) {
         for (auto& L : A) {
             bool any = false;
             double mn = 1e300, mx = -1e300;
@@ -802,8 +1033,8 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint) {
             }
         }
     };
-    clip(H, V, 20);
-    clip(V, H, 20);
+    clip(H, V, 20, true);
+    clip(V, H, 20, false);
     auto snap = [](Lines& A, const Lines& B, double tol) {
         for (auto& L : A) {
             Vec cr;
@@ -846,11 +1077,29 @@ void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
             if (r[0] > t1[i]) { t1[i] = r[0]; c1[i] = r[1] + r[2]; }
         }
     }
+    // each piece's trace, sorted along (for the overlap test below)
+    std::vector<Vec> st(n), sc(n);
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<std::pair<double, double>> q;
+        for (const auto& r : per[i]) q.push_back({r[0], r[1] + r[2]});
+        std::sort(q.begin(), q.end());
+        for (const auto& e : q) { st[i].push_back(e.first); sc[i].push_back(e.second); }
+    }
     for (size_t i = 0; i < n; ++i)
         for (size_t j = i + 1; j < n; ++j) {
             if (per[i].empty() || per[j].empty()) continue;
             double gap = std::max(t0[i], t0[j]) - std::min(t1[i], t1[j]);
             if (std::fabs(ideal[i] - ideal[j]) <= 6 && gap < 80) { parent[find(i)] = find(j); continue; }
+            // (app) pieces whose traces run on the same ink (median 2 px apart over >= 16 px of
+            // overlap) are one rule, however far apart their ideals: a wavy rule found as pieces
+            // at its flatter stretches, each traced on over its neighbours' ground. Two heights
+            // for one place tore the page there.
+            if (gap <= -16) {
+                Vec d;
+                for (double t = std::max(t0[i], t0[j]); t <= std::min(t1[i], t1[j]); t += 4)
+                    d.push_back(std::fabs(interp(t, st[i], sc[i]) - interp(t, st[j], sc[j])));
+                if (d.size() >= 4 && median(d) <= 2) { parent[find(i)] = find(j); continue; }
+            }
             // pieces that physically continue each other (their traces meet within 5 px across a
             // gap < 40 px) are one line even when a curl moved one piece's ideal (box sides
             // stacked down a curled page edge)
@@ -870,7 +1119,7 @@ void share_ideals(std::vector<std::vector<std::array<double, 3>>>& per) {
 }
 
 Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* prior_dx, const Field* prior_dy, int threads,
-                bool share_rows = false, bool faint = false) {
+                bool share_rows = false, bool faint = false, const cv::Mat* PH = nullptr, const cv::Mat* PV = nullptr) {
     Samples out;
     for (int pass = 0; pass < 2; ++pass) {
         bool hz = pass == 0;
@@ -881,7 +1130,11 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         double lo = 1e300, hi = -1e300;
         for (const auto& L : lines) { lo = std::min(lo, L[1]); hi = std::max(hi, L[2]); }
         std::vector<std::vector<std::array<double, 3>>> per(lines.size());
-        std::atomic<int> bowed{0};
+        std::atomic<int> bowed{0}, extended{0}, net_kept{0};
+        const cv::Mat* P = (hz ? PH : PV) && !(hz ? PH : PV)->empty() ? (hz ? PH : PV) : nullptr;
+        std::vector<std::array<double, 2>> span(lines.size(), {NaN, NaN});
+        std::vector<std::array<std::array<double, 2>, 2>> ext_piece(lines.size(), {{{NaN, NaN}, {NaN, NaN}}});
+        std::vector<Samples::Trace> traces(lines.size());
         auto one = [&](size_t li) {
             const Line& L = lines[li];
             double p = L[0], a = L[1], b = L[2], th = L[3];
@@ -951,8 +1204,40 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 Vec dev;
                 for (size_t i = 0; i < tv.size(); ++i) dev.push_back(std::fabs(cv[i] - polyval(pf, tv[i])));
                 std::sort(dev.begin(), dev.end());
-                if (dev[(size_t)(0.95 * (dev.size() - 1))] > 3 + 0.01 * (tv.back() - tv.front())) { ++bowed; return; }
+                // with the rule net: a bowed trace that lies on a rule the net marks is a rule the
+                // page still bends (a curled corner), and straightening it is the point
+                if (dev[(size_t)(0.95 * (dev.size() - 1))] > 3 + 0.01 * (tv.back() - tv.front())) {
+                    if (P && trace_on_rule(*P, hz, tv, cv) >= 0.8) ++net_kept;
+                    else { ++bowed; return; }
+                }
             }
+            // app, neural pages: the rule's ink on past where the trace was cut (extend_trace); the
+            // extension keeps the line's ideal, so the page there is straightened with the rest of it
+            if (share_rows && faint && tv.size() >= 8) {
+                Vec ws;
+                for (size_t i = 0; i < n; ++i)
+                    if (ok[i]) ws.push_back(wd[i]);
+                double mw = median(ws), slope0 = polyfit(tv, cv, 1)[0];
+                Vec bt0, bc0, ft, fc;
+                Lines others;   // the other lines of this direction near this one
+                for (size_t j = 0; j < lines.size(); ++j)
+                    if (j != li && std::fabs(lines[j][0] - p) < 60) others.push_back(lines[j]);
+                // (not gated by the rule net: it marks a curled corner's rules less far into the
+                // corner than the ink runs, and the trace's own tests - continuous ink of the rule's
+                // width, no sharp turn - keep it off text)
+                extend_trace(D, hz, tv, cv, -1, thr, maxrun, mw, ideal, slope0, bt0, bc0, nullptr, &others);
+                extend_trace(D, hz, tv, cv, 1, thr, maxrun, mw, ideal, slope0, ft, fc, nullptr, &others);
+                if (!bt0.empty() || !ft.empty()) {
+                    extended += (int)!bt0.empty() + (int)!ft.empty();
+                    if (!bt0.empty()) ext_piece[li][0] = {bt0.front(), tv.front()};
+                    if (!ft.empty()) ext_piece[li][1] = {tv.back(), ft.back()};
+                    bt0.insert(bt0.end(), tv.begin(), tv.end()); bt0.insert(bt0.end(), ft.begin(), ft.end());
+                    bc0.insert(bc0.end(), cv.begin(), cv.end()); bc0.insert(bc0.end(), fc.begin(), fc.end());
+                    tv.swap(bt0); cv.swap(bc0);
+                }
+            }
+            span[li] = {tv.front(), tv.back()};
+            traces[li].t = tv; traces[li].c = cv;
             // 4-px bins of consecutive samples
             Vec tt, cc;
             {
@@ -998,6 +1283,17 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
         for (auto& q : ts) q.join();
         if (share_rows) share_ideals(per);
         out.n_bowed += bowed;
+        out.n_extended += extended;
+        out.n_net_kept += net_kept;
+        (hz ? out.span_h : out.span_v) = span;
+        for (size_t li = 0; li < lines.size(); ++li)   // ideals after share_ideals
+            for (const auto& e : ext_piece[li])
+                if (!std::isnan(e[0]) && !per[li].empty()) (hz ? out.ext_h : out.ext_v).push_back({per[li][0][1], e[0], e[1]});
+        for (size_t li = 0; li < lines.size(); ++li)
+            if (!per[li].empty() && !traces[li].t.empty()) {
+                traces[li].ideal = per[li][0][1]; traces[li].line = li;
+                (hz ? out.tr_h : out.tr_v).push_back(std::move(traces[li]));
+            }
         for (auto& r : per) rows_out.insert(rows_out.end(), r.begin(), r.end());
     }
     return out;
@@ -1324,7 +1620,96 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 void set_warp_cg_rtol(double rtol) { cg_rtol_store() = rtol > 0 ? rtol : 1e-8; }
 double warp_cg_rtol() { return cg_rtol_store().load(); }
 
-GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges) {
+// App, neural pages: a rule whose trace stops short of a rule it ends at, where collect's junction
+// bridge does not join them because the other rule's found segment ends before it (a table border
+// found short and traced on into a curled corner, where the rows end). That corner was never placed
+// and the tip kept its curl as a hook. The corner is measured on the other rule's trace: where it
+// crosses this trace carried on along a parabola through its last 80 px, or its end if it stops
+// short of that (an L). The rule gets 3 samples there with its own ideal, so the field moves the
+// corner with the rule. Within 40 px along and 25 px across of the trace's end.
+int corner_junctions(Samples& S, const Lines& H, const Lines& V) {
+    int n = 0;
+    auto at = [](const Samples::Trace& T, double t) { return interp(t, T.t, T.c); };
+    for (int hz = 1; hz >= 0; --hz) {
+        auto& A = hz ? S.tr_h : S.tr_v;   // the rules whose ends are pinned here
+        auto& B = hz ? S.tr_v : S.tr_h;   // the rules they end at
+        auto& rows = hz ? S.h : S.v;
+        const Lines &LA = hz ? H : V, &LB = hz ? V : H;
+        for (const auto& T : A) {
+            if (T.t.size() < 20 || T.line >= LA.size()) continue;
+            const Line& TL = LA[T.line];
+            for (int end = 0; end < 2; ++end) {
+                const double te = end ? T.t.back() : T.t.front(), ce = end ? T.c.back() : T.c.front();
+                const int dir = end ? 1 : -1;
+                // a parabola through this trace's last 80 px, to carry it on to the other rule
+                Vec ft, fc;
+                for (size_t i = 0; i < T.t.size(); ++i)
+                    if (std::fabs(T.t[i] - te) <= 80) { ft.push_back(T.t[i]); fc.push_back(T.c[i]); }
+                if (ft.size() < 10) continue;
+                Vec pf = polyfit(ft, fc, 2);
+                double best = 1e300, bt = 0, bc = 0;
+                for (const auto& U : B) {
+                    if (U.t.size() < 20 || U.line >= LB.size()) continue;
+                    // collect's junction bridge already joins T to U where U's found segment reaches T
+                    // (and U lies within T's segment); only where U's trace runs on past its segment
+                    // (a border found short, traced on into the curled corner) is the bridge missing
+                    const Line& UL = LB[U.line];
+                    if (UL[1] - 12 <= TL[0] && TL[0] <= UL[2] + 12 && TL[1] - 15 <= UL[0] && UL[0] <= TL[2] + 15) continue;
+                    // U runs along this rule's across axis: U's along = this rule's across (c), U's
+                    // across = this rule's along (t); its position across near this end
+                    if (ce < U.t.front() - 40 || ce > U.t.back() + 40) continue;
+                    double ue = at(U, std::min(std::max(ce, U.t.front()), U.t.back()));
+                    double gap = (ue - te) * dir;   // how far past this end U lies (along this rule)
+                    if (gap < -10 || gap > 40) continue;
+                    // the corner: where U crosses this trace's parabola if U runs that far (a T, or
+                    // a row meeting the table's side), else U's own end (an L: U stops short of it)
+                    double ct = ue, cc = 0;
+                    for (int it = 0; it < 3; ++it) { cc = polyval(pf, ct); ct = at(U, std::min(std::max(cc, U.t.front()), U.t.back())); }
+                    cc = polyval(pf, ct);
+                    const double uf = U.t.front(), ub = U.t.back();
+                    if (cc < uf - 3 || cc > ub + 3) {
+                        bool front = std::fabs(uf - cc) < std::fabs(ub - cc);
+                        cc = front ? uf : ub; ct = front ? U.c.front() : U.c.back();
+                    }
+                    if (std::fabs(cc - polyval(pf, ct)) > 25 || (ct - te) * dir < -10) continue;
+                    double d = std::fabs(ct - te) + std::fabs(cc - ce);
+                    if (d < best) { best = d; bt = ct; bc = cc; }
+                }
+                if (best > 1e299 || std::fabs(bt - te) < 2) continue;
+                for (int k = 0; k < 3; ++k) rows.push_back({bt, T.ideal, bc - T.ideal});
+                ++n;
+            }
+        }
+    }
+    S.n_corners = n;
+    return n;
+}
+
+// the page at half size (INTER_AREA), padded to multiples of 32 (edge pixels repeated), through the
+// net; its two maps cropped and scaled back to the page (bilinear)
+bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& PV) {
+    if (!net || bgr.empty()) return false;
+    const int w2 = (bgr.cols + 1) / 2, h2 = (bgr.rows + 1) / 2, pw = (w2 + 31) / 32 * 32, ph = (h2 + 31) / 32 * 32;
+    cv::Mat small, pad;
+    cv::resize(bgr, small, cv::Size(w2, h2), 0, 0, cv::INTER_AREA);
+    cv::copyMakeBorder(small, pad, 0, ph - h2, 0, pw - w2, cv::BORDER_REPLICATE);
+    const size_t plane = (size_t)pw * ph;
+    std::vector<float> io(3 * plane);
+    for (int y = 0; y < ph; ++y) {
+        const uint8_t* r = pad.ptr<uint8_t>(y);
+        for (int x = 0; x < pw; ++x)
+            for (int k = 0; k < 3; ++k) io[k * plane + (size_t)y * pw + x] = r[3 * x + k] / 255.f;
+    }
+    if (!net(io, pw, ph) || io.size() != 2 * plane) return false;
+    for (int k = 0; k < 2; ++k) {
+        cv::Mat m(ph, pw, CV_32F, io.data() + k * plane);
+        cv::resize(m(cv::Rect(0, 0, w2, h2)), k ? PV : PH, bgr.size(), 0, 0, cv::INTER_LINEAR);
+    }
+    return true;
+}
+
+GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges,
+                   const RuleNetFn* rule_net, const cv::Mat* drop_lines) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1343,14 +1728,50 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
                    }), rows.end());
         d.n_ignored += (int)(n0 - rows.size());
     };
+    // drop_lines: a line (the samples sharing one ideal) with any sample on it is left out whole
+    const bool dropping = drop_lines && !drop_lines->empty() && drop_lines->size() == src.size();
+    auto drop_whole = [&](std::vector<std::array<double, 3>>& rows, bool hz) {
+        if (!dropping) return;
+        auto on = [&](const std::array<double, 3>& r) {
+            int xi = (int)std::lround(hz ? r[0] : r[1] + r[2]), yi = (int)std::lround(hz ? r[1] + r[2] : r[0]);
+            return xi >= 0 && yi >= 0 && xi < drop_lines->cols && yi < drop_lines->rows && drop_lines->at<uint8_t>(yi, xi) != 0;
+        };
+        std::set<double> hit;
+        for (const auto& r : rows)
+            if (on(r)) hit.insert(r[1]);
+        size_t n0 = rows.size();
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const std::array<double, 3>& r) { return hit.count(r[1]) > 0; }), rows.end());
+        d.n_lines_dropped += (int)hit.size();
+        d.n_ignored += (int)(n0 - rows.size());
+    };
     const int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     int h = src.rows, w = src.cols;
     auto t0 = Clock::now();
     // ---- global stage (global_grid)
     std::vector<DLine> Hs, Vs;
     std::vector<cv::Point2d> sp, dp;
+    // the rule net on the page as given (its maps follow the global stage's remap below)
+    cv::Mat P0h, P0v;
+    if (faint && rule_net && *rule_net) {
+        if (!rule_probs(src, *rule_net, P0h, P0v)) { P0h.release(); P0v.release(); }
+        d.ms.emplace_back("rule net", ms_since(t0));
+        t0 = Clock::now();
+    }
     try {
         dewarp_detect(src, Hs, Vs, faint);
+        if (!P0h.empty()) {   // the global grid from rules only: a line the net marks over half its samples
+            for (int hz = 1; hz >= 0; --hz) {
+                std::vector<DLine>& A = hz ? Hs : Vs;
+                std::vector<DLine> keep;
+                for (auto& L : A) {
+                    long n = 0, hit = 0;
+                    for (size_t i = 0; i < L.t.size(); i += 4, ++n) hit += prob_at(hz ? P0h : P0v, hz, (long)L.t[i], L.v[i], 2) >= 0.5f;
+                    if (n && 2 * hit >= n) keep.push_back(std::move(L));
+                    else ++d.net.dropped_global;
+                }
+                A.swap(keep);
+            }
+        }
         build_controls(Hs, Vs, sp, dp);
     } catch (const std::exception&) {
         sp.clear(); dp.clear();
@@ -1405,8 +1826,10 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     std::vector<float> gx(d.GX.v.begin(), d.GX.v.end()), gy(d.GY.v.begin(), d.GY.v.end());
     if (skip_global) {
         d.A_img = src.clone();
-    } else if (gpu_stages_enabled() && remap_offset_gpu(src, gx, gy, gw, gh, GG, d.A_img)) {
-        // the same map and bicubic on the GPU, byte-identical (resample.h)
+        d.PH = P0h; d.PV = P0v;
+    } else if (P0h.empty() && gpu_stages_enabled() && remap_offset_gpu(src, gx, gy, gw, gh, GG, d.A_img)) {
+        // the same map and bicubic on the GPU, byte-identical (resample.h); with the rule net's maps
+        // (remapped with the page below) the CPU path runs
     } else {
         d.A_img.create(h, w, src.type());
         const int band = 64;
@@ -1428,15 +1851,26 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
             }
             cv::Mat dst = d.A_img.rowRange(y0, y1);
             cv::remap(src, dst, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar::all(255));
+            if (!P0h.empty()) {
+                if (d.PH.empty()) { d.PH.create(h, w, CV_32F); d.PV.create(h, w, CV_32F); }
+                cv::Mat ph = d.PH.rowRange(y0, y1), pv = d.PV.rowRange(y0, y1);
+                cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+            }
         }
     }
     d.D = darkness_fast(d.A_img);
     d.ms.emplace_back("global_remap+darkness", ms_since(t0));
     t0 = Clock::now();
     // ---- local stage (local_field)
-    get_lines(d.D, d.H, d.V, faint);
+    const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
+    const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
+    get_lines(d.D, d.H, d.V, faint, PH, PV, &d.net);
     const int GC = 16, GF = 8;
-    if (d.H.empty() || d.V.empty()) {
+    // (app: lines of one direction alone are straightened too - a ruled sheet, a receipt with only
+    // horizontal rules, a page whose vertical "rules" the rule net found to be picture edges; the
+    // other direction gets a zero field. The reference needs both.)
+    if (faint ? (d.H.empty() && d.V.empty()) : (d.H.empty() || d.V.empty())) {
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
         // pages then get the surface model only.
         d.n_text = 0;
@@ -1445,11 +1879,13 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         return compose_maps(d, w, h);
     }
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
-    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint);
+    d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint, PH, PV);
+    if (share_rows && faint) corner_junctions(d.S1, d.H, d.V);
     d.T = text_rows(d.D, d.H, d.V, d.n_text);
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
         drop(d.M, false);
+        drop_whole(d.M, false);
     }
     if (edges && share_rows) {
         Lines eh, ev;
@@ -1459,10 +1895,15 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.E_lines.insert(d.E_lines.end(), ev.begin(), ev.end());
         drop(d.EH, true);
         drop(d.EV, false);
+        drop_whole(d.EH, true);
+        drop_whole(d.EV, false);
     }
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
+    drop_whole(d.S1.h, true);
+    drop_whole(d.S1.v, false);
+    drop_whole(d.T, true);
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
     Field Fx_prev, Fy_prev;
@@ -1472,9 +1913,12 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         const Samples& S = it == 0 ? d.S1 : d.S2;
         if (it == 1) {
             auto tc = Clock::now();
-            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint);
+            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
+            if (share_rows && faint) corner_junctions(d.S2, d.H, d.V);
             drop(d.S2.h, true);
             drop(d.S2.v, false);
+            drop_whole(d.S2.h, true);
+            drop_whole(d.S2.v, false);
             d.ms.emplace_back("trace pass2", ms_since(tc));
         }
         const Samples& SS = it == 0 ? d.S1 : d.S2;

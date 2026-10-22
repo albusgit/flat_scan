@@ -313,6 +313,7 @@ fun SettingsScreen(vm: ScanViewModel) {
     var uvDoc by remember { mutableStateOf(s.uvDoc) }
     var flatNets by remember { mutableIntStateOf(s.flatNets) }
     var neuralShadows by remember { mutableStateOf(s.neuralShadows) }
+    var ruleNet by remember { mutableStateOf(s.ruleNet) }
     var reviewCrops by remember { mutableStateOf(s.reviewCrops) }
     var bookRtl by remember { mutableStateOf(s.bookRightToLeft) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
@@ -339,6 +340,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
             if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc high-res only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
             SwitchRow("Remove shadows", "Shadow net: hand, object and leaf shadows; colours kept", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
+            SwitchRow("Table rules (neural net)", "Rule net: straighten printed rules, not text rows or curves; off: rules from darkness alone", ruleNet) { ruleNet = it; s.ruleNet = it }
             SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
             SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

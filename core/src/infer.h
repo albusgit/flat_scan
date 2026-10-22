@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace fs {
-enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet };
+enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet };
 enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML };
 struct InferConfig {
     std::function<std::vector<uint8_t>(const std::string& file)> load;  // model bytes (Android: AAssetManager)
