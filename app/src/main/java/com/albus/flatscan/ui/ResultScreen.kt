@@ -48,6 +48,7 @@ import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Compare
 import androidx.compose.material.icons.outlined.DoneAll
+import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.GridView
@@ -106,6 +107,7 @@ import androidx.compose.ui.unit.sp
 import com.albus.flatscan.FilterKind
 import com.albus.flatscan.ImportSource
 import com.albus.flatscan.ScanViewModel
+import com.albus.flatscan.ScreenMode
 import com.albus.flatscan.Screen
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -493,6 +495,13 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
         }
         val ne = vm.erase.size / 4
         EditorChip(if (ne > 0) "Erased ($ne)" else "Erase", onClick = onErase, icon = Icons.Outlined.AutoFixHigh)
+        // photo of a monitor / laptop / phone: descreen (moire, pixel grid) before the filter. Auto finds only clear
+        // cases (docs/results/r11/filters.md), so a tap cycles Auto -> On -> Off
+        EditorChip(
+            "Screen photo: ${p.screen.label}",
+            onClick = { vm.setScreen(when (p.screen) { ScreenMode.Auto -> ScreenMode.On; ScreenMode.On -> ScreenMode.Off; ScreenMode.Off -> ScreenMode.Auto }) },
+            icon = Icons.Outlined.Monitor, selected = p.screen == ScreenMode.On,
+        )
         if (vm.pages.size > 1) {
             // the filter, strength and adjustments of this page on every page of the document
             EditorChip(
