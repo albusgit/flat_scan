@@ -133,7 +133,9 @@ def main():
     ap.add_argument("--only", default="")
     a = ap.parse_args()
     spec = json.load(open(a.spec))
-    taken_global = set()
+    taken_global = set()   # titles already in any category of OUT (earlier runs)
+    for lic in __import__("glob").glob(os.path.join(a.out, "*", "licences.csv")):
+        taken_global.update(r["title"] for r in csv.DictReader(open(lic, encoding="utf-8")))
     for name, s in spec.items():
         if a.only and name not in a.only.split(","):
             continue
@@ -161,7 +163,7 @@ def main():
             if len(rows) >= cap:
                 break
         print(name, "kept", len(rows), flush=True)
-        with ThreadPoolExecutor(4) as ex:
+        with ThreadPoolExecutor(2) as ex:
             ok = list(ex.map(lambda r: fetch(r["url"], os.path.join(d, r["file"])), rows))
         rows = [r for r, o in zip(rows, ok) if o]
         taken_global.update(r["title"] for r in rows)

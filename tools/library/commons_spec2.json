@@ -1,0 +1,17 @@
+{
+  "screens2": {
+    "search": ["photo of computer monitor showing text", "laptop screen close-up", "computer screen close-up text", "LCD monitor closeup",
+               "smartphone screen showing", "screen photographed moire", "monitor displaying spreadsheet", "monitor displaying document",
+               "computer screen web page", "terminal screen text", "e-book reader screen", "kindle screen", "tablet showing text",
+               "departure board screen", "ATM screen", "screen glare monitor", "old CRT screen text", "phone screen photo text"],
+    "search_limit": 120, "max": 400
+  },
+  "colour_docs2": {
+    "search": ["magazine page photographed", "open magazine", "comic book page", "children's book page", "colouring book page",
+               "folded map paper", "tourist brochure", "museum leaflet", "concert poster paper", "wall calendar", "printed form filled in",
+               "school worksheet", "highlighted notes", "notebook page colored pen", "sticky notes on document", "post-it note paper",
+               "greeting card", "postcard back", "banknote", "stamp collection album page", "invoice stamped", "certificate photographed",
+               "menu card table", "product label", "boarding pass", "lottery ticket", "envelope stamped", "recipe card"],
+    "search_limit": 100, "max": 450
+  }
+}
