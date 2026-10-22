@@ -117,7 +117,10 @@ def bn_convs(m, w16):
     return out
 
 
-def rewrite(path, dst, bn, out_name):
+def rewrite(path, dst, bn, out_name, fp32_filters='unfold'):
+    """fp32_filters: what to do with a conv filter that is not fp16 numbers: 'unfold' (a BatchNorm-folded ONNX fp16
+    weight, the GPU nets) or 'round' (an fp32 source, the page finder: rounded to fp16, a change measured by
+    tools/litert/ship.py's parity)."""
     """The fp32 .tflite at path in its GPU form with fp16 weights (module docstring, step 3); its output gets the
     ONNX output's name (onnx2tf names it Identity). Returns a summary line."""
     from tensorflow.lite.python import schema_py_generated as s
@@ -160,7 +163,7 @@ def rewrite(path, dst, bn, out_name):
     mul = opcode(B.MUL, 1)
     resize = opcode(B.RESIZE_NEAREST_NEIGHBOR, 1)
     code = [c.builtinCode for c in m.operatorCodes]
-    ops, unfolded, used, n_prelu, n_bcast = [], 0, set(), 0, 0
+    ops, unfolded, used, n_prelu, n_bcast, n_round = [], 0, set(), 0, 0, 0
     for o in g.operators:
         ops.append(o)
         op = code[o.opcodeIndex]
@@ -187,6 +190,10 @@ def rewrite(path, dst, bn, out_name):
         # unfold BatchNorm-scaled filters (step 3, second case)
         f = const(o.inputs[1])
         if np.array_equal(f.astype(np.float16).astype(np.float32), f):
+            continue
+        if fp32_filters == 'round':
+            set_data(o.inputs[1], f.astype(np.float16).astype(np.float32))
+            n_round += 1
             continue
         if len(o.inputs) < 3 or o.inputs[2] < 0:
             raise SystemExit(f'conv filter {g.tensors[o.inputs[1]].name}: BatchNorm-folded but no bias')
@@ -216,7 +223,7 @@ def rewrite(path, dst, bn, out_name):
         p.builtinOptions.fusedActivationFunction = act
         ops.append(p)
         unfolded += 1
-    if unfolded != len(bn):
+    if fp32_filters == 'unfold' and unfolded != len(bn):
         raise SystemExit(f'{unfolded} filters unfolded, {len(bn)} Conv + BatchNorm pairs in the ONNX graph')
     # fp16 storage of the constants that are fp16 numbers (step 3, first case)
     deq, done, n16, v16, n32, v32 = [], set(), 0, 0, 0, 0
@@ -254,7 +261,7 @@ def rewrite(path, dst, bn, out_name):
     fu.write_model(m, dst)
     return (f'fp16 constants {n16} ({v16} values), fp32 constants {n32} ({v32} values), '
             f'{unfolded} BatchNorm-folded filters unfolded, {n_prelu} PRelu slope(s) per channel, '
-            f'{n_bcast} broadcast Mul(s) -> nearest resize')
+            f'{n_bcast} broadcast Mul(s) -> nearest resize' + (f', {n_round} fp32 filters rounded to fp16' if n_round else ''))
 
 
 def gpu_ops(path):
