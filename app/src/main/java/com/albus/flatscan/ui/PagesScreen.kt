@@ -9,7 +9,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -37,6 +39,8 @@ import androidx.compose.material.icons.outlined.AddPhotoAlternate
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DragIndicator
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.SaveAlt
@@ -50,6 +54,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -64,6 +69,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.toOffset
+import androidx.compose.ui.unit.toSize
+import androidx.compose.ui.zIndex
+import com.albus.flatscan.DocumentName
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -85,7 +101,7 @@ import com.albus.flatscan.ScanViewModel
 
 private enum class PagesSheet { None, Save, Share }
 
-/** All pages of the current document: open, delete, reorder, add, save. */
+/** All pages of the current document: open, delete, reorder (hold and drag), add, rename, save. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PagesScreen(vm: ScanViewModel) {
@@ -97,12 +113,34 @@ fun PagesScreen(vm: ScanViewModel) {
     val pickPhotos = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
     val n = vm.pages.size
     val ready = n > 0 && !exporter.busy
+    val ctx = LocalContext.current
+    var docName by remember { mutableStateOf(DocumentName.get(ctx)) }
+    var renaming by remember { mutableStateOf(false) }
+    val grid = rememberLazyGridState()
+    // the page being dragged: the pointer in grid coordinates and where it holds the card
+    var dragId by remember { mutableStateOf<String?>(null) }
+    var dragPos by remember { mutableStateOf(Offset.Zero) }
+    var grab by remember { mutableStateOf(Offset.Zero) }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
             title = {
-                Column {
-                    Text("Document", style = MaterialTheme.typography.titleLarge.copy(fontSize = 18.sp))
-                    Text(if (n == 1) "1 page" else "$n pages", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(
+                    Modifier.clip(RoundedCornerShape(10.dp)).clickable(role = Role.Button, onClickLabel = "Rename the document") { renaming = true }
+                        .padding(end = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f, fill = false)) {
+                        Text(
+                            docName ?: "Document", style = MaterialTheme.typography.titleLarge.copy(fontSize = 18.sp),
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            (if (n == 1) "1 page" else "$n pages") + if (n > 1) " · hold and drag to reorder" else "",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    Icon(Icons.Outlined.Edit, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             },
             navigationIcon = { IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
@@ -113,6 +151,10 @@ fun PagesScreen(vm: ScanViewModel) {
                         DropdownMenuItem(
                             text = { Text("Save as…") }, leadingIcon = { Icon(Icons.Outlined.SaveAlt, null) }, enabled = ready,
                             onClick = { sheet = PagesSheet.Save; menu = false },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Rename") }, leadingIcon = { Icon(Icons.Outlined.Edit, null) },
+                            onClick = { renaming = true; menu = false },
                         )
                         DropdownMenuItem(
                             text = { Text("Add page from camera") }, leadingIcon = { Icon(Icons.Outlined.AddAPhoto, null) },
@@ -128,17 +170,57 @@ fun PagesScreen(vm: ScanViewModel) {
             colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
         )
         LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
+            // two columns on a phone, more on wider screens
+            columns = GridCells.Adaptive(150.dp),
+            state = grid,
             contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
             modifier = Modifier.weight(1f).fillMaxWidth(),
         ) {
             itemsIndexed(vm.pages, key = { _, id -> id }) { i, id ->
+                val dragging = dragId == id
                 PageCard(
                     vm, id, i, n,
                     onOpen = { vm.openPage(id) },
                     onDelete = { confirmDelete = id },
+                    dragging = dragging,
+                    modifier = Modifier
+                        .zIndex(if (dragging) 1f else 0f)
+                        .graphicsLayer {
+                            if (dragging) {
+                                // follows the finger wherever the grid has moved the item to
+                                val info = grid.layoutInfo.visibleItemsInfo.firstOrNull { it.key == id }
+                                if (info != null) {
+                                    translationX = dragPos.x - grab.x - info.offset.x
+                                    translationY = dragPos.y - grab.y - info.offset.y
+                                }
+                                scaleX = 1.04f
+                                scaleY = 1.04f
+                            }
+                        }
+                        .pointerInput(id) {
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = { local ->
+                                    val info = grid.layoutInfo.visibleItemsInfo.firstOrNull { it.key == id } ?: return@detectDragGesturesAfterLongPress
+                                    grab = local
+                                    dragPos = info.offset.toOffset() + local
+                                    dragId = id
+                                },
+                                onDrag = { change, d ->
+                                    change.consume()
+                                    dragPos += d
+                                    val target = grid.layoutInfo.visibleItemsInfo.firstOrNull {
+                                        it.key is String && it.key != "add" && it.key != id && Rect(it.offset.toOffset(), it.size.toSize()).contains(dragPos)
+                                    } ?: return@detectDragGesturesAfterLongPress
+                                    val from = vm.pages.indexOf(id)
+                                    val to = vm.pages.indexOf(target.key as String)
+                                    if (from >= 0 && to >= 0) repeat(kotlin.math.abs(to - from)) { vm.movePage(id, if (to > from) 1 else -1) }
+                                },
+                                onDragEnd = { dragId = null },
+                                onDragCancel = { dragId = null },
+                            )
+                        },
                 )
             }
             item(key = "add") { AddPageTile(onCamera = { vm.startCamera() }, onGallery = pickPhotos) }
@@ -161,7 +243,28 @@ fun PagesScreen(vm: ScanViewModel) {
     }
     if (sheet != PagesSheet.None) {
         val share = sheet == PagesSheet.Share
-        ExportSheet(share, n, onPick = { if (share) exporter.share(it) else exporter.save(it) }, onDismiss = { sheet = PagesSheet.None })
+        ExportSheet(share, n, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = PagesSheet.None; docName = DocumentName.get(ctx) })
+    }
+    if (renaming) {
+        var text by remember { mutableStateOf(docName ?: "") }
+        AlertDialog(
+            onDismissRequest = { renaming = false },
+            title = { Text("Rename the document") },
+            text = {
+                OutlinedTextField(
+                    value = text, onValueChange = { text = it.take(80) }, singleLine = true, label = { Text("Name") },
+                    placeholder = { Text(DocumentName.default()) }, keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    DocumentName.set(ctx, text)
+                    docName = DocumentName.get(ctx)
+                    renaming = false
+                }) { Text("Rename") }
+            },
+            dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } },
+        )
     }
     confirmDelete?.let { id ->
         val number = vm.pages.indexOf(id) + 1
@@ -176,9 +279,11 @@ fun PagesScreen(vm: ScanViewModel) {
 
 private val CardHeight = 210.dp
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PageCard(vm: ScanViewModel, id: String, index: Int, count: Int, onOpen: () -> Unit, onDelete: () -> Unit) {
+private fun PageCard(
+    vm: ScanViewModel, id: String, index: Int, count: Int, onOpen: () -> Unit, onDelete: () -> Unit,
+    dragging: Boolean = false, modifier: Modifier = Modifier,
+) {
     val version = vm.pageVersions[id] ?: 0
     var thumb by remember(id) { mutableStateOf<Bitmap?>(null) }
     var loaded by remember(id) { mutableStateOf(false) }
@@ -190,14 +295,14 @@ private fun PageCard(vm: ScanViewModel, id: String, index: Int, count: Int, onOp
     val current = id == vm.currentId
     val shape = RoundedCornerShape(14.dp)
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Column {
+    Column(modifier) {
         Box(
             Modifier.fillMaxWidth().height(CardHeight)
-                .shadow(8.dp, shape, ambientColor = Palette.Ink.copy(alpha = 0.3f), spotColor = Palette.Ink.copy(alpha = 0.3f))
+                .shadow(if (dragging) 18.dp else 8.dp, shape, ambientColor = Palette.Ink.copy(alpha = 0.3f), spotColor = Palette.Ink.copy(alpha = 0.3f))
                 .clip(shape)
                 .background(Color.White)
-                .then(if (current) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier)
-                .combinedClickable(onClick = onOpen, onLongClick = { menu = true }, onLongClickLabel = "Page actions")
+                .then(if (current || dragging) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier)
+                .clickable(onClick = onOpen, onClickLabel = "Open page ${index + 1}")
                 .semantics { contentDescription = "Page ${index + 1}" },
             contentAlignment = Alignment.Center,
         ) {
@@ -225,7 +330,7 @@ private fun PageCard(vm: ScanViewModel, id: String, index: Int, count: Int, onOp
                 color = muted, maxLines = 1, modifier = Modifier.weight(1f),
             )
             Box {
-                IconButton(onClick = { menu = true }, modifier = Modifier.size(36.dp)) {
+                IconButton(onClick = { menu = true }) {
                     Icon(Icons.Outlined.MoreHoriz, "Page ${index + 1} actions", tint = muted)
                 }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {

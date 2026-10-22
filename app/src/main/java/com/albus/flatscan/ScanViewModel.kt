@@ -174,6 +174,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var rotation by mutableIntStateOf(0)
         private set
+    /** Light, colour and page shape on top of the core's render (PageLook; default: unchanged). */
+    var look by mutableStateOf(PageLook())
+        private set
+    /** Undo / redo of the current page's edits ([trackEdits]). */
+    val history = EditHistory()
+    /** "Apply to all pages" is re-rendering the other pages. */
+    var applyingAll by mutableStateOf(false)
+        private set
     /** The cleaned page, unrotated (rotation is applied when drawing and on export). */
     var page by mutableStateOf<Bitmap?>(null)
         private set
@@ -237,6 +245,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             pages.addAll(order)
         }
         viewModelScope.launch { renderLoop() }
+        viewModelScope.launch { trackEdits(this@ScanViewModel, history) }
     }
 
     // ---- self-test / benchmark
@@ -1220,6 +1229,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             stored != null -> stored.rotation
             else -> 0
         }
+        val startLook = when {
+            same -> look
+            stored != null -> stored.look
+            else -> LookPrefs.newPageLook(getApplication())
+        }
+        val quadHw = measuredPageHw(corners, p.width, p.height, focalPx)
         val autoOrient = settings.autoRotate && !userRotated
         val width = settings.outputWidth
         val useUv = settings.uvDoc
@@ -1276,7 +1291,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 pageVersions[id] = 0
             }
             val order = pages.toList()
-            val meta = geom.copy(params = startParams, protect = startProtect.toFloatArray(), rotation = startRotation)
+            // the measured shape in the page's frame: a sideways page was turned a quarter (rot 0 / 2)
+            val hw = if (quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 }) 1f / quadHw else quadHw
+            val geomL = geom.copy(look = startLook.copy(measuredHw = hw))
+            val meta = geomL.copy(params = startParams, protect = startProtect.toFloatArray(), rotation = startRotation)
             withContext(Dispatchers.IO) {
                 runCatching {
                     store.saveMeta(meta)
@@ -1292,7 +1310,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val text = describe(info, edited, force, po, ig.size / 4)
             // the processed page is kept on disk: opening it again needs no re-processing
             storeSession(id, key, info, text, withContext(nativeCtx) { if (h == nativeHandle) NativeLib.snapshot(h) else 0L })
-            activate(h, geom, startParams, startProtect, startRotation, text, restored = false)
+            activate(h, geomL, startParams, startProtect, startRotation, text, restored = false)
             // a book spread: its second page follows from the same photo
             val next = spreadNext
             if (next != null && pageIndex == 0) {
@@ -1312,6 +1330,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         params = p
         protect = prot
         rotation = rot
+        look = geom.look
         lines = ln
         ignore = geom.ignore.toList()
         erase = geom.erase.toList()
@@ -1512,7 +1531,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun currentMeta(): PageMeta? =
-        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray())
+        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray(), look = look)
 
     /**
      * Writes the current page's settings and (if it changed) its rendered output to disk.
@@ -1527,8 +1546,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val v = outVersion
             val pg = page
             val rot = rotation
+            val lk = look
             // copy on the native thread: no render can write the buffer meanwhile
-            val snap = if (v != committedVersion && pg != null) withContext(nativeCtx) { pg.rotatedCopy(rot) } else null
+            val snap = if (v != committedVersion && pg != null) withContext(nativeCtx) { finishPage(pg, rot, lk) } else null
             val ok = withContext(Dispatchers.IO) {
                 runCatching {
                     store.saveMeta(meta)
@@ -1671,6 +1691,100 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun rotateResult180() {
         rotation = (rotation + 2) % 4
         outVersion++
+    }
+
+    /** Light, colour or page shape of the current page (PageLook); the shape is remembered for new pages. */
+    fun setLook(v: PageLook) {
+        if (v == look) return
+        if (v.shape != look.shape) LookPrefs.rememberShape(getApplication(), v.shape)
+        look = v
+        outVersion++
+    }
+
+    /** The edits [history] tracks, as they are now. */
+    fun editState() = EditState(params, look, rotation, protect, erase)
+
+    fun undo() {
+        // a change still inside the debounce is the one to undo
+        if (handle != 0L) history.record(editState())
+        history.undo()?.let { applyEditState(it) }
+    }
+
+    fun redo() { history.redo()?.let { applyEditState(it) } }
+
+    private fun applyEditState(s: EditState) {
+        if (handle == 0L) return
+        if (s.params != params || s.protect != protect) {
+            params = s.params
+            protect = s.protect
+            requestRender(false)
+        }
+        if (s.look != look || s.rotation != rotation) {
+            look = s.look
+            rotation = s.rotation
+            outVersion++
+        }
+        if (s.erase != erase) setEraseRects(s.erase)
+    }
+
+    /**
+     * "Apply to all pages": the current page's filter, strength, Solid colors, adjustments and colour
+     * sliders on every other page of the document (each keeps its shape, rotation, protected and
+     * erased areas). Each page is rendered again from its stored session (the geometry its out.jpg
+     * was made with) on the native thread, one at a time, and its out.jpg and meta are rewritten.
+     */
+    fun applyToAllPages() {
+        val id = currentId ?: return
+        if (applyingAll) return
+        val p = params
+        val lk = look
+        val others = pages.filter { it != id }
+        if (others.isEmpty()) return
+        applyingAll = true
+        viewModelScope.launch {
+            var done = 0
+            for (o in others) {
+                val ok = runCatching { renderStoredPage(o, p, lk) }.onFailure { Log.e(TAG, "apply to $o failed", it) }.getOrDefault(false)
+                if (ok) {
+                    done++
+                    pageVersions[o] = (pageVersions[o] ?: 0) + 1
+                }
+            }
+            applyingAll = false
+            message = when {
+                done == others.size -> "Applied to all ${others.size + 1} pages"
+                done == 0 -> "Could not update the other pages"
+                else -> "Applied to ${done + 1} of ${others.size + 1} pages"
+            }
+        }
+    }
+
+    /** Page [id] (not the live one) rendered again with [p] and the colours of [lk]: its meta and out.jpg. */
+    private suspend fun renderStoredPage(id: String, p: RenderParams, lk: PageLook): Boolean {
+        val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
+        val dir = withContext(Dispatchers.IO) { store.sessionDir(id) } ?: return false
+        val look2 = m.look.withColorsOf(lk)
+        val bmp = withContext(nativeCtx) {
+            val h = NativeLib.restoreSession(dir.absolutePath, true)
+            if (h == 0L) return@withContext null
+            try {
+                if (m.erase.isNotEmpty()) NativeLib.setErase(h, m.erase)
+                val size = NativeLib.pageSize(h)
+                val b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
+                val ok = JSONObject(NativeLib.render(h, p.toArray(), m.protect, true, b)).optBoolean("ok")
+                if (ok) b else null.also { b.recycle() }
+            } finally {
+                NativeLib.release(h)
+            }
+        } ?: return false
+        val fin = finishPage(bmp, m.rotation, look2)
+        if (fin !== bmp) bmp.recycle()
+        withContext(Dispatchers.IO) {
+            store.saveMeta(m.copy(params = p, look = look2))
+            store.saveOutput(id, fin)
+        }
+        fin.recycle()
+        return true
     }
 
     fun setWrinkles(v: Boolean) {

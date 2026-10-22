@@ -30,6 +30,7 @@ data class PageMeta(
     val ignore: FloatArray = FloatArray(0),   // areas whose lines the unwarp must not use (page fractions)
     val perspectiveOnly: Boolean = false,     // the user turned the unwarp off for this page
     val erase: FloatArray = FloatArray(0),    // Erase tool rectangles (page fractions), applied after processing
+    val look: PageLook = PageLook(),          // light, colour and page shape (Kotlin, after the core's render)
 ) {
     /**
      * Everything the processed geometry depends on: a stored session (DocumentStore.saveSession)
@@ -64,6 +65,7 @@ data class PageMeta(
         put("ignore", ignore.toJson())
         put("perspective_only", perspectiveOnly)
         put("erase", erase.toJson())
+        if (look != PageLook()) put("look", look.toJson())
     }
 
     companion object {
@@ -94,6 +96,7 @@ data class PageMeta(
                 ignore = j.optJSONArray("ignore")?.toFloats() ?: FloatArray(0),
                 perspectiveOnly = j.optBoolean("perspective_only"),
                 erase = j.optJSONArray("erase")?.toFloats() ?: FloatArray(0),
+                look = PageLook.fromJson(j.optJSONObject("look")),
             )
         }
 
@@ -188,6 +191,9 @@ class DocumentStore(ctx: Context) {
         d.deleteRecursively()
         return tmp.renameTo(d)
     }
+
+    /** The page's stored session directory whatever its geometry key (the geometry out.jpg was made with), or null. */
+    fun sessionDir(id: String): File? = File(dir(id), "session").takeIf { File(it, "ready.json").exists() }
 
     fun saveOutput(id: String, page: Bitmap) {
         dir(id).mkdirs()
