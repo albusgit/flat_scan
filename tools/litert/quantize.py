@@ -91,7 +91,7 @@ def onnx_conv_weights(path):
     return out
 
 
-def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), onnx_src=None, qmap=None):
+def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), onnx_src=None, qmap=None, strict=True):
     """Rewrites src (fp16 filters behind DEQUANTIZE) with int8 filters; returns a summary dict.
     onnx_src: the ONNX file the .tflite was made from; each filter is matched to its ONNX Conv weight by value
     (OIHW -> OHWI for CONV_2D, -> 1 x KH x KW x C for DEPTHWISE_CONV_2D), so that keep (ONNX Conv node name
@@ -114,9 +114,9 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
         if c.builtinCode == B.DEQUANTIZE:
             dq_op = i
     done, drop = {}, set()
-    n_q = n_keep = v_q = v_keep = n_gptq = 0
+    n_q = n_keep = v_q = v_keep = n_gptq = n_bias = 0
     ows = onnx_conv_weights(onnx_src) if onnx_src else []
-    matched, kept = [], []
+    matched, kept, unmatched = [], [], []
     for o in g.operators:
         op = code[o.opcodeIndex]
         if op not in filt:
@@ -141,9 +141,14 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
                 if list(Wt.shape) == list(w.shape) and np.array_equal(Wt.astype(np.float16).astype(np.float32), w):
                     match = (node, wname)
                     break
-            if match is None:
+            if match is None and strict:
                 raise SystemExit(f'{name} {list(w.shape)}: no ONNX Conv weight with these values in {onnx_src}')
-            matched.append(match[0])
+            if match is None:
+                # a filter the converter changed (folded a following scale into it): rounded to nearest; the
+                # sim ONNX then differs from the .tflite for this filter (counted in the summary)
+                unmatched.append(name)
+            else:
+                matched.append(match[0])
         label = match[0] if match else name
         if w.size < min_size or any(kk in label for kk in keep):
             n_keep, v_keep = n_keep + 1, v_keep + w.size
@@ -169,6 +174,22 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
         t.quantization = qp
         done[t16] = d
         n_q, v_q = n_q + 1, v_q + w.size
+        # an fp16 bias (fp16 DEQUANTIZE) of this op becomes an fp32 constant: XNNPACK passes fp16 DEQUANTIZEs that
+        # feed GEMMs to its fp16-weight path, and a conv with an int8-unpacked fp32 filter and an fp16 bias failed
+        # to delegate (tensorflow 2.19.1: "failed to delegate CONV_2D", AllocateTensors fails). Same values.
+        if len(o.inputs) > 2 and o.inputs[2] >= 0:
+            bd = made.get(o.inputs[2])
+            if bd is not None and code[bd.opcodeIndex] == B.DEQUANTIZE and g.tensors[bd.inputs[0]].type == T.FLOAT16:
+                bt = g.tensors[bd.inputs[0]]
+                bv = np.frombuffer(bytes(m.buffers[bt.buffer].data), np.float16).astype(np.float32)
+                buf = s.BufferT()
+                buf.data = np.frombuffer(bv.tobytes(), np.uint8)
+                m.buffers.append(buf)
+                nt = s.TensorT()
+                nt.name, nt.shape, nt.type, nt.buffer = bt.name + b'_fp32', np.array(bt.shape, np.int32), T.FLOAT32, len(m.buffers) - 1
+                g.tensors.append(nt)
+                o.inputs[2] = len(g.tensors) - 1
+                n_bias += 1
         if form == 'conv':
             # the op reads the int8 constant itself; the DEQUANTIZE goes
             for u in users.get(t_out, []):
@@ -215,8 +236,14 @@ def tflite_int8(src, dst, form='dq', per_tensor=False, min_size=4096, keep=(), o
             ordered.append(o)
         ordered.extend(by_out.values())
         g.operators = ordered
+    read = {i for o in g.operators for i in o.inputs} | set(g.outputs)
+    code2 = [c.builtinCode for c in m.operatorCodes]
+    g.operators = [o for o in g.operators if not (code2[o.opcodeIndex] == B.DEQUANTIZE and o.outputs[0] not in read)]
+    for i, t in enumerate(g.tensors):
+        if i not in {j for o in g.operators for j in list(o.inputs) + list(o.outputs)} and i not in g.outputs                 and m.buffers[t.buffer].data is not None:
+            m.buffers[t.buffer].data = None
     fu.write_model(m, dst)
-    return dict(quantized=n_q, quantized_values=v_q, from_qmap=n_gptq, kept_fp16=n_keep, kept_values=v_keep,
+    return dict(unmatched=unmatched, fp32_biases=n_bias, quantized=n_q, quantized_values=v_q, from_qmap=n_gptq, kept_fp16=n_keep, kept_values=v_keep,
                 kept=kept, bytes=os.path.getsize(dst))
 
 

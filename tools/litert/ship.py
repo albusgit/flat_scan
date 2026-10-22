@@ -175,7 +175,10 @@ def main():
     final = os.path.join(out, stem + '.tflite')
     if opts['--weights'] == 'int8':
         qm = quantize.load_qmap(opts['--qmap'])
-        r = quantize.tflite_int8(fp16, final, keep=tuple(keep), onnx_src=st, qmap=qm)
+        r = quantize.tflite_int8(fp16, final, keep=tuple(keep), onnx_src=st, qmap=qm, strict=gpu)
+        if r['unmatched']:
+            say(f'  {len(r["unmatched"])} filters changed by onnx2tf (no ONNX weight with their values): rounded to nearest, '
+                'not in the sim ONNX (the parity below measures the .tflite itself)')
         say(f'  int8 file: {r["bytes"]} bytes; {r["quantized"]} filters int8 ({r["quantized_values"]} values, '
             f'{r["from_qmap"]} from the qmap), {r["kept_fp16"]} fp16 ({r["kept_values"]} values: {r["kept"]})')
         # the sim ONNX of the int8 weights, on the CPU path's (dynamic) source graph
