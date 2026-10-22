@@ -39,14 +39,18 @@ ScreenInfo detect_screen(const cv::Mat& page_bgra);
 
 struct DescreenStats {
     int peaks = 0;            // spectral peaks notched
+    double gated = 0;         // fraction of the page where the notch was turned off (gate)
     double ms = 0;
 };
 // Descreen constants (defaults shipped; desktop tools override them for tuning)
 struct DescreenTune {
     float peak_thr = 2.0f;    // notch: log magnitude above the 21 x 21 median
+    float text_contrast = 40.f;   // notch: pixels this far from their sigma-6 surroundings are text (masked)
+    float peak_thr_axis = 4.0f;   // ... on the two axes (+-2 bins): text rows and columns have harmonics there
     float min_period = 12.f;  // notch: only periods below this (px)
     int chroma_r = 8;         // guided chroma: radius (0 = off)
     float chroma_eps = 20.f;  // guided chroma: eps (levels)
+    float gate0 = 0.6f, gate1 = 1.0f;   // notch gate: rms(high-pass) / rms(removed) from gate0 (off) to gate1 (on)
 };
 DescreenTune& descreen_tune();
 // Returns a new BGRA page (same size).

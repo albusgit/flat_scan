@@ -67,6 +67,10 @@ int main(int argc, char** argv) {
                     else if (k == "min_period") descreen_tune().min_period = v;
                     else if (k == "chroma_r") descreen_tune().chroma_r = (int)v;
                     else if (k == "chroma_eps") descreen_tune().chroma_eps = v;
+                    else if (k == "gate0") descreen_tune().gate0 = v;
+                    else if (k == "text_contrast") descreen_tune().text_contrast = v;
+                    else if (k == "peak_thr_axis") descreen_tune().peak_thr_axis = v;
+                    else if (k == "gate1") descreen_tune().gate1 = v;
                     else std::fprintf(stderr, "unknown tune key %s\n", k.c_str());
                 }
                 if (e == std::string::npos) break;
@@ -100,8 +104,8 @@ int main(int argc, char** argv) {
         pp.screen = descreened;
         pp_ms = std::min(pp_ms, ms_since(t0));
     }
-    std::printf("{\"page\": \"%s\", \"w\": %d, \"h\": %d, \"page_params_ms\": %.1f, \"sigma\": %.4f, \"ink\": %.3f, \"screen_score\": %.3f, \"screen_score_y\": %.3f, \"screen\": %d, \"detect_ms\": %.1f, \"descreen_ms\": %.1f, \"peaks\": %d, \"filters\": [", argv[1], page.cols,
-                page.rows, pp_ms, pp.sigma, pp.ink, si.score, si.score_y, (int)si.screen, si.ms, ds.ms, ds.peaks);
+    std::printf("{\"page\": \"%s\", \"w\": %d, \"h\": %d, \"page_params_ms\": %.1f, \"sigma\": %.4f, \"ink\": %.3f, \"screen_score\": %.3f, \"screen_score_y\": %.3f, \"screen\": %d, \"detect_ms\": %.1f, \"descreen_ms\": %.1f, \"peaks\": %d, \"gated\": %.3f, \"filters\": [", argv[1], page.cols,
+                page.rows, pp_ms, pp.sigma, pp.ink, si.score, si.score_y, (int)si.screen, si.ms, ds.ms, ds.peaks, ds.gated);
     bool first = true;
     for (size_t i = 0; i < fl.size(); ++i) {
         if (fl[i] < '0' || fl[i] > '9') continue;

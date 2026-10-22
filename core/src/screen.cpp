@@ -156,8 +156,29 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
         cv::copyMakeBorder(ch[c] - means[c], p, 0, H - h, 0, W - w, cv::BORDER_REFLECT);
         cv::dft(p, spec[c], cv::DFT_COMPLEX_OUTPUT);
     }
+    // The peaks are found on the background only: text (strong local contrast, dilated) is replaced
+    // by the smooth surroundings, so the harmonics of regular text (monospaced code, terminal
+    // rows) are not taken for the screen's pattern, which covers the background too.
     cv::Mat mag, planes[2];
-    cv::split(spec[0], planes);
+    {
+        cv::Mat sm, txt, wgt, fill, Yb;
+        cv::GaussianBlur(ch[0], sm, cv::Size(0, 0), 6.0);
+        cv::Mat dev = cv::abs(ch[0] - sm);
+        txt = dev > tn.text_contrast;
+        cv::dilate(txt, txt, cv::Mat::ones(7, 7, CV_8U));
+        cv::Mat keep;
+        cv::bitwise_not(txt, keep);
+        keep.convertTo(wgt, CV_32F, 1.0 / 255);
+        cv::Mat num, den;
+        cv::GaussianBlur(ch[0].mul(wgt), num, cv::Size(0, 0), 8.0);
+        cv::GaussianBlur(wgt, den, cv::Size(0, 0), 8.0);
+        fill = num / (den + 1e-3f);
+        Yb = ch[0].mul(wgt) + fill.mul(1.f - wgt);
+        cv::Mat p, Fb;
+        cv::copyMakeBorder(Yb - means[0], p, 0, H - h, 0, W - w, cv::BORDER_REFLECT);
+        cv::dft(p, Fb, cv::DFT_COMPLEX_OUTPUT);
+        cv::split(Fb, planes);
+    }
     cv::magnitude(planes[0], planes[1], mag);
     mag += 1.f;
     cv::log(mag, mag);
@@ -173,10 +194,12 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
         const uint8_t* m = med.ptr<uint8_t>(y);
         uint8_t* o = pk.ptr<uint8_t>(y);
         double fy = (double)(y - H / 2) / H;
+        const bool yaxis = std::abs(y - H / 2) <= 2;
         for (int x = 0; x < W; ++x) {
             double fx = (double)(x - W / 2) / W;
             if (fy * fy + fx * fx <= rmin * rmin) continue;
-            if (l[x] - m[x] / 16.f > tn.peak_thr) o[x] = 1, ++npk;
+            const float thr = yaxis || std::abs(x - W / 2) <= 2 ? tn.peak_thr_axis : tn.peak_thr;
+            if (l[x] - m[x] / 16.f > thr) o[x] = 1, ++npk;
         }
     }
     if (npk > 0) {
@@ -188,12 +211,28 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
         fftshift(M, true);
         cv::Mat M2;
         cv::merge(std::vector<cv::Mat>{M, M}, M2);
+        std::vector<cv::Mat> notched(3);
         for (int c = 0; c < 3; ++c) {
             cv::Mat back;
             cv::multiply(spec[c], M2, spec[c]);
             cv::dft(spec[c], back, cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_REAL_OUTPUT);
-            ch[c] = back(cv::Rect(0, 0, w, h)) + means[c];
+            notched[c] = back(cv::Rect(0, 0, w, h)) + means[c];
         }
+        // Where the removed pattern is not in the photo, the notch would add it (a peak that is
+        // only in some areas - the harmonics of monospaced text, a pattern in one picture - is
+        // cancelled everywhere, so flat areas get its negative as waves). The notch is kept where
+        // the local energy of the removed part d is covered by the photo's own fine detail
+        // (high-pass, sigma 3 px): w = smoothstep(0.6, 1.0, rms(hp) / rms(d)), both over sigma 8 px.
+        cv::Mat d = ch[0] - notched[0], hp, ed, eh, gate;
+        cv::GaussianBlur(ch[0], hp, cv::Size(0, 0), 3.0);
+        hp = ch[0] - hp;
+        cv::GaussianBlur(d.mul(d), ed, cv::Size(0, 0), 8.0);
+        cv::GaussianBlur(hp.mul(hp), eh, cv::Size(0, 0), 8.0);
+        cv::sqrt(eh / (ed + 1e-3f), gate);
+        gate = cv::min(cv::max((gate - tn.gate0) / (tn.gate1 - tn.gate0), 0.f), 1.f);
+        gate = gate.mul(gate).mul(3.f - 2.f * gate);
+        if (st) st->gated = 1.0 - cv::mean(gate)[0];
+        for (int c = 0; c < 3; ++c) ch[c] = ch[c] + gate.mul(notched[c] - ch[c]);
     }
     // 2. chroma guided by the luminance
     if (tn.chroma_r > 0)
