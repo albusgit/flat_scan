@@ -1694,7 +1694,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Light, colour or page shape of the current page (PageLook); the shape is remembered for new pages. */
-    fun setLook(v: PageLook) {
+    fun updateLook(v: PageLook) {
         if (v == look) return
         if (v.shape != look.shape) LookPrefs.rememberShape(getApplication(), v.shape)
         look = v

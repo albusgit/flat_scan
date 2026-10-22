@@ -101,7 +101,7 @@ fun AdjustPanel(vm: ScanViewModel) {
         Row(Modifier.padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Adjust", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
             val any = AdjustTool.entries.any { it != AdjustTool.Shape && it.changed(p, l) }
-            TextButton(onClick = { vm.resetAdjustments(); vm.setLook(l.copy(brightness = 0f, contrast = 0f, saturation = 0f, warmth = 0f)) }, enabled = any) {
+            TextButton(onClick = { vm.resetAdjustments(); vm.updateLook(l.copy(brightness = 0f, contrast = 0f, saturation = 0f, warmth = 0f)) }, enabled = any) {
                 Text("Reset")
             }
         }
@@ -113,10 +113,10 @@ fun AdjustPanel(vm: ScanViewModel) {
         }
         Box(Modifier.fillMaxWidth().heightIn(min = 76.dp).padding(start = 20.dp, end = 20.dp, top = 4.dp), contentAlignment = Alignment.CenterStart) {
             when (tool) {
-                AdjustTool.Brightness -> Bipolar("Brightness", l.brightness, "Lighter or darker page") { vm.setLook(l.copy(brightness = it)) }
-                AdjustTool.Contrast -> Bipolar("Contrast", l.contrast, "Darker text on the same paper, or softer") { vm.setLook(l.copy(contrast = it)) }
-                AdjustTool.Saturation -> Bipolar("Saturation", l.saturation, "Stronger or paler colours; all the way left: grey") { vm.setLook(l.copy(saturation = it)) }
-                AdjustTool.Warmth -> Bipolar("Warmth", l.warmth, "Warmer (yellow) or cooler (blue) paper") { vm.setLook(l.copy(warmth = it)) }
+                AdjustTool.Brightness -> Bipolar("Brightness", l.brightness, "Lighter or darker page") { vm.updateLook(l.copy(brightness = it)) }
+                AdjustTool.Contrast -> Bipolar("Contrast", l.contrast, "Darker text on the same paper, or softer") { vm.updateLook(l.copy(contrast = it)) }
+                AdjustTool.Saturation -> Bipolar("Saturation", l.saturation, "Stronger or paler colours; all the way left: grey") { vm.updateLook(l.copy(saturation = it)) }
+                AdjustTool.Warmth -> Bipolar("Warmth", l.warmth, "Warmer (yellow) or cooler (blue) paper") { vm.updateLook(l.copy(warmth = it)) }
                 AdjustTool.Cleanup -> Column {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Background cleanup", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
@@ -138,7 +138,7 @@ fun AdjustPanel(vm: ScanViewModel) {
                     }
                     LevelsEditor(vm.histogram, p.black, p.white, p.gamma, onChange = { b, w, g -> vm.setLevels(b, w, g) })
                 }
-                AdjustTool.Shape -> ShapeChooser(l) { vm.setLook(l.copy(shape = it)) }
+                AdjustTool.Shape -> ShapeChooser(l) { vm.updateLook(l.copy(shape = it)) }
             }
         }
     }
