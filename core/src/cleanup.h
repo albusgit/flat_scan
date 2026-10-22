@@ -77,6 +77,7 @@ struct PageParams {
     float wb[3] = {1, 1, 1};  // per-channel paper colour / paper luminance
     float sigma = 0.02f;      // paper noise of luma(v)
     float ink = 0.3f;         // median luma(v) of ink on paper (Scan's black point)
+    bool screen = false;      // the page was descreened (screen mode): Scan's black point is deeper (glowing screen black)
     int page_w = 0, page_h = 0;
     bool gpu_background = false;
     double ms = 0;
@@ -93,16 +94,17 @@ struct Curve {
     float speck_bg = 1;       // speck removal only where the local background bgv >= speck_bg
     bool gray = false, specks = false;
 };
-Curve filter_curve(Filter f, float sigma, float ink = 0.3f);
+Curve filter_curve(Filter f, float sigma, float ink = 0.3f, bool screen = false);
 
 // Scan constants (defaults are the shipped values; the desktop tools override them for tuning)
 struct ScanTune {
     float wp_k = 2.5f;        // white point 1 - wp_k sigma (as Auto color)
-    float gamma = 1.1f;       // luminance curve exponent
+    float gamma = 1.0f;       // luminance curve exponent
     float black_k = 0.5f;     // black point = black_k x the page's ink level ...
     float black_max = 0.2f;   // ... at most this
-    float sharpen = 0.8f;     // unsharp amount at strength 1
+    float sharpen = 1.2f;     // unsharp amount at strength 1
     float sharpen_sigma = 1.0f;   // px at page size
+    float black_k_screen = 0.8f, black_max_screen = 0.35f;   // screen mode: a screen's black glows
 };
 ScanTune& scan_tune();
 
@@ -118,11 +120,17 @@ struct Adjust {
 };
 
 // Everything a render depends on besides the page (NativeLib.kt RenderParams).
+// Screen mode (screen.h): Off, On, or Auto (on when detect_screen says the page is a photo of a
+// screen). render_page does not descreen: the caller passes the descreened page and its params
+// (jni_bridge.cpp Session caches them per page).
+enum class ScreenMode : int { Off = 0, On = 1, Auto = 2 };
+
 struct RenderParams {
     Filter filter = Filter::AutoColor;
     float strength = 0.7f;
     bool solid = false;
     Adjust adj;
+    ScreenMode screen = ScreenMode::Auto;
 };
 
 // Adjustment constants (shared by the CPU and GPU code).

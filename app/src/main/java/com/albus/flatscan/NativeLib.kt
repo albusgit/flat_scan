@@ -11,6 +11,7 @@ fun interface ProgressListener {
 /** Filters of the filter strip; [id] is the native enum value (core/src/cleanup.h Filter). */
 enum class FilterKind(val id: Int, val label: String) {
     Original(0, "Original"),
+    Scan(6, "Scan"),                     // round 11: flattened white paper at any strength, black ink, colours kept, sharpened
     Lighten(1, "Lighten"),
     AutoColor(2, "Auto color"),
     Grayscale(3, "Grayscale"),
@@ -22,17 +23,26 @@ enum class FilterKind(val id: Int, val label: String) {
  * Everything the user can change on the result screen; switching any of these never re-runs
  * the geometry. Defaults are the tested defaults (identity adjustments).
  */
+/** Screen mode (core/src/screen.h): descreen a photo of a monitor / laptop / phone before the filter. */
+enum class ScreenMode(val id: Int, val label: String) {
+    Off(0, "Off"),
+    On(1, "On"),
+    Auto(2, "Auto"),                     // on when the core detects a screen photo (info() "screen")
+}
+
 data class RenderParams(
-    val filter: FilterKind = FilterKind.AutoColor,
+    val filter: FilterKind = FilterKind.Scan,
     val strength: Float = 0.7f,          // 0..1, 0 = Original
     val solid: Boolean = false,          // Solid colors (ignored for B&W)
     val bgCleanup: Float = 0f,           // 0..1: push near-paper grey artefacts to white (0 = off)
     val black: Float = 0f,               // levels black point, 0..0.5 (output fraction)
     val white: Float = 1f,               // levels white point, 0.5..1
     val gamma: Float = 1f,               // levels midtones, 0.3..3 (> 1 brightens mid-tones)
+    val screen: ScreenMode = ScreenMode.Auto,
 ) {
-    /** Layout read by jni_bridge.cpp: [filter, strength, solid, bgCleanup, black, white, gamma]. */
-    fun toArray(): FloatArray = floatArrayOf(filter.id.toFloat(), strength, if (solid) 1f else 0f, bgCleanup, black, white, gamma)
+    /** Layout read by jni_bridge.cpp: [filter, strength, solid, bgCleanup, black, white, gamma, screen]. */
+    fun toArray(): FloatArray =
+        floatArrayOf(filter.id.toFloat(), strength, if (solid) 1f else 0f, bgCleanup, black, white, gamma, screen.id.toFloat())
 }
 
 /** JNI entry points of the C++ core (app/src/main/cpp/jni_bridge.cpp). */

@@ -148,6 +148,16 @@ class Ref:
         self.edges = cv2.dilate((cv2.Canny(cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY), 50, 150) > 0).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
 
 
+def ssim(a, b):
+    a, b = a.astype(np.float32), b.astype(np.float32)
+    C1, C2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    g = lambda x: cv2.GaussianBlur(x, (0, 0), 1.5)
+    ma, mb = g(a), g(b)
+    va, vb, cab = g(a * a) - ma * ma, g(b * b) - mb * mb, g(a * b) - ma * mb
+    m = ((2 * ma * mb + C1) * (2 * cab + C2)) / ((ma * ma + mb * mb + C1) * (va + vb + C2))
+    return float(m.mean())
+
+
 def score(ref, out):
     r = {}
     c1 = contrast(out)
@@ -195,6 +205,19 @@ def score(ref, out):
             Lm = cv2.blur(L, (3, 3))
             r['bg_resid'] = round(float(Lm[wm].std()), 2)
             r['bg_chroma'] = round(float((out.max(-1).astype(np.float32) - out.min(-1))[wm].mean()), 2)
+        # tone-invariant fidelity: per-channel gain + offset fitted from the output to the GT, then
+        # PSNR (all channels) and SSIM (luma); a shadow left behind or moire stays, a different
+        # paper level or contrast does not count
+        of, gf = out.reshape(-1, 3).astype(np.float64), g.reshape(-1, 3).astype(np.float64)
+        fit = np.empty_like(of)
+        for c in range(3):
+            A = np.stack([of[:, c], np.ones(len(of))], 1)
+            k, *_ = np.linalg.lstsq(A[::7], gf[::7, c], rcond=None)
+            fit[:, c] = A @ k
+        fit = np.clip(fit, 0, 255)
+        mse = float(((fit - gf) ** 2).mean())
+        r['psnr_fit'] = round(10 * np.log10(255 ** 2 / max(mse, 1e-6)), 2)
+        r['ssim_fit'] = round(ssim(lum(fit.reshape(out.shape)), lum(g)), 4)
         la, lb = lab(out), lab(g)
         dE = np.sqrt(((la - lb) ** 2).sum(-1))
         r['dE'] = round(float(dE.mean()), 2)

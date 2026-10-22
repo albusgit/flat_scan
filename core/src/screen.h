@@ -41,6 +41,14 @@ struct DescreenStats {
     int peaks = 0;            // spectral peaks notched
     double ms = 0;
 };
+// Descreen constants (defaults shipped; desktop tools override them for tuning)
+struct DescreenTune {
+    float peak_thr = 2.0f;    // notch: log magnitude above the 21 x 21 median
+    float min_period = 12.f;  // notch: only periods below this (px)
+    int chroma_r = 8;         // guided chroma: radius (0 = off)
+    float chroma_eps = 40.f;  // guided chroma: eps (levels)
+};
+DescreenTune& descreen_tune();
 // Returns a new BGRA page (same size).
 cv::Mat descreen(const cv::Mat& page_bgra, DescreenStats* st = nullptr);
 

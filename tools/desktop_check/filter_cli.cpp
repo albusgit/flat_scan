@@ -63,6 +63,10 @@ int main(int argc, char** argv) {
                     else if (k == "black_max") t.black_max = v;
                     else if (k == "sharpen") t.sharpen = v;
                     else if (k == "sharpen_sigma") t.sharpen_sigma = v;
+                    else if (k == "peak_thr") descreen_tune().peak_thr = v;
+                    else if (k == "min_period") descreen_tune().min_period = v;
+                    else if (k == "chroma_r") descreen_tune().chroma_r = (int)v;
+                    else if (k == "chroma_eps") descreen_tune().chroma_eps = v;
                     else std::fprintf(stderr, "unknown tune key %s\n", k.c_str());
                 }
                 if (e == std::string::npos) break;
@@ -77,6 +81,7 @@ int main(int argc, char** argv) {
         if (r == 0 || s1.ms < si.ms) si = s1;
     }
     DescreenStats ds;
+    bool descreened = false;
     if (screen == 1 || (screen == 2 && si.screen)) {
         cv::Mat d;
         for (int r = 0; r < repeat; ++r) {
@@ -85,12 +90,14 @@ int main(int argc, char** argv) {
             if (r == 0 || d1.ms < ds.ms) ds = d1;
         }
         page = d;
+        descreened = true;
     }
     double pp_ms = 1e30;
     PageParams pp;
     for (int r = 0; r < repeat; ++r) {
         auto t0 = Clock::now();
         pp = page_params(page, gpu);
+        pp.screen = descreened;
         pp_ms = std::min(pp_ms, ms_since(t0));
     }
     std::printf("{\"page\": \"%s\", \"w\": %d, \"h\": %d, \"page_params_ms\": %.1f, \"sigma\": %.4f, \"ink\": %.3f, \"screen_score\": %.3f, \"screen_score_y\": %.3f, \"screen\": %d, \"detect_ms\": %.1f, \"descreen_ms\": %.1f, \"peaks\": %d, \"filters\": [", argv[1], page.cols,

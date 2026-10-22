@@ -59,9 +59,9 @@ float peak_prominence(const cv::Mat& L, int ksize, double rmin_frac_of_n, float 
             double fy = (double)dy / h, fx = (double)dx / w;
             double r = std::sqrt(fy * fy + fx * fx);
             if (r < rmin_frac_of_n || std::fabs(fy) >= 0.5 - 2.0 / h || std::fabs(fx) >= 0.5 - 2.0 / w) continue;
-            // the 8 x 8 grid of JPEG blocks (an unwarped JPEG page): peaks at (k / 8, l / 8) cycles per px
-            double jx = fx * 8 - std::round(fx * 8), jy = fy * 8 - std::round(fy * 8);
-            if (std::fabs(jx) * w <= 8.0 * 1.5 && std::fabs(jy) * h <= 8.0 * 1.5) continue;
+            // the grid of JPEG blocks and 2x2-subsampled chroma (an unwarped JPEG page): peaks at (k / 16, l / 16) cycles per px
+            double jx = fx * 16 - std::round(fx * 16), jy = fy * 16 - std::round(fy * 16);
+            if (std::fabs(jx) * w <= 16.0 * 1.5 && std::fabs(jy) * h <= 16.0 * 1.5) continue;
             best = std::max(best, l[x] - m[x] / scale);
         }
     }
@@ -91,8 +91,10 @@ ScreenInfo detect_screen(const cv::Mat& page) {
     ScreenInfo si;
     CV_Assert(page.type() == CV_8UC4);
     int h = page.rows, w = page.cols;
-    const int n = std::min(h, w) >= 1024 ? 512 : 256;
-    if (std::min(h, w) < n) return si;
+    // pages below 1024 px (thumbnails, small imports) are never detected: too little of the page per
+    // tile, and resampled small images carry their own periodic patterns
+    const int n = 512;
+    if (std::min(h, w) < 1024) return si;
     cv::Mat bgr, ycc;
     cv::cvtColor(page, bgr, cv::COLOR_BGRA2BGR);
     cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
@@ -128,7 +130,13 @@ ScreenInfo detect_screen(const cv::Mat& page) {
     return si;
 }
 
+DescreenTune& descreen_tune() {
+    static DescreenTune t;
+    return t;
+}
+
 cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
+    const DescreenTune& tn = descreen_tune();
     auto t0 = std::chrono::steady_clock::now();
     CV_Assert(page.type() == CV_8UC4);
     int h = page.rows, w = page.cols;
@@ -159,7 +167,7 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
     cv::medianBlur(q, med, 21);
     cv::Mat pk(H, W, CV_8U, cv::Scalar(0));
     int npk = 0;
-    const double rmin = 1.0 / 12;
+    const double rmin = 1.0 / tn.min_period;
     for (int y = 0; y < H; ++y) {
         const float* l = mag.ptr<float>(y);
         const uint8_t* m = med.ptr<uint8_t>(y);
@@ -168,7 +176,7 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
         for (int x = 0; x < W; ++x) {
             double fx = (double)(x - W / 2) / W;
             if (fy * fy + fx * fx <= rmin * rmin) continue;
-            if (l[x] - m[x] / 16.f > 2.0f) o[x] = 1, ++npk;
+            if (l[x] - m[x] / 16.f > tn.peak_thr) o[x] = 1, ++npk;
         }
     }
     if (npk > 0) {
@@ -188,7 +196,8 @@ cv::Mat descreen(const cv::Mat& page, DescreenStats* st) {
         }
     }
     // 2. chroma guided by the luminance
-    for (int c = 1; c < 3; ++c) ch[c] = guided(ch[0], ch[c], 8, 40.f * 40.f);
+    if (tn.chroma_r > 0)
+        for (int c = 1; c < 3; ++c) ch[c] = guided(ch[0], ch[c], tn.chroma_r, tn.chroma_eps * tn.chroma_eps);
     cv::merge(ch, ycc);
     cv::cvtColor(ycc, f, cv::COLOR_YCrCb2BGR);
     cv::Mat out8, out;

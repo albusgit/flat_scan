@@ -319,7 +319,7 @@ ScanTune& scan_tune() {
     return t;
 }
 
-Curve filter_curve(Filter f, float sigma, float ink) {
+Curve filter_curve(Filter f, float sigma, float ink, bool screen) {
     Curve c;
     switch (f) {
         case Filter::Original: c.kind = 0; break;
@@ -336,7 +336,8 @@ Curve filter_curve(Filter f, float sigma, float ink) {
         case Filter::Scan: {
             const ScanTune& t = scan_tune();
             c.kind = 4; c.wp = 1.f - t.wp_k * sigma; c.wp_base = 1.f - 1.5f * sigma; c.gamma = t.gamma;
-            c.black = std::min(t.black_max, std::max(0.f, t.black_k * ink));
+            c.black = screen ? std::min(t.black_max_screen, std::max(0.f, t.black_k_screen * ink))
+                             : std::min(t.black_max, std::max(0.f, t.black_k * ink));
             c.sharpen = t.sharpen; c.specks = true;
             break;
         }
@@ -723,7 +724,7 @@ static inline void scan_px(const Curve& c, const float* v, float l, float tint, 
 
 cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, const Adjust& adj) {
     if (f == Filter::Original && adj.identity()) return img.clone();
-    Curve c = filter_curve(f, p.sigma, p.ink);
+    Curve c = filter_curve(f, p.sigma, p.ink, p.screen);
     AdjustK ak = adjust_constants(adj, c.specks);
     bool full = img.cols == p.page_w && img.rows == p.page_h;
     float sx = (float)p.page_w / img.cols, sy = (float)p.page_h / img.rows;
@@ -856,7 +857,7 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
     bool trivial = ff == Filter::Original && rp.adj.identity();
     s.gpu_filter = !trivial && use_gpu && Gpu::instance().filter(src, p, ff, strength, rp.adj, out);
     if (!s.gpu_filter) out = filter_cpu(src, p, ff, strength, rp.adj);
-    else post_filter(out, p, filter_curve(ff, p.sigma, p.ink), strength);   // CPU stages after the GPU curve (Scan's sharpening)
+    else post_filter(out, p, filter_curve(ff, p.sigma, p.ink, p.screen), strength);   // CPU stages after the GPU curve (Scan's sharpening)
     s.ms_filter = ms_since(t0);
     if (sol) {
         t0 = std::chrono::steady_clock::now();

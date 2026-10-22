@@ -1572,6 +1572,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         requestRender(false)
     }
 
+    /** Screen mode (descreen before the filter): Off / On / Auto. The descreened page is made once per page. */
+    fun setScreen(v: ScreenMode) {
+        if (v == params.screen) return
+        params = params.copy(screen = v)
+        requestRender(false)
+    }
+
     fun setBgCleanup(v: Float) {
         params = params.copy(bgCleanup = v.coerceIn(0f, 1f))
         requestRender(true)
