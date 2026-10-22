@@ -529,6 +529,11 @@ int main(int argc, char** argv) {
         cv::Mat bgr;
         cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);
         cv::imwrite(argv[2], bgr, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // FS_PAGE_PNG=PREFIX: the flattened page and its paper alpha, lossless (tools/filters/)
+        if (const char* pg = std::getenv("FS_PAGE_PNG")) {
+            cv::imwrite(std::string(pg) + "_page.png", bgr);
+            if (!r.paper.empty()) cv::imwrite(std::string(pg) + "_paper.png", r.paper);
+        }
         const cv::Scalar col[3] = {{0, 0, 255}, {0, 160, 0}, {255, 0, 0}};
         for (const auto& l : r.lines)
             cv::line(bgr, cv::Point((int)(l[1] * bgr.cols), (int)(l[2] * bgr.rows)), cv::Point((int)(l[3] * bgr.cols), (int)(l[4] * bgr.rows)),

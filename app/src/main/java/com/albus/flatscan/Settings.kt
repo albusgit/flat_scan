@@ -102,7 +102,12 @@ class Settings(ctx: Context) {
         set(v) = p.edit().putBoolean("hold_hint_shown", v).apply()
 
     /** Render parameters of a new page. */
-    fun defaultParams() = RenderParams(filter = defaultFilter, strength = defaultStrength, solid = solidColors)
+    /** Screen mode of a new scan (Auto: descreen when the page is detected as a photo of a screen). */
+    var screenMode: ScreenMode
+        get() = ScreenMode.entries.firstOrNull { it.name == p.getString("screen_mode", null) } ?: ScreenMode.Auto
+        set(v) = p.edit().putString("screen_mode", v.name).apply()
+
+    fun defaultParams() = RenderParams(filter = defaultFilter, strength = defaultStrength, solid = solidColors, screen = screenMode)
 
     companion object {
         val OUTPUT_WIDTHS = listOf(1240 to "Compact (1240 px, 150 dpi)", 1600 to "Standard (1600 px)", 2480 to "High (2480 px, 300 dpi)")

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "cleanup.h"
+#include "screen.h"
 #include "gpu.h"
 #include "infer.h"
 #include "log.h"
@@ -57,16 +58,61 @@ struct Session {
     bool use_gpu = true;
     std::string accel;        // the nets' timings and backends: the members of info()'s "accel" object
 
-    // paper-filled page at `sz` (the full page itself when sz is the page size)
-    cv::Mat filled_at(cv::Size sz) {
+    // Screen mode (screen.h): detected once per page (page_changed); the descreened page and its
+    // params are made on first use and cached like the page's own
+    ScreenInfo screen;
+    bool scr_built = false;
+    cv::Mat scr_page;
+    PageParams scr_pp;
+    std::vector<std::pair<cv::Size, cv::Mat>> scr_small;
+
+    // after result.page and pp changed (process, erase, restore): screen detection, caches dropped
+    void page_changed() {
+        ScreenInfo si = detect_screen(result.page);
         std::lock_guard<std::mutex> lk(mu);
-        for (auto& e : small)
+        screen = si;
+        scr_built = false;
+        scr_page.release();
+        scr_small.clear();
+        small.clear();
+    }
+    // Original always shows the page as photographed (and flattened)
+    bool screen_on(const RenderParams& rp) const {
+        if (rp.filter == Filter::Original) return false;
+        return rp.screen == ScreenMode::On || (rp.screen == ScreenMode::Auto && screen.screen);
+    }
+    void ensure_screen() {   // called with mu held
+        if (scr_built) return;
+        scr_page = descreen(result.page);
+        scr_pp = page_params(scr_page, use_gpu);
+        scr_built = true;
+    }
+    // the page (and its params) a render with `scr` uses
+    cv::Mat page_for(bool scr) {
+        if (!scr) return result.page;
+        std::lock_guard<std::mutex> lk(mu);
+        ensure_screen();
+        return scr_page;
+    }
+    PageParams pp_for(bool scr) {
+        if (!scr) return pp;
+        std::lock_guard<std::mutex> lk(mu);
+        ensure_screen();
+        return scr_pp;
+    }
+
+    // paper-filled page at `sz` (the full page itself when sz is the page size); scr: descreened
+    cv::Mat filled_at(cv::Size sz, bool scr = false) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (scr) ensure_screen();
+        auto& cache = scr ? scr_small : small;
+        for (auto& e : cache)
             if (e.first == sz) return e.second;
-        cv::Mat full = apply_paper(result.page, result.paper, pp), out;
+        cv::Mat full = apply_paper(scr ? scr_page : result.page, result.paper, scr ? scr_pp : pp), out;
         if (sz == full.size()) out = full;
         else cv::resize(full, out, sz, 0, 0, cv::INTER_AREA);
-        if (small.size() >= 3) small.erase(small.begin());
-        small.emplace_back(sz, out);
+        if (cache.size() >= 3) cache.erase(cache.begin());
+        cache.emplace_back(sz, out);
         return out;
     }
 };
@@ -203,15 +249,16 @@ std::string escape(const std::string& s) {
     return o;
 }
 
-// RenderParams.toArray(): [filter, strength, solid, bgCleanup, black, white, gamma]
+// RenderParams.toArray(): [filter, strength, solid, bgCleanup, black, white, gamma, screen]
+// (screen: 0 off, 1 on, 2 auto; arrays without it are auto)
 RenderParams parse_params(JNIEnv* env, jfloatArray a) {
     RenderParams rp;
     if (!a) return rp;
     jsize n = env->GetArrayLength(a);
-    float v[7] = {(float)Filter::AutoColor, 0.7f, 0.f, 0.f, 0.f, 1.f, 1.f};
-    env->GetFloatArrayRegion(a, 0, std::min<jsize>(n, 7), v);
+    float v[8] = {(float)Filter::AutoColor, 0.7f, 0.f, 0.f, 0.f, 1.f, 1.f, (float)ScreenMode::Auto};
+    env->GetFloatArrayRegion(a, 0, std::min<jsize>(n, 8), v);
     int f = (int)std::lround(v[0]);
-    rp.filter = (Filter)std::min(5, std::max(0, f));
+    rp.filter = (Filter)std::min(kFilterCount - 1, std::max(0, f));
     rp.strength = std::isfinite(v[1]) ? std::min(1.f, std::max(0.f, v[1])) : 0.7f;
     rp.solid = v[2] > 0.5f;
     rp.adj.bg_cleanup = v[3];
@@ -219,6 +266,8 @@ RenderParams parse_params(JNIEnv* env, jfloatArray a) {
     rp.adj.white = v[5];
     rp.adj.gamma = v[6];
     rp.adj = rp.adj.clamped();
+    int sm = std::isfinite(v[7]) ? (int)std::lround(v[7]) : 2;
+    rp.screen = (ScreenMode)std::min(2, std::max(0, sm));
     return rp;
 }
 
@@ -713,6 +762,9 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
             auto t0 = Clock::now();
             s->pp = page_params(r.page, use_gpu);
             r.ms.emplace_back(s->pp.gpu_background ? "page params (GPU)" : "page params (CPU)", ms_since(t0));
+            t0 = Clock::now();
+            s->page_changed();
+            r.ms.emplace_back("screen detection", ms_since(t0));
             s->legend_px = r.disp.x.empty() ? 1.f : wrinkle_legend_px(r.disp);
         }
     } catch (const std::exception& e) {
@@ -751,6 +803,8 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
+      << ", \"screen\": {\"detected\": " << (s->screen.screen ? "true" : "false") << ", \"score\": " << json_num(s->screen.score)
+      << ", \"threshold\": " << json_num(kScreenThreshold) << "}"
       << ", \"rule_net\": " << (r.rule_net ? "true" : "false") << ", \"net\": [" << r.net_dropped << ", " << r.net_added << ", " << r.net_joined
       << ", " << r.net_kept << "], \"spots_dropped\": " << (r.lines_spots_dropped ? "true" : "false");
     if (r.detection.ok) f << ", " << finder_json(r.detection);
@@ -784,7 +838,8 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_render(JNIEnv* env, 
     RenderStats st;
     cv::Mat page;
     try {
-        page = render_page(s->result.page, s->result.paper, s->pp, rp, prot, use_gpu, &st);
+        const bool scr = s->screen_on(rp);
+        page = render_page(s->page_for(scr), s->result.paper, s->pp_for(scr), rp, prot, use_gpu, &st);
     } catch (const std::exception& e) {
         return env->NewStringUTF((std::string("{\"ok\": false, \"error\": \"") + escape(e.what()) + "\"}").c_str());
     }
@@ -809,8 +864,9 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_renderThumb(JNIEnv* env
     if (bs.width <= 0 || bs.height <= 0) return;
     RenderParams rp = parse_params(env, params);
     try {
-        cv::Mat src = s->filled_at(bs);
-        cv::Mat t = filter_cpu(src, s->pp, rp.filter, rp.strength, rp.adj);
+        const bool scr = s->screen_on(rp);
+        cv::Mat src = s->filled_at(bs, scr);
+        cv::Mat t = filter_cpu(src, s->pp_for(scr), rp.filter, rp.strength, rp.adj);
         bgra_to_bitmap(env, t, out);
     } catch (const std::exception& e) {
         LOGI("renderThumb failed: %s", e.what());
@@ -852,8 +908,9 @@ JNIEXPORT jintArray JNICALL Java_com_albus_flatscan_NativeLib_histogram(JNIEnv* 
         RenderParams rp = parse_params(env, params);
         try {
             const cv::Mat& pg = s->result.page;
-            cv::Mat src = s->filled_at(cv::Size(std::max(1, pg.cols / 4), std::max(1, pg.rows / 4)));
-            hist = luma_histogram(filter_cpu(src, s->pp, rp.filter, rp.strength, rp.adj));
+            const bool scr = s->screen_on(rp);
+            cv::Mat src = s->filled_at(cv::Size(std::max(1, pg.cols / 4), std::max(1, pg.rows / 4)), scr);
+            hist = luma_histogram(filter_cpu(src, s->pp_for(scr), rp.filter, rp.strength, rp.adj));
         } catch (const std::exception& e) {
             LOGI("histogram failed: %s", e.what());
         }
@@ -891,8 +948,7 @@ JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setErase(JNIEnv* en
             fill_with_paper(r.page, mask, r.paper.empty() ? nullptr : &r.paper);
         }
         s->pp = page_params(r.page, s->use_gpu);
-        std::lock_guard<std::mutex> lk(s->mu);
-        s->small.clear();
+        s->page_changed();   // screen detection; drops the downscaled and descreened caches
     } catch (const std::exception& e) {
         LOGI("setErase failed: %s", e.what());
         return JNI_FALSE;
@@ -969,6 +1025,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv*
         auto t0 = Clock::now();
         s->pp = page_params(r.page, use_gpu);
         r.ms.emplace_back("restored; page params", ms_since(t0));
+        s->page_changed();
         r.ok = true;
     } catch (const std::exception& e) {
         LOGI("restoreSession failed: %s", e.what());

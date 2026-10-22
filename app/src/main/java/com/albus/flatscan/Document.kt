@@ -56,6 +56,7 @@ data class PageMeta(
             put("black", params.black.toDouble())
             put("white", params.white.toDouble())
             put("gamma", params.gamma.toDouble())
+            put("screen", params.screen.name)
         })
         put("protect", protect.toJson())
         put("rotation", rotation)
@@ -87,6 +88,7 @@ data class PageMeta(
                     black = p.optDouble("black", d.black.toDouble()).toFloat(),
                     white = p.optDouble("white", d.white.toDouble()).toFloat(),
                     gamma = p.optDouble("gamma", d.gamma.toDouble()).toFloat(),
+                    screen = ScreenMode.entries.firstOrNull { it.name == p.optString("screen") } ?: d.screen,
                 ),
                 protect = j.optJSONArray("protect")?.toFloats() ?: FloatArray(0),
                 rotation = j.optInt("rotation"),
