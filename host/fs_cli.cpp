@@ -14,6 +14,7 @@
 #include "npz.h"
 #include "resample.h"
 #include "cli_ext.h"
+#include "gpu_stages.h"
 
 using namespace fs;
 
@@ -78,7 +79,7 @@ static int cmd_selftest_resample(int argc, char** argv) {
     bool gpu = Gpu::instance().available();
     std::printf("GPU: %s\n", gpu ? Gpu::instance().info().c_str() : "unavailable");
     std::mt19937 rng(1234);
-    int worst = 0, cases = 0;
+    int worst = 0, worst_stages = 0, cases = 0;
     struct Case { const char* name; int sw, sh, ow, oh; };
     std::vector<Case> cs = {{"tiny 2x2 src", 2, 2, 9, 7}, {"3x3 src", 3, 3, 13, 11}, {"5x4 src", 5, 4, 17, 21},
                             {"medium", 211, 157, 123, 181}, {"large", 1203, 1609, 801, 1131}};
@@ -116,11 +117,14 @@ static int cmd_selftest_resample(int argc, char** argv) {
                 cv::Mat e = cv::abs(gx - mx) + cv::abs(gy - my);
                 double emax; cv::minMaxLoc(e, nullptr, &emax);
                 std::printf("  %-28s max |dx|+|dy| %.3g px\n", "gpu map expansion vs cpu", emax);
+                // the other bicubic stages (stage-1 / orientation page, global remap): byte-exact
+                worst_stages = std::max(worst_stages, gpu_stage_fixtures(src, mx, my, rng));
             }
             ++cases;
         }
     std::printf("cases %d, worst |diff| %d (gate: <= 1)\n", cases, worst);
-    return worst <= 1 ? 0 : 1;
+    if (gpu) std::printf("GPU stages (dense / offset remap): worst |diff| %d (gate: 0)\n", worst_stages);
+    return worst <= 1 && worst_stages == 0 ? 0 : 1;
 }
 
 // resample IMG GRID.npz OUT.png [--gpu|--model] [--dense OUT.npz]
@@ -155,7 +159,7 @@ static int cmd_gpuinfo(int, char**) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: fs_cli gpuinfo | selftest-resample | resample IMG GRID.npz OUT.png [--gpu] [--dense D.npz] | ...\n");
+        std::fprintf(stderr, "usage: fs_cli gpuinfo | selftest-resample | resample IMG GRID.npz OUT.png [--gpu] [--dense D.npz] | gpu-stages OUT.json PHOTO... | gpu-bench PHOTO | cg-tol OUT.txt RTOL PHOTO... | ...\n");
         return 2;
     }
     std::string c = argv[1];
@@ -163,6 +167,9 @@ int main(int argc, char** argv) {
         if (c == "gpuinfo") return cmd_gpuinfo(argc, argv);
         if (c == "selftest-resample") return cmd_selftest_resample(argc, argv);
         if (c == "resample" && argc >= 5) return cmd_resample(argc, argv);
+        if (c == "gpu-stages" && argc >= 4) return cmd_gpu_stages(argc, argv);
+        if (c == "gpu-bench" && argc >= 3) return cmd_gpu_bench(argc, argv);
+        if (c == "cg-tol" && argc >= 5) return cmd_cg_tol(argc, argv);
         return cli_ext(c, argc, argv);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

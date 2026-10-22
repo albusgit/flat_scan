@@ -97,6 +97,13 @@ GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::M
                    bool faint = false, bool robust = false, bool edges = false, const RuleNetFn* rule_net = nullptr,
                    const cv::Mat* drop_lines = nullptr);
 
+// Report-only option (docs/results/accel/cg_rtol.txt): the relative-residual tolerance of the
+// warp map's conjugate-gradient field solves. Default 1e-8, the reference; a looser value is
+// faster and changes the map. Process-wide; FS_CG_RTOL=x in the environment sets it at start
+// (desktop harnesses); values <= 0 restore the default. The app never sets it.
+void set_warp_cg_rtol(double rtol);
+double warp_cg_rtol();
+
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint = false, const cv::Mat* PH = nullptr, const cv::Mat* PV = nullptr,

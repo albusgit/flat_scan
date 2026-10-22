@@ -57,6 +57,17 @@ struct PageAssessment {
     std::vector<std::string> reasons; // quality_gate
 };
 
+// The flattening nets' grids (PipelineOptions::flat_nets) for the uv_out / uv_crop, uv_out2 / uv_crop2
+// and uv_out_pass1 / uv_crop_pass1 slots; an empty vector leaves its slot as the options have it.
+struct FlatNetGrids {
+    std::vector<float> grid1, grid2, grid_pass1;
+    UvCrop crop1, crop2, crop_pass1;
+};
+// The page corners for the nets (TL, TR, BR, BL, photo px): run_photo's detection, or the corners set
+// by hand. It may wait for the detection; null: no page was found.
+using NetCornersFn = std::function<const std::array<cv::Point2d, 4>*()>;
+using FlatNetsFn = std::function<FlatNetGrids(const NetCornersFn& corners)>;
+
 struct PipelineOptions {
     bool corners_edited = false;      // user moved a corner -> homography path
     bool force_homography = false;    // the quality gate flagged the crop: homography path
@@ -84,6 +95,16 @@ struct PipelineOptions {
     UvCrop uv_crop_pass1;
     double uv_min_consistency = 0.95;
     double uv_consistent_floor = 0.5;
+    // The flattening nets run by run_photo itself (nets.h flat_nets_fn), instead of uv_out* given in
+    // advance; their grids fill those slots. overlap_nets: on a worker thread, started before the
+    // detection, while the CPU stages that do not need a grid run (detection, surface fit, quality
+    // gate, the orientation page and a speculative orientation decision); run_photo waits for them
+    // before the grid check and redoes what a grid changed (new page corners: the orientation page;
+    // a different page shape: the decision). The callback must not need the calling thread (no JNI
+    // env, no GL context). Off: the same callback on the calling thread after the detection, nothing
+    // speculative. The outputs are bit-identical either way (Gate D).
+    FlatNetsFn flat_nets;
+    bool overlap_nets = true;
     bool line_stage = true;           // the warp map (line refinement) on top of stage 1
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
@@ -156,6 +177,12 @@ struct PipelineResult {
     int uv_zoom_quarters = -1;        // zoomed pass: quarters whose grid was used (-1: not run)
     double uv_zoom_spread[2] = {-1, -1};   // ... text-row spread with the first / the zoomed grid
     bool uv_zoom = false;             // ... the zoomed grid was kept
+    int nets_overlap = -1;            // flat_nets: -1 not run, 0 after the detection, 1 beside the CPU stages
+    bool orient_page_reused = false;  // ... the orientation page made while they ran was kept (same corners)
+    bool orient_reused = false;       // ... and its orientation decision (the same page-shape test)
+    double nets_ms = -1;              // ... their own wall time (ms)
+    double nets_wait_ms = -1;         // ... how long run_photo waited for them after its own stages
+    double nets_join_ms = -1;         // ... run_photo's start to the grids in hand
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
     bool lines_spots_dropped = false; // ... too large at first: kept without the lines through the overstretched spots

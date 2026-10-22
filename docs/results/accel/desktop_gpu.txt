@@ -1,0 +1,101 @@
+Stream F (desktop GPU) results, 2026-10-21. Machine: i5-14400F, RTX 5060 8 GB (Blackwell, sm_120), driver 591.44,
+Windows 11; shared with other agents while measuring (timings indicative, ~10 % noise). SMOKE ONLY (speed mode):
+5 of the 35 photos; the full run is `tools/desktop_check/gate_f.sh OUT full` (see the end).
+
+Photos: dewarpnet__1_1_copy, docres__for_dewarping, page_dewarp__boston_cooking_a, scanner_samples__receipt,
+user__projector_screen (round4_robustness/real_photos). Reference: Gate B's Python ORT 1.22.0 path
+(scratchpad/accel_b/s35_ref, ShadeNet on).
+
+Builds (tools/desktop_check, build_gpu.bat BUILD_DIR GPU ORT_ROOT [EP..]):
+  build         FS_DESKTOP_GPU=OFF  onnxruntime-win-x64-1.22.0                     (unchanged default)
+  build/f_dml   FS_DESKTOP_GPU=WGL  Microsoft.ML.OnnxRuntime.DirectML 1.22.0 + DirectML 1.15.4, FS_ORT_DML
+  build/f_cuda  FS_DESKTOP_GPU=WGL  onnxruntime-win-x64-gpu-1.22.0 (CUDA 12, cuDNN 9), FS_ORT_CUDA FS_ORT_TENSORRT
+  build/f_mesa  FS_DESKTOP_GPU=MESA onnxruntime-win-x64-1.22.0
+  ORT packages in C:/Users/User/Android/ort/ (DirectML one assembled from the two NuGet packages, see its README.txt).
+  CUDA runtime: the round-4 venv's torch/lib (CUDA 12.8 cudart/cublas/cufft/curand, cuDNN 9) on PATH; no toolkit.
+
+GPU context (gpu_gl43.cpp, WGL on the system driver): "NVIDIA GeForce RTX 5060/PCIe/SSE2 | OpenGL ES 3.2 NVIDIA 591.44 | precise";
+FS_GL_PROFILE=core: "4.6.0 NVIDIA 591.44 | precise". Mesa: "D3D12 (NVIDIA GeForce RTX 5060) | OpenGL ES 3.1 Mesa 26.2.4 | precise",
+llvmpipe "OpenGL ES 3.2 Mesa 26.2.4 | precise".
+
+1. CPU backend unchanged (gate_b.py cmp vs the reference: logits, p1, rc0, rc2, page, JSON bit for bit)
+  build: photos with any difference: 0 of 5
+  f_dml: photos with any difference: 0 of 5
+  f_cuda: photos with any difference: 0 of 5
+  f_mesa: photos with any difference: 0 of 5
+
+2. GPU stages vs CPU
+  selftest-resample wgl_es: cases 30, worst |diff| 0 (gate: <= 1); GPU stages (dense / offset remap): worst |diff| 0 (gate: 0)
+  selftest-resample wgl_core: cases 30, worst |diff| 0 (gate: <= 1); GPU stages (dense / offset remap): worst |diff| 0 (gate: 0)
+  selftest-resample mesa_d3d12: cases 30, worst |diff| 0 (gate: <= 1); GPU stages (dense / offset remap): worst |diff| 0 (gate: 0)
+  selftest-resample mesa_llvmpipe: cases 30, worst |diff| 0 (gate: <= 1); GPU stages (dense / offset remap): worst |diff| 0 (gate: 0)
+  fs_cli gpu-stages (every GPU stage on, dense included), native GL, round-4 dewarpnet__1_1_copy + scanner_samples__receipt: photos 2, not identical 0, worst |diff| 0 (gate: 0)
+  fs_cli gpu-stages, native GL, DocUNet 1_1 with the cached nets (separate run): photos 1, not identical 0, worst |diff| 0 (gate: 0)
+  pipeline_cli FS_GPU=1 --backend cpu vs reference: pages with any difference: 0 of 5; photos with different JSON: 0 of 5
+  page_bench cpu vs cpu --gpu pages: pages with any difference: 0 of 5
+
+3. Accelerated nets vs CPU on the same inputs (net_check.exe on Stream A's cached net inputs; px of the 1600 x 2263 page)
+DirectML (fp32):
+  photo                                         logits                p1               rc0               rc2             shade   (max / p99: px of the page; shade: levels; logits: max |d| / mask flips)
+  dewarpnet__1_1_copy                                -   0.0007/  0.0005   0.0007/  0.0005   0.0008/  0.0004   0.0001/  0.0000
+  docres__for_dewarping                              -   0.0009/  0.0006   0.0009/  0.0006   0.0007/  0.0005   0.0001/  0.0000
+  page_dewarp__boston_cooking_a                      -   0.0007/  0.0006   0.0008/  0.0005   0.0007/  0.0004   0.0001/  0.0000
+  scanner_samples__receipt                           -   0.0008/  0.0006   0.0008/  0.0006   0.0013/  0.0007   0.0001/  0.0000
+  user__projector_screen                             -   0.0008/  0.0006   0.0008/  0.0006   0.0008/  0.0005   0.0001/  0.0000
+  
+  pooled over 5 photos (Gate A tolerance: grid p99 < 0.25 px):
+    UVDoc pass 1     max 0.0009 px, p99 0.0006 px  PASS
+    UVDoc re-crop    max 0.0009 px, p99 0.0006 px  PASS
+    SyntheticDoc-HR  max 0.0013 px, p99 0.0005 px  PASS
+    ShadeNet         max 0.0001 levels, p99 0.0000 levels
+CUDA (fp32, use_tf32=0):
+  photo                                         logits                p1               rc0               rc2             shade   (max / p99: px of the page; shade: levels; logits: max |d| / mask flips)
+  dewarpnet__1_1_copy                                -   0.0028/  0.0024   0.0028/  0.0024   0.0012/  0.0005   0.0001/  0.0000
+  docres__for_dewarping                              -   0.0031/  0.0027   0.0031/  0.0020   0.0011/  0.0005   0.0001/  0.0000
+  page_dewarp__boston_cooking_a                      -   0.0067/  0.0057   0.0125/  0.0105   0.0009/  0.0005   0.0001/  0.0000
+  scanner_samples__receipt                           -   0.0385/  0.0345   0.0184/  0.0164   0.0013/  0.0007   0.0001/  0.0000
+  user__projector_screen                             -   0.0034/  0.0022   0.0034/  0.0022   0.0011/  0.0006   0.0001/  0.0000
+  
+  pooled over 5 photos (Gate A tolerance: grid p99 < 0.25 px):
+    UVDoc pass 1     max 0.0385 px, p99 0.0253 px  PASS
+    UVDoc re-crop    max 0.0184 px, p99 0.0136 px  PASS
+    SyntheticDoc-HR  max 0.0013 px, p99 0.0006 px  PASS
+    ShadeNet         max 0.0001 levels, p99 0.0000 levels
+CUDA with ORT's default TF32 (before the infer.cpp change, same 5 photos): UVDoc pass 1 p99 0.1095 px (max 0.169),
+UVDoc re-crop p99 0.1085 px, SyntheticDoc-HR p99 0.5036 px (max 0.799) -> FAIL against 0.25 px; the end-to-end pages
+then differed by up to 244 levels on 27-94 % of pixels. Hence infer.cpp sets use_tf32=0 for the CUDA EP.
+
+End to end (pipeline_cli --backend dml|cuda FS_GPU=1, ShadeNet on) vs the CPU reference:
+  dml:  photos with different decisions: 0 of 5 (mode, net winner uv_model, uv/lines rejected, manual-crop reasons, rot, shade_net, assess)
+  cuda: photos with different decisions: 0 of 5
+  page finder logits: 0.000 % mask flips on both (max |logit| difference < 5e-5)
+  pages (JPEG q85) dml: max 6-13 levels on 0.8-17 % of pixels, 0 % of pixels > 8 levels; cuda: max 8-78, <= 0.49 % > 8 levels
+
+4. Per-page timing, page_bench.exe (warm sessions, 3 timed passes after a warm-up, one process per row)
+| backend | GPU stages | page finder | detect | UVDoc p1 | UVDoc | SD-HR | ShadeNet | run_photo | page | nets sum | cold first page |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| cpu | off | 19 | 51 | 58 | 56 | 523 | 19 | 1693 | 2493 | 675 | 2956 |
+| cpu | on | 19 | 47 | 58 | 58 | 518 | 19 | 1508 | 2267 | 672 | 3078 |
+| dml | off | 9 | 47 | 15 | 14 | 57 | 6 | 1749 | 1967 | 101 | 3130 |
+| dml | on | 8 | 39 | 8 | 7 | 24 | 6 | 1458 | 1620 | 53 | 3041 |
+| cuda | off | 8 | 48 | 11 | 10 | 29 | 6 | 1733 | 1890 | 64 | 3359 |
+| cuda | on | 5 | 42 | 11 | 10 | 29 | 5 | 1428 | 1622 | 59 | 3260 |
+
+ms; median over 5 photos of each photo's median (3 timed passes after one warm-up pass). 'nets sum': page finder + the three flattening-net runs + ShadeNet. 'cold first page': the first photo's warm-up pass (dewarpnet__1_1_copy): session creation, GPU context and shader compile, CUDA tuning (one process per row; the driver's CUDA JIT cache already warm).
+Notes: nets sum CPU 675 ms -> DirectML 53-101 ms, CUDA 59-64 ms (about 7-12x); the page is then bound by run_photo's
+CPU stages (~1.4-1.7 s). GPU stages on save ~150-250 ms per page (final resample, global remap). DirectML net times
+are bimodal between runs (e.g. SD-HR 24 vs 57-71 ms), apparently the GPU's clock state: they are lower when the GL
+stages keep the GPU busy. CUDA's first run on this driver JIT-compiled ORT's kernels for sm_120 (ORT 1.22.0 has no
+native sm_120 code): page finder 55.2 s once, then cached by the driver (C:/Users/User/AppData/Roaming/NVIDIA/ComputeCache,
+86 MB); the "cold first page" column was measured with that cache warm. Plan estimate for an NVIDIA desktop page was
+~1.2-1.5 s (estimate); measured 1.6 s with both GPU paths on these 5 photos.
+
+Not run here: TensorRT (the EP is compiled in build/f_cuda; without TensorRT 10.x DLLs it reports "Error loading
+onnxruntime_providers_tensorrt.dll" and the net falls back to the next backend, checked), QNN on Snapdragon X,
+OpenVINO GPU / CPU, CoreML.
+
+Full gate (Git Bash, ~45 min estimate; the DocUNet part under the heavy lock):
+  bash tools/desktop_check/gate_f.sh <OUT> full [<Gate B s35 reference dir>]
+  pass: "gate F: PASS" (every cmp_cpu_*.txt "0 of 35", selftests worst |diff| 0, gpu-stages "not identical 0",
+  pages/json_cpu_gpu "0 of 35", nets_dml/nets_cuda all PASS); report: decisions_*_gpu.txt, timing.md.
+Smoke (this file): bash tools/desktop_check/gate_f.sh <OUT> smoke  -> gate F: PASS in 6 min 51 s.

@@ -10,6 +10,12 @@ namespace fs {
 using Vec = std::vector<double>;
 static const double NaN = std::numeric_limits<double>::quiet_NaN();
 
+// std::hypot as MSVC's CRT rounds it (measured equal on 2M inputs: the plain formula, the float one in
+// double). Bionic's hypot rounds differently (12 % of inputs), so the Android build used to drift from
+// the desktop one; sqrt is correctly rounded everywhere, so these agree on every platform.
+inline double hypot_xy(double x, double y) { return std::sqrt(x * x + y * y); }
+inline float hypot_xy(float x, float y) { return (float)std::sqrt((double)x * x + (double)y * y); }
+
 // np.linspace(a, b, n): y[i] = i*step + a, last element exactly b
 inline Vec linspace(double a, double b, int n) {
     Vec y(n);

@@ -1,0 +1,20 @@
+Stream E step 3 (report only): the warp map's CG field solves, rtol 1e-8 (default, unchanged) vs 1e-6.
+Option: set_warp_cg_rtol() / FS_CG_RTOL (warpmap.h), default OFF. Measured 2026-10-21, smoke only
+(3 DocUNet photos, baseline nets, CPU path; shared machine, timing noise ~10%).
+Command: fs_cli cg-tol OUT.txt 1e-6 PHOTOS... --logits .. --uvpass1 .. --uvout .. --uvout2 .. (host/gpu_stage_gate.sh step 4)
+"iters": CG iterations of the global and the two line-stage solves (not the robust re-solves).
+"map max px": max |dx|+|dy| of the final 4-px map; "page max" / "page n>0": max level difference and
+count of differing values on the final page.
+
+CG rtol 1e-8 vs 1e-06, CPU path, warp-map ms median of 3
+photo                        warp 1e-8  warp tol   iters   iters map max px  page max  page n>0
+1_1                             1034.1     908.9     107      79     0.0248         5       641
+17_2                            2219.8    1627.4      78      57     0.0000         0         0
+42_1                             372.0     341.4       0       0     0.0000         0         0
+sum warp-map ms: 1e-8 3625.9, 1e-06 2877.7 (-20.6%)
+
+Not measured (SPEED MODE; for the Coordinator): the 35-photo and DocUNet metrics with FS_CG_RTOL=1e-6.
+DocUNet: run docunet_bench/run_ours.py with a pipeline_cli built from this tree (run_ours.py's REPO points
+at the user's checkout: use a copy with REPO set to this worktree) and the new_fold2 config plus
+FS_CG_RTOL=1e-6, into a new work/e_cgtol6 folder; score with docunet_eval.py (--jobs 4) only the images
+that differ from work/new_fold2. Recommendation pending those numbers: keep 1e-8.

@@ -1,0 +1,1 @@
+Batch selftest done: 1 processed, 0 already there, 1 ok, 43 s; page finder cpu, UVDoc cpu, SyntheticDoc high-res cpu, shadow net cpu -> /storage/emulated/0/Android/data/com.albus.flatscan/files/batch_out/st_norn

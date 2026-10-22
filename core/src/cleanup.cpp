@@ -8,6 +8,7 @@
 
 #include "gpu.h"
 #include "solid.h"
+#include "nputil.h"
 
 #pragma STDC FP_CONTRACT OFF
 
@@ -182,7 +183,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
         std::vector<float> r[3];
         for (int i = 0; i < bg4.rows; ++i)
             for (int j = 0; j < bg4.cols; ++j) {
-                if (!cand.at<uint8_t>(i, j) || std::hypot(A.at<float>(i, j) - a0, B.at<float>(i, j) - b0) >= 4.f) continue;
+                if (!cand.at<uint8_t>(i, j) || hypot_xy(A.at<float>(i, j) - a0, B.at<float>(i, j) - b0) >= 4.f) continue;
                 const uint8_t* q = bg4.ptr<uint8_t>(i) + 4 * j;
                 float l = std::max(lum.at<float>(i, j), 1.f);
                 for (int c = 0; c < 3; ++c) r[c].push_back(q[c] / l);
@@ -202,7 +203,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
         for (int i = 0; i < bg4.rows; i += 2)
             for (int j = 0; j + 2 < bg4.cols; j += 2)
                 if (cand.at<uint8_t>(i, j) && cand.at<uint8_t>(i, j + 2))
-                    dn.push_back(std::hypot(A.at<float>(i, j + 2) - A.at<float>(i, j), B.at<float>(i, j + 2) - B.at<float>(i, j)));
+                    dn.push_back(hypot_xy(A.at<float>(i, j + 2) - A.at<float>(i, j), B.at<float>(i, j + 2) - B.at<float>(i, j)));
         noise = 0.f;
         if (dn.size() > 100) {
             std::nth_element(dn.begin(), dn.begin() + dn.size() * 9 / 10, dn.end());
@@ -224,7 +225,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
                 for (int k = 0; k < 4; ++k) {
                     int i0 = std::min(std::max(i - ey[k], 0), bg4.rows - 1), j0 = std::min(std::max(j - ex[k], 0), bg4.cols - 1);
                     int i1 = std::min(std::max(i + ey[k], 0), bg4.rows - 1), j1 = std::min(std::max(j + ex[k], 0), bg4.cols - 1);
-                    g = std::max(g, std::hypot(As.at<float>(i1, j1) - As.at<float>(i0, j0), Bs.at<float>(i1, j1) - Bs.at<float>(i0, j0)));
+                    g = std::max(g, hypot_xy(As.at<float>(i1, j1) - As.at<float>(i0, j0), Bs.at<float>(i1, j1) - Bs.at<float>(i0, j0)));
                 }
                 edge.at<uint8_t>(i, j) = g > edge_c ? 1 : 0;
             }
@@ -236,7 +237,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
     std::vector<cv::Point> queue;
     for (int i = 0; i < bg4.rows; ++i)
         for (int j = 0; j < bg4.cols; ++j)
-            if (cand.at<uint8_t>(i, j) && std::hypot(A.at<float>(i, j), B.at<float>(i, j)) < kSeedC) {
+            if (cand.at<uint8_t>(i, j) && hypot_xy(A.at<float>(i, j), B.at<float>(i, j)) < kSeedC) {
                 grown.at<uint8_t>(i, j) = 1;
                 RA.at<float>(i, j) = A.at<float>(i, j);
                 RB.at<float>(i, j) = B.at<float>(i, j);
@@ -251,7 +252,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
             if (q.x < 0 || q.y < 0 || q.x >= bg4.cols || q.y >= bg4.rows) continue;
             if (grown.at<uint8_t>(q) || !cand.at<uint8_t>(q) || edge.at<uint8_t>(q)) continue;
             float aq = A.at<float>(q), bq = B.at<float>(q);
-            if (std::hypot(aq - ra, bq - rb) < step_c && std::hypot(aq, bq) < kMaxC) {
+            if (hypot_xy(aq - ra, bq - rb) < step_c && hypot_xy(aq, bq) < kMaxC) {
                 grown.at<uint8_t>(q) = 1;
                 RA.at<float>(q) = ra + kPathAlpha * (aq - ra);
                 RB.at<float>(q) = rb + kPathAlpha * (bq - rb);
@@ -281,7 +282,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
             for (int j = 0; j < bg4.cols; ++j) {
                 int k = lab.at<int>(i, j);
                 if (k > 0 && k != main_c)
-                    d[k].push_back(std::hypot(A.at<float>(i, j) - Ar.at<float>(i, j), B.at<float>(i, j) - Br.at<float>(i, j)));
+                    d[k].push_back(hypot_xy(A.at<float>(i, j) - Ar.at<float>(i, j), B.at<float>(i, j) - Br.at<float>(i, j)));
             }
         std::vector<char> keep(n, 1);
         for (int k = 1; k < n; ++k) {
@@ -523,7 +524,7 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
         const float tint0 = std::max(kTint0, kNoiseTint * cnoise);   // noisy paper: a larger distance
         for (int i = 0; i < bg4.rows; ++i)
             for (int j = 0; j < bg4.cols; ++j) {
-                float d = std::hypot(A.at<float>(i, j) - Af.at<float>(i, j), B.at<float>(i, j) - Bf.at<float>(i, j));
+                float d = hypot_xy(A.at<float>(i, j) - Af.at<float>(i, j), B.at<float>(i, j) - Bf.at<float>(i, j));
                 tint.at<float>(i, j) = smoothstep(tint0, tint0 + (kTint1 - kTint0), d) * smoothstep(0.7f, 0.85f, p.bgv.at<float>(i, j));
             }
         cv::blur(tint, p.tint, cv::Size(3, 3), cv::Point(-1, -1), cv::BORDER_REPLICATE);

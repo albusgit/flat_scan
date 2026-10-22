@@ -1,0 +1,84 @@
+Stream D: the flattening nets beside the CPU stages (core/src/pipeline.cpp run_photo, PipelineOptions::flat_nets)
+=============================================================================================================
+
+1. Which run_photo stages depend on the nets' grids (audit, accel/main 7dc7ce0)
+---------------------------------------------------------------------------------
+  page finder (logits)          before both branches: the detection and the nets' book-spread mask need it
+  detect (detect_corners)       independent                                         -> CPU branch
+  surface fit + quality gate    independent (its surface page may be replaced)       -> CPU branch
+  the nets                      need the detection's corners only without a first-pass grid (UVDoc on
+                                the whole photo failed) -> they ask for them (NetCornersFn) and wait
+  flattening net check          needs the grids                                      -> after the join
+  uv_defines_page / set_corners a grid can move the page corners: Uh, W / H, M change -> the orientation
+                                page, the before page, the deformation grid and the paper mask follow
+  stage-1 page                  remap of U, and U IS the grid whenever one is accepted (35/35 photos in
+                                Gate B's s35 run are mode "uvdoc"), so it cannot be made before the
+                                grids. Only the homography page is made beside the nets (it is also the
+                                orientation page and the Homography-mode stage-1 page); the surface page
+                                is not (it would be wasted whenever a grid is accepted)
+  orientation page              the homography page of the corners: depends on the grids only through
+                                uv_defines_page                                      -> CPU branch, redone if
+                                                                                        the corners moved
+  orientation decision          page_hw_ratio(U) (the grid's page shape) sets the resize and the turn
+                                ratio: made beside the nets with the CPU branch's U, kept if the final U
+                                gives the same (rows, INTER_AREA, min_ratio) on the same page, else redone
+  text-row spread (2 nets), zoomed pass, warp map, compose, resample, shadows, paper mask, before page:
+                                depend on the grids                                  -> after the join
+
+So the CPU branch is: detect -> surface fit -> quality gate -> orientation page -> orientation decision;
+the net branch: UVDoc on the whole photo -> UVDoc + SyntheticDoc-HR on its re-crop. ShadeNet and the
+zoomed pass stay where they were (after the join, on the calling thread).
+
+How often the speculation is redone
+  orientation page: exactly when uv_defines_page fires. From Gate B's reference outputs (same decisions,
+  scratchpad/accel_b/{s35_ref,du_ref}, counted with scratchpad/accel_d/count_dp.py):
+    35 photos: 3 of 35   (docres__for_appearance, docres__for_deshadowing, scanner_samples__tax)
+    DocUNet:  11 of 130  (2_1 6_2 8_1 10_2 15_2 17_2 28_1 51_2 57_1 60_2 62_2)
+  orientation decision: the page redo plus pages whose shape test differs between the grid and the
+  surface / homography (long narrow pages). Smoke only so far (see 3); the full count is in Gate D's
+  gate_d_summary.txt.
+
+2. Switches
+-----------
+  PipelineOptions::flat_nets (nets.h flat_nets_fn), overlap_nets (default on).
+  pipeline_cli: FS_NETS=1 now runs the nets inside run_photo; FS_SEQUENTIAL=1 forces the sequential
+  order (detection, then the nets on the calling thread, nothing speculative); FS_NET_DELAY_MS=n adds n ms
+  to the nets without CPU load. JSON: "nets": {"overlap": {mode, orient_page_reused, orient_reused,
+  nets_ms, wait_ms, join_ms, stages}}; "pipeline_ms" now includes the flattening nets.
+  The app (Kotlin nets, uv_out* given in advance) is unchanged until Stream C sets flat_nets.
+
+3. Smoke check (speed mode; 2026-10-21, i5-14400F shared with other agents at ~50% CPU)
+---------------------------------------------------------------------------------------
+Builds: desktop_check (MSVC, ORT 1.22.0) OK; ./gradlew assembleDebug OK (heavy lock 13:02:27-13:03:01,
+only the existing warpmap.cpp:1095 warning).
+
+Bit-identity, CPU backend, gate_b.py new + cmp (net outputs, page, JSON):
+  35-photo set, --shade, 3 photos (docres__for_deshadowing: uv_defines_page; user__page3_sideways: turned;
+  scanner_samples__receipt: long narrow page):
+    pre-D build (accel/main 7dc7ce0) vs overlapped     0 of 3 differ
+    sequential vs overlapped                           0 of 3 differ
+    pre-D build vs sequential                          0 of 3 differ
+    with FS_NET_DELAY_MS=1500, both orders vs pre-D    0 of 3 differ (3 runs of each order)
+  DocUNet 18_1, 4_2 (heavy lock 13:01:11-13:01:24): sequential vs overlapped 0 of 2 differ; both pages
+    identical to docunet_bench/work/new_fold2
+  Synthetic photos (uniform grey; a light box on dark), FS_NETS with and without FS_FRAME_CORNERS:
+    pre-D vs new JSON and page identical (4/4)
+  Reuse: deshadowing page + decision redone (uv_defines_page); receipt, sideways, 18_1 both kept;
+    4_2 page kept, decision redone.
+
+Wall time, nets delayed by 1500 ms (FS_NET_DELAY_MS), one photo per process, ms (second of two runs; the
+first gave the same picture). join = run_photo's start to the grids in hand; cpu branch = start to the wait.
+  photo                         seq join  seq run | ovl nets  cpu br.  ovl join  ovl run  saved
+  docres__for_deshadowing           2649     4555 |     2899     1510      2900     3661    894
+  scanner_samples__receipt          2674     4457 |     2646      299      2646     4077    379
+  user__page3_sideways              2653     4406 |     2658      226      2658     4129    276
+  overlapped join vs max(cpu branch, nets): 2900 vs 2899, 2646 vs 2646, 2658 vs 2658
+(An earlier delayed run had one outlier, deshadowing overlapped at 7288 ms with its nets at 6344 ms,
+while the machine was loaded; it is left out of the table.)
+The pre-join phase takes max(CPU branch, net branch); what is saved is the CPU branch (detect + surface
+fit + orientation, 0.2-1.5 s here). The rest of the page (warp map etc.) still follows the nets; run-to-run
+noise on it is ~300 ms on this shared machine.
+Without the delay (nets on the CPU EP, both branches sharing the cores) the 3 photos ran 2303-2399 ms
+overlapped vs 2477-2630 ms sequential (one run each; indicative only).
+
+Full gate (not run, speed mode): tools/desktop_check/gate_d.sh OUT [REF_S35 [REF_DU]].

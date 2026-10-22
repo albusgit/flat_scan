@@ -5,6 +5,7 @@
 #include <GLES3/gl31.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -14,39 +15,24 @@
 namespace fs {
 
 // ---------------------------------------------------------------- shaders
-static const char* kResampleCS = R"(#version 310 es
+// OpenCV INTER_CUBIC tap at one map position (shared by the resample shaders): 1/32-px
+// positions, BicubicTab_i weights, constant white border, packed RGBA8.
+#define CUBIC_COMMON R"(
 precision highp float;
 precision highp int;
 layout(local_size_x = 16, local_size_y = 8) in;
 uniform highp usampler2D uSrc;      // RGBA8UI source photo (texelFetch only)
-uniform highp sampler2D uGx;        // R32F backward map grid, x (source px)
-uniform highp sampler2D uGy;        // R32F backward map grid, y
 layout(std430, binding = 0) readonly buffer Tab { int tab[]; };      // OpenCV BicubicTab_i
 layout(std430, binding = 1) writeonly buffer Dst { uint px[]; };     // packed RGBA8 band
 uniform ivec2 uOut;                 // dense output size
-uniform ivec2 uGrid;                // grid samples (gw, gh)
-uniform int uStride;
 uniform int uRow0;
 uniform int uRows;
 uniform ivec2 uSrcSize;
 
-float grid(highp sampler2D t, int ix, int iy, float a, float b) {
-    int x0 = min(ix, uGrid.x - 1), x1 = min(ix + 1, uGrid.x - 1);
-    int y0 = min(iy, uGrid.y - 1), y1 = min(iy + 1, uGrid.y - 1);
-    float w0 = (1.0 - b) * (1.0 - a), w1 = (1.0 - b) * a, w2 = b * (1.0 - a), w3 = b * a;
-    return texelFetch(t, ivec2(x0, y0), 0).r * w0 + texelFetch(t, ivec2(x1, y0), 0).r * w1 +
-           texelFetch(t, ivec2(x0, y1), 0).r * w2 + texelFetch(t, ivec2(x1, y1), 0).r * w3;
-}
-
-void main() {
-    int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
-    if (x >= uOut.x || r >= uRows) return;
-    int y = uRow0 + r;
-    float inv = 1.0 / float(uStride);
-    float a = float(x % uStride) * inv, b = float(y % uStride) * inv;
-    int ix = x / uStride, iy = y / uStride;
-    float mx = clamp(grid(uGx, ix, iy, a, b), -40000.0, 40000.0);
-    float my = clamp(grid(uGy, ix, iy, a, b), -40000.0, 40000.0);
+uint cubic(float mx, float my) {
+    if (isnan(mx) || isnan(my)) return 0xFFFFFFFFu;   // cvRound(NaN) is INT_MIN: outside, white
+    mx = clamp(mx, -40000.0, 40000.0);
+    my = clamp(my, -40000.0, 40000.0);
     int X = int(roundEven(mx * 32.0)), Y = int(roundEven(my * 32.0));
     int sx = clamp(X >> 5, -32768, 32767) - 1, sy = clamp(Y >> 5, -32768, 32767) - 1;
     int wb = ((Y & 31) * 32 + (X & 31)) * 16;
@@ -70,30 +56,78 @@ void main() {
         }
         o = uvec4(clamp((sum + 16384) >> 15, 0, 255));
     }
-    px[r * uOut.x + x] = o.r | (o.g << 8) | (o.b << 16) | (o.a << 24);
+    return o.r | (o.g << 8) | (o.b << 16) | (o.a << 24);
+}
+)"
+
+// the 4-px grid map (bilinear, clamped to the last sample) as warpmap.load_maps / expand_rows.
+// PRECISE (`precise` where the context has it, see init_locked) keeps the compiler from fusing
+// the products and sums into FMAs: the map must round as the CPU's float32 steps do, or a
+// 1/32-px position flips (seen on a desktop GPU, Mesa d3d12: up to 12 levels).
+#define GRID_COMMON R"(
+uniform highp sampler2D uGx;        // R32F backward map grid, x (source px)
+uniform highp sampler2D uGy;        // R32F backward map grid, y
+uniform ivec2 uGrid;                // grid samples (gw, gh)
+uniform int uStride;
+float grid(highp sampler2D t, int ix, int iy, float a, float b) {
+    int x0 = min(ix, uGrid.x - 1), x1 = min(ix + 1, uGrid.x - 1);
+    int y0 = min(iy, uGrid.y - 1), y1 = min(iy + 1, uGrid.y - 1);
+    PRECISE float w0 = (1.0 - b) * (1.0 - a), w1 = (1.0 - b) * a, w2 = b * (1.0 - a), w3 = b * a;
+    PRECISE float v = texelFetch(t, ivec2(x0, y0), 0).r * w0 + texelFetch(t, ivec2(x1, y0), 0).r * w1 +
+                      texelFetch(t, ivec2(x0, y1), 0).r * w2 + texelFetch(t, ivec2(x1, y1), 0).r * w3;
+    return v;
+}
+)"
+
+// (the resample-family shaders get their #version line from init_locked)
+static const char* kResampleCS = CUBIC_COMMON GRID_COMMON R"(
+void main() {
+    int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+    if (x >= uOut.x || r >= uRows) return;
+    int y = uRow0 + r;
+    float inv = 1.0 / float(uStride);
+    float a = float(x % uStride) * inv, b = float(y % uStride) * inv;
+    int ix = x / uStride, iy = y / uStride;
+    px[r * uOut.x + x] = cubic(grid(uGx, ix, iy, a, b), grid(uGy, ix, iy, a, b));
+}
+)";
+
+// The global stage's A_img (warpmap.cpp): map = pixel + the bilinear offset field (32-px grid).
+static const char* kOffsetCS = CUBIC_COMMON GRID_COMMON R"(
+void main() {
+    int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+    if (x >= uOut.x || r >= uRows) return;
+    int y = uRow0 + r;
+    float inv = 1.0 / float(uStride);
+    float a = float(x % uStride) * inv, b = float(y % uStride) * inv;
+    int ix = x / uStride, iy = y / uStride;
+    PRECISE float mx = float(x) + grid(uGx, ix, iy, a, b), my = float(y) + grid(uGy, ix, iy, a, b);
+    px[r * uOut.x + x] = cubic(mx, my);
+}
+)";
+
+// Dense float32 maps made on the CPU (the stage-1 and orientation pages' exact unroll map).
+static const char* kDenseCS = CUBIC_COMMON R"(
+uniform highp sampler2D uMx;        // R32F, output size
+uniform highp sampler2D uMy;
+void main() {
+    int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+    if (x >= uOut.x || r >= uRows) return;
+    ivec2 p = ivec2(x, uRow0 + r);
+    px[r * uOut.x + x] = cubic(texelFetch(uMx, p, 0).r, texelFetch(uMy, p, 0).r);
 }
 )";
 
 // Parity/debug only: the dense maps exactly as the resample shader reconstructs them.
-static const char* kExpandCS = R"(#version 310 es
+static const char* kExpandCS = R"(
 precision highp float;
 precision highp int;
 layout(local_size_x = 16, local_size_y = 8) in;
-uniform highp sampler2D uGx;
-uniform highp sampler2D uGy;
+)" GRID_COMMON R"(
 layout(std430, binding = 1) writeonly buffer Dst { vec2 m[]; };
 uniform ivec2 uOut;
-uniform ivec2 uGrid;
-uniform int uStride;
 uniform int uRow0;
 uniform int uRows;
-float grid(highp sampler2D t, int ix, int iy, float a, float b) {
-    int x0 = min(ix, uGrid.x - 1), x1 = min(ix + 1, uGrid.x - 1);
-    int y0 = min(iy, uGrid.y - 1), y1 = min(iy + 1, uGrid.y - 1);
-    float w0 = (1.0 - b) * (1.0 - a), w1 = (1.0 - b) * a, w2 = b * (1.0 - a), w3 = b * a;
-    return texelFetch(t, ivec2(x0, y0), 0).r * w0 + texelFetch(t, ivec2(x1, y0), 0).r * w1 +
-           texelFetch(t, ivec2(x0, y1), 0).r * w2 + texelFetch(t, ivec2(x1, y1), 0).r * w3;
-}
 void main() {
     int x = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
     if (x >= uOut.x || r >= uRows) return;
@@ -156,9 +190,27 @@ bool Gpu::init_locked() {
     info_ = std::string(ren ? ren : "?") + " | " + (ver ? ver : "?");
     if (major < 3 || (major == 3 && minor < 1)) { info_ += " (needs GLES 3.1)"; release(); return false; }
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex_);
-    prog_resample_ = program("resample", kResampleCS);
-    prog_expand_ = program("expand", kExpandCS);
-    bool ok = prog_resample_ != 0 && prog_expand_ != 0 && init_cleanup_programs();
+    // `precise` for the map arithmetic: GLSL ES 3.20, or 3.10 with gpu_shader5
+    std::string hdr = "#version 310 es\n#define PRECISE\n";
+    auto has_ext = [](const char* e) {
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (GLint i = 0; i < n; ++i) {
+            const char* x = (const char*)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+            if (x && !std::strcmp(x, e)) return true;
+        }
+        return false;
+    };
+    if (major > 3 || minor >= 2) hdr = "#version 320 es\n#define PRECISE precise\n";
+    else if (has_ext("GL_OES_gpu_shader5")) hdr = "#version 310 es\n#extension GL_OES_gpu_shader5 : require\n#define PRECISE precise\n";
+    else if (has_ext("GL_EXT_gpu_shader5")) hdr = "#version 310 es\n#extension GL_EXT_gpu_shader5 : require\n#define PRECISE precise\n";
+    precise_ = hdr.find("precise\n") != std::string::npos;
+    info_ += precise_ ? " | precise" : " | no precise";
+    prog_resample_ = program("resample", (hdr + kResampleCS).c_str());
+    prog_expand_ = program("expand", (hdr + kExpandCS).c_str());
+    prog_offset_ = program("remap_offset", (hdr + kOffsetCS).c_str());
+    prog_dense_ = program("remap_dense", (hdr + kDenseCS).c_str());
+    bool ok = prog_resample_ != 0 && prog_expand_ != 0 && prog_offset_ != 0 && prog_dense_ != 0 && init_cleanup_programs();
     release();
     return ok;
 }
@@ -264,32 +316,76 @@ bool Gpu::run_banded(unsigned prog, int w, int h, cv::Mat& out) {
     return ok && glGetError() == GL_NO_ERROR;
 }
 
+// The bicubic programs' common inputs: source texture on unit 0, weight table at binding 0.
+static GLuint bind_cubic(GLuint prog, GLuint tsrc, int src_w, int src_h) {
+    const int16_t* itab = bicubic_itab();
+    std::vector<int32_t> tab(itab, itab + 1024 * 16);
+    GLuint buf;
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, tab.size() * 4, tab.data(), GL_STATIC_DRAW);
+    glUseProgram(prog);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tsrc); set_i(prog, "uSrc", 0);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buf);
+    set_i2(prog, "uSrcSize", src_w, src_h);
+    return buf;
+}
+
 bool Gpu::resample(const cv::Mat& src, const GridMap& g, cv::Mat& out) {
+    return run_grid(prog_resample_, src, g, out);
+}
+
+bool Gpu::remap_offset(const cv::Mat& src, const GridMap& off, cv::Mat& out) {
+    return run_grid(prog_offset_, src, off, out);
+}
+
+bool Gpu::run_grid(unsigned prog, const cv::Mat& src, const GridMap& g, cv::Mat& out) {
     if (!available()) return false;
     std::lock_guard<std::mutex> lk(mu_);
     if (src.cols > max_tex_ || src.rows > max_tex_ || g.gw > max_tex_ || g.gh > max_tex_) return false;
     if (!make_current()) return false;
+    auto t0 = std::chrono::steady_clock::now();
     cv::Mat s = src.isContinuous() ? src : src.clone();
     GLuint tsrc = gpu_tex_rgba8ui(s);
     GLuint tgx = tex_r32f(g.gw, g.gh, g.x.data()), tgy = tex_r32f(g.gw, g.gh, g.y.data());
-    const int16_t* itab = bicubic_itab();
-    std::vector<int32_t> tab(itab, itab + 1024 * 16);
-    GLuint bufs[1];
-    glGenBuffers(1, bufs);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[0]);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, tab.size() * 4, tab.data(), GL_STATIC_DRAW);
-    glUseProgram(prog_resample_);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tsrc); set_i(prog_resample_, "uSrc", 0);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tgx); set_i(prog_resample_, "uGx", 1);
-    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tgy); set_i(prog_resample_, "uGy", 2);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bufs[0]);
-    set_i2(prog_resample_, "uGrid", g.gw, g.gh);
-    set_i(prog_resample_, "uStride", g.stride);
-    set_i2(prog_resample_, "uSrcSize", s.cols, s.rows);
-    bool ok = run_banded(prog_resample_, g.out_w, g.out_h, out);
+    GLuint buf = bind_cubic(prog, tsrc, s.cols, s.rows);
+    auto t1 = std::chrono::steady_clock::now();
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tgx); set_i(prog, "uGx", 1);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tgy); set_i(prog, "uGy", 2);
+    set_i2(prog, "uGrid", g.gw, g.gh);
+    set_i(prog, "uStride", g.stride);
+    bool ok = run_banded(prog, g.out_w, g.out_h, out);
     ok = ok && glGetError() == GL_NO_ERROR;
-    glDeleteBuffers(1, bufs);
+    times_ = {std::chrono::duration<double, std::milli>(t1 - t0).count(),
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count()};
+    glDeleteBuffers(1, &buf);
     GLuint ts[3] = {tsrc, tgx, tgy};
+    glDeleteTextures(3, ts);
+    glFinish();
+    release();
+    return ok;
+}
+
+bool Gpu::remap_dense(const cv::Mat& src, const cv::Mat& mx, const cv::Mat& my, cv::Mat& out) {
+    if (!available()) return false;
+    if (mx.type() != CV_32F || my.type() != CV_32F || mx.size() != my.size() || !mx.isContinuous() || !my.isContinuous()) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (src.cols > max_tex_ || src.rows > max_tex_ || mx.cols > max_tex_ || mx.rows > max_tex_) return false;
+    if (!make_current()) return false;
+    auto t0 = std::chrono::steady_clock::now();
+    cv::Mat s = src.isContinuous() ? src : src.clone();
+    GLuint tsrc = gpu_tex_rgba8ui(s);
+    GLuint tmx = tex_r32f(mx.cols, mx.rows, mx.ptr<float>()), tmy = tex_r32f(my.cols, my.rows, my.ptr<float>());
+    GLuint buf = bind_cubic(prog_dense_, tsrc, s.cols, s.rows);
+    auto t1 = std::chrono::steady_clock::now();
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tmx); set_i(prog_dense_, "uMx", 1);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tmy); set_i(prog_dense_, "uMy", 2);
+    bool ok = run_banded(prog_dense_, mx.cols, mx.rows, out);
+    ok = ok && glGetError() == GL_NO_ERROR;
+    times_ = {std::chrono::duration<double, std::milli>(t1 - t0).count(),
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count()};
+    glDeleteBuffers(1, &buf);
+    GLuint ts[3] = {tsrc, tmx, tmy};
     glDeleteTextures(3, ts);
     glFinish();
     release();

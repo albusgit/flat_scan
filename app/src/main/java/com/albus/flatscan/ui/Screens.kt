@@ -79,8 +79,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import com.albus.flatscan.Accel
 import com.albus.flatscan.BuildConfigInfo
 import com.albus.flatscan.FilterKind
+import com.albus.flatscan.NetEnv
+import com.albus.flatscan.QnnPacks
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
 import com.albus.flatscan.Settings
@@ -278,6 +281,7 @@ fun SettingsScreen(vm: ScanViewModel) {
     var reviewCrops by remember { mutableStateOf(s.reviewCrops) }
     var bookRtl by remember { mutableStateOf(s.bookRightToLeft) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
+    var accel by remember { mutableStateOf(s.acceleration) }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
             title = { Text("Settings", style = MaterialTheme.typography.titleLarge) },
@@ -307,6 +311,31 @@ fun SettingsScreen(vm: ScanViewModel) {
             Section("Output resolution")
             for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            Section("Acceleration")
+            for ((k, label) in Accel.CHOICES) Choice(label, accel == k) { accel = k; s.acceleration = k }
+            Text(
+                "Where the neural nets run. The CPU gives the reference results; an accelerator is used only for the nets " +
+                    "whose results match the CPU closely, and any net that fails on it runs on the CPU. " +
+                    "ONNX Runtime ${NetEnv.ortVersion}, providers in this build: ${NetEnv.providers.joinToString(", ").ifEmpty { "none" }}. " +
+                    "The NPU libraries are downloaded on first use, on Snapdragon phones only: ${QnnPacks.status}.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (accel == Accel.AUTO) {
+                val plan = vm.currentPlan()
+                Text(
+                    if (plan.note == "not benchmarked yet") "Auto has not chosen yet: the first processed page runs a one-time benchmark."
+                    else "Auto (${plan.note}): ${plan.summary()}.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { vm.runAccelBenchmark() }, enabled = !vm.selfTestRunning) { Text("Run the acceleration benchmark") }
+            if (vm.batchStatus.isNotEmpty()) {
+                Section("Batch mode (debug)")
+                if (vm.batchRunning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
+            }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("About")
             Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(4.dp))
@@ -314,7 +343,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Self-test and benchmark")
             Text(
-                "Processes a bundled test page 6 times and checks the result against the reference implementation. Takes about a minute.",
+                "Processes a bundled test page 6 times and checks the result against the reference implementation, then times the neural nets on it 6 times. Takes a few minutes.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(8.dp))

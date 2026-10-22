@@ -1,7 +1,23 @@
 // The app's photo pipeline (core/src/pipeline.cpp, CPU paths) on one photo, for the round-4
 // checks: crash fixes, quality gate, orientation, page finder. Driven by tools/round4_check.py.
-//   pipeline_cli PHOTO OUT.jpg [LOGITS.npz]
+//   pipeline_cli [--backend B] PHOTO OUT.jpg [LOGITS.npz | net]
+// The nets run in-process through core/src/infer.cpp (ONNX Runtime) on the repo's models
+// (FS_MODELS=DIR overrides app/src/main/assets/models): LOGITS "net" = the page finder;
+// FS_NETS=1 (both) | uv | hr = the flattening nets as the app runs them (core/src/nets.cpp: a first
+// UVDoc pass on the whole photo unless FS_FRAME_CORNERS, then the nets on its re-crop);
+// FS_NET_DUMP=PREFIX writes their outputs (PREFIX_logits.npz, _p1.npz, _rc0.npz, _rc2.npz, as the
+// Python caches). --backend / FS_BACKEND=cpu,dml,...: the backends to try in order (CPU is always
+// last); FS_ORT_THREADS=n: intra-op threads (default: ORT's); FS_ORT_CACHE=DIR: compiled-model
+// cache. The JSON then has "nets" (per-net backend and times) and "pipeline_ms".
+// FS_NETS runs the flattening nets inside run_photo (PipelineOptions::flat_nets), beside its CPU
+// stages; FS_SEQUENTIAL=1: after the detection, nothing speculative (Gate D: the same outputs).
+// FS_NET_DELAY_MS=n: the nets take n ms longer without CPU load (an accelerator's time). "nets" then
+// has "overlap" (mode, what was reused, the nets' and the wait's ms), and "pipeline_ms" includes them.
 // FS_IGNORE="x0,y0,x1,y1;..." (output-page fractions): areas whose lines the warp map ignores;
+// FS_GPU=1 (a build with FS_DESKTOP_GPU): the GPU image stages on (PipelineOptions::use_gpu; the
+// GPU stage policy's defaults, FS_GPU_DENSE=1 adds the dense stage); the JSON then has "gpu".
+// FS_RULE_NET=1 | MODEL.onnx: the rule net in the line stage, in-process as the other nets (JSON "nets" has "rulenet");
+// FS_RULE_NET_PY=1 with it: through tools/shadow_net/run_onnx.py and FS_PYTHON instead (Round 10's way).
 // FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
 // Prints one JSON line: the crop-screen assessment of every page (assess_pages) and the
 // processing result of page 0 (run_photo) without user edits; OUT.jpg = the page (or "-").
@@ -10,15 +26,24 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <iterator>
+#include <memory>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "npz.h"
 #include "cleanup.h"
+#include "nets.h"
 #include "pipeline.h"
+#ifdef FS_DESKTOP_GPU
+#include "gpu.h"
+#include "resample.h"
+#endif
 
 using namespace fs;
 
@@ -35,6 +60,15 @@ static std::string strs(const std::vector<std::string>& v) {
     return o + "]";
 }
 
+static std::vector<uint8_t> read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+using Clock = std::chrono::steady_clock;
+static double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
 // a command line for std::system: cmd /c on Windows needs the whole line quoted once more
 static std::string shell_line(const std::string& py, const std::string& script, const std::vector<std::string>& args) {
     std::string c = "\"" + py + "\" -I \"" + script + "\"";
@@ -47,7 +81,43 @@ static std::string shell_line(const std::string& py, const std::string& script, 
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: pipeline_cli PHOTO OUT.jpg [LOGITS.npz]\n"); return 2; }
+    // --backend B (anywhere): the inference backends, as FS_BACKEND
+    std::string backend_arg = std::getenv("FS_BACKEND") ? std::getenv("FS_BACKEND") : "cpu";
+    {
+        int k = 1;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--backend" && i + 1 < argc) backend_arg = argv[++i];
+            else argv[k++] = argv[i];
+        }
+        argc = k;
+    }
+    if (argc < 3) { std::fprintf(stderr, "usage: pipeline_cli [--backend B] PHOTO OUT.jpg [LOGITS.npz | net]\n"); return 2; }
+    // in-process inference, created on first use
+    std::unique_ptr<Inference> inf_store;
+    const std::string models = std::getenv("FS_MODELS") ? std::getenv("FS_MODELS") : std::string(FS_REPO_DIR) + "/app/src/main/assets/models";
+    const char* shade_model = std::getenv("FS_SHADE_NET");
+    // FS_RULE_NET: "1" the repo's rulenet.onnx, else a model file
+    const char* rule_model = std::getenv("FS_RULE_NET");
+    const std::string rule_file = rule_model && std::string(rule_model) != "1" ? rule_model : "";
+    auto inference = [&]() -> Inference& {
+        if (!inf_store) {
+            InferConfig cfg;
+            if (!parse_backends(backend_arg, cfg.preference)) std::fprintf(stderr, "unknown backend in \"%s\"; using cpu\n", backend_arg.c_str());
+            // FS_SHADE_NET=MODEL.onnx is the CPU ShadeNet model
+            std::string shade = shade_model ? shade_model : "";
+            cfg.load = [models, shade, rule_file](const std::string& file) {
+                if (file == "rulenet.onnx" && !rule_file.empty()) return read_file(rule_file);
+                return read_file(file == "shadenet.onnx" && !shade.empty() ? shade : models + "/" + file);
+            };
+            if (const char* t = std::getenv("FS_ORT_THREADS")) cfg.threads = std::atoi(t);
+            if (const char* c = std::getenv("FS_ORT_CACHE")) cfg.cache_dir = c;
+            inf_store = Inference::create(cfg);
+        }
+        return *inf_store;
+    };
+    std::ostringstream net_json;   // "nets" timings
+    auto net_sep = [&]() { return net_json.tellp() > 0 ? ", " : ""; };
+    const char* dump = std::getenv("FS_NET_DUMP");
     cv::Mat img = cv::imread(argv[1], cv::IMREAD_COLOR);
     if (img.empty()) { std::fprintf(stderr, "cannot read %s\n", argv[1]); return 1; }
     // FS_RENDER_ONLY=1: PHOTO is an already flattened page; write its Auto color 0.7 render to OUT.jpg
@@ -61,7 +131,14 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<float> lg;
-    if (argc > 3) {
+    if (argc > 3 && std::string(argv[3]) == "net") {
+        auto t0 = Clock::now();
+        Inference& inf = inference();
+        bool ok = page_finder_logits(img, inf, lg);
+        net_json << "\"page_finder\": {\"ok\": " << (ok ? "true" : "false") << ", \"backend\": \"" << backend_name(inf.backend(NetId::PageFinder))
+                 << "\", \"ms\": " << num(inf.last_ms(NetId::PageFinder)) << ", \"total_ms\": " << num(ms_since(t0)) << "}";
+        if (ok && dump) write_npz(std::string(dump) + "_logits.npz", {{"logits", NpyArray::f32({2, (size_t)SEG_SIZE, (size_t)SEG_SIZE}, lg.data())}});
+    } else if (argc > 3) {
         Npz z = read_npz(argv[3]);
         const NpyArray& a = z.at("logits");
         lg.assign(a.as<float>(), a.as<float>() + a.count());
@@ -85,6 +162,15 @@ int main(int argc, char** argv) {
     }
     PipelineOptions o;
     o.use_gpu = false;
+#ifdef FS_DESKTOP_GPU
+    const bool gpu_on = std::getenv("FS_GPU") != nullptr;
+    if (gpu_on) {
+        o.use_gpu = true;
+        GpuStagePolicy gp = gpu_stage_policy();
+        if (std::getenv("FS_GPU_DENSE")) gp.dense = true;
+        set_gpu_stage_policy(gp);
+    }
+#endif
     o.seg_logits = logits;
     o.perspective_only = std::getenv("FS_PERSPECTIVE_ONLY") != nullptr;
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
@@ -112,71 +198,55 @@ int main(int argc, char** argv) {
     if (const char* ma = std::getenv("FS_UV_MIN_AGREE")) o.uv_min_agreement = o.uv_min_agreement_quad = std::atof(ma);
     // FS_UV_PREFER=x: the text-row spread margin (deg) by which the second net must beat the first
     if (const char* pm = std::getenv("FS_UV_PREFER")) o.uv_prefer_margin = std::atof(pm);
-    // FS_ZOOM=1: the zoomed second flattening pass (uv_zoom), the repo's ONNX models run by
-    // tools/shadow_net/run_onnx.py with FS_PYTHON
+    // FS_ZOOM=1: the zoomed second flattening pass (uv_zoom), the repo's ONNX models in-process
     if (std::getenv("FS_ZOOM")) {
-        std::string py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
-        std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
-        std::string repo = FS_REPO_DIR;
         o.zoom_pass = true;
-        o.uv_net = [=](int model, std::vector<float>& io) {
-            const UvSpec& sp = uv_spec(model);
-            std::string fin = base + ".zin.f32", fout = base + ".zout.f32";
-            std::string onnx = repo + (model == 1 ? "/app/src/main/assets/models/syntheticdoc.onnx" : "/app/src/main/assets/models/uvdoc.onnx");
-            { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
-            std::string cmd = shell_line(py, repo + "/tools/shadow_net/run_onnx.py", {onnx, fin, fout, std::to_string(sp.in_w), std::to_string(sp.in_h)});
-            if (std::system(cmd.c_str()) != 0) return false;
-            io.assign((size_t)sp.output_len(), 0.f);
-            std::ifstream f(fout, std::ios::binary);
-            f.read((char*)io.data(), io.size() * 4);
-            bool ok = (size_t)f.gcount() == io.size() * 4;
-            std::remove(fin.c_str()); std::remove(fout.c_str());
-            return ok;
-        };
+        o.uv_net = uv_net_fn(inference());
         if (const char* zw = std::getenv("FS_ZOOM_WORSE")) o.zoom_max_worse = std::atof(zw);
         if (const char* zm = std::getenv("FS_ZOOM_MODEL")) o.zoom_model = std::atoi(zm);
         if (const char* zs = std::getenv("FS_ZOOM_SPLIT")) { o.zoom_nu = zs[0] - '0'; o.zoom_nv = zs[1] - '0'; }   // e.g. 22, 12
     } else {
         o.zoom_pass = false;
     }
-    // FS_SHADE_NET=MODEL.onnx: the shadow net, run by tools/shadow_net/run_onnx.py with FS_PYTHON
-    // (raw float32 files next to OUT); FS_SHADE_AFTER: after SyntheticDoc's map; FS_SHADE_LS: long side
-    if (const char* sm = std::getenv("FS_SHADE_NET")) {
-        std::string model = sm, py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
-        std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
-        std::string fin = base + ".shin.f32", fout = base + ".shout.f32";
-        std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
-        o.shade_net = [=](std::vector<float>& io, int w, int h) {
-            { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
-            std::string cmd = shell_line(py, script, {model, fin, fout, std::to_string(w), std::to_string(h)});
-            if (std::system(cmd.c_str()) != 0) return false;
-            std::ifstream f(fout, std::ios::binary);
-            f.read((char*)io.data(), io.size() * 4);
-            bool ok = (size_t)f.gcount() == io.size() * 4;
-            std::remove(fin.c_str()); std::remove(fout.c_str());
-            return ok;
-        };
+    // FS_SHADE_NET=MODEL.onnx: the shadow net, in-process; FS_SHADE_AFTER: after SyntheticDoc's map;
+    // FS_SHADE_LS: long side
+    double shade_ms = 0;
+    if (shade_model) {
+        o.shade_net = shade_net_fn(inference(), &shade_ms);
         o.shade_after_uv = std::getenv("FS_SHADE_AFTER") != nullptr;
         if (const char* ls = std::getenv("FS_SHADE_LS")) o.shade_long_side = std::atoi(ls);
     }
-    // FS_RULE_NET=MODEL.onnx: the rule net, run by tools/shadow_net/run_onnx.py with FS_PYTHON (raw
-    // float32 files next to OUT; the model outputs 2 x h x w probabilities)
-    if (const char* rm = std::getenv("FS_RULE_NET")) {
-        std::string model = rm, py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
-        std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
-        std::string fin = base + ".rnin.f32", fout = base + ".rnout.f32";
-        std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
-        o.rule_net = [=](std::vector<float>& io, int w, int h) {
-            { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
-            std::string cmd = shell_line(py, script, {model, fin, fout, std::to_string(w), std::to_string(h)});
-            if (std::system(cmd.c_str()) != 0) return false;
-            io.assign((size_t)2 * w * h, 0.f);
-            std::ifstream f(fout, std::ios::binary);
-            f.read((char*)io.data(), io.size() * 4);
-            bool ok = (size_t)f.gcount() == io.size() * 4;
-            std::remove(fin.c_str()); std::remove(fout.c_str());
-            return ok;
-        };
+    // FS_RULE_NET=1 | MODEL.onnx: the rule net (PipelineOptions::rule_net), in-process (nets.cpp
+    // rule_net_fn; MODEL.onnx replaces the repo's rulenet.onnx). FS_RULE_NET_PY=1: run by
+    // tools/shadow_net/run_onnx.py with FS_PYTHON instead, as Round 10 did (raw float32 files next to
+    // OUT), to compare the two runtimes.
+    double rule_ms = 0;
+    int rule_calls = 0;
+    if (rule_model) {
+        if (std::getenv("FS_RULE_NET_PY")) {
+            std::string model = rule_file.empty() ? models + "/rulenet.onnx" : rule_file;
+            std::string py = std::getenv("FS_PYTHON") ? std::getenv("FS_PYTHON") : "python";
+            std::string base = std::string(argv[2]) == "-" ? std::string(argv[1]) : std::string(argv[2]);
+            std::string fin = base + ".rnin.f32", fout = base + ".rnout.f32";
+            std::string script = std::string(FS_REPO_DIR) + "/tools/shadow_net/run_onnx.py";
+            o.rule_net = [=](std::vector<float>& io, int w, int h) {
+                { std::ofstream f(fin, std::ios::binary); f.write((const char*)io.data(), io.size() * 4); }
+                std::string cmd = shell_line(py, script, {model, fin, fout, std::to_string(w), std::to_string(h)});
+                if (std::system(cmd.c_str()) != 0) return false;
+                io.assign((size_t)2 * w * h, 0.f);
+                std::ifstream f(fout, std::ios::binary);
+                f.read((char*)io.data(), io.size() * 4);
+                bool ok = (size_t)f.gcount() == io.size() * 4;
+                std::remove(fin.c_str()); std::remove(fout.c_str());
+                return ok;
+            };
+        } else {
+            RuleNetFn net = rule_net_fn(inference(), &rule_ms);
+            o.rule_net = [net, &rule_calls](std::vector<float>& io, int w, int h) {
+                ++rule_calls;
+                return net(io, w, h);
+            };
+        }
     }
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
@@ -192,7 +262,28 @@ int main(int argc, char** argv) {
     // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
     // net input for the detected corners and exits; FS_UVOUT=Y.npz ("out": 2 x 45 x 31) uses it
     std::vector<float> uv, uv_sh, uv2, p1_store;
-    if (std::getenv("FS_UVIN") || std::getenv("FS_UVOUT")) {
+    NetsResult nets;
+    const char* flat_nets = std::getenv("FS_NETS");
+    if (flat_nets) {
+        // the flattening nets in-process, as the app runs them (nets.cpp), inside run_photo: their
+        // corners are its detection (the same call detect_corners made here before)
+        NetsRequest rq;
+        rq.corners_edited = frame_corners;
+        rq.perspective_only = o.perspective_only;
+        rq.nets = std::string(flat_nets) == "uv" ? FlatNets::UVDocOnly : std::string(flat_nets) == "hr" ? FlatNets::SynthDocOnly : FlatNets::Both;
+        rq.seg_logits = logits;
+        FlatNetsFn fn = flat_nets_fn(img, rq, inference(), &nets);
+        if (const char* d = std::getenv("FS_NET_DELAY_MS")) {
+            const int delay = std::atoi(d);
+            fn = [fn, delay](const NetCornersFn& c) {
+                FlatNetGrids g = fn(c);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                return g;
+            };
+        }
+        o.flat_nets = fn;
+        o.overlap_nets = std::getenv("FS_SEQUENTIAL") == nullptr;
+    } else if (std::getenv("FS_UVIN") || std::getenv("FS_UVOUT")) {
         PageCorners pc;
         if (frame_corners) pc.ok = true, pc.pts = o.corners;
         else pc = detect_corners(img, o.max_analysis_side, logits, 0);
@@ -255,12 +346,46 @@ int main(int argc, char** argv) {
         }
     }
     PipelineResult r;
+    auto t_run = Clock::now();
     try {
         // FS_SCAN=1: the warp map on the image itself (run_scan), e.g. on an already flattened page
         r = std::getenv("FS_SCAN") ? run_scan(img, o) : run_photo(img, o);
     } catch (const std::exception& e) {
         r.ok = false;
         r.error = std::string("exception: ") + e.what();
+    }
+    const double run_ms = ms_since(t_run);
+    if (flat_nets) {
+        // no page: no nets and this short line, as before the nets moved into run_photo
+        if (!r.ok && r.error == "no page found" && !frame_corners) { std::printf("%s, \"ok\": false, \"error\": \"no page found\"}\n", f.str().c_str()); return 0; }
+        for (const NetRun& n : nets.runs)
+            net_json << net_sep() << "\"" << n.name << "\": {\"ok\": " << (n.ok ? "true" : "false") << ", \"backend\": \"" << backend_name(n.backend)
+                     << "\", \"ms\": " << num(n.ms) << ", \"total_ms\": " << num(n.total_ms) << "}";
+        net_json << net_sep() << "\"overlap\": {\"mode\": \"" << (r.nets_overlap == 1 ? "overlap" : r.nets_overlap == 0 ? "sequential" : "none")
+                 << "\", \"orient_page_reused\": " << (r.orient_page_reused ? "true" : "false") << ", \"orient_reused\": " << (r.orient_reused ? "true" : "false")
+                 << ", \"nets_ms\": " << num(r.nets_ms) << ", \"wait_ms\": " << num(r.nets_wait_ms) << ", \"join_ms\": " << num(r.nets_join_ms) << ", \"stages\": [";
+        for (size_t i = 0; i < r.ms.size(); ++i) net_json << (i ? ", " : "") << "[\"" << r.ms[i].first << "\", " << num(r.ms[i].second) << "]";
+        net_json << "]}";
+        if (dump) {
+            auto put = [&](const char* tag, const std::vector<float>& g, const UvCrop& c) {
+                if (g.empty()) return;
+                const UvSpec& sp = uv_spec(c.model);
+                write_npz(std::string(dump) + tag, {{"out", NpyArray::f32({2, (size_t)sp.gh, (size_t)sp.gw}, g.data())}});
+            };
+            put("_p1.npz", nets.grid_pass1, nets.crop_pass1);
+            put(nets.crop1.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid1, nets.crop1);
+            put(nets.crop2.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid2, nets.crop2);
+        }
+    }
+    if (o.shade_net) {
+        Inference& inf = inference();
+        net_json << net_sep() << "\"shadenet\": {\"ok\": " << (r.shade_net ? "true" : "false") << ", \"backend\": \""
+                 << backend_name(inf.backend(NetId::ShadeNet)) << "\", \"ms\": " << num(shade_ms) << "}";
+    }
+    if (o.rule_net && rule_calls > 0) {
+        Inference& inf = inference();
+        net_json << net_sep() << "\"rulenet\": {\"ok\": " << (r.rule_net ? "true" : "false") << ", \"backend\": \""
+                 << backend_name(inf.backend(NetId::RuleNet)) << "\", \"ms\": " << num(rule_ms) << ", \"calls\": " << rule_calls << "}";
     }
     f << ", \"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << r.error << "\", \"mode\": \""
       << geom_mode_name(r.mode) << "\", \"fit_median_full_px\": "
@@ -312,6 +437,28 @@ int main(int argc, char** argv) {
             f << ", \"det_p99\": " << num(dets[(size_t)(0.99 * (dets.size() - 1))]) << ", \"det_frac20\": " << num((double)n20 / dets.size());
         }
         f << "}";
+    }
+#ifdef FS_DESKTOP_GPU
+    if (gpu_on) {
+        std::string s = f.str();
+        s.pop_back();
+        f.str(s);
+        f.seekp(0, std::ios_base::end);
+        const bool av = Gpu::instance().available();
+        std::string info = Gpu::instance().info();
+        for (char& c : info)
+            if (c == '"' || c == '\\') c = '\'';
+        f << ", \"gpu\": {\"available\": " << (av ? "true" : "false") << ", \"info\": \"" << info << "\", \"resample\": "
+          << (r.gpu_resample ? "true" : "false") << "}}";
+    }
+#endif
+    if (inf_store) {
+        // in-process nets: their timings, and run_photo's own time (which includes ShadeNet)
+        std::string s = f.str();
+        s.pop_back();
+        f.str(s);
+        f.seekp(0, std::ios_base::end);
+        f << ", \"nets\": {" << net_json.str() << "}, \"pipeline_ms\": " << num(run_ms) << "}";
     }
     std::printf("%s\n", f.str().c_str());
     // FS_DUMP=PREFIX: the stage-1 page (PREFIX_stage1.png) and the line tracer's segments on it
