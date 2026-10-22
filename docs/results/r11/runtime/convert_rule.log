@@ -1,0 +1,12 @@
+tensorflow 2.19.1, onnx2tf 1.28.8, onnx 1.17.0
+rule net C:\Users\User\Desktop\fs_r11_runtime\app\src\main\assets\models\rulenet.onnx: static 512 x 352 529436 bytes; fp16 constants 45 (253744 values), fp32 constants 7 (82 values), 0 BatchNorm-folded filters unfolded, 0 PRelu slope(s) per channel, 1 broadcast Mul(s) -> nearest resize
+  in page [1, 512, 352, 3] float32, out rules [1, 512, 352, 2] float32
+  ops DEQUANTIZE 45, CONV_2D 23, PAD 4, DEPTHWISE_CONV_2D 4, CONCATENATION 7, ADD 2, MEAN 1, RESIZE_NEAREST_NEIGHBOR 1, RESIZE_BILINEAR 4, LOGISTIC 1
+  GPU op check: not run (CPU only)
+  analyzer (gpu_compatibility=True): Your model looks compatible with GPU delegate on TFLite runtime version 2.19.1. / This does not guarantee that your model will work well with GPU delegate because there could still be runtime incompatibililties.
+  metadata min_runtime_version, CONVERSION_METADATA
+rulenet.tflite: 531552 bytes; 5 resize sizes from 5 SHAPE -> STRIDED_SLICE pairs, input / output signature [1, -1, -1, C]
+  in page signature [1, -1, -1, 3]; runs at 32x32, 64x96, 96x1440, 352x512, 512x352, 800x1152, 1024x1024, 1152x800, 1440x1024; 512 x 352 bit for bit rulenet_512x352.tflite
+  ops DEQUANTIZE 45, CONV_2D 23, PAD 4, DEPTHWISE_CONV_2D 4, CONCATENATION 7, ADD 2, MEAN 1, SHAPE 5, STRIDED_SLICE 5, RESIZE_NEAREST_NEIGHBOR 1, RESIZE_BILINEAR 4, LOGISTIC 1
+  GPU op check (information only: CPU only): 34 problems, e.g. op 52 DEPTHWISE_CONV_2D: op not taken by the GPU delegate (or not checked here)
+done
