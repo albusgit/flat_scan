@@ -299,6 +299,161 @@ form's header), that round 7 turned sideways (the dollar bill), and on the DocUN
 4.0 deg, but LD 41.9 -> 5.5: UVDoc's straight rows sat on a folded page). App: one extra UVDoc pass
 (0.1 s on the desktop CPU).
 
+## Round 9: table edges and curled corners no longer skipped
+
+On a two-page Hebrew form, the Lines tab showed table edges cut short: the right border and the
+Transaction column's edge stopped above the last rows, and the rows of a curled top corner were not
+used. The page stayed bent there. The ink of those lines had been found. Rules later in the line
+stage dropped it (`warpmap.cpp`, app path, neural pages only):
+
+- **Text rows passed as box sides.** The one-end short pass (round 6) took any ≥ 45 px horizontal
+  ink touching a rule at one end. Right-aligned text rows end at their column's rule, so 55 rows on
+  page 1 counted as rules. Their traces tore the page beside the rule, and the distortion guard then
+  dropped the whole app refinement (p99 0.25 > 0.2). The fallback, the reference lines alone, cuts
+  every rule at the outermost rule found crossing it (`clip`, `trace_bounds`). A one-end segment must
+  now be continuous ink (`ink_cover` ≥ 0.9 on the darkness map: rules ≥ 0.99, these rows ≤ 0.89).
+  Page 1 keeps the app refinement (p99 0.052).
+- **Traces continue past the cut** (`extend_trace`). From each end of an accepted trace, the rule's
+  ink is followed 1 px at a step: within 2 px of the line through the last 30 hits, as wide as the
+  rule, at most 6 missed steps in a row, ≤ 40 px off its ideal, and stopping where it turns > ~11°
+  (rounded corners). An extension is kept if it runs ≥ 30 px with hits on ≥ 70 % of it, and it gets
+  the line's ideal. It also follows rows into a curled corner whose border was not found.
+- **Bump guard:** a curled corner's rows fan together (spacing halves), so straightening them
+  stretches the page there by up to 2x. `soften_bumps` faded that out and left kinks. A band between
+  two neighbouring rules that were both extended through it (widened by their spacing and 16 px
+  along) is now neither flagged nor faded (`extension_support`).
+- **Lines tab:** ruled lines are drawn over the stretch their traces covered, extensions included.
+  Lines that gave no samples are not drawn. Before, every detected segment was drawn at its
+  detected length, including curves that were left out.
+
+Measured on the form's two pages and a third table page (desktop build; `p95` distance of each long
+rule from its straight fit on the finished page):
+
+| page | before: median / p90 (px) | after |
+|---|---|---|
+| form page 1 | 0.64 / 1.23 | 0.10 / 0.94 |
+| form page 2 (curled corner) | 0.72 / 1.47 | 0.70 / 1.53; corner rows straight (visual check) |
+| third page | 0.84 / 3.26 | 0.82 / 1.69 |
+
+The 35 photos and DocUNet were not re-run (not in this checkout). A ~20 px hook is left at the
+very tip of the curled corner, past the border, where no rule reaches. `pipeline_cli` prints
+`"extended"` (line ends continued, per pass).
+
+## Round 10: rule net, line-stage guards that judge straightness, curled corners
+
+### End-to-end test of the line stage (`tools/rule_net/e2e_eval.py`)
+
+Only 3 real photos of forms were at hand, so the line stage now has a synthetic end-to-end test as
+well. 40 stage-1-sized pages (1600 x 2263) are drawn with known rules by `tools/rule_net/synth.py`:
+forms, tables and text, pictures, stamps, curves, dashed lines and page edges. Each page gets the
+warps the nets leave behind (a smooth field, a curled corner, a fold, a small turn) plus shading,
+blur, noise and JPEG. The pages go through the app's line stage for flattened pages (`pipeline_cli`,
+`FS_SCAN=1 FS_SCAN_FLAT=1`), and the known rule masks go through the map it returns. A rule's
+deviation is the p95 distance of its centre line from its straight fit.
+
+| 40 synthetic pages | rules > 2 px off | p90 deviation (px) | line stage rejected | better / worse than round 9 (pages) |
+|---|---|---|---|---|
+| input (no line stage) | 33.4 % | 7.08 | - | - |
+| round 9 (`run_scan` path, no fallbacks) | 24.4 % | 7.02 | 18 | - |
+| round 10, rule net off | 14.1 % | 3.45 | 9 | 16 / 3 |
+| **round 10, rule net on (default)** | **9.0 %** | **1.83** | 11 | **20 / 1** |
+
+The net was trained on the same generator (other seeds), so the last row flatters it. On the
+user's three photos, page 1 is unchanged and the curled corner of page 2 is straight now (below).
+Page 3 is unchanged to the eye.
+
+### Line stage (`warpmap.cpp`, `pipeline.cpp`), app path
+
+- **Guards judge straightness** (`neural_line_stage`, shared by photos and flattened scans). There
+  are three candidates, tried in turn:
+  1. the line stage as before;
+  2. the same lines without every line that passes through an overstretched spot. Lines are left
+     out whole, because dropping only their samples there straightened a rule on one side of a spot
+     and not on the other;
+  3. the reference lines alone.
+
+  Each candidate must pass the distortion guard, and must also leave the rules traced by the first
+  attempt straighter than the page as it is, by 0.1 px on average (`straightness_through`: trace
+  points mapped back by inverting the 4-px map). Otherwise the page stays as the nets left it.
+- **Second pass** (`second_line_pass`): the line stage runs again on its own output and its map is
+  composed with the first. It is kept only if it passes the guard, straightens the rules it traced
+  by more than 0.1 px, and leaves the first pass's rules no less straight. The idea comes from
+  Marior and ArbDR (run again on your own output, stop on a score).
+- **Wavy rules found as pieces:**
+  - an extension stops where it meets another found piece of the same rule;
+  - `share_ideals` gives one height to pieces whose traces run on the same ink (median gap ≤ 2 px
+    over ≥ 16 px).
+
+  Before, two heights for one place tore the page.
+- **Curled corners:**
+  - `corner_junctions` pins a rule's end to the corner it meets, where the junction bridge is
+    missing because the other rule's found segment stops short of its trace;
+  - found lines within 15 px of the page border are dropped as the paper's edge (one folded the
+    correction over itself);
+  - the margin the line stage pulls in from beyond the stage-1 page is filled with paper instead
+    of repeated edge pixels;
+  - the bump guard leaves alone the band between two neighbouring rules whose traces both bend the
+    same way by more than 4 px.
+- **Lines of one direction alone are straightened.** The reference skipped the line stage unless
+  both directions had lines.
+
+### Rule net (`tools/rule_net`, `assets/models/rulenet.onnx`)
+
+A 0.25 M-parameter U-Net (517 KB, fp16 weights). It marks horizontal and vertical printed rules on
+the stage-1 page at half size. Its design:
+- a light full-resolution stem;
+- an encoder to 1/16 with dilated context and the global mean;
+- 1x15 / 15x1 depthwise "line" blocks.
+
+It was trained here on CPU on 8000 synthetic pages (`synth.py`, `gen_pool.py`, `train.py`): 3000
+iterations, then 700 at a low learning rate. Validation F1 on rule pixels is 0.935 horizontal and
+0.902 vertical. It runs in about 0.4 s at 800 x 1152 on two desktop cores; not measured on a phone.
+
+What the line stage does with it (`net_lines`):
+- **Drops** found lines and global-stage grid lines that are not marked over at least half their
+  length. On the user's sideways pages, 43 and 58 found "lines" were letter strokes.
+- **Adds** rules that only the net found, if their ink is at least as dark as a faint printed rule
+  (darkness ≥ 25). On the user's page 1 the net also marks rules on the back of the sheet and on a
+  sheet behind it, at darkness 7 - 17. Tracing those bent the page (median rule deviation
+  0.10 -> 0.59 px).
+- **Joins** pieces of one wavy rule into one line.
+- **Keeps** a bowed trace that lies on a marked rule: a warped rule, not a printed curve.
+
+Extensions are not gated by the net. It marks a curled corner's rules less far into the corner
+than the ink runs. Settings > *Table rules (neural net)* turns it off; processing details show its
+counts.
+
+**In the core since the Round 11 merge.** Round 10 ran the net through ONNX Runtime's Java API
+(`RuleNet.kt`, called back from the core over JNI). After the merge with the in-core nets (see
+*Acceleration*) it runs like the other nets: `NetId::RuleNet` in `core/src/infer.cpp` (model
+`models/rulenet.onnx`), `rule_net_fn` in `core/src/nets.cpp`, and its own net group in
+`jni_bridge.cpp`, on the CPU only. It has no fixed-shape model, so it never runs on QNN or NNAPI, and
+it is not in Settings > Acceleration. `RuleNet.kt` and the JNI callback are gone. `NativeLib.process`
+and the debug batch mode take a `rules` switch (batch: `--ez rules false`), and the processing
+details' `accel` nets have a `rulenet` entry. On the desktop, `pipeline_cli FS_RULE_NET=1` (or
+`=MODEL.onnx`) runs it in-process; `FS_RULE_NET_PY=1` keeps Round 10's Python subprocess for
+comparisons. Checked on the desktop (CPU, cached net outputs, `docs/results/r11/merge.md`): with the rule
+net on, the 34 round-4 photos and 25 DocUNet pages (1_1..10_2 and the pages Round 10 changed most) give
+the same pages and JSON as Round 10's own build. With it off, the 25 DocUNet pages match Round 10's
+rule-net-off run. On the x86_64 emulator, the debug batch mode runs it (`rule_net` true, its counts).
+
+### Literature
+
+No published method was found that is a classical straightening stage on top of neural
+flattening. The closest is RDGR (Jiang et al., CVPR 2022): a grid least-squares solve driven by
+line constraints. The ideas used here, and those left for later:
+- **Used:** iterate with a score-based stop (Marior, ACM MM 2022; ArbDR, TMM 2026); one height per
+  rule from its pieces (line-preserving mesh warps, e.g. He et al., SIGGRAPH 2013); allow stretch
+  where the evidence supports it (a curl seen on neighbouring rules).
+- **Left for later:** solving each rule's height jointly with the field (RDGR); a row-spacing
+  prior; robust (L1) smoothing at creases; fine-tuning the flattening net itself with an
+  axis-aligned straightness loss (AADD, AAAI 2026), which needs a GPU.
+
+### Not verified
+
+The new code has not run on a phone. Only 3 real photos were tested: real form photos (30 - 50)
+would be the better test set, and could be used to tune the net.
+
 ## Acceleration: nets on the NPU / GPU, CPU stages beside the nets, more image stages on the GPU
 
 The nets now run inside the C++ core (`core/src/infer.*`, `core/src/nets.*`) on ONNX Runtime **1.22.0**
@@ -318,6 +473,8 @@ a phone yet**: every phone number is a HUMAN GATE (STATUS.md).
 | Desktop (`tools/desktop_check`) | CPU, DirectML, CUDA | all five | `--backend` / `FS_BACKEND`. CUDA runs **without TF32** (`use_tf32=0`): with ORT's default TF32, SyntheticDoc-HR's grid moved by p99 0.50 px on the RTX 5060. TensorRT, OpenVINO, CoreML and QNN (Snapdragon X) are compiled in behind CMake options (`FS_ORT_<EP>`) but were not run (no hardware or package here). |
 
 - The **page finder always runs on the CPU** (34 NNAPI partitions; HardSigmoid is unsupported).
+- The **rule net** (Round 10, merged later) runs in the core too, in its own net group, **on the CPU only**.
+  It has no fixed-shape model, and it is not in Settings > Acceleration or in Auto's benchmark.
 - Accelerators get **fixed-shape models** (`tools/accel/prepare_models.py`, `tools/shadow_net/export.py --static`):
   `uvdoc_static.onnx`, `syntheticdoc_hr_static.onnx` (unused `shading` output removed) and
   `shadenet_512x352.onnx` (the A4 page always gives the shadow net 512 x 352). NNAPI coverage: 1 partition /

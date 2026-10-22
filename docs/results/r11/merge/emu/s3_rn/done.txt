@@ -1,0 +1,1 @@
+Batch s3 done: 3 processed, 0 already there, 3 ok, 111 s; page finder cpu, UVDoc cpu, SyntheticDoc high-res cpu, shadow net cpu -> /storage/emulated/0/Android/data/com.albus.flatscan/files/batch_out/s3_rn
