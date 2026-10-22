@@ -3,11 +3,7 @@ package com.albus.flatscan.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -268,10 +264,10 @@ fun ProcessingScreen(vm: ScanViewModel) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         if (photo != null) {
-            // the photo being flattened, with a scan line sweeping over it (drawn only: no work for the core)
+            // the photo being flattened, a scan line down to the progress: it moves only when the core
+            // reports a step (no endless animation competing with processing on slow phones)
             val img = remember(photo) { photo.asImageBitmap() }
-            val sweep = rememberInfiniteTransition(label = "scan")
-            val y by sweep.animateFloat(0f, 1f, infiniteRepeatable(tween(1600), RepeatMode.Reverse), label = "scan line")
+            val y = shown
             val accent = MaterialTheme.colorScheme.primary
             Box(
                 Modifier.heightIn(max = 300.dp).aspectRatio(photo.width.toFloat() / photo.height.coerceAtLeast(1))
