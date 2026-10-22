@@ -18,10 +18,10 @@ Real photos without geometric GT (filters, monitor scanning, visual review):
 | set | count | what | licence |
 |---|---|---|---|
 | uhdm_screens | 500 | 4K phone photos of screens (moire) + aligned clean screenshot | not stated (repo Apache-2.0) |
-| commons_screens | 395 (90 tagged `curated`: screen content fills the photo) | monitors, laptops, phones, CRTs, pixel macro shots | per file CC0/PD/CC BY/CC BY-SA |
-| commons_colour_docs | 389 (139 `curated`) | menus, forms, stamps, certificates, flyers, highlighters | per file |
+| commons_screens + commons_screens2 | 395 + 300 (90 + 52 tagged `curated`: screen content fills the photo) | monitors, laptops, phones, CRTs, e-readers, departure boards, pixel macro shots | per file CC0/PD/CC BY/CC BY-SA |
+| commons_colour_docs + commons_colour_docs2 | 389 + 450 (139 + 166 `curated`) | menus, forms, stamps, certificates, flyers, magazines, maps, sticky notes, coloured paper, postcards, banknotes | per file |
 | commons_receipts_tickets | 345 (266 `curated`) | receipts, tickets, parking tickets | per file |
-| commons_pages_lighting | 347 (83 `curated`) | open books, letters, newspapers under room light | per file |
+| commons_pages_lighting | 347 (99 `curated`) | open books, letters, newspapers under room light | per file |
 | rdd_shadow / jung_shadow | 545 / 87 | photos with shadows + shadow-free GT | not stated / research |
 | wildreceipt | 1739 | receipt photos + true words | Apache-2.0 |
 | cord | 200 | receipt photos + true words | CC BY 4.0 |
