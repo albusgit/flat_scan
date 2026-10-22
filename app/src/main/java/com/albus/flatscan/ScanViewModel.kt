@@ -256,12 +256,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     var selfTestReport by mutableStateOf("")
         private set
 
-    fun runSelfTest(runs: Int = 5) {
+    /** [report] (debug batch mode `--ez selftest true`): the report is also written there. */
+    fun runSelfTest(runs: Int = 5, report: java.io.File? = null) {
         if (selfTestRunning) return
         selfTestRunning = true
         selfTestReport = ""
         viewModelScope.launch {
-            val report = withContext(Dispatchers.Default) {
+            val text = withContext(Dispatchers.Default) {
                 val app = getApplication<Application>()
                 val ref = java.io.File(app.cacheDir, "photo1_reference_warpmap.npz")
                 app.assets.open("selftest/photo1_reference_warpmap.npz").use { i -> ref.outputStream().use { i.copyTo(it) } }
@@ -276,18 +277,19 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 }.onFailure { Log.e(TAG, "net benchmark failed", it) }
                 formatSelfTest(JSONObject(json), nets, thermalBefore, thermalMid, thermalStatus(app))
             }
-            selfTestReport = report
+            report?.let { f -> runCatching { f.parentFile?.mkdirs(); f.writeText(text) } }
+            selfTestReport = text
             selfTestRunning = false
         }
     }
 
-    /** The bundled self-test photo (assets/selftest/photo1.png, 1659 x 2212). */
+    /** The bundled self-test photo (assets/selftest/photo1.webp, 1659 x 2212: lossless WebP, the pixels of the earlier photo1.png). */
     private fun selfTestPhoto(): Bitmap {
         val opts = android.graphics.BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
             inScaled = false
         }
-        return getApplication<Application>().assets.open("selftest/photo1.png").use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
+        return getApplication<Application>().assets.open("selftest/photo1.webp").use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
     }
 
     /**
@@ -303,7 +305,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     synchronized(netsLock) {
                         val stage = { s: String -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s }; Unit }
-                        ensureQnn(Accel.AUTO, stage)
                         val stored = runAutoBenchmark(stage)
                         if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
                         formatBench(stored)
@@ -321,9 +322,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val netsLock = Any()
 
     init {
-        // QNN HTP: the skeleton libraries come from the asset packs (QnnPacks: NativeLib.loadQnn sets
-        // ADSP_LIBRARY_PATH); a -Ppacks=false build has them in the native library directory
-        runCatching { android.system.Os.setenv("ADSP_LIBRARY_PATH", app.applicationInfo.nativeLibraryDir, true) }
         // the CPU until processing asks for the setting's backends (ensureNets)
         configureNets(netPlan)
     }
@@ -334,6 +332,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) {
         val app = getApplication<Application>()
+        // the LiteRT GPU's serialised kernels (the folder kept its earlier name)
         val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
         NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, 0, staticModels)
         netPlan = plan
@@ -341,11 +340,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * The nets on the current setting's backends; with Auto and no benchmark for this SoC and app
-     * version yet, the benchmark runs first ([stage]: its progress; it takes seconds to minutes, as QNN
-     * compiles each graph on first use) and its choice is kept.
+     * version yet, the benchmark runs first ([stage]: its progress; it takes seconds to a minute, as the GPU
+     * compiles its kernels on first use; none on a phone without a GPU candidate) and its choice is kept.
      */
     private fun ensureNets(stage: (String) -> Unit): Accel.Plan = synchronized(netsLock) {
-        ensureQnn(settings.acceleration, stage)
         if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
             stage("Choosing the acceleration (once per phone and app version)")
             runAutoBenchmark(stage)
@@ -354,28 +352,17 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The NPU libraries ([QnnPacks]) before nets run on QNN: for the NPU setting, and for Auto before its
-     * benchmark (so that QNN is a candidate). A phone without a Snapdragon fetches nothing. A failed
-     * download leaves the nets on the CPU; [QnnPacks.status] says why (processing details, self-test).
+     * Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice].
+     * No candidate (no GPU on this phone): the CPU at once, without running anything.
      */
-    private fun ensureQnn(setting: String, stage: (String) -> Unit) {
-        val wants = setting == Accel.AUTO || Accel.fixed(setting)?.let { Accel.usesQnn(it) } == true
-        if (!wants || QnnPacks.loaded || !NetEnv.has("QNNExecutionProvider")) return
-        if (QnnPacks.ensure(getApplication(), stage)) {
-            // the groups are remade with the QNN libraries (NativeLib.loadQnn); an Auto benchmark made
-            // without them (no QNN candidate) runs again
-            val cand = runCatching { JSONObject(settings.autoChoice ?: "").optString("candidates") }.getOrDefault("")
-            if (setting == Accel.AUTO && "qnn" !in cand) settings.autoChoice = null
-            configureNets(netPlan)
-        }
-    }
-
-    /** Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice]. */
     private fun runAutoBenchmark(stage: (String) -> Unit): JSONObject {
         val cand = Accel.candidates()
-        val bench = JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
         val at = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.ROOT).format(java.util.Date())
+        val bench = if (cand.isEmpty()) JSONObject().put("ok", true).put("runs", 0)
+            .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu"))
+        else JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
         val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
+        if (cand.isEmpty()) stored.put("note", "no GPU on this phone: ${NetEnv.gpuWhy}")
         settings.autoChoice = stored.toString()
         Log.i(TAG, "auto acceleration $stored")
         return stored
@@ -387,12 +374,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val b = stored.optJSONObject("bench") ?: JSONObject()
         sb.append("FlatScan ${BuildConfigInfo.VERSION} acceleration benchmark (measured on this device, ${stored.optString("at")})\n")
         sb.append("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, SoC: ${stored.optString("soc")}\n")
-        sb.append("ONNX Runtime ${NetEnv.ortVersion}; providers: ${NetEnv.providers.joinToString(", ")}; candidates: ${stored.optString("candidates").ifEmpty { "none" }}\n")
+        sb.append("${NetEnv.runtime}; GPU: ${if (NetEnv.gpuAvailable) "available" else "unavailable (${NetEnv.gpuWhy})"}; candidates: ${stored.optString("candidates").ifEmpty { "none" }}\n")
         if (!b.optBoolean("ok")) sb.append("FAILED: ").append(b.optString("error")).append("\n")
         val tol = b.optJSONObject("tolerance")
         if (tol != null) sb.append("Tolerance vs CPU: grids p99 <= %.2f px, max <= %.1f px (1600 x 2263 page); shadow net p99 <= %.1f, max <= %.1f levels\n".format(
             tol.optDouble("grid_p99_px"), tol.optDouble("grid_max_px"), tol.optDouble("shade_p99_levels"), tol.optDouble("shade_max_levels")))
-        sb.append("%d timed runs after a first run (first: session creation, QNN graph compile or cached context). ms; diff vs CPU:\n".format(b.optInt("runs")))
+        sb.append("%d timed runs after a first run (first: session creation, GPU kernel compile or cached kernels). ms; diff vs CPU:\n".format(b.optInt("runs")))
         val arr = b.optJSONArray("backends")
         for (i in 0 until (arr?.length() ?: 0)) {
             val be = arr!!.getJSONObject(i)
@@ -538,7 +525,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val pageExt = ext ?: if (set == "docunet") ".png" else ".jpg"
         if (pageExt != ".jpg" && pageExt != ".png") error("ext must be .jpg or .png")
         val plan = synchronized(netsLock) {
-            ensureQnn(if (staticModels) Accel.NPU else setting) { status("Batch $set: $it") }
             val pl = Accel.fixed(setting) ?: (Accel.autoPlan(settings.autoChoice)
                 ?: run { runAutoBenchmark { status("Batch $set: $it") }; Accel.autoPlan(settings.autoChoice) } ?: Accel.fixed(Accel.CPU)!!)
             configureNets(pl, staticModels)
@@ -613,11 +599,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             sb.append("\nNeural nets: FAILED: ").append(it.message ?: it.toString()).append("\n")
             return
         }
-        sb.append("\nNeural nets: %s (acceleration %s; ONNX Runtime %s; providers in this build: %s; %d cores)\n".format(
-            n.optString("backend"), n.optJSONObject("acceleration")?.optString("setting"), n.optString("ort"), n.optString("ort_providers"), n.optInt("cores")))
+        sb.append("\nNeural nets: %s (acceleration %s; %s; GPU %s; %d cores)\n".format(
+            n.optString("backend"), n.optJSONObject("acceleration")?.optString("setting"), n.optString("runtime"), n.optString("gpu"), n.optInt("cores")))
         sb.append("photo 1, automatic corners, every net on, render width %d, %d runs after 1 warm-up (median / p95 ms;\n".format(
             n.optInt("render_width"), n.optInt("runs")))
-        sb.append("other: input and checks; warm-up other includes creating the session, QNN: compiling the graph):\n")
+        sb.append("other: input and checks; warm-up other includes creating the session, GPU: compiling its kernels):\n")
         val nj = n.optJSONObject("nets")
         for ((key, label) in NET_LABELS) {
             val o = nj?.optJSONObject(key) ?: continue
@@ -1517,7 +1503,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val ac = a.optJSONObject("acceleration")
             sb.append("\n\nAcceleration: %s%s".format(Accel.CHOICES.firstOrNull { it.first == ac?.optString("setting") }?.second?.substringBefore(':') ?: "?",
                 ac?.optString("note")?.takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""))
-            sb.append("\nNets (ONNX Runtime %s), run / other ms, backend:".format(a.optString("ort")))
+            sb.append("\nNets (%s), run / other ms, backend:".format(a.optString("runtime")))
             val n = a.optJSONObject("nets")
             for ((k, label) in NET_LABELS) n?.optJSONObject(k)?.let { t ->
                 sb.append("\n%s: %.0f / %.0f ms, %s".format(label, t.optDouble("run_ms"), t.optDouble("input_ms"), t.optString("backend")))

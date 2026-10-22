@@ -1,0 +1,166 @@
+LiteRT GPU models (stream MODELS, contract C2): conversion, GPU op check, parity with ONNX Runtime
+=================================================================================================
+2026-10-21, branch litert/models on ba245e8. Speed mode: conversion, desktop parity on the 35 photos, one
+emulator smoke. No phone here: every GPU-delegate result on a phone is a HUMAN GATE (end of this file).
+
+Files (app/src/main/litert/models, tracked; made by tools/litert/convert.py, byte-identical when re-run)
+  file                            bytes        input (float32 NHWC)   output (float32 NHWC)   sha256
+  uvdoc_static.tflite             15,817,028   image [1,712,488,3]    grid [1,45,31,2]        4938cbb73f53725e...
+  syntheticdoc_hr_static.tflite   15,857,620   image [1,1440,1024,3]  grid [1,121,177,2]      5626ffbb1c913583...
+  shadenet_512x352.tflite          1,052,328   page [1,512,352,3]     shading [1,512,352,3]   7c48c9e86f041b42...
+  The input holds the same values as the ONNX NCHW input (x.transpose(0,2,3,1)); the output is the ONNX output
+  [1,2,gh,gw] / [1,3,512,352] transposed the same way (core/src/uvdoc.h: UVDOC_SPEC 488x712 -> 31x45 grid,
+  SYNTHDOC_HR_SPEC 1024x1440 -> 177x121 grid; gh x gw = 45 x 31 and 121 x 177 as in the ONNX files).
+  Weights fp16 (DEQUANTIZE fp16 -> fp32 in front of each, the converter's float16 layout), compute and I/O fp32,
+  no `reduced_precision_support` metadata. fp32 constants left: uvdoc 34 values (last conv bias, PRelu slope),
+  SD-HR 8,418 (biases / BatchNorm scales of 44 convs, PRelu slope, last bias), ShadeNet 82 (biases).
+  Sources: app/src/main/assets/models/{uvdoc_static, syntheticdoc_hr_static, shadenet_512x352}.onnx at ba245e8.
+
+Environment (C:/Users/User/Android/litert_venv, Python 3.11.9 = round4 venv's base interpreter)
+  tensorflow 2.19.1, tf_keras 2.19.0, keras 3.15.1, onnx2tf 1.28.8, onnx 1.17.0, onnxsim 0.4.36,
+  onnx_graphsurgeon 0.6.1, sng4onnx 2.0.1, onnxruntime 1.22.0 (the app's version), ai-edge-litert 2.1.2,
+  numpy 2.1.3, protobuf 3.20.3, h5py 3.11.0, ml_dtypes 0.5.1, psutil 5.9.5, flatbuffers 25.12.19
+  (onnx2tf 1.28.8's README pins, with tensorflow 2.19.1 and onnxruntime 1.22.0; ai-edge-litert 1.2.0 has
+  no Windows wheel, 2.1.2 is the oldest one that has). Install:
+    C:/Users/User/AppData/Local/Programs/Python/Python311/python.exe -m venv C:/Users/User/Android/litert_venv
+    litert_venv/Scripts/python.exe -m pip install tensorflow==2.19.1 tf-keras==2.19.0 onnx==1.17.0 \
+      onnx-graphsurgeon onnxruntime==1.22.0 onnxsim==0.4.36 sng4onnx psutil==5.9.5 protobuf==3.20.3 \
+      h5py==3.11.0 ml_dtypes==0.5.1 "flatbuffers>=23.5.26" onnx2tf==1.28.8 ai-edge-litert==2.1.2
+
+Commands
+  litert_venv/Scripts/python.exe -I tools/litert/convert.py [--work DIR]                     (~80 s)
+  litert_venv/Scripts/python.exe -I tools/litert/compare.py <net-input cache> [--log FILE]    (~390 s, 35 photos)
+  bash tools/litert/gpu_check.sh OUT [PHOTO ...]   (emulator fs35, or SERIAL=<phone> for a phone; heavy lock)
+  Net-input cache: Stream A's tools/accel/net_inputs.py output, scratchpad/accel_a/in (35 photos).
+
+What convert.py does (details in its docstring)
+  1. fp32 copy of the ONNX graph (each fp16 weight's Cast folded: exact).
+  2. onnx2tf -> fp32 .tflite, NHWC I/O (onnxsim folds BatchNorm into the convs in fp32, as ORT does).
+  3. Own rewrite of the flatbuffer instead of the converter's float16 mode:
+     - the converter's float16 mode rounds every fp32 constant (BatchNorm-folded weights, the fp32 biases) and
+       writes `reduced_precision_support: fp16accfp32`. Measured on 3 photos (doctr__25, scanner_samples__tax,
+       docres__190_in) against ORT: uvdoc rc0 p99 0.067-0.075 px, SD-HR p99 0.11-1.77 px with max 2.08 px on
+       scanner_samples__tax (outside the 1 px tolerance), ShadeNet p99 0.008-0.063 levels. Not used;
+     - fp16 storage only of constants whose values are fp16 numbers (exact);
+     - SD-HR's 44 BatchNorm-folded filters unfolded: the ONNX fp16 weight, bias / s, then a per-channel MUL by
+       the BatchNorm scale s carrying the conv's activation;
+     - GPU forms: the PRelu slope (one value for 32 channels, [1,1,1]) per channel [1,1,32] in uvdoc and SD-HR;
+       ShadeNet's x[1,1,1,96] * ones[1,16,11,1] broadcast (prepare_models.py's form of its Expand) as a
+       RESIZE_NEAREST_NEIGHBOR of x to 16 x 11. Both exact (same values / same copies).
+  Ops: uvdoc DEQUANTIZE 89, PAD 3, CONV_2D 45, ADD 13, CONCATENATION 1, MIRROR_PAD 2, PRELU 1
+       SD-HR DEQUANTIZE 47, MUL 45, SUB 1, PAD 4, CONV_2D 45, ADD 13, CONCATENATION 1, MIRROR_PAD 2, PRELU 1,
+             TANH 1, RESIZE_BILINEAR 1
+       ShadeNet DEQUANTIZE 43, PAD 5, CONV_2D 25, MEAN 1, RESIZE_NEAREST_NEIGHBOR 1, CONCATENATION 6,
+             RESIZE_BILINEAR 6, ADD 1, LOGISTIC 1
+
+GPU compatibility
+  tf.lite.experimental.Analyzer.analyze(model_path, gpu_compatibility=True) on each file:
+    "Your model looks compatible with GPU delegate on TFLite runtime version 2.19.1." (all three)
+  BUT this verdict carries no information in the builds available here: a negative control (a model with
+  WHERE, GATHER_ND, GREATER, int32 MUL / ADD, TOPK_V2 and a Flex op) gets the same "looks compatible" from
+  tensorflow 2.19.1 (Windows), ai-edge-litert 2.1.2 (Windows) and ai-edge-litert 1.4.0 (Linux, in WSL); none
+  of their binaries contains the GPU checker's warning strings. So convert.py checks the graph itself
+  (gpu_ops: every op in a form the GPU delegate's op parsers take: fp16-constant DEQUANTIZE, constant conv
+  weights, H/W-only constant PAD, REFLECT MIRROR_PAD, ADD/SUB/MUL with a same-shape runtime operand or a
+  scalar / per-channel constant, channel CONCATENATION, per-channel PRelu slope, constant-size resizes without
+  align_corners, MEAN over H,W, TANH, LOGISTIC; all tensors float32 [1,H,W,C]). Result: no problem in any of
+  the three files. The same check flags the two forms the rewrite fixed in onnx2tf's own output
+  (PRELU slope [1,1,1] for 32 channels; MUL [1,1,1,96] x const [1,16,11,1] -> [1,16,11,96]) and every op of
+  the negative control. This is a static check of my reading of the delegate's rules, not the delegate: the
+  delegate's own verdict (partition log "Replacing N out of N node(s) ... yielding 1 partitions") needs a
+  device with OpenCL (HUMAN GATE below).
+
+Parity, desktop: LiteRT interpreter (CPU, fp32, XNNPACK) vs ONNX Runtime 1.22.0 CPU EP on the CPU path's
+models (uvdoc.onnx, syntheticdoc_hr.onnx, shadenet.onnx), 35 photos x 4 net inputs, all of them (386 s).
+Grid px of the 1600 x 2263 analysis page (tools/accel/compare_outputs.py grid_px), shading in 8-bit levels.
+  net        p99          max          tolerance (p99 / max)   photos
+  uv_p1      0.00060 px   0.00135 px   0.25 / 1 px             35   ok
+  uv_rc0     0.00057 px   0.00148 px   0.25 / 1 px             35   ok
+  sdhr_rc2   0.00095 px   0.00340 px   0.25 / 1 px             35   ok   (worst photo scanner_samples__tax)
+  shade      0.00003 lv   0.00038 lv   0.5 / 2 levels          35   ok
+  Per photo: appendix (compare.py --log); identical numbers before and after
+  the PRelu / broadcast rewrite (both exact). For scale: the fp32 .tflite straight from onnx2tf is ~5e-7 off
+  ORT in raw output values, these files the same; the converter's float16 mode 1e-4 to 2e-4.
+
+Emulator smoke (AVD fs35, Android 15 x86_64, GLES 3.1 over the RTX 5060, LiteRT 1.4.0 AAR libraries:
+libtensorflowlite_jni.so + libtensorflowlite_gpu_jni.so, x86_64, loaded with dlopen + dlsym by gpu_check.c)
+  - LiteRT 1.4.0 CPU kernels load and run all three files; outputs vs desktop ORT on doctr__25 and
+    scanner_samples__tax: uvdoc p1 / rc0 max <= 0.00075 px, SD-HR max 0.00277 px (tax), ShadeNet max 0.00006
+    levels: within tolerance. So the files (DEQUANTIZE v3 fp16, RESIZE_NEAREST_NEIGHBOR, op versions) are
+    valid for the LiteRT 1.4.0 runtime the app ships.
+  - GPU delegate: NOT RUN. TfLiteInterpreterCreate with the delegate crashes the process (SIGSEGV, null
+    pointer in strlen) for every model, also a one-op RELU model and also with
+    TFLITE_GPU_EXPERIMENTAL_FLAGS_GL_ONLY. Backtrace: libtensorflowlite_gpu_jni.so builds "Failed to load
+    OpenCL library with dlopen: " + dlerror() + ". Trying ICD loader." with dlerror() == NULL. The emulator has
+    no libOpenCL*.so. So LiteRT 1.4.0's GPU delegate loads OpenCL unconditionally and crashes where it is
+    missing (see open issues for the app).
+
+HUMAN GATE (phone, e.g. Galaxy S24 FE): the GPU delegate's own partition log and fp32 parity
+  1. adb devices: note the serial; phone in developer mode with USB debugging.
+  2. From the worktree: SERIAL=<serial> bash tools/litert/gpu_check.sh <OUT> doctr__25 scanner_samples__tax
+     (arm64 build of gpu_check, pushes the two AAR libraries, the three .tflite and the inputs to
+     /data/local/tmp, no app needed).
+  3. Pass: <OUT>/run.log shows for each model "Replacing N out of N node(s) with delegate
+     (TfLiteGpuDelegateV2) node, yielding 1 partitions" (if the line is missing there, `adb logcat -d -s tflite`
+     in <OUT>/logcat.txt has it), "interpreter created (gpu delegate)", and <OUT>/device.txt ends with "all
+     outputs present and within tolerance" (gpu and cpu rows). invoke times in run.log are the phone's
+     (second invoke = warm).
+
+Open issues for the runtime / app streams (found here, not fixed here: outside tools/litert)
+  - LiteRT 1.4.0's GPU delegate crashes the process (SIGSEGV in TfLiteInterpreterCreate) where no OpenCL
+    library loads, even with GL_ONLY (emulator above). infer.cpp should only create the delegate after its
+    own dlopen of libOpenCL.so (or libOpenCL-pixel.so / libOpenCL-car.so, the names the delegate tries)
+    succeeds, and treat the GPU backend as unavailable otherwise (the emulator then has no GPU backend).
+  - Android 12+ (targetSdk >= 31): an app reaches the vendor's libOpenCL.so only if the manifest declares
+    <uses-native-library android:name="libOpenCL.so" android:required="false"/> (and libOpenCL-pixel.so,
+    libOpenCL-car.so likewise). Without it the delegate cannot load OpenCL inside the app, which with the
+    crash above would take the app down. (gpu_check runs from adb shell, outside an app namespace.)
+  - The GPU delegate options for full precision: is_precision_loss_allowed 0, inference_priority1
+    MAX_PRECISION (1), priority2/3 AUTO; TfLiteGpuDelegateOptionsV2Default sets experimental_flags 1
+    (ENABLE_QUANT) and max_delegated_partitions 1 (gpu_check.c prints them).
+
+Appendix: compare.py log (per photo: max / p99)
+  compare.py: onnxruntime 1.22.0 CPU EP vs LiteRT interpreter (CPU, fp32); models C:\Users\User\Desktop\fs_lrt_models\app\src\main\litert\models
+  35 photos; grid diffs in px of the 1600 x 2263 analysis page (max / p99), shading in 8-bit levels
+  500c2810-image                       uv_p1 0.00106/0.00063  uv_rc0 0.00078/0.00057  sdhr_rc2 0.00080/0.00037  shade 0.00006/0.00003
+  dewarpnet__13_2_copy                 uv_p1 0.00068/0.00053  uv_rc0 0.00068/0.00053  sdhr_rc2 0.00060/0.00032  shade 0.00011/0.00003
+  dewarpnet__14_2_copy                 uv_p1 0.00081/0.00053  uv_rc0 0.00081/0.00053  sdhr_rc2 0.00055/0.00032  shade 0.00008/0.00003
+  dewarpnet__1_1_copy                  uv_p1 0.00135/0.00054  uv_rc0 0.00135/0.00054  sdhr_rc2 0.00061/0.00032  shade 0.00008/0.00003
+  dewarpnet__4_2_copy                  uv_p1 0.00077/0.00051  uv_rc0 0.00077/0.00051  sdhr_rc2 0.00061/0.00036  shade 0.00009/0.00005
+  docgeonet__63_2_copy                 uv_p1 0.00068/0.00052  uv_rc0 0.00068/0.00052  sdhr_rc2 0.00061/0.00032  shade 0.00008/0.00005
+  docres__151_in                       uv_p1 0.00080/0.00054  uv_rc0 0.00104/0.00057  sdhr_rc2 0.00053/0.00033  shade 0.00008/0.00003
+  docres__189_origin                   uv_p1 0.00112/0.00061  uv_rc0 0.00083/0.00051  sdhr_rc2 0.00066/0.00033  shade 0.00008/0.00005
+  docres__190_in                       uv_p1 0.00108/0.00063  uv_rc0 0.00078/0.00055  sdhr_rc2 0.00055/0.00033  shade 0.00007/0.00003
+  docres__208_in                       uv_p1 0.00098/0.00053  uv_rc0 0.00093/0.00056  sdhr_rc2 0.00058/0.00033  shade 0.00009/0.00005
+  docres__218_in                       uv_p1 0.00072/0.00059  uv_rc0 0.00087/0.00052  sdhr_rc2 0.00052/0.00035  shade 0.00008/0.00005
+  docres__for_appearance               uv_p1 0.00089/0.00058  uv_rc0 0.00089/0.00058  sdhr_rc2 0.00059/0.00033  shade 0.00006/0.00003
+  docres__for_binarization             uv_p1 0.00113/0.00054  uv_rc0 0.00113/0.00054  sdhr_rc2 0.00059/0.00033  shade 0.00006/0.00003
+  docres__for_deshadowing              uv_p1 0.00079/0.00065  uv_rc0 0.00079/0.00065  sdhr_rc2 0.00062/0.00042  shade 0.00006/0.00003
+  docres__for_dewarping                uv_p1 0.00096/0.00052  uv_rc0 0.00094/0.00063  sdhr_rc2 0.00060/0.00034  shade 0.00006/0.00003
+  docscanner__27_2_copy                uv_p1 0.00121/0.00054  uv_rc0 0.00121/0.00054  sdhr_rc2 0.00054/0.00031  shade 0.00008/0.00005
+  docscanner__42_2_copy                uv_p1 0.00073/0.00056  uv_rc0 0.00073/0.00056  sdhr_rc2 0.00058/0.00033  shade 0.00006/0.00003
+  docscanner__48_1_copy                uv_p1 0.00095/0.00054  uv_rc0 0.00095/0.00054  sdhr_rc2 0.00055/0.00032  shade 0.00038/0.00003
+  doctr__25                            uv_p1 0.00092/0.00052  uv_rc0 0.00092/0.00062  sdhr_rc2 0.00062/0.00033  shade 0.00006/0.00003
+  doctr__48_2_copy                     uv_p1 0.00083/0.00057  uv_rc0 0.00083/0.00057  sdhr_rc2 0.00053/0.00031  shade 0.00012/0.00003
+  doctr__51_1_copy                     uv_p1 0.00085/0.00055  uv_rc0 0.00085/0.00055  sdhr_rc2 0.00055/0.00032  shade 0.00006/0.00003
+  page_dewarp__boston_cooking_a        uv_p1 0.00107/0.00058  uv_rc0 0.00090/0.00061  sdhr_rc2 0.00054/0.00031  shade 0.00008/0.00003
+  page_dewarp__boston_cooking_b        uv_p1 0.00086/0.00057  uv_rc0 0.00105/0.00066  sdhr_rc2 0.00062/0.00031  shade 0.00008/0.00003
+  page_dewarp__linguistics_thesis_a    uv_p1 0.00086/0.00052  uv_rc0 0.00079/0.00051  sdhr_rc2 0.00059/0.00031  shade 0.00008/0.00004
+  page_dewarp__linguistics_thesis_b    uv_p1 0.00100/0.00055  uv_rc0 0.00096/0.00059  sdhr_rc2 0.00060/0.00036  shade 0.00008/0.00003
+  scanner_samples__cell_pic            uv_p1 0.00096/0.00060  uv_rc0 0.00113/0.00057  sdhr_rc2 0.00067/0.00038  shade 0.00006/0.00003
+  scanner_samples__chart               uv_p1 0.00082/0.00057  uv_rc0 0.00106/0.00055  sdhr_rc2 0.00065/0.00032  shade 0.00008/0.00003
+  scanner_samples__desk                uv_p1 0.00125/0.00089  uv_rc0 0.00097/0.00067  sdhr_rc2 0.00104/0.00043  shade 0.00006/0.00003
+  scanner_samples__dollar_bill         uv_p1 0.00098/0.00069  uv_rc0 0.00085/0.00059  sdhr_rc2 0.00060/0.00037  shade 0.00018/0.00003
+  scanner_samples__math_cheat_sheet    uv_p1 0.00081/0.00056  uv_rc0 0.00081/0.00056  sdhr_rc2 0.00059/0.00031  shade 0.00008/0.00003
+  scanner_samples__notepad             uv_p1 0.00078/0.00055  uv_rc0 0.00088/0.00053  sdhr_rc2 0.00060/0.00036  shade 0.00006/0.00003
+  scanner_samples__receipt             uv_p1 0.00099/0.00067  uv_rc0 0.00148/0.00059  sdhr_rc2 0.00106/0.00042  shade 0.00011/0.00003
+  scanner_samples__tax                 uv_p1 0.00075/0.00053  uv_rc0 0.00075/0.00053  sdhr_rc2 0.00340/0.00259  shade 0.00005/0.00003
+  user__page3_sideways                 uv_p1 0.00071/0.00051  uv_rc0 0.00071/0.00051  sdhr_rc2 0.00060/0.00031  shade 0.00006/0.00003
+  user__projector_screen               uv_p1 0.00093/0.00052  uv_rc0 0.00093/0.00052  sdhr_rc2 0.00099/0.00055  shade 0.00006/0.00003
+
+  LiteRT vs ONNX Runtime, pooled over all photos:
+    uv_p1     p99 0.00060 px, max 0.00135 px (tolerance p99 <= 0.25, max <= 1.0): ok, photos 35
+    uv_rc0    p99 0.00057 px, max 0.00148 px (tolerance p99 <= 0.25, max <= 1.0): ok, photos 35
+    sdhr_rc2  p99 0.00095 px, max 0.00340 px (tolerance p99 <= 0.25, max <= 1.0): ok, photos 35
+    shade     p99 0.00003 levels, max 0.00038 levels (tolerance p99 <= 0.5, max <= 2.0): ok, photos 35
+  all nets within tolerance; 386 s

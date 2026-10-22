@@ -6,11 +6,11 @@ import android.view.View
 
 /** Compile-time defaults of feature flags (each can be changed in Settings). */
 object Features {
-    /** The page-finder net (assets/models/pagefinder.onnx); off: the colour-threshold paper mask. */
+    /** The page-finder net (assets/models/pagefinder.tflite); off: the colour-threshold paper mask. */
     const val PAGE_FINDER_NET = true
-    /** Flattening nets (assets/models/uvdoc.onnx, syntheticdoc_hr.onnx); off: the page outline's surface model. */
+    /** Flattening nets (assets/models/uvdoc_static.tflite, syntheticdoc_hr_static.tflite); off: the page outline's surface model. */
     const val UVDOC = true
-    /** The shadow net (assets/models/shadenet.onnx) divides shadows out of the page. */
+    /** The shadow net (assets/models/shadenet.tflite) divides shadows out of the page. */
     const val NEURAL_SHADOWS = true
     /** The rule net (assets/models/rulenet.onnx) tells the line refinement which lines are printed rules. */
     const val RULE_NET = true
@@ -69,9 +69,9 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("neural_shadows", Features.NEURAL_SHADOWS)
         set(v) = p.edit().putBoolean("neural_shadows", v).apply()
 
-    /** Where the nets run ([Accel]: auto, cpu, npu, nnapi); CPU unless chosen. */
+    /** Where the nets run ([Accel]: auto, cpu, gpu); Auto unless chosen (an older NPU / NNAPI choice is Auto now). */
     var acceleration: String
-        get() = p.getString("acceleration", Accel.CPU).takeIf { s -> Accel.CHOICES.any { it.first == s } } ?: Accel.CPU
+        get() = p.getString("acceleration", Accel.AUTO).takeIf { s -> Accel.CHOICES.any { it.first == s } } ?: Accel.AUTO
         set(v) = p.edit().putString("acceleration", v).apply()
 
     /** Auto's last benchmark: JSON soc, app (version), at, bench (NativeLib.benchBackends); null: none yet. */

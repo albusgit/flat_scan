@@ -55,12 +55,11 @@ object NativeLib {
     @JvmStatic external fun gpuInfo(): String
 
     /**
-     * The nets' backends (core/src/infer.h, ONNX Runtime in libflatscan): per group, the backends to try
-     * in order, comma separated ("cpu", "qnn", "nnapi", "xnnpack"; "" = CPU only; the CPU is always the
-     * last resort): [finder] the page finder, [flat] UVDoc (both passes), [hr] SyntheticDoc high-res,
-     * [shade] the shadow net. Models come from [assets] (models/); [cacheDir] keeps QNN's compiled graphs;
-     * [threads]: ONNX Runtime intra-op threads (0: its default). [staticModels]: the CPU runs the
-     * fixed-shape copies of UVDoc and SyntheticDoc high-res (debug, HUMAN GATE A-1). A group whose
+     * The nets' backends (core/src/infer.h, LiteRT in the APK): per group, the backends to try in order, comma
+     * separated ("cpu", "gpu"; "" = CPU only; the CPU is always the last resort): [finder] the page finder,
+     * [flat] UVDoc (both passes), [hr] SyntheticDoc high-res, [shade] the shadow net. Models come from
+     * [assets] (models/, the .tflite files); [cacheDir] keeps the GPU's compiled kernels; [threads]: CPU threads (0: the
+     * default, min(cores, 4)). [staticModels]: no effect since the .onnx models left the app. A group whose
      * backends did not change keeps its loaded sessions.
      */
     @JvmStatic external fun configureNets(
@@ -68,14 +67,10 @@ object NativeLib {
     )
 
     /**
-     * The QNN libraries from the asset packs ([QnnPacks]): [libDir] libQnnHtp, libQnnHtpPrepare and libQnnSystem,
-     * [modelsDir] the static models, [htpDirs] (';'-separated) the Hexagon generations' skeleton + stub folders
-     * (ADSP_LIBRARY_PATH). JSON: ok, loaded (library names), adsp_library_path, error.
+     * JSON: cpu (the nets' CPU runtime, "LiteRT <version>"), litert (its version), gpu (whether the LiteRT GPU
+     * delegate can be tried: its library loads and the phone has an OpenCL library), gpu_why, with_ort, ort, providers.
      */
-    @JvmStatic external fun loadQnn(libDir: String, modelsDir: String, htpDirs: String): String
-
-    /** JSON: with_ort, ort (ONNX Runtime version), providers (the execution providers this build has). */
-    @JvmStatic external fun ortInfo(): String
+    @JvmStatic external fun runtimeInfo(): String
 
     /**
      * The page-finder net's logits for [photo] (float[2 * 256 * 256]: page paper, book gutter), or null

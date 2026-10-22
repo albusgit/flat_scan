@@ -1,0 +1,61 @@
+compare.py: onnxruntime 1.22.0 CPU EP vs LiteRT interpreter (CPU, fp32); models build/conv/out1
+35 photos; grid diffs in px of the 1600 x 2263 analysis page (max / p99), shading in 8-bit levels
+500c2810-image                       uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder -
+dewarpnet__13_2_copy                 uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00011/0.00003  shade_any 0.00011/0.00003  finder 0.00002/0.00001 flips 0
+dewarpnet__14_2_copy                 uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00002/0.00001 flips 0
+dewarpnet__1_1_copy                  uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00003/0.00001 flips 0
+dewarpnet__4_2_copy                  uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00009/0.00005  shade_any 0.00009/0.00005  finder 0.00002/0.00001 flips 0
+docgeonet__63_2_copy                 uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00005  shade_any 0.00008/0.00005  finder 0.00002/0.00001 flips 0
+docres__151_in                       uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00002/0.00000 flips 0
+docres__189_origin                   uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00005  shade_any 0.00008/0.00005  finder 0.00001/0.00000 flips 0
+docres__190_in                       uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00007/0.00003  shade_any 0.00007/0.00003  finder 0.00002/0.00001 flips 0
+docres__208_in                       uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00009/0.00005  shade_any 0.00009/0.00005  finder 0.00002/0.00001 flips 0
+docres__218_in                       uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00005  shade_any 0.00008/0.00005  finder 0.00002/0.00001 flips 0
+docres__for_appearance               uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00003/0.00001 flips 0
+docres__for_binarization             uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+docres__for_deshadowing              uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+docres__for_dewarping                uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+docscanner__27_2_copy                uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00005  shade_any 0.00008/0.00005  finder 0.00002/0.00001 flips 0
+docscanner__42_2_copy                uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+docscanner__48_1_copy                uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00038/0.00003  shade_any 0.00038/0.00003  finder 0.00002/0.00001 flips 0
+doctr__25                            uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00004/0.00000 flips 0
+doctr__48_2_copy                     uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00012/0.00003  shade_any 0.00012/0.00003  finder 0.00002/0.00001 flips 0
+doctr__51_1_copy                     uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00003/0.00001 flips 0
+page_dewarp__boston_cooking_a        uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00002/0.00001 flips 0
+page_dewarp__boston_cooking_b        uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00002/0.00001 flips 0
+page_dewarp__linguistics_thesis_a    uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00004  shade_any 0.00008/0.00004  finder 0.00002/0.00001 flips 0
+page_dewarp__linguistics_thesis_b    uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00003/0.00001 flips 0
+scanner_samples__cell_pic            uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+scanner_samples__chart               uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00003/0.00001 flips 0
+scanner_samples__desk                uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+scanner_samples__dollar_bill         uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00018/0.00003  shade_any 0.00018/0.00003  finder 0.00001/0.00001 flips 0
+scanner_samples__math_cheat_sheet    uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00008/0.00003  shade_any 0.00008/0.00003  finder 0.00002/0.00001 flips 0
+scanner_samples__notepad             uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+scanner_samples__receipt             uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00011/0.00003  shade_any 0.00011/0.00003  finder 0.00002/0.00001 flips 0
+scanner_samples__tax                 uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00005/0.00003  shade_any 0.00005/0.00003  finder 0.00006/0.00002 flips 0
+user__page3_sideways                 uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+user__projector_screen               uv_p1 -  uv_rc0 -  sdhr_rc2 -  shade 0.00006/0.00003  shade_any 0.00006/0.00003  finder 0.00002/0.00001 flips 0
+
+shadenet.tflite (any size) vs shadenet.onnx on 35 real pages per width (max / p99 levels):
+  512 x  32: max 0.00015 p99 0.00006
+  512 x  64: max 0.00015 p99 0.00005
+  512 x  96: max 0.00032 p99 0.00003
+  512 x 128: max 0.00011 p99 0.00003
+  512 x 160: max 0.00009 p99 0.00003
+  512 x 192: max 0.00014 p99 0.00003
+  512 x 224: max 0.00041 p99 0.00003
+  512 x 256: max 0.00012 p99 0.00003
+  512 x 288: max 0.00012 p99 0.00003
+  512 x 320: max 0.00014 p99 0.00003
+  512 x 352: max 0.00006 p99 0.00003
+  512 x 384: max 0.00030 p99 0.00003
+  512 x 416: max 0.00030 p99 0.00003
+  512 x 448: max 0.00017 p99 0.00003
+  512 x 480: max 0.00024 p99 0.00003
+  512 x 512: max 0.00014 p99 0.00003
+
+LiteRT vs ONNX Runtime, pooled over all photos:
+  shade     p99 0.00003 levels, max 0.00038 levels (tolerance p99 <= 0.5, max <= 2.0): ok, photos 35
+  shade_any p99 0.00003 levels, max 0.00041 levels (tolerance p99 <= 0.5, max <= 2.0): ok, inputs (35 photos at 512 x 352 + the pages at each width) 51
+  finder    p99 0.00001 logits, max 0.00006 logits (tolerance p99 <= 0.01, max <= 0.1), decisions flipped 0 of 4456448 (0.0000 %, tolerance 0.01 %): ok, photos 34
+all nets within tolerance; 1064 s

@@ -1,0 +1,21 @@
+dewarpnet__13_2_copy_1600x1200           608x800  max 0.000009  p99 0.000000  flips 0
+dewarpnet__13_2_copy_1000x1600           800x512  max 0.000004  p99 0.000000  flips 0
+dewarpnet__13_2_copy_1600x2263           1152x800  max 0.000009  p99 0.000000  flips 0
+dewarpnet__14_2_copy_1600x1200           608x800  max 0.000006  p99 0.000000  flips 0
+dewarpnet__14_2_copy_1000x1600           800x512  max 0.000008  p99 0.000000  flips 0
+dewarpnet__14_2_copy_1600x2263           1152x800  max 0.000006  p99 0.000000  flips 0
+dewarpnet__1_1_copy_1600x1200            608x800  max 0.000007  p99 0.000000  flips 0
+dewarpnet__1_1_copy_1000x1600            800x512  max 0.000007  p99 0.000000  flips 0
+dewarpnet__1_1_copy_1600x2263            1152x800  max 0.000004  p99 0.000000  flips 0
+dewarpnet__4_2_copy_1600x1200            608x800  max 0.000006  p99 0.000000  flips 0
+dewarpnet__4_2_copy_1000x1600            800x512  max 0.000003  p99 0.000000  flips 0
+dewarpnet__4_2_copy_1600x2263            1152x800  max 0.000004  p99 0.000000  flips 0
+docgeonet__63_2_copy_1240x1754           896x640  max 0.000008  p99 0.000000  flips 0
+docgeonet__63_2_copy_700x2263            1152x352  max 0.000006  p99 0.000000  flips 0
+docres__151_in_1240x1754                 896x640  max 0.000000  p99 0.000000  flips 0
+docres__151_in_700x2263                  1152x352  max 0.000000  p99 0.000000  flips 0
+docres__189_origin_1240x1754             896x640  max 0.000000  p99 0.000000  flips 0
+docres__189_origin_700x2263              1152x352  max 0.000000  p99 0.000000  flips 0
+docres__190_in_1240x1754                 896x640  max 0.000007  p99 0.000000  flips 0
+docres__190_in_700x2263                  1152x352  max 0.000003  p99 0.000000  flips 0
+pooled over 20 pages: max 0.000009  p99 0.000000  flips 0 of 22372352 (0.00000 %)
