@@ -53,14 +53,16 @@ class Data(torch.utils.data.IterableDataset):
         pools, sizes, n = [], None, 0
         while True:
             if n % 2000 == 0:   # pools still being generated join once their log says done
-                ready = [p for p in tpools if os.path.exists(p + '_img.npy') and (not os.path.exists(p + '.log') or 'done' in open(p + '.log').read())]
+                partial = os.environ.get('RN_PARTIAL') == '1'   # pools whose generation was stopped: the drawn samples
+                ready = [p for p in tpools if os.path.exists(p + '_img.npy') and (partial or not os.path.exists(p + '.log') or 'done' in open(p + '.log').read())]
                 if len(ready) != len(pools):
                     pools = [load(p) for p in ready]
-                    sizes = np.array([p[0].shape[0] for p in pools], np.float64)
+                    valid = [np.nonzero(np.asarray(X[:, 200, ::40, 0]).any(1))[0] for X, _, _ in pools]
+                    sizes = np.array([len(v) for v in valid], np.float64)
             n += 1
             pi = rs.choice(len(pools), p=sizes / sizes.sum())
             X, Y, E = pools[pi]
-            i = rs.integers(0, X.shape[0]); S = X.shape[1]
+            i = valid[pi][rs.integers(0, len(valid[pi]))]; S = X.shape[1]
             sc = rs.uniform(0.8, 1.25) if rs.random() < 0.5 else 1.0
             cs = min(S, int(math.ceil(C / sc)))
             y0, x0 = rs.integers(0, S - cs + 1, 2)
