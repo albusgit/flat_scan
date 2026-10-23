@@ -262,8 +262,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         selfTestRunning = true
         selfTestReport = ""
         viewModelScope.launch {
-            val text = withContext(Dispatchers.Default) {
-                val app = getApplication<Application>()
+            val app = getApplication<Application>()
+            val text = withContext(Dispatchers.Default) { CrashGuard.guard(app, "the self-test", gpu = !currentPlan().cpuOnly || Accel.candidates().isNotEmpty()) {
                 val ref = java.io.File(app.cacheDir, "photo1_reference_warpmap.npz")
                 app.assets.open("selftest/photo1_reference_warpmap.npz").use { i -> ref.outputStream().use { i.copyTo(it) } }
                 val bmp = selfTestPhoto()
@@ -276,7 +276,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     benchNets(bmp, runs) { s -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s } }
                 }.onFailure { Log.e(TAG, "net benchmark failed", it) }
                 formatSelfTest(JSONObject(json), nets, thermalBefore, thermalMid, thermalStatus(app))
-            }
+            } }
             report?.let { f -> runCatching { f.parentFile?.mkdirs(); f.writeText(text) } }
             selfTestReport = text
             selfTestRunning = false
@@ -298,6 +298,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun runAccelBenchmark() {
         if (selfTestRunning) return
+        enableGpu()   // asked for explicitly: the GPU is tried again even after a crash turned it off
         selfTestRunning = true
         selfTestReport = ""
         viewModelScope.launch {
@@ -322,8 +323,24 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val netsLock = Any()
 
     init {
+        // a crash in guarded native work last time (CrashGuard): report it, and keep the nets off a GPU that crashed
+        val app = getApplication<Application>()
+        CrashGuard.installHandler(app)
+        CrashGuard.check(app)?.let { r ->
+            selfTestReport = r
+            message = r.lineSequence().first() + (if (CrashGuard.gpuDisabled(app)) " - the GPU is off now" else "") + " (details: Settings > Self-test)"
+        }
+        Accel.gpuOff = CrashGuard.gpuDisabled(app)
         // the CPU until processing asks for the setting's backends (ensureNets)
         configureNets(netPlan)
+    }
+
+    /** Settings: the user asks for the GPU again after a crash turned it off. */
+    fun enableGpu() {
+        val app = getApplication<Application>()
+        if (!CrashGuard.gpuDisabled(app)) return
+        CrashGuard.enableGpu(app)
+        Accel.gpuOff = false
     }
 
     /** The current setting's plan: a fixed setting's, Auto's stored choice, or the CPU while Auto has not run. */
@@ -360,7 +377,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val at = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.ROOT).format(java.util.Date())
         val bench = if (cand.isEmpty()) JSONObject().put("ok", true).put("runs", 0)
             .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu"))
-        else JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
+        else CrashGuard.guard(getApplication(), "the acceleration benchmark (GPU)", gpu = true) {
+            JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
+        }
         val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
         if (cand.isEmpty()) stored.put("note", "no GPU on this phone: ${NetEnv.gpuWhy}")
         settings.autoChoice = stored.toString()
@@ -686,6 +705,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     spreadNext = null
                     spreadCurrent = null
                 }
+                batch = false
                 fallback()
             }
             Screen.Result -> {
@@ -695,7 +715,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }
             Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home
             Screen.Settings -> returnTo
-            else -> Screen.Home
+            else -> {
+                batch = false
+                Screen.Home
+            }
         }
     }
 
@@ -718,12 +741,37 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         pending.clear()
         pending.addAll(uris.drop(1))
         pendingTotal = uris.size
+        batch = uris.size > 1
         persist()
         loadUri(uris[0])
     }
 
+    /**
+     * Several photos picked at once: each is found, flattened and added as a page without stopping (a photo
+     * whose page is doubtful or not found is flattened from the best crop there is; re-crop it afterwards),
+     * then the pages screen opens. With Settings > "Check every crop" each crop still stops for a look, and
+     * the batch goes on after it. A failure stops at that photo's crop; back there ends the batch.
+     */
+    var batch by mutableStateOf(false)
+        private set
+
     /** Index (1-based) of the next imported image, for "Next page (k of n)". */
     val nextPendingIndex: Int get() = pendingTotal - pending.size + 1
+
+    /** Index (1-based) of the imported image being worked on. */
+    val importIndex: Int get() = pendingTotal - pending.size
+
+    /** The batch's next photo, or its end: the pages screen with every page. */
+    private fun continueBatch() {
+        if (pending.isNotEmpty()) {
+            nextPage()
+            return
+        }
+        val n = pendingTotal
+        batch = false
+        open(Screen.Pages)
+        message = "$n photos imported"
+    }
 
     fun nextPage() {
         val u = pending.removeFirstOrNull() ?: return
@@ -741,7 +789,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             cropReasons = emptyList()
             spreadNext = null
             spreadCurrent = null
-            screen = Screen.Crop
+            screen = if (batch && !settings.reviewCrops) Screen.Processing else Screen.Crop
             try {
                 val p = withContext(Dispatchers.IO) { loadPhoto(getApplication(), uri, focalMmPerLongSide) }
                 discardStaging()
@@ -762,7 +810,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 Log.e(TAG, "load failed", e)
                 message = "Could not open the image"
                 detecting = false
-                screen = fallback()
+                if (batch) continueBatch() else screen = fallback()
             }
         }
     }
@@ -827,8 +875,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             focalPx = focalPx, cropRotation = cropRotation, userRotated = userRotated,
         ) else null
         detecting = false
-        if (first == null) message = "Page not found - drag the corners to the page"
-        else if (auto && cropReasons.isEmpty() && !settings.reviewCrops) process()
+        val doubtful = first == null || cropReasons.isNotEmpty()
+        if (first == null && !(batch && !settings.reviewCrops)) message = "Page not found - drag the corners to the page"
+        if (auto && !settings.reviewCrops && (!doubtful || batch)) process()
     }
 
     /** The second page of a book spread: same photo, its own corners and gate, a new document page. */
@@ -854,7 +903,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             firstSource?.join()
             runCatching { store.copySource(sp.firstId, id) }.onFailure { Log.e(TAG, "spread source copy failed", it) }
         }
-        if (cropReasons.isEmpty() && !settings.reviewCrops) {
+        if ((cropReasons.isEmpty() || batch) && !settings.reviewCrops) {
             process()
         } else {
             screen = Screen.Crop
@@ -1250,10 +1299,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     val logits = logitsFor(p)
                     val finder = if (logits != null) finderTiming(p) else null
                     accel = { j -> j.put("accel", accelJson(j.optJSONObject("accel"), finder, reused, plan)) }
-                    NativeLib.process(
-                        p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules,
-                    ) { pct, s ->
-                        viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
+                    CrashGuard.guard(getApplication(), "processing a page", gpu = !plan.cpuOnly) {
+                        NativeLib.process(
+                            p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules,
+                        ) { pct, s ->
+                            viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "process failed", e)
@@ -1304,6 +1355,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             if (next != null && pageIndex == 0) {
                 next.firstRot = info.optInt("rot", -1)
                 startSpreadPage(next)
+            } else if (batch) {
+                continueBatch()
             }
         }
     }
@@ -1334,7 +1387,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         awaitRender()
         // a stored session renders what out.jpg already holds
         if (restored) committedVersion = outVersion
-        if (screen == Screen.Processing) screen = Screen.Result
+        if (screen == Screen.Processing && !batch) screen = Screen.Result
         fetchBefore(h)
         if (showWrinkles) fetchOverlay(h)
     }

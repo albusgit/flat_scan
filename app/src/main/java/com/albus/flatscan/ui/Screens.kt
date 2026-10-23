@@ -287,6 +287,10 @@ fun ProcessingScreen(vm: ScanViewModel) {
             Spacer(Modifier.height(28.dp))
         }
         Text(if (photo == null) "Opening the page" else "Flattening the page", style = MaterialTheme.typography.headlineSmall)
+        if (vm.batch) {
+            Spacer(Modifier.height(6.dp))
+            Text("Photo ${vm.importIndex} of ${vm.pendingTotal}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Spacer(Modifier.height(20.dp))
         LinearProgressIndicator(
             progress = { shown },
@@ -347,7 +351,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Acceleration")
-            for ((k, label) in Accel.CHOICES) Choice(label, accel == k) { accel = k; s.acceleration = k }
+            for ((k, label) in Accel.CHOICES) Choice(label, accel == k) { accel = k; s.acceleration = k; if (k == Accel.GPU) vm.enableGpu() }
             Text(
                 "Where the neural nets run. The CPU gives the reference results; Auto uses the GPU only for the nets " +
                     "whose results match the CPU closely, and any net that fails on the GPU runs on the CPU. " +

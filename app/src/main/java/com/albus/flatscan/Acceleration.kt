@@ -49,12 +49,15 @@ object Accel {
     /** The plan of a fixed setting; null for [AUTO] (its plan comes from the stored benchmark). */
     fun fixed(setting: String): Plan? = when (setting) {
         CPU -> Plan(CPU, "", "", "", "")
-        GPU -> Plan(GPU, "", "gpu", "gpu", "gpu")
+        GPU -> if (gpuOff) Plan(GPU, "", "", "", "", "the GPU crashed the app on this phone: CPU") else Plan(GPU, "", "gpu", "gpu", "gpu")
         else -> null
     }
 
     /** Auto's candidates (backend names for benchBackends): the LiteRT GPU where this phone can try it. */
-    fun candidates(): String = if (NetEnv.gpuAvailable) "gpu" else ""
+    fun candidates(): String = if (NetEnv.gpuAvailable && !gpuOff) "gpu" else ""
+
+    /** The GPU crashed the app on this phone ([CrashGuard]): the nets stay on the CPU until it is turned on again. */
+    @Volatile var gpuOff = false
 
     /**
      * The plan of a stored Auto benchmark ([Settings.autoChoice]) if it was made on this SoC and app version
