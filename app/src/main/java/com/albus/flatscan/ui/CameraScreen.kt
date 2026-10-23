@@ -84,7 +84,7 @@ fun CameraScreen(vm: ScanViewModel) = EditorTheme {
         ) {
             Text("Camera access is needed to scan a page.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
             PrimaryPill(
-                onClick = { request.launch(Manifest.permission.CAMERA) }, container = Palette.Accent, content = Color.White,
+                onClick = { request.launch(Manifest.permission.CAMERA) }, container = Editor.Accent, content = Editor.Ground,
                 modifier = Modifier.padding(top = 20.dp),
             ) { PillText("Allow camera") }
         }
@@ -193,7 +193,7 @@ private fun CameraPreview(vm: ScanViewModel) {
                 },
             contentAlignment = Alignment.Center,
         ) {
-            if (busy) CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp, color = Palette.Accent)
+            if (busy) CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp, color = Editor.Accent)
         }
     }
 }

@@ -1,7 +1,8 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <!-- a page with a flattened grid -->
-    <path android:fillColor="#FFFFFF" android:pathData="M38,30h26l8,8v40h-34z" />
-    <path android:fillColor="#C7D2FE" android:pathData="M64,30v8h8z" />
-    <path android:strokeColor="#1F4ED8" android:strokeWidth="2" android:pathData="M43,46h24M43,54h24M43,62h24M43,70h24M55,42v32" />
+    <!-- a sheet with a folded corner; its first line starts wavy and ends straight -->
+    <path android:fillColor="#FFFFFF" android:pathData="M36,28h28l11,11v41H36z" />
+    <path android:fillColor="#FFE45C" android:pathData="M64,28v11h11z" />
+    <path android:strokeColor="#2747A8" android:strokeWidth="3" android:strokeLineCap="round"
+        android:pathData="M42,49c3,-4 5,4 8,0s5,4 8,0 3,-1 4,-1h7M42,58h27M42,67h19" />
 </vector>

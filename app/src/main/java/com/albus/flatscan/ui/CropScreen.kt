@@ -165,7 +165,7 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
             PrimaryPill(
                 onClick = { vm.process() },
                 enabled = !vm.detecting && !circling && photo != null && vm.corners.size == 4,
-                container = Palette.Accent, content = Color.White,
+                container = Editor.Accent, content = Editor.Ground,
                 modifier = Modifier.weight(1.6f),
             ) {
                 PillText("Flatten page")

@@ -152,7 +152,7 @@ fun HomeScreen(vm: ScanViewModel) {
                 Spacer(Modifier.height(32.dp))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        "CURRENT DOCUMENT", style = MaterialTheme.typography.labelMedium.copy(fontSize = 13.sp, letterSpacing = 0.08.em),
+                        "CURRENT DOCUMENT", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 13.sp, letterSpacing = 0.08.em),
                         color = muted, modifier = Modifier.weight(1f),
                     )
                     TextButton(onClick = { vm.open(Screen.Pages) }) { Text("Open") }
@@ -181,7 +181,7 @@ fun HomeScreen(vm: ScanViewModel) {
     }
 }
 
-/** The app mark: a page with a folded corner and two accent lines. */
+/** The app mark: a page with a folded corner; its first accent line starts wavy and ends straight. */
 @Composable
 private fun LogoMark(modifier: Modifier = Modifier) {
     val ink = MaterialTheme.colorScheme.onSurface
@@ -192,8 +192,14 @@ private fun LogoMark(modifier: Modifier = Modifier) {
             moveTo(5 * u, 3 * u); lineTo(16 * u, 3 * u); lineTo(21 * u, 8 * u); lineTo(21 * u, 23 * u); lineTo(5 * u, 23 * u); close()
         }
         drawPath(page, ink, style = Stroke(width = 2 * u, join = StrokeJoin.Round))
-        drawLine(accent, Offset(9 * u, 13 * u), Offset(17 * u, 13 * u), strokeWidth = 2 * u, cap = StrokeCap.Round)
-        drawLine(accent, Offset(9 * u, 17 * u), Offset(15 * u, 17 * u), strokeWidth = 2 * u, cap = StrokeCap.Round)
+        val wave = Path().apply {
+            moveTo(8.5f * u, 12 * u)
+            cubicTo(9.7f * u, 10.4f * u, 10.5f * u, 13.6f * u, 11.7f * u, 12 * u)
+            cubicTo(12.9f * u, 10.4f * u, 13.7f * u, 11.6f * u, 14.3f * u, 11.6f * u)
+            lineTo(17 * u, 11.6f * u)
+        }
+        drawPath(wave, accent, style = Stroke(width = 2 * u, cap = StrokeCap.Round, join = StrokeJoin.Round))
+        drawLine(accent, Offset(8.5f * u, 17 * u), Offset(15 * u, 17 * u), strokeWidth = 2 * u, cap = StrokeCap.Round)
     }
 }
 
@@ -313,8 +319,8 @@ fun ProcessingScreen(vm: ScanViewModel) {
         )
         Spacer(Modifier.height(14.dp))
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(vm.stage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, modifier = Modifier.weight(1f))
-            Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(vm.stage, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, modifier = Modifier.weight(1f))
+            Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -420,7 +426,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             }
             if (vm.selfTestReport.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
-                Text(vm.selfTestReport, style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace))
+                Text(vm.selfTestReport, style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono))
             }
             Spacer(Modifier.height(24.dp))
         }

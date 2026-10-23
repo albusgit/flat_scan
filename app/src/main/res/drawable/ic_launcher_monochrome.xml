@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- themed icon (Android 13+): the outline and the straightening line only -->
+    <path android:strokeColor="#000000" android:strokeWidth="3.2" android:strokeLineJoin="round"
+        android:pathData="M36,28h28l11,11v41H36zM64,28v11h11" />
+    <path android:strokeColor="#000000" android:strokeWidth="3" android:strokeLineCap="round"
+        android:pathData="M42,49c3,-4 5,4 8,0s5,4 8,0 3,-1 4,-1h7" />
+</vector>
