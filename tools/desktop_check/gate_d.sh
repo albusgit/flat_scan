@@ -14,7 +14,7 @@
 set -e
 OUT=$(realpath -m "$1"); REF_S35=${2:-}; REF_DU=${3:-}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-PY=${PY:-/c/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe}
+PY=${PY:-/c/Users/User/envs/flatscan_torch/Scripts/python.exe}
 LOCK=/c/Users/User/Desktop/docunet_bench/.heavy_lock
 G=$REPO/tools/desktop_check
 CLI=$G/build/pipeline_cli.exe

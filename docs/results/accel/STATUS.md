@@ -8,7 +8,7 @@ unchanged. Bit-identical outputs mean unchanged scores (DocUNet LD 5.162 / MS-SS
 - `<SCR>` = `C:/Users/User/AppData/Local/Temp/claude/C--Users-User-Desktop-flat-scan/922e3e9d-4193-49a6-b4b4-d3421c7157d5/scratchpad`.
 - `<OUT>` = `C:/Users/User/Desktop/fs_accel_out`. It holds the final APK, plus copies of the check scripts in
   `<OUT>/check/`, because the scratchpad is temporary.
-- `PY` = `C:/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe` (always run with `-I`).
+- `PY` = `C:/Users/User/envs/flatscan_torch/Scripts/python.exe` (always run with `-I`).
 
 ## Merge log (accel/main)
 
@@ -199,7 +199,7 @@ with `JAVA_HOME=/c/Users/User/Android/jdk17 ./gradlew assembleDebug`).
    - Force-stop the app, run the benchmark again (first_ms is now loaded from the cache), and send both reports.
 3. **Push the inputs** (once):
    - 35 photos:
-     `for f in C:/Users/User/Desktop/round4_robustness/real_photos/*.jpg; do n=$(basename "$f" .jpg); adb exec-in run-as $PKG sh -c "mkdir -p files/batch/s35 && cat > files/batch/s35/$n.jpg" < "$f"; done`
+     `for f in E:/fs_datasets/round4/real_photos/*.jpg; do n=$(basename "$f" .jpg); adb exec-in run-as $PKG sh -c "mkdir -p files/batch/s35 && cat > files/batch/s35/$n.jpg" < "$f"; done`
    - The receipt:
      `adb exec-in run-as $PKG sh -c 'cat > files/batch/s35/500c2810-image.jpg' < <SCR>/rc/photo.jpg`
    - DocUNet:

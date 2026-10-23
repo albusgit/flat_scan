@@ -15,8 +15,8 @@ tints and pictures are the page, and that shadows are not.
 import glob, os, random, sys
 import numpy as np, cv2
 
-POOLS = [r'C:\Users\User\Desktop\shadow_train\pool', r'C:\Users\User\Desktop\round4_robustness\work\pool']
-BSDS = sorted(glob.glob(r'C:\Users\User\Desktop\round4_robustness\assets\bsds\BSDS500\data\images\*\*.jpg'))
+POOLS = [r'E:\fs_datasets\shadow_pool', r'E:\fs_datasets\round4\work\pool']
+BSDS = sorted(glob.glob(r'E:\fs_datasets\round4\assets\bsds\BSDS500\data\images\*\*.jpg'))
 PAGES = sorted(sum((glob.glob(os.path.join(p, '*.jpg')) for p in POOLS), []))
 
 

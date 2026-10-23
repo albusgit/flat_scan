@@ -29,7 +29,7 @@ from multiprocessing import Pool
 
 import numpy as np
 
-S35_DIR = r"C:\Users\User\Desktop\round4_robustness\real_photos"
+S35_DIR = r"E:\fs_datasets\round4\real_photos"
 SCRATCH = r"C:\Users\User\AppData\Local\Temp\claude\C--Users-User-Desktop-flat-scan\922e3e9d-4193-49a6-b4b4-d3421c7157d5\scratchpad"
 RECEIPT = os.path.join(SCRATCH, "rc", "photo.jpg")   # the hand-held receipt (round 5 "user" photo)
 DOCUNET = r"C:\Users\User\Desktop\docunet_bench\data_crop\crop"

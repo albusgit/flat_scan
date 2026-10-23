@@ -3,7 +3,7 @@ Windows 11; shared with other agents while measuring (timings indicative, ~10 % 
 5 of the 35 photos; the full run is `tools/desktop_check/gate_f.sh OUT full` (see the end).
 
 Photos: dewarpnet__1_1_copy, docres__for_dewarping, page_dewarp__boston_cooking_a, scanner_samples__receipt,
-user__projector_screen (round4_robustness/real_photos). Reference: Gate B's Python ORT 1.22.0 path
+user__projector_screen (E:/fs_datasets/round4/real_photos). Reference: Gate B's Python ORT 1.22.0 path
 (scratchpad/accel_b/s35_ref, ShadeNet on).
 
 Builds (tools/desktop_check, build_gpu.bat BUILD_DIR GPU ORT_ROOT [EP..]):

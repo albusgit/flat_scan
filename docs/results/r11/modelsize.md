@@ -91,7 +91,7 @@ DocUNet (130 crops, doc 64 excluded, scorer docunet_bench/docunet_eval.py, only 
 
 ```
 PY=C:/Users/User/Android/litert_venv/Scripts/python.exe        # tensorflow 2.19.1, onnx2tf, onnxruntime 1.22.0
-PT=C:/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe   # torch (gptq.py only)
+PT=C:/Users/User/envs/flatscan_torch/Scripts/python.exe   # torch (gptq.py only)
 IN=<SCR>/accel_a/in    # 35-photo net inputs (tools/accel/net_inputs.py) + NAME_pf_in.npz (pagefind_cli input)
 # 1. GPTQ values (UVDoc / SD-HR; ~10-20 min each on the CPU), calibration photos = <OUT>/calib.txt
 $PT -I tools/litert/gptq.py NEW_uvdoc.onnx OUT/uv_gptq --net uv --inputs $IN --names $(cat <OUT>/calib.txt)

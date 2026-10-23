@@ -1,6 +1,6 @@
 Stream A (models), 2026-10-21. Tools: C:/Users/User/Android/accel_venv (Python 3.11, onnxruntime 1.22.0 = the
 app's ORT, onnx 1.18.0, onnxconverter-common 1.16.0, onnxsim 0.8.1 installed but not used, see prepare_models.py);
-torch export with C:/Users/User/Desktop/round4_robustness/.venv (torch 2.11.0+cu128).
+torch export with C:/Users/User/envs/flatscan_torch (torch 2.11.0+cu128).
 
 New assets (app/src/main/assets/models; originals untouched; .onnx is stored uncompressed in the APK, noCompress)
   file                          bytes       sha256 (first 16)  made by

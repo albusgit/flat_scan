@@ -28,7 +28,7 @@ Coordinator notes for `docs/accel/PLAN.md` (2026-10-21). Where these differ from
 ## ONNX Runtime versions (measured 2026-10-21)
 
 - The app uses ORT Android 1.22.0. The desktop Python reference venv
-  `C:\Users\User\Desktop\round4_robustness\.venv` (Python 3.11, torch 2.11 cu128) has ORT **1.31.0**.
+  `C:\Users\User\envs\flatscan_torch` (Python 3.11, torch 2.11 cu128) has ORT **1.31.0**.
   A Python ORT **1.22.0** venv exists at
   `C:\Users\User\AppData\Local\Temp\claude\C--Users-User-Desktop-flat-scan\922e3e9d-4193-49a6-b4b4-d3421c7157d5\scratchpad\ort122`.
 - uvdoc.onnx and syntheticdoc_hr.onnx: outputs bit-identical between ORT 1.22 and 1.31 and across
@@ -41,9 +41,9 @@ Coordinator notes for `docs/accel/PLAN.md` (2026-10-21). Where these differ from
 
 ## Resolved external inputs
 
-- `<APP_REF_DIR>` = `C:\Users\User\Desktop\round4_robustness` (`code/`, `seg/`, `real_photos/`, `gt/`).
-- `<PHOTOS_35_DIR>` = `C:\Users\User\Desktop\round4_robustness\real_photos` (34 photos) + `user2` photo as
-  `tools/round4_check.py` defines the set; `<GT_JSON>` = `C:\Users\User\Desktop\round4_robustness\gt\gt.json`.
+- `<APP_REF_DIR>` = `E:\fs_datasets\round4` (`code/`, `seg/`, `real_photos/`, `gt/`).
+- `<PHOTOS_35_DIR>` = `E:\fs_datasets\round4\real_photos` (34 photos) + `user2` photo as
+  `tools/round4_check.py` defines the set; `<GT_JSON>` = `E:\fs_datasets\round4\gt\gt.json`.
 - `<DOCUNET_DIR>` = `C:\Users\User\Desktop\docunet_bench` (`data_crop/crop/{k}_{m} copy.png` photos,
   `data_scan/scan/{k}.png` scans). `<DOCUNET_SCORER>` = `docunet_bench/docunet_eval.py` run with the
   round4 venv python (`-I`). Harness: `run_ours.py` (see its docstring; RESULTS.md has the exact configs).

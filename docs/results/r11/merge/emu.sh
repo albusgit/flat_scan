@@ -33,7 +33,7 @@ sleep 8
 echo "pid after launch: $($S shell pidof $PKG | tr -d '\r')"
 $S exec-in run-as $PKG sh -c "mkdir -p files/batch/selftest && cat > files/batch/selftest/photo1.png" < "$PHOTO"
 for n in $PHOTOS; do
-  $S exec-in run-as $PKG sh -c "mkdir -p files/batch/s3 && cat > files/batch/s3/$n.jpg" < "C:/Users/User/Desktop/round4_robustness/real_photos/$n.jpg"
+  $S exec-in run-as $PKG sh -c "mkdir -p files/batch/s3 && cat > files/batch/s3/$n.jpg" < "E:/fs_datasets/round4/real_photos/$n.jpg"
 done
 $S shell run-as $PKG ls -l files/batch/selftest files/batch/s3
 run() {  # run TAG SET MAXWAIT_S EXTRA...

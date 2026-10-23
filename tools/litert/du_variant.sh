@@ -9,7 +9,7 @@ set -u
 NAME=$1; MODELS=$2; BASE=$3; shift 3
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${OUT:-C:/Users/User/Desktop/flatscan_out/r11/modelsize}
-PY=/c/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe
+PY=/c/Users/User/envs/flatscan_torch/Scripts/python.exe
 CLI=${CLI:-$OUT/bin/pipeline_cli.exe}
 DB=/c/Users/User/Desktop/docunet_bench
 LOCK=$DB/.heavy_lock

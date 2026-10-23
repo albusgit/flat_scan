@@ -16,8 +16,8 @@ set -u -o pipefail
 OUT=${1:?OUT_DIR}; MODE=${2:-smoke}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 B=C:/Users/User/Desktop/docunet_bench; W=$B/work; CROP=$B/data_crop/crop
-R4=C:/Users/User/Desktop/round4_robustness/real_photos
-PY=/c/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe
+R4=E:/fs_datasets/round4/real_photos
+PY=/c/Users/User/envs/flatscan_torch/Scripts/python.exe
 PCLI=$REPO/tools/desktop_check/build/pipeline_cli.exe
 FCLI=$REPO/build-host-win/fs_cli.exe
 export PATH="/c/Users/User/Android/opencv/build/x64/vc16/bin:$PATH"

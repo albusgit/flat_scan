@@ -33,7 +33,7 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
 
 ## Round 4: robustness on real photos
 
-What changed (brief: `round4_robustness/README_FOR_APP_AGENT.md`; reference: its `code/` and `seg/`):
+What changed (brief: `E:/fs_datasets/round4/README_FOR_APP_AGENT.md`; reference: its `code/` and `seg/`):
 
 1. **Crash fixes** (C++ ports of the reference fixes):
    - `paper_mask` (`core/src/corners.cpp`): white neutral, then above Otsu with low chroma, then above Otsu; the first whose largest component covers 10-99% of the frame; else the whole frame inset 2 px.

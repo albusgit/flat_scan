@@ -8,7 +8,7 @@ anywhere**: the emulator has no OpenCL. Every phone result is the HUMAN GATE bel
 - `<SCR>` = `C:/Users/User/AppData/Local/Temp/claude/C--Users-User-Desktop-flat-scan/922e3e9d-4193-49a6-b4b4-d3421c7157d5/scratchpad` (temporary).
 - `<OUT>` = `C:/Users/User/Desktop/flatscan_out/litert`: the builds, `SHA256SUMS.txt`, and in `<OUT>/check/` the
   check scripts, their logs and the emulator outputs (copies, because the scratchpad is temporary).
-- `PY` = `C:/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe` (always with `-I`).
+- `PY` = `C:/Users/User/envs/flatscan_torch/Scripts/python.exe` (always with `-I`).
 - Stream reports: `docs/results/litert/models.txt` (conversion, parity), `docs/results/litert/runtime.txt`
   (infer.cpp, LiteRT 1.4.0 facts, the OpenCL crash).
 

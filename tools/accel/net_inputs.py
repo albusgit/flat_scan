@@ -27,7 +27,7 @@ import numpy as np
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 MODELS = os.path.join(REPO, 'app', 'src', 'main', 'assets', 'models')
-APP_REF = r'C:\Users\User\Desktop\round4_robustness'
+APP_REF = r'E:\fs_datasets\round4'
 # the hand-held receipt (round 5 onwards; the 35th photo)
 RECEIPT = (r'C:\Users\User\AppData\Local\Temp\claude\C--Users-User-Desktop-flat-scan'
            r'\922e3e9d-4193-49a6-b4b4-d3421c7157d5\scratchpad\rc\photo.jpg', '500c2810-image')

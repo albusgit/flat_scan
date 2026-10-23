@@ -14,7 +14,7 @@ OUT=$(realpath -m "$1"); BASE_REF=${2:-accel/main}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SCR=/c/Users/User/AppData/Local/Temp/claude/C--Users-User-Desktop-flat-scan/922e3e9d-4193-49a6-b4b4-d3421c7157d5/scratchpad
 PY122=${PY122:-$SCR/ort122/Scripts/python.exe}
-PY=${PY:-/c/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe}
+PY=${PY:-/c/Users/User/envs/flatscan_torch/Scripts/python.exe}
 REF35=${REF35:-$SCR/ref_net}
 LOCK=/c/Users/User/Desktop/docunet_bench/.heavy_lock
 G=$REPO/tools/desktop_check

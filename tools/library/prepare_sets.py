@@ -166,8 +166,8 @@ def commons():
 
 
 def real35():
-    real_folder("real35", r"C:/Users/User/Desktop/round4_robustness/real_photos", "visual review (Round 8-10 35 real photos; some are DocUNet photos)",
-                "see round4_robustness/real_photos/SOURCES.md", "round4_robustness", tags_from_dir=False)
+    real_folder("real35", r"E:/fs_datasets/round4/real_photos", "visual review (Round 8-10 35 real photos; some are DocUNet photos)",
+                "see E:/fs_datasets/round4/real_photos/SOURCES.md", "round4", tags_from_dir=False)
 
 
 def uvdoc_bench():

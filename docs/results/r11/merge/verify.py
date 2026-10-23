@@ -6,13 +6,13 @@ and DocUNet pages, cached net outputs, CPU.
 import glob, json, os, subprocess, sys
 from multiprocessing import Pool
 
-PY = r"C:\Users\User\Desktop\round4_robustness\.venv\Scripts\python.exe"
+PY = r"C:\Users\User\envs\flatscan_torch\Scripts\python.exe"
 SCR = r"C:\Users\User\AppData\Local\Temp\claude\C--Users-User-Desktop-flat-scan\922e3e9d-4193-49a6-b4b4-d3421c7157d5\scratchpad"
 R10 = r"C:\Users\User\Desktop\fs_round10\tools\desktop_check\build\pipeline_cli.exe"
 PRE = SCR + r"\merge\build_pre\pipeline_cli.exe"
 NEW = r"C:\Users\User\Desktop\fs_r11\tools\desktop_check\build\pipeline_cli.exe"
 RULE = r"C:\Users\User\Desktop\fs_round10\app\src\main\assets\models\rulenet.onnx"
-S35 = r"C:\Users\User\Desktop\round4_robustness\real_photos"
+S35 = r"E:\fs_datasets\round4\real_photos"
 S35N = SCR + r"\accel_b\s35_ref"
 DU = r"C:\Users\User\Desktop\docunet_bench\data_crop\crop"
 W = r"C:\Users\User\Desktop\docunet_bench\work"

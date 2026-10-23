@@ -4,14 +4,14 @@
 Text rows: ink blobs merged along a row, centroid track per 8-px column, linear fit; per row the 95th
 percentile deviation (px at 2263 px long side) and the row angle. A page's score:
   rows, row_dev_med, row_dev_p90 (px), angle_spread (deg, p90 - p10 of the row angles).
-Table lines (optional, round4_robustness/code/evaluate.py): tlines, tline_med, tline_p90 (px, p98 deviation)."""
+Table lines (optional, E:/fs_datasets/round4/code/evaluate.py): tlines, tline_med, tline_p90 (px, p98 deviation)."""
 import os
 import sys
 
 import cv2
 import numpy as np
 
-R4 = r"C:\Users\User\Desktop\round4_robustness\code"
+R4 = r"E:\fs_datasets\round4\code"
 
 
 def norm(img):

@@ -26,10 +26,10 @@ OUT=${1:?OUT_DIR}; MODE=${2:-smoke}
 SC=C:/Users/User/AppData/Local/Temp/claude/C--Users-User-Desktop-flat-scan/922e3e9d-4193-49a6-b4b4-d3421c7157d5/scratchpad
 REF=${3:-$SC/accel_b/s35_ref}
 D=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$D/../.." && pwd)
-PY=/c/Users/User/Desktop/round4_robustness/.venv/Scripts/python.exe
-CUDA_BIN=${CUDA_BIN:-/c/Users/User/Desktop/round4_robustness/.venv/Lib/site-packages/torch/lib}
+PY=/c/Users/User/envs/flatscan_torch/Scripts/python.exe
+CUDA_BIN=${CUDA_BIN:-/c/Users/User/envs/flatscan_torch/Lib/site-packages/torch/lib}
 NET_IN=${NET_IN:-$SC/accel_a/in}
-R4=C:/Users/User/Desktop/round4_robustness/real_photos
+R4=E:/fs_datasets/round4/real_photos
 B=C:/Users/User/Desktop/docunet_bench; W=$B/work
 export PATH="/c/Users/User/Android/opencv/build/x64/vc16/bin:$PATH"
 mkdir -p "$OUT"; M=$(cygpath -m "$OUT"); w() { cygpath -w "$1"; }

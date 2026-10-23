@@ -1,9 +1,9 @@
 """Flat pages for the shadow net's albedo pool, from the round-4 page generator (doc_gen.py).
-  python gen_pool.py N [LONG_SIDE] [WORKERS]  -> C:/Users/User/Desktop/shadow_train/pool/NNNNN.jpg"""
+  python gen_pool.py N [LONG_SIDE] [WORKERS]  -> E:/fs_datasets/shadow_pool/NNNNN.jpg"""
 import os, sys, random
 from multiprocessing import Pool
-sys.path.insert(0, r'C:\Users\User\Desktop\round4_robustness\seg')
-OUT = r'C:\Users\User\Desktop\shadow_train\pool'
+sys.path.insert(0, r'E:\fs_datasets\round4\seg')
+OUT = r'E:\fs_datasets\shadow_pool'
 
 
 def one(i):
