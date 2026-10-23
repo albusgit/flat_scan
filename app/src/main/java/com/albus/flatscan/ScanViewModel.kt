@@ -37,7 +37,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Trash }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Trash, Sync }
 
 enum class ImportSource { Camera, Gallery }
 
@@ -731,11 +731,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             Screen.Result -> {
                 persist()
                 adjustOpen = false
+                documentDone()
                 Screen.Home
             }
-            Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home
+            Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home.also { documentDone() }
             Screen.Settings -> returnTo
             Screen.Trash -> Screen.Home
+            Screen.Sync -> Screen.Settings
             else -> {
                 batch = false
                 Screen.Home
@@ -1429,6 +1431,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun closeDocument() {
+        docId?.let { autoUpload(it) }
         closeSession()
         endPageSession()
         val old = docId
@@ -1446,6 +1449,41 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         settings.lastDocument = null
         // a document whose scan was abandoned before its first page has nothing to keep
         if (old != null) runCatching { library.dropEmpty(null) }
+    }
+
+    // ------------------------------------------------------------------ sync (feature 6)
+    val syncConfig by lazy { com.albus.flatscan.sync.SyncConfig(app) }
+
+    /** Back to the history from the open document: it is finished for now (automatic upload). */
+    private fun documentDone() {
+        val d = docId ?: return
+        viewModelScope.launch {
+            commitCurrent()
+            autoUpload(d)
+        }
+    }
+
+    /** Queues [doc] when automatic upload is on and it changed since its last upload. */
+    private suspend fun autoUpload(doc: String) {
+        val c = syncConfig
+        if (!c.autoUpload || !c.configured) return
+        val d = library.document(doc) ?: return
+        if (d.deletedAt != null || library.pageIds(doc).isEmpty()) return
+        if (d.uploadedModified == d.modifiedAt) return
+        runCatching { com.albus.flatscan.sync.SyncWorker.enqueue(getApplication(), doc) }.onFailure { Log.e(TAG, "upload queue failed", it) }
+    }
+
+    /** Uploads the documents now (history selection, pages screen). */
+    fun uploadDocuments(ids: Collection<String>) {
+        if (!syncConfig.configured) {
+            message = "Set up sync first: Settings > Sync to your server"
+            return
+        }
+        viewModelScope.launch {
+            if (docId in ids) commitCurrent()
+            ids.forEach { runCatching { com.albus.flatscan.sync.SyncWorker.enqueue(getApplication(), it) } }
+            message = if (ids.size == 1) "Upload queued" else "${ids.size} uploads queued"
+        }
     }
 
     /** Opens document [id] of the history on the pages screen. */

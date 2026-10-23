@@ -36,6 +36,11 @@ data class DocumentEntity(
     @ColumnInfo(name = "deleted_at") val deletedAt: Long? = null,
     @ColumnInfo(name = "sync_status") val syncStatus: SyncStatus = SyncStatus.None,
     @ColumnInfo(name = "sync_error") val syncError: String? = null,
+    /** An upload in progress (sync ledger, [com.albus.flatscan.sync.SyncLedger]): reserved remote name / checksum and task. */
+    @ColumnInfo(name = "sync_remote") val syncRemote: String? = null,
+    /** When the last upload finished, and the document's [modifiedAt] it uploaded (changed since: upload again). */
+    @ColumnInfo(name = "uploaded_at") val uploadedAt: Long? = null,
+    @ColumnInfo(name = "uploaded_modified") val uploadedModified: Long? = null,
 )
 
 /**
@@ -105,6 +110,18 @@ interface LibraryDao {
     @Query("UPDATE documents SET modified_at = :now WHERE id = :id")
     suspend fun touch(id: String, now: Long)
 
+    @Query("UPDATE documents SET sync_status = :status, sync_error = :error WHERE id = :id")
+    suspend fun setSync(id: String, status: SyncStatus, error: String?)
+
+    @Query("UPDATE documents SET sync_remote = :remote WHERE id = :id")
+    suspend fun setSyncRemote(id: String, remote: String?)
+
+    @Query("SELECT sync_remote FROM documents WHERE id = :id")
+    suspend fun syncRemote(id: String): String?
+
+    @Query("UPDATE documents SET sync_status = 'Uploaded', sync_error = NULL, sync_remote = NULL, uploaded_at = :at, uploaded_modified = :modified WHERE id = :id")
+    suspend fun markUploaded(id: String, at: Long, modified: Long)
+
     @Query("UPDATE documents SET deleted_at = :at WHERE id IN (:ids)")
     suspend fun setDeleted(ids: List<String>, at: Long?)
 
@@ -148,7 +165,7 @@ interface LibraryDao {
     }
 }
 
-@Database(entities = [DocumentEntity::class, PageEntity::class], version = 1, exportSchema = true)
+@Database(entities = [DocumentEntity::class, PageEntity::class], version = 2, exportSchema = true)
 abstract class LibraryDb : RoomDatabase() {
     abstract fun dao(): LibraryDao
 
@@ -156,7 +173,16 @@ abstract class LibraryDb : RoomDatabase() {
         const val NAME = "library.db"
 
         /** Every migration, oldest first (LibraryMigrationTest runs them on the exported schemas). */
-        val MIGRATIONS = arrayOf<androidx.room.migration.Migration>()
+        val MIGRATIONS = arrayOf<androidx.room.migration.Migration>(
+            // 2: sync (feature 6) - the upload in progress and the last finished upload
+            object : androidx.room.migration.Migration(1, 2) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE documents ADD COLUMN sync_remote TEXT")
+                    db.execSQL("ALTER TABLE documents ADD COLUMN uploaded_at INTEGER")
+                    db.execSQL("ALTER TABLE documents ADD COLUMN uploaded_modified INTEGER")
+                }
+            },
+        )
 
         @Volatile private var instance: LibraryDb? = null
 

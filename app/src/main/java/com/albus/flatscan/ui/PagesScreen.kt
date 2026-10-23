@@ -40,6 +40,7 @@ import androidx.compose.material.icons.outlined.CallSplit
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
@@ -204,6 +205,10 @@ fun PagesScreen(vm: ScanViewModel) {
                         DropdownMenuItem(
                             text = { Text("Rename") }, leadingIcon = { Icon(Icons.Outlined.Edit, null) },
                             onClick = { renaming = true; menu = false },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Upload now") }, leadingIcon = { Icon(Icons.Outlined.CloudUpload, null) }, enabled = ready,
+                            onClick = { menu = false; vm.docId?.let { vm.uploadDocuments(listOf(it)) } },
                         )
                     }
                 }

@@ -1,0 +1,18 @@
+# paperless-ngx for the sync integration tests (tools/sync_it/run.sh). SQLite, no Tika/Gotenberg.
+services:
+  broker:
+    image: redis:7
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:2.18
+    depends_on: [broker]
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_ADMIN_USER: admin
+      PAPERLESS_ADMIN_PASSWORD: admin-pass
+      PAPERLESS_SECRET_KEY: flatscan-test-only
+      PAPERLESS_OCR_LANGUAGE: eng
+      PAPERLESS_OCR_MODE: skip
+      PAPERLESS_URL: http://127.0.0.1:8000
+      # IPv4 only: hosts without IPv6 cannot bind the default [::]
+      PAPERLESS_BIND_ADDR: 0.0.0.0

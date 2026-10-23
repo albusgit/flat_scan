@@ -167,12 +167,22 @@ val syncRobolectric by tasks.registering(Sync::class) {
 }
 tasks.withType<Test>().configureEach {
     dependsOn(syncRobolectric)
+    // the sync integration tests (tools/sync_it/run.sh) find their servers through these; unset: skipped
+    for (k in listOf("FS_WEBDAV_URL", "FS_WEBDAV_USER", "FS_WEBDAV_PASS", "FS_WEBDAV_ROOT", "FS_PAPERLESS_URL", "FS_PAPERLESS_TOKEN")) {
+        System.getenv(k)?.let { environment(k, it) }
+    }
     systemProperty("robolectric.offline", "true")
     systemProperty("robolectric.dependency.dir", robolectricJars.get().asFile.absolutePath)
 }
 
 val roomVersion = "2.7.2"
 dependencies {
+    // sync (feature 6): HTTP for WebDAV / paperless-ngx, queued uploads, encrypted credentials
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.work:work-runtime-ktx:2.10.5")
+    implementation("androidx.security:security-crypto:1.1.0")
+    testImplementation("androidx.work:work-testing:2.10.5")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")

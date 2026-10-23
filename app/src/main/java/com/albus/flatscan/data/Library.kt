@@ -141,6 +141,17 @@ class Library(
         result
     }
 
+    // ---- sync (feature 6)
+    suspend fun setSync(doc: String, status: SyncStatus, error: String? = null) = io { dao.setSync(doc, status, error) }
+
+    suspend fun markUploaded(doc: String, modified: Long) = io { dao.markUploaded(doc, clock(), modified) }
+
+    /** The documents' upload records (what a retry continues from). */
+    val ledger: com.albus.flatscan.sync.SyncLedger = object : com.albus.flatscan.sync.SyncLedger {
+        override suspend fun get(doc: String): String? = io { dao.syncRemote(doc) }
+        override suspend fun set(doc: String, value: String?) = io { dao.setSyncRemote(doc, value) }
+    }
+
     private suspend fun <T> io(f: suspend () -> T): T = withContext(Dispatchers.IO) { f() }
 
     companion object {

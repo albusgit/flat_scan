@@ -113,6 +113,7 @@ fun HomeScreen(vm: ScanViewModel) {
                 if (selected.size == 1) {
                     IconButton(onClick = { renaming = docs?.firstOrNull { it.id in selected } }) { Icon(Icons.Outlined.Edit, "Rename") }
                 }
+                IconButton(onClick = { vm.uploadDocuments(selected); selected = emptySet() }) { Icon(Icons.Outlined.CloudUpload, "Upload") }
                 IconButton(onClick = { confirmDelete = true }, modifier = Modifier.testTag("delete_selected")) { Icon(Icons.Outlined.Delete, "Delete") }
             } else {
                 Spacer(Modifier.width(12.dp))

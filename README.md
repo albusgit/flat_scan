@@ -31,6 +31,68 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
 - **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
 
+## Sync to your own server (Phase 1, feature 6)
+
+Upload-only, free, no account and no FlatScan cloud (`sync/`). Settings › *Sync to your server*:
+
+- **Targets:** WebDAV (Nextcloud, ownCloud, Synology, most NAS boxes; the folder URL, user, password),
+  paperless-ngx (`POST /api/documents/post_document/`, `Authorization: Token`; title, created date, the
+  document's tags plus fixed ones, created when missing, and a correspondent), or a folder picked with the
+  Storage Access Framework (Syncthing, cloud-folder and SMB apps; no network code). SFTP is not done.
+- **What is uploaded:** the document as PDF (the current exporter), named by the file name template
+  (`{date}_{title}` by default; `{title} {date} {time} {pages}`, a choice of date formats; shared with
+  export). A taken name gets " (2)", " (3)"...; nothing is overwritten.
+- **Queue:** WorkManager, one unique job per document, exponential backoff from 30 s, up to 10 attempts;
+  options *Only on Wi-Fi* (unmetered network) and *Only while charging*. *Upload automatically* queues a
+  document when you go back from it after scanning or editing it (only if it changed since its last
+  upload); otherwise upload by hand (history: long press › Upload; pages screen ⋮ › Upload now).
+- **Status in the history:** waiting / uploading / uploaded / failed with the reason (e.g. "the server
+  refused the credentials (HTTP 401)"). Wrong settings or credentials fail at once; network trouble is
+  retried ("Will retry: ...").
+- **Exactly once:** the PDF is written once per document version and reused by retries (same bytes). WebDAV
+  and the folder reserve the file name in the database *before* the first byte; a retry uploads to that
+  same name (replacing its own partial file) or, if the earlier upload arrived and only the answer was lost,
+  finds it complete and stops. paperless: the file's MD5 is recorded first; a retry asks paperless for a
+  document with that checksum (and the recorded task) before uploading again, and paperless refuses a
+  duplicate file anyway.
+- **Security:** password / token and pinned certificates in EncryptedSharedPreferences (AES-256, key in
+  the Android Keystore); never logged (no HTTP logging; only headers carry them). HTTPS by default (an
+  address without a scheme gets `https://`). A self-signed certificate is accepted only after the user
+  trusts it on first use: Test connection shows its SHA-256 fingerprint and subject. Plain `http://` works
+  only when typed, with a warning (`res/xml/network_security_config.xml` allows cleartext for that).
+- **Test connection does a real authenticated upload and delete:** WebDAV puts a small file, reads it back
+  and deletes it; paperless uploads a tiny PDF, waits for its consumption and deletes the document (it stays
+  in paperless's own trash until emptied); the folder creates and deletes a file. A ping is not enough.
+- **New permission: `INTERNET`** (used only by sync, only when a server is set up). Database version 2
+  (`sync_remote`, `uploaded_at`, `uploaded_modified`), with its migration.
+
+**Integration tests against real servers** (`tools/sync_it/run.sh`): wsgidav (WebDAV over HTTPS with a
+self-signed certificate, basic auth) and paperless-ngx 2.18 + redis in Docker. Needs python3 with
+`wsgidav cheroot`, openssl, Docker with compose. The script starts both, gets a paperless token, runs
+`SyncIntegrationTest` and stops them (`KEEP=1` leaves them running). Measured here, all 10 pass:
+
+| Test | What it shows |
+|---|---|
+| webdavTestConnectionUploadsAndDeletes | real upload, read back, delete; folder empty after |
+| webdavWrongPasswordFailsTheTestAsAuth | the test fails with an authentication error, not a "works" |
+| webdavNeverOverwritesAndAddsASuffix | an existing `..._Bill.pdf` is kept, the upload becomes `..._Bill (2).pdf` |
+| webdavOfflineMidUploadThenOnlineUploadsExactlyOnce | a proxy cuts the connection after 200 KB of a 512 KB upload; the retry completes; one file, identical bytes |
+| webdavAnswerLostThenRetryDoesNotUploadTwice | the PUT arrives but its answer is dropped; the retry finds it complete; one file |
+| paperlessTestConnectionUploadsAndDeletes | upload, consumption, delete |
+| paperlessWrongTokenFailsAsAuth | authentication error |
+| paperlessUploadSendsTitleDateTagsAndCorrespondent | title, created date, 2 tags, correspondent on the stored document |
+| paperlessOfflineMidUploadThenOnlineUploadsExactlyOnce | cut after 200 KB, retry: exactly one document with that title |
+| paperlessAnswerLostThenRetryKeepsOneDocument | answer lost, retry: exactly one document |
+
+Without the servers these tests are skipped. JVM tests that always run: `SyncWorkerTest` (a cut upload is
+retried with status "pending" and its reserved name, then stored once and marked uploaded; wrong
+credentials fail at once with the reason; the last attempt gives up; Wi-Fi / charging constraints and one
+queued job per document), `LibraryMigrationTest` (v1 -> v2 keeps the data), `FileNameTemplateTest`.
+
+Not verified on a phone: the settings screen, the certificate dialog, the Keystore, the SAF folder target
+(no test runs it), WorkManager rescheduling on a real network change (the retry itself is tested, the
+"phone offline" is simulated by the proxy), Nextcloud / Synology specifically (wsgidav stands in).
+
 ## Page editor (Phase 1, feature 2)
 
 The pages screen is the document's page editor (`ui/PagesScreen.kt`, `ui/PageGrid.kt`, `PageEditing.kt`):

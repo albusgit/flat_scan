@@ -229,6 +229,15 @@ fun SettingsScreen(vm: ScanViewModel) {
                 Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
             }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            Section("Sync")
+            val sc = vm.syncConfig
+            Text(
+                if (sc.configured) "Uploading to ${sc.kind.label}" + (if (sc.autoUpload) ", automatically" else ", by hand") else "Off: scans stay on this phone",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { vm.open(Screen.Sync) }) { Text("Sync to your server") }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             StorageSection(vm)
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("About")
