@@ -95,3 +95,31 @@ fun formatBytes(n: Long): String {
     while (v >= 1024 && i < units.lastIndex) { v /= 1024; i++ }
     return if (v < 10) "%.1f %s".format(java.util.Locale.US, v, units[i]) else "%.0f %s".format(java.util.Locale.US, v, units[i])
 }
+
+/**
+ * The pages of a PDF ([uri]) as PNG files in cacheDir/pdf_import/ (the folder is emptied first), white
+ * background, at 200 dpi with the long side capped at 3508 px (A4 at 300 dpi). For importing PDF pages.
+ */
+fun renderPdfPages(ctx: Context, uri: Uri): List<File> {
+    val dir = File(ctx.cacheDir, "pdf_import").apply { deleteRecursively(); mkdirs() }
+    val out = mutableListOf<File>()
+    ctx.contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+        android.graphics.pdf.PdfRenderer(fd).use { r ->
+            for (i in 0 until r.pageCount) {
+                r.openPage(i).use { page ->
+                    val k = minOf(200f / 72f, 3508f / max(page.width, page.height))
+                    val w = (page.width * k).toInt().coerceAtLeast(1)
+                    val h = (page.height * k).toInt().coerceAtLeast(1)
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    b.eraseColor(android.graphics.Color.WHITE)
+                    page.render(b, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                    val f = File(dir, "page_%04d.png".format(java.util.Locale.US, i + 1))
+                    f.outputStream().buffered().use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    b.recycle()
+                    out += f
+                }
+            }
+        }
+    } ?: error("cannot open $uri")
+    return out
+}

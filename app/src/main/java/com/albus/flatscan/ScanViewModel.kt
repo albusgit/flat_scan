@@ -811,6 +811,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         val n = pendingTotal
         batch = false
+        flatImport = false
+        insertAt = null
         open(Screen.Pages)
         message = "$n photos imported"
     }
@@ -898,6 +900,19 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun detect(auto: Boolean = false) {
         val p = photo ?: return
+        if (flatImport) {
+            // a PDF page: the whole image is the page, already flat
+            detected = listOf(Offset(0f, 0f), Offset(p.width - 1f, 0f), Offset(p.width - 1f, p.height - 1f), Offset(0f, p.height - 1f))
+            corners = detected!!
+            cropPageIndex = 0
+            cropReasons = emptyList()
+            forceHomography = true
+            spreadNext = null
+            detecting = false
+            if (auto) process(perspective = true)
+            if (pending.isEmpty()) flatImport = false
+            return
+        }
         detecting = true
         val focal = focalPx
         val res = withContext(Dispatchers.Default) {
@@ -1197,26 +1212,194 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun deletePage(id: String) {
-        viewModelScope.launch {
-            if (id == currentId) closeSession()
-            if (photoPageId == id) photoPageId = null
-            pages.remove(id)
-            pageVersions.remove(id)
-            saveOrderNow()
-            withContext(Dispatchers.IO) { store.delete(id) }
-            if (pages.isEmpty() && screen == Screen.Pages) screen = Screen.Home
-        }
-    }
+    fun deletePage(id: String) = deletePages(setOf(id))
 
     fun movePage(id: String, delta: Int) {
         val i = pages.indexOf(id)
-        val j = i + delta
-        if (i < 0 || j !in pages.indices) return
-        pages[i] = pages[j]
-        pages[j] = id
-        saveOrder()
+        editPages { PageOps.moveOne(it, i, i + delta) }
     }
+
+    // ------------------------------------------------------------------ page editor (feature 2)
+    /**
+     * Undo / redo of the page editor: one history per open document, covering every structural edit of
+     * the session (order, delete, insert, duplicate, rotate, split, move to another document). Pages a
+     * state still refers to keep their files until the session ends ([endPageSession]).
+     */
+    private var pagesHistory: PagesHistory? = null
+    /** Result rotation of each page the session turned, before its first turn (undo target). */
+    private val baseRotations = mutableMapOf<String, Int>()
+    var canUndoPages by mutableStateOf(false)
+        private set
+    var canRedoPages by mutableStateOf(false)
+        private set
+    /** New pages (camera, photos, PDF) go here instead of the end; null: the end. */
+    var insertAt by mutableStateOf<Int?>(null)
+        private set
+    private val pagesMutex = Mutex()
+
+    private fun pagesSession(): PagesHistory? {
+        val d = docId ?: return null
+        val h = pagesHistory
+        if (h != null && h.state.current == d) return h
+        return PagesHistory(PagesState(d, mapOf(d to pages.toList()))).also {
+            pagesHistory = it
+            baseRotations.clear()
+            updateUndoFlags()
+        }
+    }
+
+    private fun updateUndoFlags() {
+        canUndoPages = pagesHistory?.canUndo == true
+        canRedoPages = pagesHistory?.canRedo == true
+    }
+
+    /** Applies one structural edit [f] to the open document as an undo step, and writes it. */
+    private fun editPages(f: suspend (PagesState) -> PagesState) {
+        viewModelScope.launch {
+            pagesMutex.withLock {
+                val h = pagesSession() ?: return@withLock
+                // a live change (drag and drop, a new page) becomes its own step first
+                val folded = h.state.pages != pages.toList()
+                if (folded) h.apply(h.state.copy(docs = h.state.docs + (h.state.current to pages.toList())))
+                val next = f(h.state)
+                if (next != h.state) h.apply(next) else if (!folded) return@withLock
+                commitPagesState(h.state)
+                updateUndoFlags()
+            }
+        }
+    }
+
+    fun undoPages() = walkPages { it.undo() }
+    fun redoPages() = walkPages { it.redo() }
+
+    private fun walkPages(step: (PagesHistory) -> PagesState?) {
+        viewModelScope.launch {
+            pagesMutex.withLock {
+                val h = pagesSession() ?: return@withLock
+                val s = step(h) ?: return@withLock
+                commitPagesState(s)
+                updateUndoFlags()
+            }
+        }
+    }
+
+    /** Makes [s] true on screen, in the database and in the pages' rotations. */
+    private suspend fun commitPagesState(s: PagesState) {
+        val now = s.pages
+        if (currentId != null && currentId !in now) closeSession()
+        if (pages.toList() != now) {
+            pages.clear()
+            pages.addAll(now)
+        }
+        for ((doc, ids) in s.docs) runCatching { library.setPages(doc, ids) }.onFailure { Log.e(TAG, "page order of $doc failed", it) }
+        // rotations: every page the session ever turned goes to the state's value, or back to where it started
+        for ((id, base) in baseRotations) {
+            val want = s.rotations[id] ?: base
+            if (id == currentId && handle != 0L) {
+                if (rotation != want) { rotation = want; outVersion++ }
+            } else if (store.exists(id)) {
+                val m = withContext(Dispatchers.IO) { runCatching { store.loadMeta(id) }.getOrNull() } ?: continue
+                if (m.rotation != want && rotateStoredPage(id, m, want)) pageVersions[id] = (pageVersions[id] ?: 0) + 1
+            }
+        }
+    }
+
+    /** Page [id] (not the live one) with result rotation [rot]: rendered again from its session, else its out.jpg turned. */
+    private suspend fun rotateStoredPage(id: String, m: PageMeta, rot: Int): Boolean = runCatching {
+        if (renderStoredPage(id, m.params, m.look, rot)) return@runCatching true
+        withContext(Dispatchers.IO) {
+            val b = android.graphics.BitmapFactory.decodeFile(store.outputFile(id).absolutePath) ?: return@withContext false
+            val t = b.rotatedQuarterTurns(rot - m.rotation)
+            store.saveOutput(id, t)
+            store.saveMeta(m.copy(rotation = rot))
+            true
+        }
+    }.onFailure { Log.e(TAG, "rotate $id failed", it) }.getOrDefault(false)
+
+    /** Ends the editing session of the open document: pages no state refers to any more are deleted. */
+    private suspend fun endPageSession() {
+        pagesHistory = null
+        baseRotations.clear()
+        insertAt = null
+        updateUndoFlags()
+        runCatching {
+            library.dropEmpty(docId)
+            library.pruneOrphans(keep = pages + listOfNotNull(photoPageId, currentId))
+        }.onFailure { Log.e(TAG, "page clean-up failed", it) }
+    }
+
+    /** Drag and drop on the pages screen: the order changes live ([dragMove]), one undo step at the drop ([dragEnd]). */
+    fun dragMove(from: Int, to: Int) {
+        if (from !in pages.indices || to !in pages.indices || from == to) return
+        pages.add(to, pages.removeAt(from))
+    }
+
+    fun dragEnd() = editPages { it }   // records the live order (editPages folds it in as one step)
+
+    fun deletePages(sel: Set<String>) {
+        if (photoPageId in sel && currentId !in sel) photoPageId = null
+        editPages { PageOps.delete(it, sel) }
+    }
+
+    fun reversePages() = editPages { PageOps.reverse(it) }
+
+    fun movePagesTo(sel: Set<String>, to: Int) = editPages { PageOps.move(it, sel, to) }
+
+    fun rotatePages(sel: Set<String>, quarters: Int) = editPages { s ->
+        commitCurrent()
+        for (id in sel) if (id !in baseRotations) baseRotations[id] = if (id == currentId) rotation
+            else withContext(Dispatchers.IO) { runCatching { store.loadMeta(id).rotation }.getOrDefault(0) }
+        PageOps.rotate(s, sel, quarters) { baseRotations[it] ?: 0 }
+    }
+
+    fun duplicatePages(sel: Set<String>) = editPages { s ->
+        commitCurrent()
+        val (next, copies) = PageOps.duplicate(s, sel) { store.newId() }
+        withContext(Dispatchers.IO) { copies.forEach { (from, to) -> store.copyPage(from, to) } }
+        copies.forEach { (from, to) -> baseRotations[from]?.let { baseRotations[to] = it } }
+        next
+    }
+
+    /** Pages from [page] on become a new document ("<title> (2)"). */
+    fun splitAt(page: String) = editPages { s ->
+        val at = s.pages.indexOf(page)
+        if (at <= 0) return@editPages s
+        commitCurrent()
+        val d = library.createDocument("${docTitle ?: DocumentName.default()} (2)")
+        message = "Pages ${at + 1}-${s.pages.size} moved to \"${d.title}\""
+        PageOps.split(s, at, d.id)
+    }
+
+    /** The selected pages go to the end of document [target] (null: a new document). */
+    fun movePagesToDocument(sel: Set<String>, target: String?) = editPages { s ->
+        commitCurrent()
+        val t = target?.let { library.document(it) } ?: library.createDocument()
+        message = if (sel.size == 1) "Page moved to \"${t.title}\"" else "${sel.size} pages moved to \"${t.title}\""
+        PageOps.moveToDocument(s, sel, t.id, library.pageIds(t.id))
+    }
+
+    /** New pages are inserted before [page] (null: at the end) until the import or scan is done. */
+    fun insertBefore(page: String?) {
+        insertAt = page?.let { pages.indexOf(it).takeIf { i -> i >= 0 } }
+    }
+
+    /** Pages of a PDF ([uri]) imported as pages (rendered at up to 200 dpi, perspective only, no page finding). */
+    fun importPdf(uri: Uri) {
+        viewModelScope.launch {
+            val files = withContext(Dispatchers.IO) {
+                runCatching { renderPdfPages(getApplication(), uri) }.onFailure { Log.e(TAG, "PDF import failed", it) }.getOrNull()
+            }
+            if (files.isNullOrEmpty()) {
+                message = "Could not read the PDF"
+                return@launch
+            }
+            flatImport = true
+            importUris(files.map { Uri.fromFile(it) })
+        }
+    }
+
+    /** The photos being imported are already flat pages (PDF pages): no detection, perspective only. */
+    private var flatImport = false
 
     /** Writes the page order of the open document (creating the document for its first page). */
     private fun saveOrder() {
@@ -1247,6 +1430,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun closeDocument() {
         closeSession()
+        endPageSession()
         val old = docId
         // before the pages go: a staged photo that is one of them (a re-crop) must not be deleted
         discardStaging()
@@ -1481,7 +1665,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (id !in pages) {
                 val i = spread?.let { pages.indexOf(it.firstId) } ?: -1
-                if (spread != null && i >= 0) pages.add(if (secondGoesFirst(spread)) i else i + 1, id) else pages.add(id)
+                val at = insertAt
+                when {
+                    spread != null && i >= 0 -> pages.add(if (secondGoesFirst(spread)) i else i + 1, id)
+                    at != null && at <= pages.size -> { pages.add(at, id); insertAt = at + 1 }
+                    else -> pages.add(id)
+                }
+                pagesHistory?.let { h -> if (h.state.current == docId) { h.apply(h.state.copy(docs = h.state.docs + (h.state.current to pages.toList()))); updateUndoFlags() } }
                 pageVersions[id] = 0
             }
             saveOrderNow()
@@ -1966,8 +2156,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Page [id] (not the live one) rendered again with [p] and the colours of [lk]: its meta and out.jpg. */
-    private suspend fun renderStoredPage(id: String, p: RenderParams, lk: PageLook): Boolean {
+    /** Page [id] (not the live one) rendered again with [p], the colours of [lk] and result rotation [rot] (null: its own): its meta and out.jpg. */
+    private suspend fun renderStoredPage(id: String, p: RenderParams, lk: PageLook, rot: Int? = null): Boolean {
         val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
         val dir = withContext(Dispatchers.IO) { store.sessionDir(id) } ?: return false
         val look2 = m.look.withColorsOf(lk)
@@ -1984,10 +2174,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 NativeLib.release(h)
             }
         } ?: return false
-        val fin = finishPage(bmp, m.rotation, look2)
+        val r = rot ?: m.rotation
+        val fin = finishPage(bmp, r, look2)
         if (fin !== bmp) bmp.recycle()
         withContext(Dispatchers.IO) {
-            store.saveMeta(m.copy(params = p, look = look2))
+            store.saveMeta(m.copy(params = p, look = look2, rotation = r))
             store.saveOutput(id, fin)
         }
         fin.recycle()

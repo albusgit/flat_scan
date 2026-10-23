@@ -31,6 +31,38 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
 - **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
 
+## Page editor (Phase 1, feature 2)
+
+The pages screen is the document's page editor (`ui/PagesScreen.kt`, `ui/PageGrid.kt`, `PageEditing.kt`):
+
+- **Drag and drop:** hold a page and drag; the order changes live and the drop is one undo step. Held near
+  the top or bottom edge, the grid scrolls by itself (faster closer to the edge), so a page can be carried
+  through a long document.
+- **Select pages** (⋮ › Select pages; All / None): rotate, duplicate, move (to the start, to the end, to
+  another document or a new one), delete. One page: split the document from it.
+- **Per page (…):** rotate, duplicate, insert pages before it (camera, photos, PDF pages), move to another
+  document, split from here, delete.
+- **Reverse page order** in one action (⋮).
+- **Insert anywhere:** new pages from the camera, photos or a **PDF** go before the chosen page. PDF pages
+  are rendered at 200 dpi (`renderPdfPages`, Android `PdfRenderer`), kept as their own original (PNG) and
+  processed perspective-only from the full page (no page finding).
+- **Undo / redo for the whole session** (top bar): order, delete, insert, duplicate, rotate, split and
+  moves between documents. Deleted pages keep their files until the session ends (leaving the document),
+  so undo can bring them back; then pages no document refers to are deleted.
+- Rotating a page that is not open re-renders it from its stored session (no quality loss); without a
+  session its `out.jpg` is turned.
+
+Tests: `PageEditingTest` (move one / a block, reverse, insert at any position, delete, duplicate, rotate,
+split, move to another document, undo / redo across a session, no-op edits not recorded);
+`PageGridDragTest` (Robolectric + Compose UI test, real pointer input on the grid the screen uses):
+page 5 dragged to position 1 in a 20-page document, and a page held at the bottom edge carried past the
+pages visible at the start (this one fails with the edge scrolling disabled; the first one does not,
+because the grid keeps its first visible item in place and so follows a dragged first item by itself).
+
+Not verified on a phone: the screen itself (dialogs, menus, PDF picker), drag smoothness, PDF import,
+rotation of stored pages. Known: dragging the first visible page makes the grid follow it (Compose keeps
+the first visible item in place), which can look like a jump.
+
 ## Scan history (Phase 1, feature 1)
 
 Every scan is a document that can be reopened, edited and exported again later.
