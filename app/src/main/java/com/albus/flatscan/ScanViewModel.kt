@@ -35,7 +35,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Licenses }
 
 enum class ImportSource { Camera, Gallery }
 
@@ -763,6 +763,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }
             Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home
             Screen.Settings -> returnTo
+            Screen.Licenses -> Screen.Settings
             else -> {
                 batch = false
                 Screen.Home

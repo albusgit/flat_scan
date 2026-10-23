@@ -118,12 +118,12 @@ Contact sheets and per-page measurements were made on the 34 pages and on synthe
 
 Research notes (model survey with licences, verified vs inferred) are in `C:\Users\User\Desktop\model_zoo\`: `dewarping_survey.md`, `enhancement_survey.md` and `occluder_survey.md`.
 
-**Models in the app** (`assets/models/`, ONNX Runtime; fp16 weights with fp32 compute; the outputs match PyTorch to 1e-4 for UVDoc and 4e-4 for the SyntheticDoc grid):
+**Models in the app** (`assets/models/`; ONNX Runtime when this was written, `.tflite` on LiteRT 1.4.0 since Round 11; fp16 weights with fp32 compute; the outputs match PyTorch to 1e-4 for UVDoc and 4e-4 for the SyntheticDoc grid):
 
 | Model | Paper | Licence | File | Input → output |
 |---|---|---|---|---|
 | UVDoc | Verhoeven et al., SIGGRAPH Asia 2023 | MIT (code and weights in the repo) | `uvdoc.onnx`, 15.8 MB | 488×712 RGB → 45×31 backward grid |
-| SyntheticDoc high-res | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages, 2× input) | code MIT; **the weights file states no licence**, so confirm with the authors before a release | `syntheticdoc_hr.onnx`, 17 MB | 1024×1440 RGB → 121×177 grid (its shading map is not used) |
+| SyntheticDoc high-res | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages, 2× input) | code and weights MIT (authors' repo); training data: SyntheticDoc dataset, CC BY 4.0 (https://doi.org/10.3929/ethz-c-000801994). Cleared for release; attribution in the app's licences screen. | `syntheticdoc_hr.onnx`, 17 MB | 1024×1440 RGB → 121×177 grid (its shading map is not used) |
 | ShadeNet (ours) | trained here, `tools/shadow_net/` | ours | `shadenet.onnx`, 1 MB | flattened page at 512 px → its shading map |
 
 **Pipeline** (`core/src/uvdoc.{h,cpp}`, `run_photo`):
@@ -721,6 +721,28 @@ tools/run_acceptance.sh   fs_cli app_ref out_ref fixtures out                 # 
 ```
 
 The raw output of those runs is in `docs/results/`.
+
+### Licences
+
+Third-party components in the release APK. **Settings > About > Open-source licences** shows the same list with
+the full texts (`assets/licenses/`; the list is `ui/Licenses.kt`).
+
+| Component | Version | Licence |
+|---|---|---|
+| UVDoc model (Verhoeven, Magne, Sorkine-Hornung, SIGGRAPH Asia 2023) | authors' weights | MIT, (c) 2023 Tanguy MAGNE |
+| SyntheticDoc high-res model (Woortmann, Magne, Sorkine-Hornung, ECCV 2026) | authors' weights | MIT, (c) 2026 Tanguy MAGNE |
+| SyntheticDoc dataset (same authors, ETH Zurich): training data of that model, not in the APK | 2026, DOI 10.3929/ethz-c-000801994 | CC BY 4.0 |
+| LiteRT (runtime and GPU delegate) | 1.4.0 | Apache-2.0 (its LICENSE also carries a Caffe BSD notice) |
+| OpenCV (the slim static build, `tools/opencv_min`) | 4.11.0 | Apache-2.0 |
+| in OpenCV: oneTBB / libjpeg-turbo / libpng / Carotene HAL / KleidiCV HAL / cpufeatures | 2021.11.0 / 3.0.3 / 1.6.43 / 0.0.1 / 0.3.0 / - | Apache-2.0 / IJG + BSD-3-Clause + zlib / libpng v2 / BSD-3-Clause / Apache-2.0 / Apache-2.0 |
+| AndroidX (Compose, Material3, Activity, Lifecycle, Core, CameraX, ExifInterface), Kotlin stdlib | `app/build.gradle.kts`; Kotlin 2.1.21 | Apache-2.0 |
+| LLVM libc++ (NDK r27c) | LLVM 18 | Apache-2.0 with LLVM Exceptions |
+| Recursive font | 1.085 | SIL OFL 1.1 |
+| Page finder (`pagefinder.tflite`) | - | **origin and licence not yet documented: must be resolved before release** |
+
+Not listed: our own nets (ShadeNet, rule net). zlib is Android's system library (not in the APK). An APK built
+without the slim OpenCV (the Maven AAR's `libopencv_java4.so`) also carries libwebp, libtiff, OpenJPEG, OpenEXR,
+protobuf, ADE and ittnotify, which this list does not cover.
 
 ## Architecture
 
