@@ -59,7 +59,6 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.albus.flatscan.DocumentName
 import com.albus.flatscan.ExportFormat
 import com.albus.flatscan.ExportPrefs
 import com.albus.flatscan.Exporter
@@ -86,7 +85,7 @@ fun rememberExportActions(vm: ScanViewModel): ExportActions {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf(DocumentName.forExport(ctx)) }
+    var name by remember { mutableStateOf(vm.exportName()) }
 
     fun launchExport(work: suspend () -> String?) {
         if (busy) return
@@ -130,7 +129,7 @@ fun rememberExportActions(vm: ScanViewModel): ExportActions {
     return remember(vm) {
         ExportActions(
             save = { f ->
-                name = DocumentName.forExport(ctx)
+                name = vm.exportName()
                 when {
                     f == ExportFormat.PDF -> savePdf.launch("$name.pdf")
                     vm.pages.size <= 1 -> saveJpg.launch("$name.jpg")
@@ -141,7 +140,7 @@ fun rememberExportActions(vm: ScanViewModel): ExportActions {
                 launchExport {
                     val files = pagesOrNull(vm.exportPages()) ?: return@launchExport "Nothing to share"
                     val o = ExportPrefs.pdf(ctx)
-                    val intent = withContext(Dispatchers.IO) { Exporter.shareIntent(ctx, files, f, DocumentName.forExport(ctx), o) }
+                    val intent = withContext(Dispatchers.IO) { Exporter.shareIntent(ctx, files, f, vm.exportName(), o) }
                     ctx.startActivity(intent)
                     null
                 }
@@ -157,16 +156,19 @@ fun rememberExportActions(vm: ScanViewModel): ExportActions {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExportSheet(share: Boolean, pageCount: Int, onSave: (ExportFormat) -> Unit, onShare: (ExportFormat) -> Unit, onDismiss: () -> Unit) {
+fun ExportSheet(
+    share: Boolean, pageCount: Int, title: String?, onRename: (String) -> Unit,
+    onSave: (ExportFormat) -> Unit, onShare: (ExportFormat) -> Unit, onDismiss: () -> Unit,
+) {
     val ctx = LocalContext.current
     var sharing by remember { mutableStateOf(share) }
-    var name by remember { mutableStateOf(DocumentName.get(ctx) ?: "") }
-    val placeholder = remember { DocumentName.default() }
+    var name by remember { mutableStateOf(title ?: "") }
+    val placeholder = remember { com.albus.flatscan.DocumentName.default() }
     var pdf by remember { mutableStateOf(ExportPrefs.pdf(ctx)) }
     var options by remember { mutableStateOf(false) }
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     fun pick(f: ExportFormat) {
-        DocumentName.set(ctx, name)
+        if (name != (title ?: "")) onRename(name)
         ExportPrefs.setPdf(ctx, pdf)
         onDismiss()
         if (sharing) onShare(f) else onSave(f)

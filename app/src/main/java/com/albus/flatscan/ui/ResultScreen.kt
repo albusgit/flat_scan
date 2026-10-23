@@ -353,7 +353,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
 
     if (sheet != Sheet.None) {
-        ExportSheet(sheet == Sheet.Share, vm.pages.size, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = Sheet.None })
+        ExportSheet(sheet == Sheet.Share, vm.pages.size, vm.docTitle, onRename = { vm.renameDocument(it) }, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = Sheet.None })
     }
     if (showDetails) {
         AlertDialog(

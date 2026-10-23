@@ -4,6 +4,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
 }
 
 val localProps = Properties().apply { rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) } }
@@ -132,6 +133,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    testOptions {
+        // JVM tests run on Robolectric (Room, Compose UI, real bitmap decoding with native graphics)
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all { it.maxHeapSize = "3g" }
+    }
+    // the Room schemas as assets of debug builds: the migration tests (Robolectric) read them from there
+    sourceSets["debug"].assets.srcDir("$projectDir/schemas")
     packaging {
         jniLibs {
             // uncompressed in the APK (loaded in place, not copied out at install: less space on the phone; Play
@@ -144,7 +152,40 @@ android {
     }
 }
 
+ksp {
+    // the Room schema of every version is kept in app/schemas (migration tests read them)
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+// Robolectric's Android runtime jar, fetched by Gradle (which retries; Robolectric's own download does not)
+// and handed to the tests offline
+val robolectricRuntime: Configuration by configurations.creating { isTransitive = false }
+val robolectricJars = layout.buildDirectory.dir("robolectric-jars")
+val syncRobolectric by tasks.registering(Sync::class) {
+    from(robolectricRuntime)
+    into(robolectricJars)
+}
+tasks.withType<Test>().configureEach {
+    dependsOn(syncRobolectric)
+    systemProperty("robolectric.offline", "true")
+    systemProperty("robolectric.dependency.dir", robolectricJars.get().asFile.absolutePath)
+}
+
+val roomVersion = "2.7.2"
 dependencies {
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.17")
+    robolectricRuntime("org.robolectric:android-all-instrumented:15-robolectric-13954326-i7")
+    testImplementation("androidx.test:core-ktx:1.6.1")
+    testImplementation("androidx.test.ext:junit-ktx:1.2.1")
+    testImplementation("androidx.room:room-testing:$roomVersion")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    testImplementation(platform("androidx.compose:compose-bom:2025.05.00"))
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     if (opencvMin == null) implementation("org.opencv:opencv:4.11.0")
     // the nets' runtime, copied out by syncLitert (not linked, no Java API used)
     litertAars("com.google.ai.edge.litert:litert:$litertVersion@aar")

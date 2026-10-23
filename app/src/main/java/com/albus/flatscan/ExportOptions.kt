@@ -1,7 +1,6 @@
 package com.albus.flatscan
 
 import android.content.Context
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -45,27 +44,8 @@ object ExportPrefs {
     }
 }
 
-/**
- * The current document's name (the exported file names). It lives beside the pages
- * (cacheDir/document/name.txt), so a new document starts without one.
- */
+/** Document names: the default name and what a file name may hold. The name itself is the document's title (Library). */
 object DocumentName {
-    private fun file(ctx: Context) = File(File(ctx.cacheDir, "document"), "name.txt")
-
-    /** The name the user gave, or null. */
-    fun get(ctx: Context): String? = runCatching { file(ctx).readText().trim() }.getOrNull()?.takeIf { it.isNotEmpty() }
-
-    fun set(ctx: Context, name: String?) {
-        val f = file(ctx)
-        val n = name?.let { clean(it) }
-        runCatching {
-            if (n.isNullOrEmpty()) f.delete() else { f.parentFile?.mkdirs(); f.writeText(n) }
-        }
-    }
-
-    /** The name for exported files: the user's, else "Scan" and the date. */
-    fun forExport(ctx: Context): String = get(ctx) ?: default()
-
     fun default(): String = "Scan " + SimpleDateFormat("yyyy-MM-dd HH.mm", Locale.US).format(Date())
 
     /** No path separators or characters file providers reject. */

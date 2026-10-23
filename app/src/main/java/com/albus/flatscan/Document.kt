@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.InputStream
 import java.util.UUID
 import kotlin.math.max
 
@@ -108,55 +109,88 @@ data class PageMeta(
 }
 
 /**
- * The current document on disk: cacheDir/document/doc.json (page order) and one folder per
- * page with source.jpg (the upright photo, JPEG q95), meta.json, out.jpg (the rendered,
- * rotated page, JPEG q95: thumbnails and export) and session/ (the processed page, so opening
- * it again does not re-run the geometry). All calls do file IO: call them off the main thread.
+ * The pages' files, one folder per page under filesDir/pages/<id>/ (app-private storage, not the cache,
+ * which Android may clear): original.<ext> (the photo exactly as captured or imported; every
+ * processing run decodes it the same way, [loadSource]), meta.json, out.jpg (the rendered, rotated
+ * page, JPEG q95: export), thumb.jpg (a small copy of out.jpg: lists) and session/ (the processed page,
+ * so opening it again does not re-run the geometry). Which pages make which document, and in what
+ * order, is in the database ([com.albus.flatscan.data.LibraryDb]). Pages made before history existed
+ * have source.jpg (the decoded photo, re-encoded at q95) instead of an original.
+ * All calls do file IO: call them off the main thread.
  */
-class DocumentStore(ctx: Context) {
-    val root = File(ctx.cacheDir, "document")
+class DocumentStore(val root: File) {
+    constructor(ctx: Context) : this(File(ctx.filesDir, "pages"))
 
     fun newId(): String = UUID.randomUUID().toString().substring(0, 12)
 
-    private fun dir(id: String) = File(root, id)
-    fun sourceFile(id: String) = File(dir(id), "source.jpg")
+    fun dir(id: String) = File(root, id)
+    /** The original photo of [id] (any image format), or null when there is none (dropped, or a legacy page). */
+    fun originalFile(id: String): File? = dir(id).listFiles()?.firstOrNull { it.isFile && it.name.startsWith("original.") && !it.name.endsWith(".tmp") }
+    private fun legacySource(id: String) = File(dir(id), "source.jpg")
     fun outputFile(id: String) = File(dir(id), "out.jpg")
+    fun thumbFile(id: String) = File(dir(id), "thumb.jpg")
     private fun metaFile(id: String) = File(dir(id), "meta.json")
 
-    fun loadOrder(): List<String> = runCatching {
-        val a = JSONObject(File(root, "doc.json").readText()).getJSONArray("pages")
-        List(a.length()) { a.getString(it) }.filter { metaFile(it).exists() && sourceFile(it).exists() }
-    }.getOrDefault(emptyList())
+    fun exists(id: String) = metaFile(id).exists()
 
-    fun saveOrder(ids: List<String>) {
-        root.mkdirs()
-        val tmp = File(root, "doc.json.tmp")
-        tmp.writeText(JSONObject().put("pages", JSONArray(ids)).toString())
-        tmp.renameTo(File(root, "doc.json"))
-    }
+    /** The page can be processed again (it has a photo to process). */
+    fun hasSource(id: String) = originalFile(id) != null || legacySource(id).exists()
 
-    /** Removes page folders that are not in [keep] (abandoned imports). */
+    /** Page folders on disk. */
+    fun pageIds(): List<String> = root.listFiles()?.filter { it.isDirectory }?.map { it.name }.orEmpty()
+
+    /** Removes page folders that are not in [keep] (abandoned imports, purged documents). */
     fun prune(keep: Collection<String>) {
-        root.listFiles()?.forEach { if (it.isDirectory && it.name !in keep) it.deleteRecursively() }
+        val k = keep.toSet()
+        root.listFiles()?.forEach { if (it.isDirectory && it.name !in k) it.deleteRecursively() }
     }
 
-    fun saveSource(id: String, photo: Bitmap) {
+    /**
+     * Stores the photo of a new page byte for byte from [input] ([ext]: its file extension, e.g. "jpg"),
+     * and returns the file. The page is processed from this file, never from an in-memory copy, so
+     * processing it again later starts from exactly the same pixels.
+     */
+    fun saveOriginal(id: String, ext: String, input: InputStream): File {
         dir(id).mkdirs()
-        writeJpeg(photo, sourceFile(id))
+        val e = ext.lowercase().filter { it.isLetterOrDigit() }.take(5).ifEmpty { "jpg" }
+        val f = File(dir(id), "original.$e")
+        val tmp = File(dir(id), "original.$e.tmp")
+        tmp.outputStream().buffered().use { input.copyTo(it) }
+        if (!tmp.renameTo(f)) error("cannot write original of $id")
+        return f
     }
 
-    /** The other page of a book spread shares its photo: a copy of [from]'s source. */
+    /** The other page of a book spread shares its photo: a copy of [from]'s original (or legacy source). */
     fun copySource(from: String, to: String) {
         dir(to).mkdirs()
-        val tmp = File(dir(to), "source.jpg.tmp")
-        sourceFile(from).copyTo(tmp, overwrite = true)
-        if (!tmp.renameTo(sourceFile(to))) error("cannot write source of $to")
+        val src = originalFile(from) ?: legacySource(from)
+        val target = if (src.name.startsWith("original.")) File(dir(to), src.name) else legacySource(to)
+        val tmp = File(dir(to), target.name + ".tmp")
+        src.copyTo(tmp, overwrite = true)
+        if (!tmp.renameTo(target)) error("cannot write source of $to")
     }
 
-    fun loadSource(id: String): Bitmap {
+    /** A copy of page [from] as page [to]: every file, session included (duplicate page). */
+    fun copyPage(from: String, to: String) {
+        val d = dir(to)
+        d.deleteRecursively()
+        dir(from).copyRecursively(d, overwrite = true)
+        if (exists(to)) saveMeta(loadMeta(to).copy(id = to, spreadWith = null))
+    }
+
+    /** The upright photo of [id] as processing sees it (EXIF orientation applied, at most [MAX_PHOTO_SIDE]). */
+    fun loadSource(id: String): LoadedPhoto {
+        originalFile(id)?.let { return loadPhotoFile(it) }
         val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-        val b = BitmapFactory.decodeFile(sourceFile(id).absolutePath, opts) ?: error("cannot read page $id")
-        return if (b.config == Bitmap.Config.ARGB_8888) b else b.copy(Bitmap.Config.ARGB_8888, false)
+        val b = BitmapFactory.decodeFile(legacySource(id).absolutePath, opts) ?: error("cannot read page $id")
+        return LoadedPhoto(if (b.config == Bitmap.Config.ARGB_8888) b else b.copy(Bitmap.Config.ARGB_8888, false), 0f)
+    }
+
+    /** Deletes the original photo (and legacy source) of [id]; returns the bytes freed. */
+    fun dropOriginal(id: String): Long {
+        var n = 0L
+        listOfNotNull(originalFile(id), legacySource(id).takeIf { it.exists() }).forEach { n += it.length(); it.delete() }
+        return n
     }
 
     fun saveMeta(m: PageMeta) {
@@ -173,6 +207,13 @@ class DocumentStore(ctx: Context) {
         val d = File(dir(id), "session")
         val j = JSONObject(File(d, "ready.json").readText())
         if (j.optString("key") != key) null else Triple(d, j.getJSONObject("info"), j.optString("details"))
+    }.getOrNull()
+
+    /** The stored session of [id] whatever its key (a page without its original can only be shown as it was made). */
+    fun loadAnySession(id: String): Triple<File, JSONObject, String>? = runCatching {
+        val d = File(dir(id), "session")
+        val j = JSONObject(File(d, "ready.json").readText())
+        Triple(d, j.getJSONObject("info"), j.optString("details"))
     }.getOrNull()
 
     /**
@@ -197,14 +238,19 @@ class DocumentStore(ctx: Context) {
     /** The page's stored session directory whatever its geometry key (the geometry out.jpg was made with), or null. */
     fun sessionDir(id: String): File? = File(dir(id), "session").takeIf { File(it, "ready.json").exists() }
 
+    /** Writes the rendered page and its thumbnail. */
     fun saveOutput(id: String, page: Bitmap) {
         dir(id).mkdirs()
-        writeJpeg(page, outputFile(id))
+        writeJpeg(page, outputFile(id), 95)
+        val s = THUMB_SIDE.toFloat() / max(page.width, page.height)
+        val t = if (s < 1f) Bitmap.createScaledBitmap(page, (page.width * s).toInt().coerceAtLeast(1), (page.height * s).toInt().coerceAtLeast(1), true) else page
+        writeJpeg(t, thumbFile(id), 85)
+        if (t !== page) t.recycle()
     }
 
-    /** The rendered page scaled to at most [maxSide] px, or null when there is none yet. */
+    /** The rendered page scaled to at most [maxSide] px (from the thumbnail when it is big enough), or null when there is none yet. */
     fun loadThumbnail(id: String, maxSide: Int): Bitmap? {
-        val f = outputFile(id)
+        val f = thumbFile(id).takeIf { it.exists() && maxSide <= THUMB_SIDE } ?: outputFile(id)
         if (!f.exists()) return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(f.absolutePath, bounds)
@@ -217,13 +263,44 @@ class DocumentStore(ctx: Context) {
         dir(id).deleteRecursively()
     }
 
-    fun deleteAll() {
-        root.deleteRecursively()
+    /** Bytes on disk: (everything, originals only) for [ids] (all pages when null). */
+    fun usage(ids: Collection<String>? = null): Pair<Long, Long> {
+        var all = 0L
+        var orig = 0L
+        for (id in ids ?: pageIds()) {
+            dir(id).walkTopDown().filter { it.isFile }.forEach {
+                all += it.length()
+                if (it.parentFile == dir(id) && (it.name.startsWith("original.") || it.name == "source.jpg")) orig += it.length()
+            }
+        }
+        return all to orig
     }
 
-    private fun writeJpeg(b: Bitmap, f: File) {
+    private fun writeJpeg(b: Bitmap, f: File, quality: Int) {
         val tmp = File(f.parentFile, f.name + ".tmp")
-        tmp.outputStream().buffered().use { b.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+        tmp.outputStream().buffered().use { b.compress(Bitmap.CompressFormat.JPEG, quality, it) }
         if (!tmp.renameTo(f)) error("cannot write $f")
     }
+
+    companion object {
+        const val THUMB_SIDE = 480
+
+        /**
+         * The single document of versions before history (cacheDir/document: doc.json, name.txt, one folder
+         * per page), or null. [LegacyDocument.dir] is where its page folders are.
+         */
+        fun legacy(ctx: Context): LegacyDocument? = legacyAt(File(ctx.cacheDir, "document"))
+
+        fun legacyAt(dir: File): LegacyDocument? {
+            val order = runCatching {
+                val a = JSONObject(File(dir, "doc.json").readText()).getJSONArray("pages")
+                List(a.length()) { a.getString(it) }
+            }.getOrNull() ?: return null
+            val name = runCatching { File(dir, "name.txt").readText().trim() }.getOrNull()?.takeIf { it.isNotEmpty() }
+            return LegacyDocument(dir, order.filter { File(File(dir, it), "meta.json").exists() }, name)
+        }
+    }
 }
+
+/** The pre-history document found in the cache: its folder, page order and name. */
+class LegacyDocument(val dir: File, val pages: List<String>, val name: String?)

@@ -114,7 +114,7 @@ fun PagesScreen(vm: ScanViewModel) {
     val n = vm.pages.size
     val ready = n > 0 && !exporter.busy
     val ctx = LocalContext.current
-    var docName by remember { mutableStateOf(DocumentName.get(ctx)) }
+    val docName = vm.docTitle
     var renaming by remember { mutableStateOf(false) }
     val grid = rememberLazyGridState()
     // the page being dragged: the pointer in grid coordinates and where it holds the card
@@ -243,7 +243,7 @@ fun PagesScreen(vm: ScanViewModel) {
     }
     if (sheet != PagesSheet.None) {
         val share = sheet == PagesSheet.Share
-        ExportSheet(share, n, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = PagesSheet.None; docName = DocumentName.get(ctx) })
+        ExportSheet(share, n, vm.docTitle, onRename = { vm.renameDocument(it) }, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = PagesSheet.None })
     }
     if (renaming) {
         var text by remember { mutableStateOf(docName ?: "") }
@@ -258,8 +258,7 @@ fun PagesScreen(vm: ScanViewModel) {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    DocumentName.set(ctx, text)
-                    docName = DocumentName.get(ctx)
+                    vm.renameDocument(text)
                     renaming = false
                 }) { Text("Rename") }
             },

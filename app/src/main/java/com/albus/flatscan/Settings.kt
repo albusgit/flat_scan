@@ -96,6 +96,11 @@ class Settings(ctx: Context) {
 
     private val appLanguageRtl = TextUtils.getLayoutDirectionFromLocale(ctx.resources.configuration.locales[0]) == View.LAYOUT_DIRECTION_RTL
 
+    /** The document open when the app was last used (reopened at start), or null. */
+    var lastDocument: String?
+        get() = p.getString("last_document", null)
+        set(v) = p.edit().apply { if (v == null) remove("last_document") else putString("last_document", v) }.apply()
+
     /** The one-time "Press and hold to see the original" hint was dismissed. */
     var holdHintShown: Boolean
         get() = p.getBoolean("hold_hint_shown", false)

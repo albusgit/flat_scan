@@ -31,6 +31,43 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
 - **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
 
+## Scan history (Phase 1, feature 1)
+
+Every scan is a document that can be reopened, edited and exported again later.
+
+- **Storage:** page folders moved from the cache to app-private storage, `filesDir/pages/<page id>/`:
+  `original.<ext>` (the photo **byte for byte** as captured or imported), `meta.json` (the processing
+  parameters: corners, crop rotation, filter, look, rotation, protect / erase / ignore areas, unwarp),
+  `out.jpg` (rendered page, the export source), `thumb.jpg` (480 px) and `session/` (the processed page).
+  Documents and page order are in a Room database, `library.db` (`data/LibraryDb.kt`): documents (title,
+  created and modified dates, tags, sync status and error, trash date) and pages (document, position,
+  created date, original dropped). Schemas are exported to `app/schemas/`.
+- **Non-destructive editing:** a new scan and a later re-edit both decode the stored original with the
+  same code (`loadPhotoFile`), so a re-crop on an old scan starts from the same pixels as the first scan
+  (before, re-edits started from a q95 re-encode of the decoded photo). Filter and look edits re-render
+  from the stored session.
+- **Home = history:** Scan / Import start a new document; the list shows documents newest first with
+  thumbnail, page count, date and sync state. Search matches every word in the title or tags (and the
+  recognised text once OCR exists). Long press selects: rename (one), delete (any number).
+- **Trash:** deleted documents stay 30 days (restore, delete forever, empty); older ones are purged at
+  start-up.
+- **Settings › Storage:** space used (all, originals), and removing the original photos of documents
+  not changed for 30 / 90 / 365 days. Such pages keep their processed page (filters, rotation and export
+  still work) but cannot be re-cropped; only pages with a stored session lose their original.
+- **Upgrade:** the single document of earlier versions (`cacheDir/document`) is imported once as the
+  first document (its pages keep their `source.jpg`, a re-encode, since the original was never kept).
+- `android:supportsRtl="true"` is set: layouts now mirror in Hebrew and Arabic locales.
+
+Tests (JVM, Robolectric with native graphics; `./gradlew testDebugUnitTest`): `LibraryTest` (ordering,
+moving pages between documents, rename and tags, 30-day trash and purge, delete forever, dropping
+originals, legacy import, the database surviving a close and reopen as after a process kill),
+`LibraryMigrationTest` (schema v1 from `app/schemas`), `DecodeParityTest` (fresh scan and re-edit decode
+identical pixels, EXIF turn included; the old re-encode did not), `HistorySearchTest` (English, Hebrew,
+tags, recognised text).
+
+Not verified on a phone: the history and trash screens, process death in the real app (tested at the
+database level), storage numbers, the mirrored layout in a Hebrew locale.
+
 ## Round 4: robustness on real photos
 
 What changed (brief: `E:/fs_datasets/round4/README_FOR_APP_AGENT.md`; reference: its `code/` and `seg/`):

@@ -91,96 +91,6 @@ import com.albus.flatscan.Screen
 import com.albus.flatscan.Settings
 import kotlinx.coroutines.delay
 
-@Composable
-fun HomeScreen(vm: ScanViewModel) {
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
-    var confirmNew by remember { mutableStateOf(false) }
-    val n = vm.pages.size
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    // scrolls on short screens; otherwise "Start a new document" sits at the bottom
-    BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
-        Column(
-            Modifier.verticalScroll(rememberScrollState()).heightIn(min = maxHeight)
-                .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 20.dp),
-        ) {
-            Row(Modifier.fillMaxWidth().height(48.dp), verticalAlignment = Alignment.CenterVertically) {
-                LogoMark(Modifier.size(26.dp))
-                Spacer(Modifier.width(10.dp))
-                Text("FlatScan", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                IconButton(onClick = { vm.open(Screen.Settings) }) { Icon(Icons.Outlined.Settings, "Settings") }
-            }
-            Spacer(Modifier.height(28.dp))
-            Text("Flat, clean pages\nfrom any photo.", style = MaterialTheme.typography.headlineLarge)
-            Spacer(Modifier.height(10.dp))
-            Text(
-                "Bent, curled or shadowed: FlatScan finds the page, flattens it and whitens the paper.",
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp), color = muted,
-            )
-            Spacer(Modifier.height(28.dp))
-            // the main action: a large accent card
-            Surface(
-                onClick = { vm.startCamera() },
-                shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.fillMaxWidth().height(168.dp),
-            ) {
-                Column(Modifier.fillMaxSize().padding(22.dp), verticalArrangement = Arrangement.SpaceBetween) {
-                    Box(
-                        Modifier.size(52.dp).background(LocalContentColor.current.copy(alpha = 0.16f), RoundedCornerShape(16.dp)),
-                        contentAlignment = Alignment.Center,
-                    ) { Icon(Icons.Outlined.PhotoCamera, null, Modifier.size(28.dp)) }
-                    Column {
-                        Text("Scan with camera", style = MaterialTheme.typography.headlineSmall)
-                        Text("Hold the phone above the page", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.alpha(0.85f))
-                    }
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            Surface(
-                onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLowest,
-                border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline),
-                modifier = Modifier.fillMaxWidth().height(64.dp),
-            ) {
-                Row(Modifier.padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(22.dp))
-                    Spacer(Modifier.width(14.dp))
-                    Text("Import photos", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold), modifier = Modifier.weight(1f))
-                    Text("Several at once", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium), color = muted)
-                }
-            }
-            if (n > 0) {
-                Spacer(Modifier.height(32.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "CURRENT DOCUMENT", style = MaterialTheme.typography.labelMedium.copy(fontSize = 13.sp, letterSpacing = 0.08.em),
-                        color = muted, modifier = Modifier.weight(1f),
-                    )
-                    TextButton(onClick = { vm.open(Screen.Pages) }) { Text("Open") }
-                }
-                Spacer(Modifier.height(4.dp))
-                DocumentCard(vm, onClick = { vm.open(Screen.Pages) })
-            }
-            Spacer(Modifier.weight(1f).heightIn(min = 24.dp))
-            if (n > 0) {
-                TextButton(
-                    onClick = { confirmNew = true },
-                    colors = ButtonDefaults.textButtonColors(contentColor = muted),
-                    modifier = Modifier.align(Alignment.CenterHorizontally).height(44.dp),
-                ) { Text("Start a new document", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)) }
-            }
-        }
-    }
-    if (confirmNew) {
-        AlertDialog(
-            onDismissRequest = { confirmNew = false },
-            title = { Text("Start a new document?") },
-            text = { Text(if (n == 1) "The current page will be removed from the app. Save it first if you need it." else "The current $n pages will be removed from the app. Save them first if you need them.") },
-            confirmButton = { TextButton(onClick = { vm.newDocument(); confirmNew = false }) { Text("New document") } },
-            dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } },
-        )
-    }
-}
-
 /** The app mark: a page with a folded corner and two accent lines. */
 @Composable
 private fun LogoMark(modifier: Modifier = Modifier) {
@@ -194,61 +104,6 @@ private fun LogoMark(modifier: Modifier = Modifier) {
         drawPath(page, ink, style = Stroke(width = 2 * u, join = StrokeJoin.Round))
         drawLine(accent, Offset(9 * u, 13 * u), Offset(17 * u, 13 * u), strokeWidth = 2 * u, cap = StrokeCap.Round)
         drawLine(accent, Offset(9 * u, 17 * u), Offset(15 * u, 17 * u), strokeWidth = 2 * u, cap = StrokeCap.Round)
-    }
-}
-
-/** The current document on the home screen: the first page over a second sheet, count and filter. */
-@Composable
-private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
-    val n = vm.pages.size
-    val first = vm.pages.firstOrNull()
-    val version = first?.let { vm.pageVersions[it] } ?: 0
-    var thumb by remember(first) { mutableStateOf<android.graphics.Bitmap?>(null) }
-    LaunchedEffect(first, version) { thumb = first?.let { vm.thumbnail(it) } }
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerLowest,
-        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outlineVariant),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(92.dp, 96.dp)) {
-                val sheet = RoundedCornerShape(4.dp)
-                val paper = Color.White
-                if (n > 1) {
-                    Box(
-                        Modifier.offset(22.dp, 2.dp).size(62.dp, 84.dp).rotate(6f)
-                            .background(paper, sheet).border(1.dp, Color(0xFFE2E0DA), sheet),
-                    )
-                }
-                Box(
-                    Modifier.offset(4.dp, 8.dp).size(62.dp, 84.dp)
-                        .shadow(4.dp, sheet).background(paper, sheet).border(1.dp, Color(0xFFD8D6D0), sheet).clip(sheet),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    val t = thumb
-                    if (t != null) {
-                        val img = remember(t) { t.asImageBitmap() }
-                        Image(img, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                    } else {
-                        Icon(Icons.Outlined.Description, null, tint = Color(0xFFB9B7B1))
-                    }
-                }
-            }
-            Spacer(Modifier.width(14.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                val ctx = androidx.compose.ui.platform.LocalContext.current
-                val name = remember(n, version) { com.albus.flatscan.DocumentName.get(ctx) }
-                if (name != null) Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                Text(if (n == 1) "1 page" else "$n pages", style = if (name != null) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium)
-                Text(
-                    if (vm.hasSession) vm.params.filter.label else "Tap to open",
-                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = muted,
-                )
-            }
-            Icon(Icons.Outlined.ChevronRight, null, tint = muted)
-        }
     }
 }
 
@@ -374,6 +229,8 @@ fun SettingsScreen(vm: ScanViewModel) {
                 Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
             }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            StorageSection(vm)
+            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("About")
             Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(4.dp))
@@ -456,5 +313,37 @@ fun MessageHost(vm: ScanViewModel) {
     }
     Box(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), contentAlignment = Alignment.BottomCenter) {
         Snackbar { Text(m) }
+    }
+}
+
+/** Settings > Storage: what the scans take, and removing the original photos of old documents. */
+@Composable
+private fun StorageSection(vm: ScanViewModel) {
+    LaunchedEffect(Unit) { vm.measureStorage() }
+    var days by remember { mutableStateOf<Int?>(null) }
+    Section("Storage")
+    val u = vm.storage
+    Text(
+        if (u == null) "Measuring..." else "${com.albus.flatscan.formatBytes(u.total)} for ${u.documents} documents (${u.pages} pages); " +
+            "original photos: ${com.albus.flatscan.formatBytes(u.originals)}",
+        style = MaterialTheme.typography.bodyMedium,
+    )
+    Text(
+        "Every page keeps its original photo, so a crop or the unwarp can be changed later without losing quality. " +
+            "Removing the originals of old documents frees space; their pages can still be filtered, rotated and exported, but not re-cropped.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        for (d in listOf(30, 90, 365)) OutlinedButton(onClick = { days = d }) { Text(if (d == 365) "> 1 year" else "> $d days") }
+    }
+    days?.let { d ->
+        AlertDialog(
+            onDismissRequest = { days = null },
+            title = { Text("Remove original photos?") },
+            text = { Text("The original photos of documents not changed in the last ${if (d == 365) "year" else "$d days"} are deleted. Their pages stay, but can no longer be re-cropped.") },
+            confirmButton = { TextButton(onClick = { vm.dropOriginals(d); days = null }) { Text("Remove") } },
+            dismissButton = { TextButton(onClick = { days = null }) { Text("Cancel") } },
+        )
     }
 }

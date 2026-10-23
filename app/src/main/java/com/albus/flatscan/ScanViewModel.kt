@@ -28,6 +28,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import com.albus.flatscan.data.Library
+import com.albus.flatscan.data.StorageUsage
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
@@ -35,7 +37,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Trash }
 
 enum class ImportSource { Camera, Gallery }
 
@@ -79,7 +81,8 @@ private class SpreadPage(
  */
 class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val settings = Settings(app)
-    private val store = DocumentStore(app)
+    val library = Library.get(app)
+    private val store = library.store
 
     var screen by mutableStateOf(Screen.Home)
     private var returnTo = Screen.Home
@@ -94,6 +97,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val buffers = arrayOfNulls<Bitmap>(2)
 
     // ---- document
+    /** The open document (null: none yet; one is created when its first page is added). */
+    var docId by mutableStateOf<String?>(null)
+        private set
+    /** Its title. */
+    var docTitle by mutableStateOf<String?>(null)
+        private set
     /** Page ids in document order. */
     val pages = mutableStateListOf<String>()
     /** Bumped whenever a page's out.jpg is rewritten (thumbnail cache key). */
@@ -240,9 +249,20 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            val order = withContext(Dispatchers.IO) { store.loadOrder().also { store.prune(it) } }
-            pages.clear()
-            pages.addAll(order)
+            // the single document of earlier versions (in the cache) becomes the first document of the history
+            val legacy = runCatching { library.importLegacy(DocumentStore.legacy(app)) }
+                .onFailure { Log.e(TAG, "legacy import failed", it) }.getOrNull()
+            runCatching { library.purgeTrash() }.onFailure { Log.e(TAG, "trash purge failed", it) }
+            val doc = (legacy ?: settings.lastDocument)?.let { library.document(it) }?.takeIf { it.deletedAt == null }
+            if (doc != null && docId == null && pages.isEmpty()) {
+                docId = doc.id
+                docTitle = doc.title
+                pages.addAll(library.pageIds(doc.id))
+            }
+            runCatching {
+                library.dropEmpty(docId)
+                library.pruneOrphans(keep = pages + listOfNotNull(photoPageId, currentId))
+            }.onFailure { Log.e(TAG, "library clean-up failed", it) }
         }
         viewModelScope.launch { renderLoop() }
         viewModelScope.launch { trackEdits(this@ScanViewModel, history) }
@@ -715,6 +735,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }
             Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home
             Screen.Settings -> returnTo
+            Screen.Trash -> Screen.Home
             else -> {
                 batch = false
                 Screen.Home
@@ -733,6 +754,27 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         persist()
         screen = Screen.Camera
     }
+
+    /** Home > Scan: the camera, into a new document. */
+    fun scanNew() {
+        viewModelScope.launch {
+            closeDocument()
+            startCamera()
+        }
+    }
+
+    /** Home > Import: the picked photos become a new document. */
+    fun importNew(uris: List<Uri>) {
+        viewModelScope.launch {
+            closeDocument()
+            importUris(uris)
+        }
+    }
+
+    /** Recognised text of a document for search (none until OCR has run on it), and its change counter. */
+    fun searchText(doc: String): String? = null
+    val searchTextVersion: Int get() = 0
+    val hasOcrText: Boolean get() = false
 
     /** Gallery import: every picked image becomes a page, one after the other. */
     fun importUris(uris: List<Uri>) {
@@ -791,19 +833,21 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             spreadCurrent = null
             screen = if (batch && !settings.reviewCrops) Screen.Processing else Screen.Crop
             try {
-                val p = withContext(Dispatchers.IO) { loadPhoto(getApplication(), uri, focalMmPerLongSide) }
-                discardStaging()
                 val id = store.newId()
+                // the photo is kept byte for byte and processed from that copy (re-edits later start from the same pixels)
+                val p = withContext(Dispatchers.IO) {
+                    val app = getApplication<Application>()
+                    val f = (app.contentResolver.openInputStream(uri) ?: error("cannot open $uri")).use { store.saveOriginal(id, extensionOf(app, uri), it) }
+                    runCatching { loadPhotoFile(f, focalMmPerLongSide) }.onFailure { store.delete(id) }.getOrThrow()
+                }
+                discardStaging()
                 photoPageId = id
                 cropMeta = null
                 usePhoto(p.bitmap)
                 focalPx = p.focalPx
                 userRotated = false
                 cropRotation = 0
-                // the upright photo is the page's source on disk (re-processing, re-crop)
-                sourceJob = viewModelScope.launch(Dispatchers.IO) {
-                    runCatching { store.saveSource(id, p.bitmap) }.onFailure { Log.e(TAG, "source save failed", it) }
-                }
+                sourceJob = null
                 detect(auto = true)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -940,8 +984,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (i < 0 || j < 0) return
         pages[i] = b
         pages[j] = a
-        val order = pages.toList()
-        viewModelScope.launch(Dispatchers.IO) { store.saveOrder(order) }
+        saveOrder()
     }
 
     private fun defaultCorners(p: Bitmap): List<Offset> {
@@ -1056,6 +1099,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun recrop() {
         val id = currentId ?: return
         val geom = currentMeta() ?: return
+        if (!sourceAvailable(id)) return
         val p = photo
         if (photoPageId == id && p != null) {
             recropBackup = CropBackup(p, photoDisplay, corners, detected, userRotated, cropRotation, cropReasons, forceHomography, cropPageIndex)
@@ -1068,7 +1112,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             photoDisplay = null
             screen = Screen.Crop
             try {
-                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(geom.cropRotation) }
                 discardStaging()
                 setCrop(geom, bmp)
                 recropBackup = CropBackup(bmp, photoDisplay, corners, detected, userRotated, cropRotation, cropReasons, forceHomography, cropPageIndex)
@@ -1084,6 +1128,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------ pages
+    /** The page still has its original photo (re-crop, unwarp changes); otherwise says why not. */
+    private fun sourceAvailable(id: String): Boolean {
+        if (photoPageId == id && photo != null) return true
+        if (store.hasSource(id)) return true
+        message = "The original photo of this page was removed to save space: it can no longer be re-cropped"
+        return false
+    }
+
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
             "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=9|rulenet=" + settings.ruleNet + "|pass1=1|hrfirst=2|fold=1" +
@@ -1105,7 +1157,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             commitCurrent()
             try {
                 val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
-                val stored = withContext(Dispatchers.IO) { store.loadSession(id, geometryKey(m)) }
+                // without its original photo (Settings > Storage) a page is shown as it was processed
+                val stored = withContext(Dispatchers.IO) {
+                    store.loadSession(id, geometryKey(m)) ?: if (!store.hasSource(id)) store.loadAnySession(id) else null
+                }
                 if (stored != null) {
                     handle = 0L
                     resetResultState()
@@ -1128,7 +1183,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     Log.w(TAG, "stored session of $id unreadable: re-processing")
                 }
-                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(m.cropRotation) }
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(m.cropRotation) }
                 discardStaging()
                 recropBackup = null
                 setCrop(m, bmp)
@@ -1148,11 +1203,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             if (photoPageId == id) photoPageId = null
             pages.remove(id)
             pageVersions.remove(id)
-            val order = pages.toList()
-            withContext(Dispatchers.IO) {
-                store.delete(id)
-                store.saveOrder(order)
-            }
+            saveOrderNow()
+            withContext(Dispatchers.IO) { store.delete(id) }
             if (pages.isEmpty() && screen == Screen.Pages) screen = Screen.Home
         }
     }
@@ -1163,23 +1215,126 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (i < 0 || j !in pages.indices) return
         pages[i] = pages[j]
         pages[j] = id
-        val order = pages.toList()
-        viewModelScope.launch(Dispatchers.IO) { store.saveOrder(order) }
+        saveOrder()
     }
 
-    /** Clears the document (all pages and the live session). */
+    /** Writes the page order of the open document (creating the document for its first page). */
+    private fun saveOrder() {
+        viewModelScope.launch { saveOrderNow() }
+    }
+
+    private val orderMutex = Mutex()
+
+    private suspend fun saveOrderNow() = orderMutex.withLock {
+        val order = pages.toList()
+        val d = docId ?: if (order.isEmpty()) return@withLock else ensureDocument()
+        runCatching { library.setPages(d, order) }.onFailure { Log.e(TAG, "page order save failed", it) }
+    }
+
+    private suspend fun ensureDocument(): String {
+        docId?.let { return it }
+        val d = library.createDocument()
+        docId = d.id
+        docTitle = d.title
+        settings.lastDocument = d.id
+        return d.id
+    }
+
+    /** Closes the open document (it stays in the history); the next scan starts a new one. */
     fun newDocument() {
+        viewModelScope.launch { closeDocument() }
+    }
+
+    private suspend fun closeDocument() {
+        closeSession()
+        val old = docId
+        // before the pages go: a staged photo that is one of them (a re-crop) must not be deleted
+        discardStaging()
+        pages.clear()
+        pageVersions.clear()
+        pending.clear()
+        pendingTotal = 0
+        photo = null
+        photoDisplay = null
+        photoPageId = null
+        docId = null
+        docTitle = null
+        settings.lastDocument = null
+        // a document whose scan was abandoned before its first page has nothing to keep
+        if (old != null) runCatching { library.dropEmpty(null) }
+    }
+
+    /** Opens document [id] of the history on the pages screen. */
+    fun openDocument(id: String) {
+        if (id == docId) {
+            open(Screen.Pages)
+            return
+        }
         viewModelScope.launch {
-            closeSession()
-            pages.clear()
-            pageVersions.clear()
-            pending.clear()
-            pendingTotal = 0
-            photo = null
-            photoDisplay = null
-            photoPageId = null
-            sourceJob?.join()
-            withContext(Dispatchers.IO) { store.deleteAll() }
+            closeDocument()
+            val d = library.document(id) ?: return@launch
+            docId = d.id
+            docTitle = d.title
+            settings.lastDocument = d.id
+            pages.addAll(library.pageIds(d.id))
+            open(Screen.Pages)
+        }
+    }
+
+    /** File name of exports of the open document: its title, else "Scan" and the date. */
+    fun exportName(): String = DocumentName.clean(docTitle ?: DocumentName.default()).ifEmpty { DocumentName.default() }
+
+    /** Renames the open document. */
+    fun renameDocument(title: String?) {
+        val t = title?.let { DocumentName.clean(it) }?.takeIf { it.isNotEmpty() }
+        viewModelScope.launch {
+            val d = ensureDocument()
+            val name = t ?: Library.defaultTitle(System.currentTimeMillis())
+            library.rename(d, name)
+            docTitle = name
+        }
+    }
+
+    fun renameDocument(id: String, title: String) {
+        val t = DocumentName.clean(title).takeIf { it.isNotEmpty() } ?: return
+        viewModelScope.launch {
+            library.rename(id, t)
+            if (id == docId) docTitle = t
+        }
+    }
+
+    /** Moves documents to the trash (the open one is closed first). */
+    fun trashDocuments(ids: Collection<String>) {
+        viewModelScope.launch {
+            if (docId in ids) closeDocument()
+            library.trash(ids)
+            message = if (ids.size == 1) "Moved to the trash" else "${ids.size} documents moved to the trash"
+        }
+    }
+
+    fun restoreDocuments(ids: Collection<String>) {
+        viewModelScope.launch { library.restore(ids) }
+    }
+
+    fun deleteForever(ids: Collection<String>) {
+        viewModelScope.launch { library.deleteForever(ids) }
+    }
+
+    /** Space used, for Settings > Storage (null while it is measured). */
+    var storage by mutableStateOf<StorageUsage?>(null)
+        private set
+
+    fun measureStorage() {
+        viewModelScope.launch { storage = library.usage() }
+    }
+
+    /** Settings > Storage: deletes the original photos of documents older than [days] days. */
+    fun dropOriginals(days: Int) {
+        viewModelScope.launch {
+            commitCurrent()
+            val freed = library.dropOriginalsOlderThan(days)
+            message = if (freed == 0L) "No original photos to remove" else "Freed ${formatBytes(freed)}"
+            storage = library.usage()
         }
     }
 
@@ -1329,7 +1484,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 if (spread != null && i >= 0) pages.add(if (secondGoesFirst(spread)) i else i + 1, id) else pages.add(id)
                 pageVersions[id] = 0
             }
-            val order = pages.toList()
+            saveOrderNow()
             // the measured shape in the page's frame: a sideways page was turned a quarter (rot 0 / 2)
             val hw = if (quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 }) 1f / quadHw else quadHw
             val geomL = geom.copy(look = startLook.copy(measuredHw = hw))
@@ -1337,7 +1492,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             withContext(Dispatchers.IO) {
                 runCatching {
                     store.saveMeta(meta)
-                    store.saveOrder(order)
                     // the first page of the spread learns its partner
                     if (spread != null) store.saveMeta(store.loadMeta(spread.firstId).copy(spreadWith = id))
                 }.onFailure { Log.e(TAG, "meta save failed", it) }
@@ -1417,6 +1571,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun reflatten(perspective: Boolean? = null) {
         val id = currentId ?: return
         val geom = currentMeta() ?: return
+        if (!sourceAvailable(id)) return
         val areas = ignore
         reopenLines = true
         val p = photo
@@ -1429,7 +1584,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             progress = 0f
             stage = "Opening the photo"
             try {
-                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(geom.cropRotation) }
                 discardStaging()
                 recropBackup = null
                 setCrop(geom, bmp)
@@ -1603,6 +1758,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             if (ok && snap != null) {
                 committedVersion = v
                 pageVersions[id] = (pageVersions[id] ?: 0) + 1
+                docId?.let { d -> runCatching { library.touch(d) } }
             }
         }
     }
