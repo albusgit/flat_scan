@@ -6,7 +6,7 @@ saves or shares it as JPG or PDF. The C++ core is a line-by-line port of the ref
 experimental option off: `UNWARP_PROP_*`, `UNWARP_LSD` and `UNWARP_R3_*`. The same core also builds
 on Linux as a test harness. That harness produced all the parity numbers below.
 
-**Debug APK:** `dist/flatscan-debug.apk` (arm64-v8a, minSdk 26, 54 MB: includes the 12.6 MB page-finder model and ONNX Runtime).
+**APK:** [GitHub Releases](https://github.com/albusgit/flat_scan/releases/latest) (arm64-v8a, minSdk 26): `flatscan-<version>.apk` (release build, 67 MB) and `-debug.apk`. APKs are no longer committed to the repo (`dist/` held them up to Round 11).
 It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 15 emulator (CPU paths only; see [Not done / not verified](#not-done--not-verified-on-a-real-phone)).
 
 ## Result screen features (v2)
@@ -602,8 +602,8 @@ Per page with warm sessions, 5 of the 35 photos (`gate_f.sh smoke`, median of 3 
 - APK (debug, arm64-v8a): 121.2 MB before the QNN libraries, 162.4 MB with them (+41.3 MB download, +110 MB
   installed; `libQnnHtpPrepare.so` alone is 23 MB). `-PqnnHtp=V73,V75,V79` saves 6.1 MB. With the app bundle
   (Build, below) the QNN libraries and static models are on-demand packs instead: 81 MB download for any arm64
-  phone, 137 MB for a Snapdragon 8 Gen 2 that uses the NPU. `dist/flatscan-debug.apk` is the single APK without
-  the NPU (`assembleDebug -PcompressLibs=true`, 89 MB).
+  phone, 137 MB for a Snapdragon 8 Gen 2 that uses the NPU. the single APK without
+  the NPU then (`assembleDebug -PcompressLibs=true`, 89 MB).
 - Plan estimates, **not measured**: a flagship Snapdragon page takes 6-9 s today, 2.5-3.5 s with QNN, and
   1.5-2.5 s with overlap and GPU stages; nets 8-15x faster on Hexagon fp16.
 
@@ -629,7 +629,7 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 ./gradlew bundleDebug                                    # app/build/outputs/bundle/debug/app-debug.aab (bundleRelease for Play)
 ./gradlew assembleRelease -PcompressLibs=true            # R8-shrunk single APK without the NPU (70 MB; debug key; no batch mode)
 ./gradlew assembleDebug                                  # one APK without the NPU libraries (the NPU falls back to the CPU)
-./gradlew assembleDebug -PcompressLibs=true              # the same, native libraries compressed: dist/flatscan-debug.apk (89 MB)
+./gradlew assembleDebug -PcompressLibs=true              # the same, native libraries compressed (89 MB before Round 11)
 ./gradlew assembleDebug -Ppacks=false                    # the old single APK with every QNN library (162 MB)
 ./gradlew assembleDebug -Port=plain                      # no Qualcomm code at all (121 MB)
 ./gradlew assembleDebug -Pabis=arm64-v8a,x86_64          # also an emulator ABI
