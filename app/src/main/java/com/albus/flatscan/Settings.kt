@@ -96,6 +96,11 @@ class Settings(ctx: Context) {
 
     private val appLanguageRtl = TextUtils.getLayoutDirectionFromLocale(ctx.resources.configuration.locales[0]) == View.LAYOUT_DIRECTION_RTL
 
+    /** Recognise the text of a document's pages in the background when it is finished (history search). */
+    var ocrAfterScan: Boolean
+        get() = p.getBoolean("ocr_after_scan", true)
+        set(v) = p.edit().putBoolean("ocr_after_scan", v).apply()
+
     /** The document open when the app was last used (reopened at start), or null. */
     var lastDocument: String?
         get() = p.getString("last_document", null)

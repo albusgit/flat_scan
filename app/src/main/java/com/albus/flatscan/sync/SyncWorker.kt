@@ -81,7 +81,10 @@ class SyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             dir.listFiles()?.forEach { if (it.name.startsWith("${d.id}_") && it != f) it.delete() }
             if (!f.exists() || f.length() == 0L) {
                 val tmp = File(dir, f.name + ".tmp")
-                tmp.outputStream().buffered().use { Exporter.writePdf(pages.map { lib.store.outputFile(it) }.filter { it.exists() }, it, ExportPrefs.pdf(ctx)) }
+                // the export options of the app (colour, size, paper, searchable text), as a PDF
+                val o = ExportPrefs.output(ctx).copy(format = com.albus.flatscan.OutputFormat.Pdf)
+                val p = Exporter(ctx, lib).prepare(com.albus.flatscan.ExportDoc(d.title, d.createdAt, d.modifiedAt, pages), o)
+                tmp.outputStream().buffered().use { Exporter(ctx, lib).writePdf(p, it) }
                 if (!tmp.renameTo(f)) error("cannot write $f")
             }
             f

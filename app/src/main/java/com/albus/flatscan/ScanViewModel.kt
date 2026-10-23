@@ -253,6 +253,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val legacy = runCatching { library.importLegacy(DocumentStore.legacy(app)) }
                 .onFailure { Log.e(TAG, "legacy import failed", it) }.getOrNull()
             runCatching { library.purgeTrash() }.onFailure { Log.e(TAG, "trash purge failed", it) }
+            refreshSearchText()
             val doc = (legacy ?: settings.lastDocument)?.let { library.document(it) }?.takeIf { it.deletedAt == null }
             if (doc != null && docId == null && pages.isEmpty()) {
                 docId = doc.id
@@ -774,9 +775,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Recognised text of a document for search (none until OCR has run on it), and its change counter. */
-    fun searchText(doc: String): String? = null
-    val searchTextVersion: Int get() = 0
-    val hasOcrText: Boolean get() = false
+    fun searchText(doc: String): String? = searchTexts[doc]
+    val hasOcrText: Boolean get() = searchTexts.isNotEmpty()
 
     /** Gallery import: every picked image becomes a page, one after the other. */
     fun importUris(uris: List<Uri>) {
@@ -1431,7 +1431,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun closeDocument() {
-        docId?.let { autoUpload(it) }
+        docId?.let { backgroundOcr(it); autoUpload(it) }
         closeSession()
         endPageSession()
         val old = docId
@@ -1459,11 +1459,18 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val d = docId ?: return
         viewModelScope.launch {
             commitCurrent()
+            backgroundOcr(d)
             autoUpload(d)
         }
     }
 
     /** Queues [doc] when automatic upload is on and it changed since its last upload. */
+    /** Recognises the text of [doc]'s pages in the background (search), when Settings > Recognise text is on. */
+    private fun backgroundOcr(doc: String) {
+        if (!settings.ocrAfterScan) return
+        runCatching { com.albus.flatscan.output.Ocr.enqueue(getApplication(), doc) }.onFailure { Log.e(TAG, "OCR queue failed", it) }
+    }
+
     private suspend fun autoUpload(doc: String) {
         val c = syncConfig
         if (!c.autoUpload || !c.configured) return
@@ -1505,6 +1512,40 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** File name of exports of the open document: its title, else "Scan" and the date. */
     fun exportName(): String = DocumentName.clean(docTitle ?: DocumentName.default()).ifEmpty { DocumentName.default() }
+
+    // ------------------------------------------------------------------ output (feature 3)
+    val exporter by lazy { Exporter(app, library) }
+
+    /** The file name exports of the open document get with [o] (no extension). */
+    fun exportFileName(o: OutputOptions): String =
+        FileNameTemplate.render(o.template, docTitle ?: DocumentName.default(), System.currentTimeMillis(), pages.size, o.dateFormat)
+
+    /**
+     * The open document's pages encoded for [o] (and recognised when [o] wants searchable text; the text
+     * also goes to the database for search). Null without pages.
+     */
+    suspend fun prepareExport(o: OutputOptions, progress: (String, Float) -> Unit): Exporter.Prepared? {
+        commitCurrent()
+        if (pages.isEmpty()) return null
+        val d = library.document(ensureDocument()) ?: return null
+        val doc = ExportDoc(d.title, d.createdAt, d.modifiedAt, pages.toList())
+        val p = withContext(Dispatchers.Default) { exporter.prepare(doc, o, progress) }
+        doc.pages.zip(p.pages).forEach { (id, pg) -> pg.text?.let { t -> runCatching { library.setPageText(id, t.text) } } }
+        if (p.pages.any { it.text != null }) refreshSearchText()
+        return p
+    }
+
+    /** Recognised text per document, for the history search. */
+    private var searchTexts by mutableStateOf<Map<String, String>>(emptyMap())
+    var searchTextVersion by mutableIntStateOf(0)
+        private set
+
+    fun refreshSearchText() {
+        viewModelScope.launch {
+            searchTexts = runCatching { library.searchTexts() }.getOrDefault(emptyMap())
+            searchTextVersion++
+        }
+    }
 
     /** Renames the open document. */
     fun renameDocument(title: String?) {

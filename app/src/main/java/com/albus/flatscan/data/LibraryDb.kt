@@ -60,7 +60,12 @@ data class PageEntity(
     val position: Int,
     @ColumnInfo(name = "created_at") val createdAt: Long,
     @ColumnInfo(name = "original_dropped") val originalDropped: Boolean = false,
+    /** Text found on the page by OCR (search); null: not recognised yet. */
+    @ColumnInfo(name = "ocr_text") val ocrText: String? = null,
 )
+
+/** A document's recognised text. */
+data class DocText(val doc: String, val text: String?)
 
 /** A document row with its page count and first page (history list). */
 data class DocumentSummary(
@@ -149,6 +154,13 @@ interface LibraryDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPages(p: List<PageEntity>)
 
+    @Query("UPDATE pages SET ocr_text = :text WHERE id = :id")
+    suspend fun setPageText(id: String, text: String?)
+
+    /** Each document's recognised text (its pages' text joined), for search. */
+    @Query("SELECT document_id AS doc, group_concat(ocr_text, ' ') AS text FROM pages WHERE ocr_text IS NOT NULL GROUP BY document_id")
+    suspend fun documentTexts(): List<DocText>
+
     @Query("UPDATE pages SET original_dropped = 1 WHERE id IN (:ids)")
     suspend fun markOriginalDropped(ids: List<String>)
 
@@ -165,7 +177,7 @@ interface LibraryDao {
     }
 }
 
-@Database(entities = [DocumentEntity::class, PageEntity::class], version = 2, exportSchema = true)
+@Database(entities = [DocumentEntity::class, PageEntity::class], version = 3, exportSchema = true)
 abstract class LibraryDb : RoomDatabase() {
     abstract fun dao(): LibraryDao
 
@@ -180,6 +192,12 @@ abstract class LibraryDb : RoomDatabase() {
                     db.execSQL("ALTER TABLE documents ADD COLUMN sync_remote TEXT")
                     db.execSQL("ALTER TABLE documents ADD COLUMN uploaded_at INTEGER")
                     db.execSQL("ALTER TABLE documents ADD COLUMN uploaded_modified INTEGER")
+                }
+            },
+            // 3: OCR (feature 3) - each page's recognised text, for search
+            object : androidx.room.migration.Migration(2, 3) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("ALTER TABLE pages ADD COLUMN ocr_text TEXT")
                 }
             },
         )

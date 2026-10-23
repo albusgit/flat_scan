@@ -41,4 +41,25 @@ class LibraryMigrationTest {
         }
         db.query("SELECT COUNT(*) FROM pages").use { c -> c.moveToFirst(); assertEquals(1, c.getInt(0)) }
     }
+
+    @Test
+    fun version2To3AddsPageText() {
+        helper.createDatabase("mig_23", 2).use { db ->
+            db.execSQL("INSERT INTO documents (id, title, created_at, modified_at, tags, sync_status, sync_remote) VALUES ('d', 'T', 1, 2, '', 'Pending', 'webdav:x.pdf')")
+            db.execSQL("INSERT INTO pages (id, document_id, position, created_at, original_dropped) VALUES ('p', 'd', 0, 1, 0)")
+        }
+        val db = helper.runMigrationsAndValidate("mig_23", 3, true, *LibraryDb.MIGRATIONS)
+        db.query("SELECT ocr_text FROM pages WHERE id = 'p'").use { c -> c.moveToFirst(); assertEquals(true, c.isNull(0)) }
+        db.query("SELECT sync_remote FROM documents WHERE id = 'd'").use { c -> c.moveToFirst(); assertEquals("webdav:x.pdf", c.getString(0)) }
+    }
+
+    @Test
+    fun version1MigratesAllTheWayToTheLatest() {
+        helper.createDatabase("mig_13", 1).use { db ->
+            db.execSQL("INSERT INTO documents (id, title, created_at, modified_at, tags, sync_status) VALUES ('d', 'Old', 1, 2, '', 'None')")
+        }
+        helper.runMigrationsAndValidate("mig_13", 3, true, *LibraryDb.MIGRATIONS).use { db ->
+            db.query("SELECT title FROM documents").use { c -> c.moveToFirst(); assertEquals("Old", c.getString(0)) }
+        }
+    }
 }

@@ -510,6 +510,29 @@ std::vector<double> grid_px(const std::vector<float>& a, const std::vector<float
 
 extern "C" {
 
+// Export (feature 3): a one-channel (grayscale) JPEG of an RGBA_8888 bitmap at [quality]; Android's own
+// encoder writes only three-channel JPEGs. Luma as in the BT.601 conversion of cv::cvtColor. Null on failure.
+JNIEXPORT jbyteArray JNICALL Java_com_albus_flatscan_NativeLib_encodeGrayJpeg(JNIEnv* env, jclass, jobject bitmap, jint quality) {
+    AndroidBitmapInfo info;
+    void* px = nullptr;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &px) != ANDROID_BITMAP_RESULT_SUCCESS) return nullptr;
+    std::vector<uchar> buf;
+    bool ok = false;
+    try {
+        cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, px, info.stride), gray;
+        cv::cvtColor(rgba, gray, cv::COLOR_RGBA2GRAY);
+        ok = cv::imencode(".jpg", gray, buf, {cv::IMWRITE_JPEG_QUALITY, (int)quality});
+    } catch (const std::exception& e) {
+        LOGI("encodeGrayJpeg failed: %s", e.what());
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+    if (!ok) return nullptr;
+    jbyteArray out = env->NewByteArray((jsize)buf.size());
+    env->SetByteArrayRegion(out, 0, (jsize)buf.size(), reinterpret_cast<const jbyte*>(buf.data()));
+    return out;
+}
+
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env, jclass) {
     bool ok = Gpu::instance().available();
     std::string s = (ok ? "GPU (OpenGL ES 3.1 compute): " : "CPU fallback (GPU unavailable): ") + Gpu::instance().info();

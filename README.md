@@ -31,6 +31,54 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
 - **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
 
+## Better output (Phase 1, feature 3)
+
+Export sheet (Save / Share): **format** PDF, JPEG per page, PNG per page, or PDF + JPEG; **colour**,
+**grayscale** or **black & white**; **size** Small / Balanced / High with the size the export will have;
+**searchable text**; paper **A4 / Letter / the page's own shape** (content centred, margins none / small /
+normal); **file name template** (`{title} {date} {time} {pages} {n}`, a choice of date formats; shared with
+sync); **always ask where to save** (system picker) or a **default export folder** (Storage Access
+Framework, remembered). Code: `Exporter.kt`, `output/` (`PdfWriter`, `Bilevel`, `Ocr`, `OcrLayout`).
+
+- **Own PDF writer** (`output/PdfWriter.kt`, PDF 1.7, no Android dependency): JPEG pages passed through as
+  DCT, black and white pages as 1-bit **CCITT G4** (or Flate), an invisible **OCR text layer** (render mode
+  3) in a glyph-less CID font (`resources/flatscan/glyphless.ttf`, built by
+  `tools/pdf_check/make_glyphless_font.py`) with a ToUnicode map, and metadata: Title (Unicode), Creator,
+  Producer, CreationDate, ModDate, /Lang. Android's `PdfDocument` (used before) can do none of these.
+- **OCR:** Tesseract 5 (Tesseract4Android 4.8.0, JitPack, Apache-2.0) with the `heb` + `eng` tessdata_fast
+  models in `assets/tessdata` (ML Kit has no Hebrew). It runs on the finished page (`out.jpg`: rotation and
+  page shape applied), which is exactly the image the PDF places, so the text layer lines up with it by
+  construction. Results are cached per page (`ocr.json`, keyed by the page image) and the text goes to the
+  database (`pages.ocr_text`, schema v3) for the **history search**. Settings › *Recognise text after
+  scanning* (on) recognises a document's pages in the background when it is finished (WorkManager).
+- **Hebrew in the text layer:** right-to-left lines are written in visual order (each Hebrew word's letters
+  reversed, Latin and digits kept), as word processors store Hebrew; OCR lines that run across table
+  columns are split at the gaps. Measured with three PDF engines (`tools/pdf_check/check.py`, report in
+  `docs/results/output/pdf_check.txt`): search finds 119 / 119 Hebrew and 191 / 191 English words in poppler
+  (Evince, Okular), PDFium (Chrome, Edge, Android) and pdf.js (Firefox); writing the logical order instead,
+  0 / 119 in all three. Where a search highlight lands vs the word in the image: Hebrew median 0.50 pt, p95
+  1.99 pt; English median 1.15 pt, p95 2.05 pt (1 pt = 0.35 mm).
+- **Black and white:** Bradley's adaptive threshold, then CCITT G4 (decoded by libtiff to identical pixels;
+  poppler renders the G4 and the Flate page identically). As pictures: 1-bit PNG.
+- **Sizes** (`OutputTest`, the two test pages, image bytes): colour / black and white = 5.8x (Small),
+  12.5x (Balanced), 17.2x (High): the plan's 3x is met. Grayscale is a one-channel JPEG (native, OpenCV) but
+  barely smaller than colour on document pages (4-5 % measured with PIL; pages are nearly neutral already).
+  High colour passes the finished page through without re-encoding.
+- **Estimate:** the pages are encoded with the chosen options and the PDF is written to a byte counter, so
+  the shown size is the size of the file (`theEstimateIsTheExactPdfSize`); OCR text is left out of it.
+- **App size:** debug APK 101.8 -> 124.8 MB with features 1-3 and 6; OCR is 12.6 MB of it uncompressed
+  (libtesseract, libleptonica, libjpeg, libpng 7.5 MB; traineddata 5.1 MB).
+
+Tests: `PdfWriterTest` (writes the sample PDFs, xref offsets, metadata strings, grapheme reversal with
+niqqud, placement), `OutputTest` (presets, never enlarging, 1-bit PNG, the B&W size target, the exact
+estimate), `LibraryMigrationTest` (v2 -> v3, v1 -> v3); `tools/pdf_check/check.py` (qpdf structure, search
+in three engines, highlight positions, rendering in poppler and PDFium within 1.3 grey levels of the page
+image, Hebrew title through pdf.js, G4 through libtiff). Samples: `docs/results/output/sample_*.pdf`.
+
+Not verified on a phone: Tesseract4Android itself (its native code cannot run in JVM tests: the OCR text
+used in the tests comes from desktop Tesseract 5.3.4 with the distribution's heb / eng models; the phone uses
+tessdata_fast), OCR speed and memory, the export sheet, saving to SAF folders, the native grayscale encoder.
+
 ## Sync to your own server (Phase 1, feature 6)
 
 Upload-only, free, no account and no FlatScan cloud (`sync/`). Settings › *Sync to your server*:

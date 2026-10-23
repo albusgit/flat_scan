@@ -141,6 +141,12 @@ class Library(
         result
     }
 
+    // ---- OCR text (feature 3)
+    suspend fun setPageText(page: String, text: String?) = io { dao.setPageText(page, text) }
+
+    /** Document id -> its pages' recognised text (documents without any are left out). */
+    suspend fun searchTexts(): Map<String, String> = io { dao.documentTexts().mapNotNull { d -> d.text?.let { d.doc to it } }.toMap() }
+
     // ---- sync (feature 6)
     suspend fun setSync(doc: String, status: SyncStatus, error: String? = null) = io { dao.setSync(doc, status, error) }
 

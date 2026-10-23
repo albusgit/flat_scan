@@ -183,6 +183,8 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0")
     testImplementation("androidx.work:work-testing:2.10.5")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    // OCR (feature 3): Tesseract 5 for Android, Apache-2.0; the heb + eng tessdata_fast models are in assets/tessdata
+    implementation("com.github.adaptech-cz.Tesseract4Android:tesseract4android:4.8.0")
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")

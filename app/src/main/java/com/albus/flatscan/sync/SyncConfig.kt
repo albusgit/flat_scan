@@ -116,14 +116,14 @@ class SyncConfig(private val ctx: Context) {
         }
     }
 
-    /** File-name template and date format of uploads and exports (feature 3 shares them). */
+    /** File-name template and date format of uploads: the export ones ([ExportPrefs], Settings and the export sheet). */
     var nameTemplate: String
-        get() = p.getString("name_template", FileNameTemplate.DEFAULT) ?: FileNameTemplate.DEFAULT
-        set(v) = p.edit().putString("name_template", v).apply()
+        get() = com.albus.flatscan.ExportPrefs.output(ctx).template
+        set(v) = com.albus.flatscan.ExportPrefs.run { setOutput(ctx, output(ctx).copy(template = v)) }
 
     var dateFormat: String
-        get() = p.getString("date_format", FileNameTemplate.DEFAULT_DATE) ?: FileNameTemplate.DEFAULT_DATE
-        set(v) = p.edit().putString("date_format", v).apply()
+        get() = com.albus.flatscan.ExportPrefs.output(ctx).dateFormat
+        set(v) = com.albus.flatscan.ExportPrefs.run { setOutput(ctx, output(ctx).copy(dateFormat = v)) }
 
     private object NoSecrets : SharedPreferences {
         override fun getAll(): MutableMap<String, *> = mutableMapOf<String, Any>()

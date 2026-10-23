@@ -99,7 +99,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.albus.flatscan.DocumentName
-import com.albus.flatscan.ExportFormat
 import com.albus.flatscan.ScanViewModel
 
 private enum class PagesSheet { None, Save, Share }
@@ -258,15 +257,15 @@ fun PagesScreen(vm: ScanViewModel) {
                 Spacer(Modifier.width(8.dp))
                 PillText("Share")
             }
-            PrimaryPill(onClick = { exporter.save(ExportFormat.PDF) }, enabled = ready, modifier = Modifier.weight(1.5f)) {
+            PrimaryPill(onClick = { exporter.save(null) }, enabled = ready, modifier = Modifier.weight(1.5f)) {
                 if (exporter.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
-                else PillText("Save as PDF")
+                else PillText("Save")
             }
         }
     }
     if (sheet != PagesSheet.None) {
         val share = sheet == PagesSheet.Share
-        ExportSheet(share, n, vm.docTitle, onRename = { vm.renameDocument(it) }, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = PagesSheet.None })
+        ExportSheet(vm, share, n, vm.docTitle, onRename = { vm.renameDocument(it) }, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = PagesSheet.None })
     }
     if (renaming) {
         var text by remember { mutableStateOf(docName ?: "") }

@@ -167,6 +167,7 @@ fun SettingsScreen(vm: ScanViewModel) {
     var filter by remember { mutableStateOf(s.defaultFilter) }
     var solid by remember { mutableStateOf(s.solidColors) }
     var autoRotate by remember { mutableStateOf(s.autoRotate) }
+    var ocrAfter by remember { mutableStateOf(s.ocrAfterScan) }
     var pageFinder by remember { mutableStateOf(s.pageFinderNet) }
     var uvDoc by remember { mutableStateOf(s.uvDoc) }
     var flatNets by remember { mutableIntStateOf(s.flatNets) }
@@ -191,6 +192,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             )
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
+            SwitchRow("Recognise text after scanning", "Hebrew and English, on the phone: search finds documents by their text", ocrAfter) { ocrAfter = it; s.ocrAfterScan = it }
             SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Section("Finding the page")

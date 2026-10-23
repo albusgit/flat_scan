@@ -51,6 +51,9 @@ object NativeLib {
         System.loadLibrary("flatscan")
     }
 
+    /** A one-channel JPEG of [bitmap] (ARGB_8888) at [quality] (export, grayscale pages); null on failure. */
+    @JvmStatic external fun encodeGrayJpeg(bitmap: Bitmap, quality: Int): ByteArray?
+
     /** Which backend the heavy image passes use, with the GLES driver string. */
     @JvmStatic external fun gpuInfo(): String
 
