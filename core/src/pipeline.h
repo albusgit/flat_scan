@@ -180,6 +180,7 @@ struct PipelineResult {
     int nets_overlap = -1;            // flat_nets: -1 not run, 0 after the detection, 1 beside the CPU stages
     bool orient_page_reused = false;  // ... the orientation page made while they ran was kept (same corners)
     bool orient_reused = false;       // ... and its orientation decision (the same page-shape test)
+    bool before_reused = false;       // ... and the before page made then (the same corners and turn)
     double nets_ms = -1;              // ... their own wall time (ms)
     double nets_wait_ms = -1;         // ... how long run_photo waited for them after its own stages
     double nets_join_ms = -1;         // ... run_photo's start to the grids in hand
@@ -188,6 +189,8 @@ struct PipelineResult {
     bool lines_spots_dropped = false; // ... too large at first: kept without the lines through the overstretched spots
     double second_pass[3] = {-1, -1, -1};   // ... the second pass: its distortion, its rules' deviation before / after (px)
     bool second_pass_kept = false;
+    double second_pass_ms = -1;       // ... its time (resample, rule net, trace and solve; -1: not run)
+    double line_retry_ms = -1;        // ... the retries after a first map that overstretched the page (-1: none)
     double line_straightness[2] = {-1, -1};    // ... the traced rules' mean p95 deviation (px): on the page as it is / through the kept map
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it

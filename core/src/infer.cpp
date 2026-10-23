@@ -48,7 +48,9 @@
 //                           the SoC, the build and the LiteRT version; no OpenCL library on the device:
 //                           no delegate (opencl_found)
 // The page finder never runs on QNN, NNAPI or the LiteRT GPU (PLAN: 34 NNAPI partitions; kept on the CPU). The rule
-// net (rulenet.onnx / rulenet.tflite, any page size) has no fixed-shape model: never on QNN / NNAPI / the GPU either.
+// net (rulenet.onnx / rulenet.tflite, any page size) runs on the LiteRT GPU from its fixed-shape copies
+// (`rulenet_1152x800.tflite`, `rulenet_800x1152.tflite`: the A4 stage-1 page at half size, portrait and landscape;
+// other shapes on the CPU for that call, as ShadeNet's), never on QNN / NNAPI.
 #include "infer.h"
 
 #include <algorithm>
@@ -930,7 +932,8 @@ struct Inference::Impl {
     std::array<Slot, N_NETS> slots;
 
     static bool accelerator_allowed(NetId net, Backend b) {
-        return !((net == NetId::PageFinder || net == NetId::RuleNet) && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
+        if (net == NetId::RuleNet) return b != Backend::QNN_HTP && b != Backend::NNAPI;   // the LiteRT GPU: its fixed-shape copies
+        return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
     }
 
     // LiteRT CPU threads: InferConfig::threads, else min(cores, 4)
@@ -951,8 +954,8 @@ struct Inference::Impl {
             try { bytes = cfg.load(f); } catch (...) { bytes.clear(); }
             return !bytes.empty();
         };
-        const std::string shade_static =
-            shape.size() == 4 ? "shadenet_" + std::to_string(shape[2]) + "x" + std::to_string(shape[3]) : std::string();
+        const std::string hw = shape.size() == 4 ? std::to_string(shape[2]) + "x" + std::to_string(shape[3]) : std::string();
+        const std::string shade_static = hw.empty() ? hw : "shadenet_" + hw;
         if (b == Backend::LiteRtGpu) {
             // LiteRT GPU: only the converted fixed-shape models (C2), the page finder has none
             if (net == NetId::UVDoc) load("uvdoc_static.tflite");
@@ -960,6 +963,10 @@ struct Inference::Impl {
             else if (net == NetId::ShadeNet && !shade_static.empty()) {
                 if (per_shape) *per_shape = true;
                 load(shade_static + ".tflite");
+            } else if (net == NetId::RuleNet && !hw.empty()) {
+                // rulenet_1152x800 / rulenet_800x1152: the A4 stage-1 page at half size (other pages: the CPU)
+                if (per_shape) *per_shape = true;
+                load("rulenet_" + hw + ".tflite");
             } else file.clear();
             return bytes;
         }
@@ -1353,7 +1360,7 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
             continue;
         }
         if (cpu && S.cpu_failed) break;
-        // ShadeNet's fixed-shape models on accelerators (every LiteRT GPU interpreter): one session per input shape
+        // ShadeNet's fixed-shape models on accelerators (every LiteRT GPU interpreter, the rule net's): one session per input shape
         std::vector<int64_t> key = (!cpu && (net == NetId::ShadeNet || b == Backend::LiteRtGpu)) ? in.shape : std::vector<int64_t>();
         auto it = S.sess.find(key);
         if (it == S.sess.end()) {

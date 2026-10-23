@@ -16,9 +16,9 @@ import java.io.File
  *    OpenCL gets the CPU at once, without a benchmark;
  *  * [CPU]: LiteRT's CPU kernels (fp32; XNNPACK where it takes the ops) for every net;
  *  * [GPU]: the LiteRT GPU delegate in full precision (fp32 compute, fp16-stored weights) for UVDoc,
- *    SyntheticDoc high-res and the shadow net on any phone with OpenCL (Mali, Adreno, Xclipse), without the
- *    CPU comparison of Auto; a net the delegate cannot take (or a shadow-net page shape without a GPU model)
- *    runs on the CPU.
+ *    SyntheticDoc high-res, the shadow net and the rule net on any phone with OpenCL (Mali, Adreno, Xclipse),
+ *    without the CPU comparison of Auto; a net the delegate cannot take (or a shadow-net / rule-net page shape
+ *    without a GPU model) runs on the CPU.
  * The page finder always runs on the CPU (PLAN: 34 NNAPI partitions). The Qualcomm NPU (ONNX Runtime QNN) and
  * NNAPI left the app with ONNX Runtime in Round 11 (docs/results/r11/runtime.md).
  */
@@ -34,22 +34,26 @@ object Accel {
 
     /**
      * The backends of each group of nets, comma separated ("" = CPU only): [finder] the page finder,
-     * [flat] UVDoc (both passes), [hr] SyntheticDoc high-res, [shade] the shadow net. [setting]: the
+     * [flat] UVDoc (both passes), [hr] SyntheticDoc high-res, [shade] the shadow net, [rule] the rule net. [setting]: the
      * Settings value it came from.
      */
-    data class Plan(val setting: String, val finder: String, val flat: String, val hr: String, val shade: String, val note: String = "") {
-        val cpuOnly: Boolean get() = finder.isEmpty() && flat.isEmpty() && hr.isEmpty() && shade.isEmpty()
+    data class Plan(
+        val setting: String, val finder: String, val flat: String, val hr: String, val shade: String, val rule: String, val note: String = "",
+    ) {
+        val cpuOnly: Boolean get() = finder.isEmpty() && flat.isEmpty() && hr.isEmpty() && shade.isEmpty() && rule.isEmpty()
         private fun name(b: String) = b.ifEmpty { "cpu" }
-        fun summary(): String = "page finder ${name(finder)}, UVDoc ${name(flat)}, SyntheticDoc high-res ${name(hr)}, shadow net ${name(shade)}"
-        fun key(): String = "${name(finder)}/${name(flat)}/${name(hr)}/${name(shade)}"
+        fun summary(): String =
+            "page finder ${name(finder)}, UVDoc ${name(flat)}, SyntheticDoc high-res ${name(hr)}, shadow net ${name(shade)}, rule net ${name(rule)}"
+        // part of the pages' geometry keys: the rule net only when it is not on the CPU (stored pages keep their keys)
+        fun key(): String = "${name(finder)}/${name(flat)}/${name(hr)}/${name(shade)}" + if (rule.isEmpty()) "" else "/rule=$rule"
         fun toJson(): JSONObject = JSONObject().put("setting", setting).put("finder", name(finder)).put("flat", name(flat))
-            .put("hr", name(hr)).put("shade", name(shade)).put("note", note)
+            .put("hr", name(hr)).put("shade", name(shade)).put("rule", name(rule)).put("note", note)
     }
 
     /** The plan of a fixed setting; null for [AUTO] (its plan comes from the stored benchmark). */
     fun fixed(setting: String): Plan? = when (setting) {
-        CPU -> Plan(CPU, "", "", "", "")
-        GPU -> if (gpuOff) Plan(GPU, "", "", "", "", "the GPU crashed the app on this phone: CPU") else Plan(GPU, "", "gpu", "gpu", "gpu")
+        CPU -> Plan(CPU, "", "", "", "", "")
+        GPU -> if (gpuOff) Plan(GPU, "", "", "", "", "", "the GPU crashed the app on this phone: CPU") else Plan(GPU, "", "gpu", "gpu", "gpu", "gpu")
         else -> null
     }
 
@@ -69,9 +73,9 @@ object Accel {
         if (j.optString("candidates") != candidates()) return null
         val c = j.optJSONObject("bench")?.optJSONObject("choice") ?: return null
         fun b(k: String) = c.optString(k, "cpu").let { if (it == "cpu") "" else it }
-        // a benchmark from before SyntheticDoc high-res had its own group has no "hr": run it again
-        if (!c.has("hr")) return null
-        return Plan(AUTO, b("finder"), b("flat"), b("hr"), b("shade"), j.optString("note").ifEmpty { "benchmarked ${j.optString("at")}" })
+        // a benchmark from before SyntheticDoc high-res / the rule net had their own groups: run it again
+        if (!c.has("hr") || !c.has("rule")) return null
+        return Plan(AUTO, b("finder"), b("flat"), b("hr"), b("shade"), b("rule"), j.optString("note").ifEmpty { "benchmarked ${j.optString("at")}" })
     }
 }
 

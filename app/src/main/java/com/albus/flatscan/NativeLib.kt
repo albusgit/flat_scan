@@ -57,13 +57,14 @@ object NativeLib {
     /**
      * The nets' backends (core/src/infer.h, LiteRT in the APK): per group, the backends to try in order, comma
      * separated ("cpu", "gpu"; "" = CPU only; the CPU is always the last resort): [finder] the page finder,
-     * [flat] UVDoc (both passes), [hr] SyntheticDoc high-res, [shade] the shadow net. Models come from
+     * [flat] UVDoc (both passes), [hr] SyntheticDoc high-res, [shade] the shadow net, [rule] the rule net. Models come from
      * [assets] (models/, the .tflite files); [cacheDir] keeps the GPU's compiled kernels; [threads]: CPU threads (0: the
      * default, min(cores, 4)). [staticModels]: no effect since the .onnx models left the app. A group whose
      * backends did not change keeps its loaded sessions.
      */
     @JvmStatic external fun configureNets(
-        assets: AssetManager, cacheDir: String, finder: String, flat: String, hr: String, shade: String, threads: Int, staticModels: Boolean,
+        assets: AssetManager, cacheDir: String, finder: String, flat: String, hr: String, shade: String, rule: String, threads: Int,
+        staticModels: Boolean,
     )
 
     /**
@@ -179,7 +180,7 @@ object NativeLib {
      * Settings > Acceleration > Auto: the nets on the self-test [photo] on the CPU and on each of
      * [candidates] (backend names, comma separated), [runs] timed runs after a first one, compared with the
      * CPU (accelerator tolerances in jni_bridge.cpp). JSON: ok, tolerance, backends [{backend, nets:
-     * {key: {ran, first_ms, median_ms, p95_ms, p99_diff, max_diff, pass}}}], choice {finder, flat, shade}.
+     * {key: {ran, first_ms, median_ms, p95_ms, p99_diff, max_diff, pass}}}], choice {finder, flat, hr, shade, rule}.
      */
     @JvmStatic external fun benchBackends(photo: Bitmap, candidates: String, runs: Int, listener: ProgressListener?): String
 

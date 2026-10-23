@@ -97,10 +97,12 @@ GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::M
                    bool faint = false, bool robust = false, bool edges = false, const RuleNetFn* rule_net = nullptr,
                    const cv::Mat* drop_lines = nullptr);
 
-// Report-only option (docs/results/accel/cg_rtol.txt): the relative-residual tolerance of the
-// warp map's conjugate-gradient field solves. Default 1e-8, the reference; a looser value is
-// faster and changes the map. Process-wide; FS_CG_RTOL=x in the environment sets it at start
-// (desktop harnesses); values <= 0 restore the default. The app never sets it.
+// The relative-residual tolerance of the warp map's conjugate-gradient field solves
+// (docs/results/accel/cg_rtol.txt). Default 1e-6: ~20 % less warp-map time than the reference's 1e-8,
+// the map within 0.03 px of it (the self-test photo; the reference's own pass-2 solver stops at 1e-5,
+// within 0.005 px of the exact solution: solver_audit.txt). Process-wide; FS_CG_RTOL=x in the
+// environment sets it at start (desktop harnesses: 1e-8 for the reference); values <= 0 restore
+// the default. The app never sets it.
 void set_warp_cg_rtol(double rtol);
 double warp_cg_rtol();
 

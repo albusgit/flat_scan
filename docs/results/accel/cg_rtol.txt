@@ -18,3 +18,6 @@ DocUNet: run docunet_bench/run_ours.py with a pipeline_cli built from this tree 
 at the user's checkout: use a copy with REPO set to this worktree) and the new_fold2 config plus
 FS_CG_RTOL=1e-6, into a new work/e_cgtol6 folder; score with docunet_eval.py (--jobs 4) only the images
 that differ from work/new_fold2. Recommendation pending those numbers: keep 1e-8.
+
+2026-10-23: 1e-6 is now the default (docs/results/speed.md: on the 34 real photos solves -22 %, text-row
+straightness unchanged: row deviation p90 6.7100 -> 6.7103 px, angle spread 1.7497 -> 1.7502 deg).

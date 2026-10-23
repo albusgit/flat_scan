@@ -2,13 +2,15 @@
 
   python tools/litert/convert.py [OUT_DIR] [--work DIR] [NAME ...]
       OUT_DIR default app/src/main/litert/models; --work default a temp folder (deleted afterwards)
-      NAME: uvdoc, sdhr, shade, finder, rule (default all; rule only when its source exists)
+      NAME: uvdoc, sdhr, shade, finder, rule, rulegpu (default all; rule and rulegpu only when its source exists)
       --rulenet PATH: the rule net's ONNX file (default app/src/main/assets/models/rulenet.onnx)
       -> uvdoc_static.tflite, syntheticdoc_hr_static.tflite, shadenet_512x352.tflite (GPU and CPU: fixed input),
          shadenet.tflite (with shade: the CPU's ShadeNet for any input size, any_hw()), pagefinder.tflite (finder:
          CPU only, fp32 weights, keep_fp32()), rulenet.tflite (rule: the rule net, CPU only, any input size:
          rulenet.onnx made static at 512 x 352 (tools/accel/prepare_models.py make_static), converted as ShadeNet,
-         then any_hw(); the static intermediate stays in the work folder), and NAME.analyzer.txt (tf.lite.experimental.Analyzer,
+         then any_hw(); the static intermediate stays in the work folder), rulenet_1152x800.tflite and
+         rulenet_800x1152.tflite (rulegpu: the rule net's GPU copies, fixed to the A4 stage-1 page at half size,
+         portrait and landscape, with the GPU op check), and NAME.analyzer.txt (tf.lite.experimental.Analyzer,
          gpu_compatibility=True) in the work folder
       The files are byte-identical when re-made by the full run (no NAME): onnx2tf's tensor names carry a counter
       of the models made in the process, so a run of fewer nets gives the same graphs and numbers under other names.
@@ -70,6 +72,9 @@ SHADE_WIDTHS = list(range(32, 513, 32))
 RULE_SRC = os.path.join(SRC, 'rulenet.onnx')
 RULE_HW = [512, 352]
 RULE_OUT = 'rulenet.tflite'
+# the GPU's fixed-shape copies (rulegpu): the A4 stage-1 page (1600 x 2263) at half size padded to multiples of 32,
+# portrait and landscape (core/src/warpmap.cpp rule_probs)
+RULE_GPU_HW = [[1152, 800], [800, 1152]]
 # sizes check_any runs it at (H, W): the half-size pages of rule_probs are multiples of 32 in both
 RULE_SIZES = [(32, 32), (64, 96), (512, 352), (352, 512), (1152, 800), (800, 1152), (1024, 1024), (1440, 1024), (96, 1440)]
 # onnx2tf runs a sample inference on this file when it is in the working folder (else it downloads one)
@@ -305,6 +310,10 @@ def gpu_ops(path):
         if op == B.CONV_2D:
             if not all(is_const(i) for i in ins[1:]):
                 bad.append(what + ': weights not constant')
+        elif op == B.DEPTHWISE_CONV_2D:
+            # the rule net's 1 x 15 / 15 x 1 line blocks: constant weights, one filter per channel
+            if not all(is_const(i) for i in ins[1:]) or o.builtinOptions.depthMultiplier not in (0, 1):
+                bad.append(what + ': weights not constant or depth multiplier > 1')
         elif op in (B.PAD, B.MIRROR_PAD):
             p = data(ins[1], np.int32).reshape(4, 2) if is_const(ins[1]) else None
             if p is None or p[0].any() or p[3].any():
@@ -513,35 +522,53 @@ def check_any(path, ref_path=None, sizes=None, gpu_note='the GPU runs shadenet_5
             f'GPU op check (information only: {gpu_note}): {len(bad)} problems' + (f', e.g. {bad[0]}' if bad else '')]
 
 
-def convert_rule(src, work, out):
-    """rulenet.tflite: the rule net made static at RULE_HW (make_static: shape arithmetic folded, the global
-    branch's Expand as a Mul by ones), converted and rewritten as the other nets (fp16 weights + DEQUANTIZE), then
-    any_hw(). CPU only: the GPU form is a by-product (the static intermediate in work, not shipped)."""
+def rule_static(src, work, hw, gpu):
+    """The rule net made static at hw = [H, W] (make_static: shape arithmetic folded, the global branch's Expand as
+    a Mul by ones), converted and rewritten as the other nets (fp16 weights + DEQUANTIZE): work/rulenet_HxW.tflite.
+    gpu: the GPU op check too. Returns its path."""
     import onnx2tf
     sys.path.insert(0, os.path.join(REPO, 'tools', 'accel'))
     from prepare_models import make_static
+    tag = '%dx%d' % tuple(hw)
     m = onnx.load(src)
     iname = m.graph.input[0].name
-    make_static(m, {iname: [1, 3] + RULE_HW}, log=lambda *a: None)
-    st = os.path.join(work, 'rule_static.onnx')
+    make_static(m, {iname: [1, 3] + list(hw)}, log=lambda *a: None)
+    st = os.path.join(work, 'rule_static_%s.onnx' % tag)
     onnx.save(m, st)
     m, w16 = fp32_onnx(st)
-    f32 = os.path.join(work, 'rule_fp32.onnx')
+    f32 = os.path.join(work, 'rule_%s_fp32.onnx' % tag)
     onnx.save(m, f32)
-    onnx2tf.convert(input_onnx_file_path=f32, output_folder_path=os.path.join(work, 'rule'),
+    onnx2tf.convert(input_onnx_file_path=f32, output_folder_path=os.path.join(work, 'rule_' + tag),
                     copy_onnx_input_output_names_to_tflite=True, non_verbose=True)
-    tfl32 = os.path.join(work, 'rule', 'rule_fp32_float32.tflite')
-    static = os.path.join(work, 'rulenet_%dx%d.tflite' % tuple(RULE_HW))
+    tfl32 = os.path.join(work, 'rule_' + tag, 'rule_%s_fp32_float32.tflite' % tag)
+    static = os.path.join(work, 'rulenet_%s.tflite' % tag)
     summary = rewrite(tfl32, static, bn_convs(m, w16), m.graph.output[0].name)
-    lines, text = check(static, [1] + RULE_HW + [3], [1] + RULE_HW + [2], gpu=False)
-    print(f'rule net {src}: static {RULE_HW[0]} x {RULE_HW[1]} {os.path.getsize(static)} bytes; {summary}')
+    lines, text = check(static, [1] + list(hw) + [3], [1] + list(hw) + [2], gpu=gpu)
+    print(f'rule net {src}: static {hw[0]} x {hw[1]} {os.path.getsize(static)} bytes; {summary}')
     for s in lines:
         print('  ' + s, flush=True)
+    return static
+
+
+def convert_rule(src, work, out):
+    """rulenet.tflite: rule_static() at RULE_HW, then any_hw(): the CPU's model for any page size."""
+    static = rule_static(src, work, RULE_HW, gpu=False)
     path = os.path.join(out, RULE_OUT)
     summary = any_hw(static, path)
     print(f'{RULE_OUT}: {os.path.getsize(path)} bytes; {summary}')
     for s in check_any(path, static, RULE_SIZES, 'CPU only'):
         print('  ' + s, flush=True)
+
+
+def convert_rule_gpu(src, work, out):
+    """rulenet_<H>x<W>.tflite for the GPU delegate at RULE_GPU_HW (the A4 stage-1 page at half size, portrait and
+    landscape: rule_probs' padded input), with the GPU op check; the loader picks the file of the input's shape
+    (as shadenet_<H>x<W>), other shapes run on the CPU."""
+    for hw in RULE_GPU_HW:
+        static = rule_static(src, work, hw, gpu=True)
+        dst = os.path.join(out, os.path.basename(static))
+        shutil.copyfile(static, dst)
+        print(f'{os.path.basename(dst)}: {os.path.getsize(dst)} bytes (GPU)', flush=True)
 
 
 def check(path, want_in, want_out, gpu=True):
@@ -590,9 +617,9 @@ def main():
         k = args.index('--rulenet')
         rule_src = os.path.abspath(args[k + 1])
         del args[k:k + 2]
-    known = [n[0] for n in NETS] + ['rule']
+    known = [n[0] for n in NETS] + ['rule', 'rulegpu']
     out = os.path.abspath(args[0]) if args and args[0] not in known else OUT
-    names = [a for a in args if a in known] or [n[0] for n in NETS] + (['rule'] if os.path.exists(rule_src) else [])
+    names = [a for a in args if a in known] or [n[0] for n in NETS] + (['rule', 'rulegpu'] if os.path.exists(rule_src) else [])
     keep_work = work is not None
     work = work or tempfile.mkdtemp(prefix='litert_convert_')
     os.makedirs(work, exist_ok=True)
@@ -635,6 +662,8 @@ def main():
                     print('  ' + s, flush=True)
         if 'rule' in names:
             convert_rule(rule_src, work, out)
+        if 'rulegpu' in names:
+            convert_rule_gpu(rule_src, work, out)
     finally:
         os.chdir(cwd)
         if not keep_work:

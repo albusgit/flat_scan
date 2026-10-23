@@ -343,7 +343,7 @@ int cmd_cg_tol(int argc, char** argv) {
                 r[k] = run_photo(img, o);
                 t[k].push_back(ms_of(r[k], "warp map"));
             }
-        set_warp_cg_rtol(1e-8);
+        set_warp_cg_rtol(0);   // the default again
         for (int k = 0; k < 2; ++k)
             for (int i = 0; i < 6; ++i) iters[k] += r[k].warp.cg_iters[i];
         double map_px = 0;

@@ -254,6 +254,20 @@ private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
 
 @Composable
 fun ProcessingScreen(vm: ScanViewModel) {
+    val preview = vm.openingPreview
+    if (preview != null) {
+        // a stored page: its last rendering while its session is restored (no steps to report)
+        val img = remember(preview) { preview.asImageBitmap() }
+        Column(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Image(img, "The page", contentScale = ContentScale.Fit, modifier = Modifier.weight(1f).fillMaxWidth())
+            Spacer(Modifier.height(12.dp))
+            LinearProgressIndicator(
+                trackColor = MaterialTheme.colorScheme.outlineVariant, gapSize = 0.dp,
+                modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+            )
+        }
+        return
+    }
     val photo = vm.photoDisplay
     // the bar moves smoothly between the core's progress steps
     val shown by animateFloatAsState(vm.progress, animationSpec = tween(400), label = "progress")

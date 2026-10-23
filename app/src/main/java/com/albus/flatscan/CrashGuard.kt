@@ -25,22 +25,31 @@ object CrashGuard {
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    /** [what]: shown in the report; [gpu]: the GPU delegate may run inside. */
-    fun begin(ctx: Context, what: String, gpu: Boolean) {
-        prefs(ctx).edit().putString("running", what).putBoolean("running_gpu", gpu).commit()
+    /**
+     * [what]: shown in the report; [gpu]: the GPU delegate may run inside. Returns the marker it replaces
+     * (guarded work inside guarded work: the self-test runs Auto's benchmark), for [end] to put back.
+     */
+    fun begin(ctx: Context, what: String, gpu: Boolean): Pair<String, Boolean>? {
+        val p = prefs(ctx)
+        val outer = p.getString("running", null)?.let { it to p.getBoolean("running_gpu", false) }
+        p.edit().putString("running", what).putBoolean("running_gpu", gpu || outer?.second == true).commit()
+        return outer
     }
 
-    fun end(ctx: Context) {
-        prefs(ctx).edit().remove("running").remove("running_gpu").commit()
+    fun end(ctx: Context, outer: Pair<String, Boolean>? = null) {
+        val e = prefs(ctx).edit()
+        if (outer != null) e.putString("running", outer.first).putBoolean("running_gpu", outer.second)
+        else e.remove("running").remove("running_gpu")
+        e.commit()
     }
 
     /** Runs [block] between [begin] and [end] (also ended when it throws: a Java exception is not a crash). */
     inline fun <T> guard(ctx: Context, what: String, gpu: Boolean, block: () -> T): T {
-        begin(ctx, what, gpu)
+        val outer = begin(ctx, what, gpu)
         try {
             return block()
         } finally {
-            end(ctx)
+            end(ctx, outer)
         }
     }
 
@@ -120,8 +129,14 @@ object CrashGuard {
                 else -> "reason ${e.reason}"
             }
             val at = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT).format(Date(e.timestamp))
-            e.reason to ("Exit: $reason at $at" + (e.description?.let { " ($it)" } ?: "") +
-                ", memory at exit: PSS ${e.pss / 1024} MB, RSS ${e.rss / 1024} MB")
+            // on screen or not: the low-memory killer takes background apps first
+            val where = when {
+                e.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND -> "on screen"
+                e.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_PERCEPTIBLE -> "visible, not in front (importance ${e.importance})"
+                else -> "in the background (importance ${e.importance})"
+            }
+            e.reason to ("Exit: $reason at $at, the app $where" + (e.description?.takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: "") +
+                ", memory at exit: " + (if (e.pss > 0) "PSS ${e.pss / 1024} MB, " else "") + "RSS ${e.rss / 1024} MB")
         }.getOrNull()
     }
 }

@@ -191,6 +191,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var before by mutableStateOf<Bitmap?>(null)
         private set
+    /** Opening a stored page: its last rendering (out.jpg), shown while the session is restored ([openPage]). */
+    var openingPreview by mutableStateOf<Bitmap?>(null)
+        private set
     var overlay by mutableStateOf<Bitmap?>(null)
         private set
     var overlayMaxPx by mutableFloatStateOf(0f)
@@ -296,7 +299,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * Settings > Acceleration > "Run the benchmark": Auto's benchmark now (its result is kept as Auto's
      * choice for this SoC and app version), with its report in the self-test area.
      */
-    fun runAccelBenchmark() {
+    fun runAccelBenchmark(candidates: String = Accel.candidates(), reportFile: java.io.File? = null) {
         if (selfTestRunning) return
         enableGpu()   // asked for explicitly: the GPU is tried again even after a crash turned it off
         selfTestRunning = true
@@ -306,12 +309,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     synchronized(netsLock) {
                         val stage = { s: String -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s }; Unit }
-                        val stored = runAutoBenchmark(stage)
+                        val stored = runAutoBenchmark(stage, candidates)
                         if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
                         formatBench(stored)
                     }
                 }.getOrElse { "Acceleration benchmark FAILED: ${it.message ?: it}" }
             }
+            reportFile?.let { f -> runCatching { f.parentFile?.mkdirs(); f.writeText(report) } }
             selfTestReport = report
             selfTestRunning = false
         }
@@ -319,7 +323,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- the nets' backends (Settings > Acceleration)
     /** The groups' backends as last given to [NativeLib.configureNets]. */
-    @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "", "")
+    @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "", "", "")
     private val netsLock = Any()
 
     init {
@@ -345,13 +349,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The current setting's plan: a fixed setting's, Auto's stored choice, or the CPU while Auto has not run. */
     fun currentPlan(): Accel.Plan = Accel.fixed(settings.acceleration) ?: Accel.autoPlan(settings.autoChoice)
-        ?: Accel.Plan(Accel.AUTO, "", "", "", "", "not benchmarked yet")
+        ?: Accel.Plan(Accel.AUTO, "", "", "", "", "", "not benchmarked yet")
 
     private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) {
         val app = getApplication<Application>()
         // the LiteRT GPU's serialised kernels (the folder kept its earlier name)
         val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
-        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, 0, staticModels)
+        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, plan.rule, 0, staticModels)
         netPlan = plan
     }
 
@@ -372,11 +376,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice].
      * No candidate (no GPU on this phone): the CPU at once, without running anything.
      */
-    private fun runAutoBenchmark(stage: (String) -> Unit): JSONObject {
-        val cand = Accel.candidates()
+    private fun runAutoBenchmark(stage: (String) -> Unit, cand: String = Accel.candidates()): JSONObject {
         val at = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.ROOT).format(java.util.Date())
         val bench = if (cand.isEmpty()) JSONObject().put("ok", true).put("runs", 0)
-            .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu"))
+            .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu").put("rule", "cpu"))
         else CrashGuard.guard(getApplication(), "the acceleration benchmark (GPU)", gpu = true) {
             JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
         }
@@ -396,8 +399,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         sb.append("${NetEnv.runtime}; GPU: ${if (NetEnv.gpuAvailable) "available" else "unavailable (${NetEnv.gpuWhy})"}; candidates: ${stored.optString("candidates").ifEmpty { "none" }}\n")
         if (!b.optBoolean("ok")) sb.append("FAILED: ").append(b.optString("error")).append("\n")
         val tol = b.optJSONObject("tolerance")
-        if (tol != null) sb.append("Tolerance vs CPU: grids p99 <= %.2f px, max <= %.1f px (1600 x 2263 page); shadow net p99 <= %.1f, max <= %.1f levels\n".format(
-            tol.optDouble("grid_p99_px"), tol.optDouble("grid_max_px"), tol.optDouble("shade_p99_levels"), tol.optDouble("shade_max_levels")))
+        if (tol != null) sb.append(("Tolerance vs CPU: grids p99 <= %.2f px, max <= %.1f px (1600 x 2263 page); shadow net p99 <= %.1f, max <= %.1f levels; " +
+            "rule net p99 <= %.2f, max <= %.2f (probability)\n").format(tol.optDouble("grid_p99_px"), tol.optDouble("grid_max_px"),
+            tol.optDouble("shade_p99_levels"), tol.optDouble("shade_max_levels"), tol.optDouble("rule_p99"), tol.optDouble("rule_max")))
         sb.append("%d timed runs after a first run (first: session creation, GPU kernel compile or cached kernels). ms; diff vs CPU:\n".format(b.optInt("runs")))
         val arr = b.optJSONArray("backends")
         for (i in 0 until (arr?.length() ?: 0)) {
@@ -410,14 +414,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     sb.append("  %-14s did not run on this backend (first call %d ms)\n".format(k, n.optInt("first_ms")))
                     continue
                 }
-                val unit = if (k == "shadenet") "levels" else "px"
+                val unit = when (k) { "shadenet" -> "levels"; "rulenet" -> "prob"; else -> "px" }
                 sb.append("  %-14s first %6d  median %7.1f  p95 %7.1f  diff p99 %.3f max %.3f %s  %s\n".format(k, n.optInt("first_ms"),
                     n.optDouble("median_ms"), n.optDouble("p95_ms"), n.optDouble("p99_diff"), n.optDouble("max_diff"), unit,
                     if (n.optBoolean("pass")) "PASS" else "FAIL"))
             }
         }
         b.optJSONObject("choice")?.let { c ->
-            sb.append("\nAuto's choice: page finder ${c.optString("finder")}, UVDoc ${c.optString("flat")}, SyntheticDoc high-res ${c.optString("hr")}, shadow net ${c.optString("shade")}\n")
+            sb.append("\nAuto's choice: page finder ${c.optString("finder")}, UVDoc ${c.optString("flat")}, SyntheticDoc high-res ${c.optString("hr")}, " +
+                "shadow net ${c.optString("shade")}, rule net ${c.optString("rule", "cpu")}\n")
         }
         sb.append("\nJSON (send this back with the report):\n").append(stored.toString())
         return sb.toString()
@@ -515,6 +520,49 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * gate_b.py); [rules]: the rule net (default: Settings > Table rules); [ext]: ".jpg" or ".png" (default ".png" for "docunet", else ".jpg"); [staticModels]: the
      * CPU runs the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1); [only]: comma-separated names.
      */
+    /**
+     * Debug (MainActivity `--es open_test SET`): imports the photos of files/batch/SET (internal storage, as
+     * [runBatch]) as a gallery batch, waits for its pages, then opens each stored page [rounds] times in turn
+     * and writes to [report] per open: ms to the stored preview on screen ([openingPreview]) and to the result
+     * screen with its first render.
+     */
+    fun runOpenTest(set: String, report: java.io.File, rounds: Int = 3) {
+        val dir = java.io.File(getApplication<Application>().filesDir, "batch/$set")
+        val photos = dir.listFiles { f -> f.extension.lowercase() in setOf("jpg", "jpeg", "png") }.orEmpty().sortedBy { it.name }
+        if (photos.size < 2) {
+            runCatching { report.parentFile?.mkdirs(); report.writeText("open test: need >= 2 photos in $dir\n") }
+            return
+        }
+        viewModelScope.launch {
+            val sb = StringBuilder("open test: ${photos.size} photos of $dir\n")
+            importUris(photos.map { Uri.fromFile(it) })
+            val done = withTimeoutOrNull(900_000) {
+                snapshotFlow { screen == Screen.Pages && !batch && pages.size >= photos.size }.first { it }
+            }
+            if (done == null) sb.append("TIMEOUT waiting for the batch (screen $screen, ${pages.size} pages)\n")
+            for (round in 0 until rounds)
+                for (id in pages.toList()) {
+                    delay(1500)   // the last page's session store and render settle
+                    if (id == currentId) open(Screen.Pages)
+                    val t0 = android.os.SystemClock.elapsedRealtime()
+                    var tPreview = -1L
+                    val watch = launch {
+                        snapshotFlow { openingPreview != null }.first { it }
+                        tPreview = android.os.SystemClock.elapsedRealtime() - t0
+                    }
+                    openPage(id)
+                    val ok = withTimeoutOrNull(120_000) {
+                        snapshotFlow { screen == Screen.Result && currentId == id && page != null }.first { it }
+                    } != null
+                    watch.cancel()
+                    sb.append("round $round page $id: preview ${tPreview} ms, result ${if (ok) android.os.SystemClock.elapsedRealtime() - t0 else -1} ms\n")
+                    Log.i(TAG, "open test: round $round page $id preview $tPreview")
+                }
+            sb.append("details of the last open:\n").append(details).append('\n')
+            runCatching { report.parentFile?.mkdirs(); report.writeText(sb.toString()) }
+        }
+    }
+
     fun runBatch(set: String, out: String?, accel: String?, shade: Boolean?, ext: String?, staticModels: Boolean, only: String?, rules: Boolean? = null) {
         if (batchRunning) return
         batchRunning = true
@@ -545,7 +593,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (pageExt != ".jpg" && pageExt != ".png") error("ext must be .jpg or .png")
         val plan = synchronized(netsLock) {
             val pl = Accel.fixed(setting) ?: (Accel.autoPlan(settings.autoChoice)
-                ?: run { runAutoBenchmark { status("Batch $set: $it") }; Accel.autoPlan(settings.autoChoice) } ?: Accel.fixed(Accel.CPU)!!)
+                ?: run { runAutoBenchmark({ status("Batch $set: $it") }); Accel.autoPlan(settings.autoChoice) } ?: Accel.fixed(Accel.CPU)!!)
             configureNets(pl, staticModels)
             pl
         }
@@ -1091,7 +1139,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
-     * re-processing), otherwise re-processed from its source.
+     * re-processing), otherwise re-processed from its source. Its last rendering is on screen at once
+     * ([openingPreview]) while that happens.
      */
     fun openPage(id: String) {
         if (id == currentId && handle != 0L) {
@@ -1102,43 +1151,56 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             screen = Screen.Processing
             progress = 0f
             stage = "Opening page"
-            commitCurrent()
-            try {
-                val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
-                val stored = withContext(Dispatchers.IO) { store.loadSession(id, geometryKey(m)) }
-                if (stored != null) {
-                    handle = 0L
-                    resetResultState()
-                    val h = withContext(nativeCtx) {
-                        if (nativeHandle != 0L) NativeLib.release(nativeHandle)
-                        nativeHandle = NativeLib.restoreSession(stored.first.absolutePath, true)
-                        nativeHandle
-                    }
-                    if (h != 0L) {
-                        discardStaging()
-                        recropBackup = null
-                        photo = null
-                        photoDisplay = null
-                        photoPageId = null
-                        cropMeta = null
-                        spreadNext = null
-                        spreadCurrent = null
-                        activate(h, m, m.params, m.protect.toList(), m.rotation, stored.third, restored = true)
-                        return@launch
-                    }
-                    Log.w(TAG, "stored session of $id unreadable: re-processing")
-                }
-                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(m.cropRotation) }
-                discardStaging()
-                recropBackup = null
-                setCrop(m, bmp)
-                process()
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                Log.e(TAG, "open page failed", e)
-                message = "Could not open the page"
-                screen = fallback()
+            val preview = launch {
+                val b = withContext(Dispatchers.IO) { runCatching { store.loadThumbnail(id, PREVIEW_MAX_SIDE) }.getOrNull() }
+                if (screen == Screen.Processing) openingPreview = b
             }
+            try {
+                commitCurrent()
+                openStored(id)
+            } finally {
+                preview.cancel()
+                openingPreview = null
+            }
+        }
+    }
+
+    private suspend fun openStored(id: String) {
+        try {
+            val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
+            val stored = withContext(Dispatchers.IO) { store.loadSession(id, geometryKey(m)) }
+            if (stored != null) {
+                handle = 0L
+                resetResultState()
+                val h = withContext(nativeCtx) {
+                    if (nativeHandle != 0L) NativeLib.release(nativeHandle)
+                    nativeHandle = NativeLib.restoreSession(stored.first.absolutePath, true)
+                    nativeHandle
+                }
+                if (h != 0L) {
+                    discardStaging()
+                    recropBackup = null
+                    photo = null
+                    photoDisplay = null
+                    photoPageId = null
+                    cropMeta = null
+                    spreadNext = null
+                    spreadCurrent = null
+                    activate(h, m, m.params, m.protect.toList(), m.rotation, stored.third, restored = true)
+                    return
+                }
+                Log.w(TAG, "stored session of $id unreadable: re-processing")
+            }
+            val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(m.cropRotation) }
+            discardStaging()
+            recropBackup = null
+            setCrop(m, bmp)
+            process()
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            Log.e(TAG, "open page failed", e)
+            message = "Could not open the page"
+            screen = fallback()
         }
     }
 
@@ -2003,6 +2065,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         const val TAG = "FlatScan"
         const val RENDER_DEBOUNCE_MS = 120L
         const val THUMB_W = 96
+        /** [openingPreview]: out.jpg decoded at full size up to this side (a page is 1600 x 2263 by default) */
+        const val PREVIEW_MAX_SIDE = 2400
         /** The nets in pipeline order: key in the "accel" JSON (processing details, self-test) -> label. */
         val NET_LABELS = listOf(
             "page_finder" to "Page finder", "uvdoc_pass1" to "UVDoc pass 1 (whole photo)", "uvdoc" to "UVDoc",

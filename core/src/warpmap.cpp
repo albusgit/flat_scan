@@ -359,12 +359,13 @@ void add_regularizer(Stencil& S) {
     for (size_t i = 0; i < (size_t)gw * gh; ++i) S.a[i * NOFF + 6] += 1e-9;
 }
 
-// The fields' CG tolerance (warpmap.h: set_warp_cg_rtol). 1e-8 is the reference.
+// The fields' CG tolerance (warpmap.h: set_warp_cg_rtol). 1e-6 (the reference: 1e-8).
+constexpr double kCgRtol = 1e-6;
 static std::atomic<double>& cg_rtol_store() {
     static std::atomic<double> v{[] {
         const char* e = std::getenv("FS_CG_RTOL");
         double r = e ? std::atof(e) : 0;
-        return r > 0 ? r : 1e-8;
+        return r > 0 ? r : kCgRtol;
     }()};
     return v;
 }
@@ -1617,7 +1618,7 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 
 }  // namespace
 
-void set_warp_cg_rtol(double rtol) { cg_rtol_store() = rtol > 0 ? rtol : 1e-8; }
+void set_warp_cg_rtol(double rtol) { cg_rtol_store() = rtol > 0 ? rtol : kCgRtol; }
 double warp_cg_rtol() { return cg_rtol_store().load(); }
 
 // App, neural pages: a rule whose trace stops short of a rule it ends at, where collect's junction

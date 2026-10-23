@@ -54,12 +54,24 @@ class MainActivity : ComponentActivity() {
      * (the folder under files/batch), out, accel (auto, cpu, gpu), shade (--ez), ext (.jpg / .png),
      * static_models (--ez, no effect now), rules (--ez: the rule net; default Settings > Table rules), only
      * (comma-separated names). `--ez selftest true` instead: the self-test (one run), its report written to
-     * files/batch_out/selftest_report.txt (external files).
+     * files/batch_out/selftest_report.txt (external files). `--es bench gpu`: Auto's benchmark with those
+     * candidates even where the GPU is unavailable (the emulator: the CPU fallback), its report in
+     * files/batch_out/bench_report.txt. `--es open_test SET`: the photos of files/batch/SET imported as pages,
+     * then each stored page opened in turn, the times in files/batch_out/open_report.txt (ScanViewModel.runOpenTest).
      */
     private fun startBatch(i: Intent?) {
         if (i == null || applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
         if (i.getBooleanExtra("selftest", false)) {
             vm.runSelfTest(1, java.io.File(getExternalFilesDir(null), "batch_out/selftest_report.txt"))
+            vm.open(Screen.Settings)
+            return
+        }
+        i.getStringExtra("open_test")?.let { set ->
+            vm.runOpenTest(set, java.io.File(getExternalFilesDir(null), "batch_out/open_report.txt"))
+            return
+        }
+        i.getStringExtra("bench")?.let { cand ->
+            vm.runAccelBenchmark(cand, java.io.File(getExternalFilesDir(null), "batch_out/bench_report.txt"))
             vm.open(Screen.Settings)
             return
         }

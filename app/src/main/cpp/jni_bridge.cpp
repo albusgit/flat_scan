@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <dlfcn.h>
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+cv::Mat read_bgra(const std::string& path);
+
 // One processed page. Everything a re-render needs is computed once in process(): the page,
 // its paper alpha, the before page, the deformation grid and the filter analysis (PageParams).
 // The stage-1 page and the warp-map debug data are freed right after processing.
@@ -52,7 +55,8 @@ struct Session {
     PipelineResult result;    // page, paper, before, disp, maps, timings (stage1 / warp freed)
     PageParams pp;
     float legend_px = 1.f;
-    std::mutex mu;            // guards the downscaled-source cache
+    std::mutex mu;            // guards the downscaled-source cache and the before page's loading
+    std::string before_file;  // restored sessions: the before page, read on first use (before_page)
     std::vector<std::pair<cv::Size, cv::Mat>> small;   // paper-filled page, INTER_AREA, by size
     cv::Mat page_orig, paper_orig;   // the page before the Erase tool (kept from its first use)
     bool use_gpu = true;
@@ -66,15 +70,26 @@ struct Session {
     PageParams scr_pp;
     std::vector<std::pair<cv::Size, cv::Mat>> scr_small;
 
-    // after result.page and pp changed (process, erase, restore): screen detection, caches dropped
-    void page_changed() {
-        ScreenInfo si = detect_screen(result.page);
+    // after result.page and pp changed (process, erase, restore): screen detection (or `known`: made
+    // beside the page params, or stored), caches dropped
+    void page_changed(const ScreenInfo* known = nullptr) {
+        ScreenInfo si = known ? *known : detect_screen(result.page);
         std::lock_guard<std::mutex> lk(mu);
         screen = si;
         scr_built = false;
         scr_page.release();
         scr_small.clear();
         small.clear();
+    }
+    // the before page (a restored session reads it now: opening a page does not wait for it); may be empty
+    cv::Mat before_page() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!before_file.empty()) {
+            cv::Mat b = read_bgra(before_file);
+            before_file.clear();
+            if (!b.empty() && b.size() == result.page.size()) result.before = b;
+        }
+        return result.before;
     }
     // Original always shows the page as photographed (and flattened)
     bool screen_on(const RenderParams& rp) const {
@@ -129,7 +144,57 @@ struct Snapshot {
     GridMap disp;
     std::vector<std::array<float, 5>> lines;
     float legend_px = 1.f;
+    PageParams pp;            // the filters' page analysis and the screen detection: a restore does not redo them
+    ScreenInfo screen;
 };
+
+// params.bin: the page params (scalars, then the quarter-grid Mats as rows, cols, type and data) and the
+// screen detection, for page_w x page_h. Version 1.
+constexpr int32_t kParamsMagic = 0x31505346;   // "FSP1"
+
+bool write_params(const std::string& path, const PageParams& p, const ScreenInfo& sc) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const int32_t head[5] = {kParamsMagic, p.page_w, p.page_h, p.gpu_background ? 1 : 0, sc.screen ? 1 : 0};
+    const float sc_f[7] = {p.wb[0], p.wb[1], p.wb[2], p.sigma, p.ink, sc.score, sc.score_y};
+    bool ok = std::fwrite(head, sizeof head, 1, f) == 1 && std::fwrite(sc_f, sizeof sc_f, 1, f) == 1;
+    for (const cv::Mat* m : {&p.illum, &p.paper, &p.bgv, &p.pic, &p.tint}) {
+        const cv::Mat c = m->isContinuous() ? *m : m->clone();
+        const int32_t mh[3] = {c.rows, c.cols, c.type()};
+        ok = ok && std::fwrite(mh, sizeof mh, 1, f) == 1;
+        const size_t n = c.total() * c.elemSize();
+        ok = ok && (n == 0 || std::fwrite(c.data, 1, n, f) == n);
+    }
+    return std::fclose(f) == 0 && ok;
+}
+
+// false when missing, of another version, or not for a page_w x page_h page
+bool read_params(const std::string& path, int page_w, int page_h, PageParams& p, ScreenInfo& sc) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    int32_t head[5];
+    float sc_f[7];
+    bool ok = std::fread(head, sizeof head, 1, f) == 1 && head[0] == kParamsMagic && head[1] == page_w && head[2] == page_h &&
+              std::fread(sc_f, sizeof sc_f, 1, f) == 1;
+    PageParams q;
+    for (cv::Mat* m : {&q.illum, &q.paper, &q.bgv, &q.pic, &q.tint}) {
+        int32_t mh[3];
+        ok = ok && std::fread(mh, sizeof mh, 1, f) == 1 && mh[0] >= 0 && mh[1] >= 0 && mh[0] <= 4096 && mh[1] <= 4096;
+        if (!ok) break;
+        if (mh[0] == 0 || mh[1] == 0) continue;
+        *m = cv::Mat(mh[0], mh[1], mh[2]);
+        const size_t n = m->total() * m->elemSize();
+        ok = std::fread(m->data, 1, n, f) == n;
+    }
+    std::fclose(f);
+    if (!ok) return false;
+    q.page_w = head[1]; q.page_h = head[2]; q.gpu_background = head[3] != 0;
+    q.wb[0] = sc_f[0]; q.wb[1] = sc_f[1]; q.wb[2] = sc_f[2]; q.sigma = sc_f[3]; q.ink = sc_f[4];
+    p = q;
+    sc = ScreenInfo();
+    sc.screen = head[4] != 0; sc.score = sc_f[5]; sc.score_y = sc_f[6];
+    return true;
+}
 
 bool write_floats(const std::string& path, const std::vector<int32_t>& head, const std::vector<const std::vector<float>*>& parts) {
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -168,7 +233,10 @@ bool write_snapshot(const Snapshot& s, const std::string& dir) {
     std::vector<float> lf;
     for (const auto& l : s.lines) lf.insert(lf.end(), l.begin(), l.end());
     lf.push_back(s.legend_px);
-    return write_floats(dir + "/lines.bin", {(int32_t)s.lines.size()}, {&lf});
+    if (!write_floats(dir + "/lines.bin", {(int32_t)s.lines.size()}, {&lf})) return false;
+    // optional (older sessions have none: the restore makes them)
+    if (s.pp.page_w == s.page.cols && s.pp.page_h == s.page.rows) write_params(dir + "/params.bin", s.pp, s.screen);
+    return true;
 }
 
 cv::Mat read_bgra(const std::string& path) {
@@ -363,8 +431,8 @@ struct Progress {
 // and the .tflite models in the APK). One Inference per
 // group of nets, so that Settings > Acceleration (or Auto's choice) can give each group its own
 // backends: the page finder, UVDoc (both passes), SyntheticDoc high-res (its own group: its fp16 grid
-// misses the accelerator tolerance where UVDoc's meets it, Gate A), the shadow net and the rule net (CPU
-// only: no fixed-shape model, not in Settings > Acceleration). An Inference keeps its sessions for the
+// misses the accelerator tolerance where UVDoc's meets it, Gate A), the shadow net and the rule net (the
+// GPU from its fixed-shape copies of the A4 stage-1 page, infer.cpp). An Inference keeps its sessions for the
 // life of the process and moves a net to its next backend (CPU last) on any failure, so a net that
 // failed on an accelerator stays on the CPU until the next configureNets with other backends.
 struct NetGroup {
@@ -517,13 +585,14 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env,
 }
 
 // Settings > Acceleration: the backends of each net group (finder, flat: UVDoc, hr: SyntheticDoc
-// high-res, shade; names as nets.h parse_backends, comma separated; "" = CPU only), the compiled-model cache (LiteRT GPU kernels), CPU threads (0: the default).
+// high-res, shade, rule: the rule net; names as nets.h parse_backends, comma separated; "" = CPU only), the compiled-model cache (LiteRT GPU kernels), CPU threads (0: the default).
 // staticModels: the CPU loads uvdoc_static / syntheticdoc_hr_static instead of the originals (HUMAN
 // GATE A-1). A group whose settings are unchanged keeps its Inference and sessions.
 JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* env, jclass, jobject assets, jstring cache_dir, jstring finder,
-                                                                       jstring flat, jstring hr, jstring shade, jint threads, jboolean static_models) {
+                                                                       jstring flat, jstring hr, jstring shade, jstring rule, jint threads,
+                                                                       jboolean static_models) {
     std::string cd = cache_dir ? jstr(env, cache_dir) : "", pf = finder ? jstr(env, finder) : "", fl = flat ? jstr(env, flat) : "",
-                hs = hr ? jstr(env, hr) : "", sh = shade ? jstr(env, shade) : "";
+                hs = hr ? jstr(env, hr) : "", sh = shade ? jstr(env, shade) : "", rl = rule ? jstr(env, rule) : "";
     std::lock_guard<std::mutex> lk(g_nets_mu);
     if (!g_assets && assets) {
         g_assets = env->NewGlobalRef(assets);
@@ -540,7 +609,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     set(g_flat, fl);
     set(g_hr, hs);
     set(g_shade, sh);
-    set(g_rule, "");
+    set(g_rule, rl);
 }
 
 // JSON: {"cpu" (the CPU runtime and version), "litert" (LiteRT's version), "gpu" (the LiteRT GPU delegate can be
@@ -694,12 +763,21 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
             // free what re-renders never need
             r.stage1.release();
             r.warp = WarpDebug();
+            // the page params (GPU) and the screen detection (CPU) side by side
             auto t0 = Clock::now();
+            double ms_screen = 0;
+            std::future<ScreenInfo> scr = std::async(std::launch::async, [&r, &ms_screen] {
+                auto ts = Clock::now();
+                ScreenInfo si = detect_screen(r.page);
+                ms_screen = ms_since(ts);
+                return si;
+            });
             s->pp = page_params(r.page, use_gpu);
             r.ms.emplace_back(s->pp.gpu_background ? "page params (GPU)" : "page params (CPU)", ms_since(t0));
-            t0 = Clock::now();
-            s->page_changed();
-            r.ms.emplace_back("screen detection", ms_since(t0));
+            const ScreenInfo si = scr.get();
+            s->page_changed(&si);
+            r.ms.emplace_back("screen detection, beside the page params", ms_screen);
+            r.ms.emplace_back("page params + screen detection", ms_since(t0));
             s->legend_px = r.disp.x.empty() ? 1.f : wrinkle_legend_px(r.disp);
         }
     } catch (const std::exception& e) {
@@ -812,7 +890,8 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_renderBefore(JNIEnv* en
     Session* s = session(h);
     if (!s || !s->result.ok) return;
     try {
-        bgra_to_bitmap(env, s->result.before.empty() ? s->result.page : s->result.before, out);
+        cv::Mat b = s->before_page();
+        bgra_to_bitmap(env, b.empty() ? s->result.page : b, out);
     } catch (const std::exception& e) {
         LOGI("renderBefore failed: %s", e.what());
     }
@@ -909,10 +988,15 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_snapshot(JNIEnv*, jcla
     auto* sn = new Snapshot();
     sn->page = s->result.page;
     sn->paper = s->result.paper;
-    sn->before = s->result.before;
+    sn->before = s->before_page();
     sn->disp = s->result.disp;
     sn->lines = s->result.lines;
     sn->legend_px = s->legend_px;
+    sn->pp = s->pp;
+    {
+        std::lock_guard<std::mutex> lk(s->mu);
+        sn->screen = s->screen;
+    }
     return (jlong)sn;
 }
 
@@ -930,6 +1014,7 @@ JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_writeSnapshot(JNIEn
 
 // a session from a written snapshot (no geometry is re-run); 0 when it cannot be read
 JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv* env, jclass, jstring dir, jboolean use_gpu) {
+    const auto t_all = Clock::now();
     std::string path = jstr(env, dir);
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
@@ -939,8 +1024,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv*
         if (r.page.empty()) return 0;
         if (std::ifstream(path + "/paper.png").good()) r.paper = cv::imread(path + "/paper.png", cv::IMREAD_GRAYSCALE);
         if (!r.paper.empty() && r.paper.size() != r.page.size()) r.paper.release();
-        r.before = read_bgra(path + "/before.jpg");
-        if (!r.before.empty() && r.before.size() != r.page.size()) r.before.release();
+        // the before page: on first use (compare, the next snapshot)
+        if (std::ifstream(path + "/before.jpg").good()) s->before_file = path + "/before.jpg";
         std::vector<int32_t> head;
         std::vector<float> data;
         if (read_floats(path + "/disp.bin", head, 5, data) && head[2] > 0 && head[3] > 0 &&
@@ -958,10 +1043,17 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv*
             s->legend_px = r.disp.x.empty() ? 1.f : wrinkle_legend_px(r.disp);
         }
         auto t0 = Clock::now();
-        s->pp = page_params(r.page, use_gpu);
-        r.ms.emplace_back("restored; page params", ms_since(t0));
-        s->page_changed();
+        ScreenInfo si;
+        if (read_params(path + "/params.bin", r.page.cols, r.page.rows, s->pp, si)) {
+            s->page_changed(&si);
+            r.ms.emplace_back("restored; page params and screen detection read", ms_since(t0));
+        } else {
+            s->pp = page_params(r.page, use_gpu);
+            r.ms.emplace_back("restored; page params", ms_since(t0));
+            s->page_changed();
+        }
         r.ok = true;
+        LOGI("restoreSession: %s %.0f ms, all %.0f ms", r.ms.back().first.c_str(), r.ms.back().second, ms_since(t_all));
     } catch (const std::exception& e) {
         LOGI("restoreSession failed: %s", e.what());
         return 0;
@@ -1078,15 +1170,20 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_selfTest(JNIEnv* env
 
 // ---- Settings > Acceleration > Auto: the nets on the bundled self-test photo, on the CPU and on every
 // candidate backend, timed and compared with the CPU on the same inputs (made as automatic processing
-// makes them; the shadow net gets the photo at the A4 page's net size, 352 x 512). A backend is
-// acceptable for a group of nets (UVDoc's two passes; SyntheticDoc high-res; the shadow net) when each
+// makes them; the shadow net gets the photo at the A4 page's net size, 352 x 512; the rule net the page
+// (the photo through the page finder's corners) at the A4 stage-1 page's half size, 800 x 1152). A backend is
+// acceptable for a group of nets (UVDoc's two passes; SyntheticDoc high-res; the shadow net; the rule net) when each
 // net of the group ran on it (no fallback to the next backend) within the accelerator tolerances below;
 // Auto takes the fastest acceptable backend per group, the CPU when none is faster. The page finder stays on the CPU (PLAN: 34 NNAPI partitions).
 // Accelerator tolerances (the CPU path itself stays bit-identical):
 //   flattening nets: Gate A's grid measure (grid_px), p99 <= 0.25 px (Gate A's target) and max <= 1 px
 //                    of the 1600 x 2263 analysis page;
-//   shadow net: |shading difference| x 255, p99 <= 0.5 and max <= 2 levels (Gate A's fp16 stand-in: p99 0.07).
-constexpr double AUTO_GRID_P99_PX = 0.25, AUTO_GRID_MAX_PX = 1.0, AUTO_SHADE_P99 = 0.5, AUTO_SHADE_MAX = 2.0;
+//   shadow net: |shading difference| x 255, p99 <= 0.5 and max <= 2 levels (Gate A's fp16 stand-in: p99 0.07);
+//   rule net: |rule probability difference|, p99 <= 0.01 and max <= 0.1 (the line stage reads it against
+//             thresholds of 0.3 - 0.5: a pixel's few-percent move changes no rule).
+constexpr double AUTO_GRID_P99_PX = 0.25, AUTO_GRID_MAX_PX = 1.0, AUTO_SHADE_P99 = 0.5, AUTO_SHADE_MAX = 2.0, AUTO_RULE_P99 = 0.01,
+                 AUTO_RULE_MAX = 0.1;
+constexpr int BENCH_SHADE = -1, BENCH_RULE = -2;   // In::model of the shadow net's and the rule net's inputs
 
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv* env, jclass, jobject bmp, jstring candidates, jint runs,
                                                                          jobject listener) {
@@ -1110,6 +1207,15 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             c.threads = g_threads;
             return Inference::create(c);
         };
+        // Memory: only one backend's sessions at a time. The app's own sessions go first (each group keeps
+        // its backends and makes its sessions again on its next run), and the CPU's before the GPU's: with
+        // the CPU and GPU copies of every net (SyntheticDoc high-res at 1440 x 1024) and the app's rule net
+        // all alive, an 8 GB phone killed the app (low memory) during this benchmark.
+        {
+            std::lock_guard<std::mutex> lk(g_nets_mu);
+            for (std::shared_ptr<NetGroup>* s : {&g_finder, &g_flat, &g_hr, &g_shade, &g_rule})
+                if (*s) *s = make_group((*s)->pref);
+        }
         // the inputs, from CPU runs as automatic processing makes them
         progress(1, "Auto: preparing the inputs (CPU)");
         std::unique_ptr<Inference> cpu = make(Backend::CPU);
@@ -1143,28 +1249,55 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             for (int y = 0; y < sh; ++y)
                 for (int x = 0; x < sw; ++x)
                     for (int c = 0; c < 3; ++c) t.data[((size_t)c * sh + y) * sw + x] = sm.at<cv::Vec3b>(y, x)[c] / 255.f;
-            in.push_back({"shadenet", NetId::ShadeNet, -1, std::move(t)});
+            in.push_back({"shadenet", NetId::ShadeNet, BENCH_SHADE, std::move(t)});
         }
-        // every backend on every input: a first run (session creation; QNN: the graph compile or the
-        // cached context) and `runs` timed runs
+        {
+            // the rule net's GPU shape (rulenet_1152x800): the page through the found corners, else the photo
+            const int rw = 800, rh = 1152;
+            cv::Mat pg;
+            if (pc.ok) {
+                std::vector<cv::Point2f> src, dst = {{0, 0}, {(float)rw - 1, 0}, {(float)rw - 1, (float)rh - 1}, {0, (float)rh - 1}};
+                for (const auto& q : pc.pts) src.emplace_back((float)q.x, (float)q.y);
+                cv::warpPerspective(bgr, pg, cv::getPerspectiveTransform(src, dst), cv::Size(rw, rh), cv::INTER_AREA, cv::BORDER_REPLICATE);
+            } else {
+                cv::resize(bgr, pg, cv::Size(rw, rh), 0, 0, cv::INTER_AREA);
+            }
+            Tensor t{{1, 3, rh, rw}, std::vector<float>((size_t)3 * rw * rh)};
+            for (int y = 0; y < rh; ++y)
+                for (int x = 0; x < rw; ++x)
+                    for (int c = 0; c < 3; ++c) t.data[((size_t)c * rh + y) * rw + x] = pg.at<cv::Vec3b>(y, x)[c] / 255.f;
+            in.push_back({"rulenet", NetId::RuleNet, BENCH_RULE, std::move(t)});
+        }
+        // every backend on every input: a first run (session creation; the GPU: its kernels' compile or
+        // the cached ones) and `runs` timed runs. The CPU (the reference, its outputs are what the GPU is
+        // compared with) skips the first run of the nets the inputs' step ran (their sessions exist) and
+        // times one run: it only has to show whether the GPU is faster (SyntheticDoc high-res: 2 CPU runs
+        // instead of 5)
         struct Res { bool ok = false, ran = false, pass = false; double first_ms = 0, median = 0, p95 = 0, p99 = 0, max = 0; std::vector<float> out; };
         std::vector<std::vector<Res>> res(all.size(), std::vector<Res>(in.size()));
         for (size_t bi = 0; bi < all.size(); ++bi) {
+            const bool on_cpu = all[bi] == Backend::CPU;
             std::unique_ptr<Inference> own;
             Inference* inf = cpu.get();
-            if (all[bi] != Backend::CPU) inf = (own = make(all[bi])).get();
+            if (!on_cpu) {
+                cpu.reset();   // the CPU's outputs are kept (res[0]): its sessions can go
+                inf = (own = make(all[bi])).get();
+            }
             for (size_t k = 0; k < in.size(); ++k) {
                 progress((int)(5 + 90 * (bi * in.size() + k) / (all.size() * in.size())),
                          std::string("Auto: ") + in[k].key + " on " + backend_name(all[bi]));
                 Res& r = res[bi][k];
                 std::vector<Tensor> y;
-                auto t0 = Clock::now();
-                r.ok = inf->run(in[k].id, in[k].x, y) && !y.empty();
-                r.first_ms = ms_since(t0);
-                r.ran = r.ok && inf->backend(in[k].id) == all[bi];
-                if (!r.ran) continue;
+                r.ok = true;
+                if (!on_cpu || in[k].model < 0) {
+                    auto t0 = Clock::now();
+                    r.ok = inf->run(in[k].id, in[k].x, y) && !y.empty();
+                    r.first_ms = ms_since(t0);
+                    r.ran = r.ok && inf->backend(in[k].id) == all[bi];
+                    if (!r.ran) continue;
+                }
                 std::vector<double> t;
-                for (int i = 0; i < runs && r.ok; ++i) {
+                for (int i = 0; i < (on_cpu ? 1 : runs) && r.ok; ++i) {
                     r.ok = inf->run(in[k].id, in[k].x, y) && !y.empty() && inf->backend(in[k].id) == all[bi];
                     t.push_back(inf->last_ms(in[k].id));
                 }
@@ -1183,7 +1316,8 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
                 if (!r.ran || !c.ran || r.out.size() != c.out.size()) continue;
                 std::vector<double> d;
                 if (in[k].model < 0) {
-                    for (size_t i = 0; i < r.out.size(); ++i) d.push_back(std::fabs((double)r.out[i] - c.out[i]) * 255);
+                    const double unit = in[k].model == BENCH_SHADE ? 255 : 1;   // the shadow net in levels, the rule net in probability
+                    for (size_t i = 0; i < r.out.size(); ++i) d.push_back(std::fabs((double)r.out[i] - c.out[i]) * unit);
                 } else {
                     const UvSpec& sp = uv_spec(in[k].model);
                     d = grid_px(c.out, r.out, sp.gw, sp.gh);
@@ -1191,10 +1325,12 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
                 if (d.empty()) continue;
                 r.p99 = pct(d, 99);
                 r.max = *std::max_element(d.begin(), d.end());
-                r.pass = in[k].model < 0 ? r.p99 <= AUTO_SHADE_P99 && r.max <= AUTO_SHADE_MAX : r.p99 <= AUTO_GRID_P99_PX && r.max <= AUTO_GRID_MAX_PX;
+                r.pass = in[k].model == BENCH_SHADE  ? r.p99 <= AUTO_SHADE_P99 && r.max <= AUTO_SHADE_MAX
+                         : in[k].model == BENCH_RULE ? r.p99 <= AUTO_RULE_P99 && r.max <= AUTO_RULE_MAX
+                                                     : r.p99 <= AUTO_GRID_P99_PX && r.max <= AUTO_GRID_MAX_PX;
             }
         // the fastest acceptable backend per group (the CPU's own runs are the reference: acceptable)
-        // model: 0 UVDoc, 2 SyntheticDoc high-res, -1 the shadow net
+        // model: 0 UVDoc, 2 SyntheticDoc high-res, BENCH_SHADE the shadow net, BENCH_RULE the rule net
         auto choose = [&](int model) {
             size_t best = 0;
             double best_ms = -1;
@@ -1215,7 +1351,8 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
         };
         o << "{\"ok\": true, \"runs\": " << runs << ", \"corners_found\": " << (pc.ok ? "true" : "false")
           << ", \"tolerance\": {\"grid_p99_px\": " << AUTO_GRID_P99_PX << ", \"grid_max_px\": " << AUTO_GRID_MAX_PX
-          << ", \"shade_p99_levels\": " << AUTO_SHADE_P99 << ", \"shade_max_levels\": " << AUTO_SHADE_MAX << "}, \"backends\": [";
+          << ", \"shade_p99_levels\": " << AUTO_SHADE_P99 << ", \"shade_max_levels\": " << AUTO_SHADE_MAX << ", \"rule_p99\": " << AUTO_RULE_P99
+          << ", \"rule_max\": " << AUTO_RULE_MAX << "}, \"backends\": [";
         for (size_t bi = 0; bi < all.size(); ++bi) {
             o << (bi ? ", " : "") << "{\"backend\": \"" << backend_name(all[bi]) << "\", \"nets\": {";
             for (size_t k = 0; k < in.size(); ++k) {
@@ -1229,10 +1366,10 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             o << "}}";
         }
         o << "], \"choice\": {\"finder\": \"cpu\", \"flat\": \"" << backend_name(choose(0)) << "\", \"hr\": \"" << backend_name(choose(2))
-          << "\", \"shade\": \"" << backend_name(choose(-1)) << "\"}}";
+          << "\", \"shade\": \"" << backend_name(choose(BENCH_SHADE)) << "\", \"rule\": \"" << backend_name(choose(BENCH_RULE)) << "\"}}";
     } catch (const std::exception& e) {
         o.str("");
-        o << "{\"ok\": false, \"error\": \"" << escape(e.what()) << "\", \"choice\": {\"finder\": \"cpu\", \"flat\": \"cpu\", \"hr\": \"cpu\", \"shade\": \"cpu\"}}";
+        o << "{\"ok\": false, \"error\": \"" << escape(e.what()) << "\", \"choice\": {\"finder\": \"cpu\", \"flat\": \"cpu\", \"hr\": \"cpu\", \"shade\": \"cpu\", \"rule\": \"cpu\"}}";
     }
     progress(100, "Done");
     return env->NewStringUTF(o.str().c_str());

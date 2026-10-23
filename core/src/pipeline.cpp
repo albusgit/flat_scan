@@ -898,6 +898,11 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     // > 0.1 px on average and leaves the first pass's rules no less straight.
     auto second_pass = [&](GridMap& m) {
         if (!opt.second_line_pass) return;
+        // no lines on the first page (plain text, photos): the second finds none either (34 real photos: 11 such
+        // pages, the pass ran ~0.9 s on each for nothing)
+        if (r.warp.H.empty() && r.warp.V.empty()) return;
+        auto t2 = Clock::now();
+        struct Done { PipelineResult& r; Clock::time_point t; ~Done() { r.second_pass_ms = ms_since(t); } } done{r, t2};
         cv::Mat page2 = resample_cpu(page, m);
         if (page2.channels() == 4) cv::cvtColor(page2, page2, cv::COLOR_BGRA2BGR);
         RuleNetFn net2 = opt.rule_net;   // the page moved: the net runs again
@@ -922,6 +927,8 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         r.second_pass_kept = true;
     };
     if (take(w0, m0)) { second_pass(m0); return m0; }
+    auto tr = Clock::now();
+    struct Done { PipelineResult& r; Clock::time_point t; ~Done() { r.line_retry_ms = ms_since(t) - std::max(0.0, r.second_pass_ms); } } retry_done{r, tr};   // without a second pass inside
     if (opt.faint_lines) {
         // the same lines without those that pass through the overstretched spots (left out whole:
         // dropping only their samples there straightened a rule on one side of a spot and not on
@@ -1070,12 +1077,15 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     // overlap: while the nets run, the orientation page (the homography page of these corners) and its
     // decision for the current unroll. Kept below when the grid check leaves the corners as they are
     // (uv_defines_page moves them) and the page-shape test gives the same input; otherwise redone.
+    // The before page (the homography page at render size, turned as decided) too: it needs only these
+    // corners and that turn, and the nets leave the CPU waiting (a GPU phone: 0.75 s); kept when both stay.
     struct {
         bool ok = false;
         Unroll Uh;
         cv::Mat page;
         OrientInput in;
         Orientation o;
+        cv::Mat before;
     } spec;
     if (overlap && opt.auto_orient && !opt.orient_on_stage1) {
         auto ts = Clock::now();
@@ -1085,6 +1095,9 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         spec.o = orient_decide(spec.page, spec.in, opt);
         spec.ok = true;
         r.ms.emplace_back("orientation, beside the nets", ms_since(ts));
+        ts = Clock::now();
+        resample_any(to_bgra(photo), at_render_size(compose(Uh, identity_grid(W, H), spec.o.rot, true), opt), opt.use_gpu, spec.before);
+        r.ms.emplace_back("before page, beside the nets", ms_since(ts));
     }
     if (overlap) {
         auto tw = Clock::now();
@@ -1248,6 +1261,8 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     r.stage1 = stage1;
     r.ms.emplace_back("warp map", ms_since(t0));
     for (auto& m : r.warp.ms) r.ms.emplace_back("  " + m.first, m.second);
+    if (r.line_retry_ms >= 0) r.ms.emplace_back("  retries (map overstretched)", r.line_retry_ms);
+    if (r.second_pass_ms >= 0) r.ms.emplace_back(r.second_pass_kept ? "  second line pass (kept)" : "  second line pass (not kept)", r.second_pass_ms);
     t0 = Clock::now();
     report(opt, 85, "Composing the map");
     r.final_map = compose(U, warp4, r.rot, true);
@@ -1311,10 +1326,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         r.paper.setTo(0, b);
     }
     if (opt.erase_fingers && !r.paper.empty()) r.fingers_erased = erase_fingers(r.page, r.paper);
-    // before page: perspective only, same rotation and size
-    cv::Mat src = to_bgra(photo);
-    GridMap hb = at_render_size(compose(Uh, identity_grid(W, H), r.rot, true), opt);
-    resample_any(src, hb, opt.use_gpu, r.before);
+    // before page: perspective only, same rotation and size (made beside the nets when they kept both)
+    if (!spec.before.empty() && same_homography(Uh, spec.Uh) && r.rot == spec.o.rot) {
+        r.before = spec.before;
+        r.before_reused = true;
+    } else {
+        GridMap hb = at_render_size(compose(Uh, identity_grid(W, H), r.rot, true), opt);
+        resample_any(to_bgra(photo), hb, opt.use_gpu, r.before);
+    }
     // deformation: page point p -> where it sat on the before page
     {
         const GridMap& g = r.render_map;
