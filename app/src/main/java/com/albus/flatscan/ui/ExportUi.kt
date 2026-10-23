@@ -241,7 +241,7 @@ private fun <T> OptionRow(label: String, values: List<T>, selected: T, text: (T)
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             for (v in values) {
                 val on = v == selected
-                val shape = RoundedCornerShape(18.dp)
+                val shape = ChipShape
                 Box(
                     Modifier.minimumInteractiveComponentSize().height(36.dp).clip(shape)
                         .background(if (on) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent)
@@ -259,7 +259,7 @@ private fun <T> OptionRow(label: String, values: List<T>, selected: T, text: (T)
 @Composable
 private fun FormatIcon(icon: ImageVector) {
     Box(
-        Modifier.size(44.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(14.dp)),
+        Modifier.size(44.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(8.dp)),
         contentAlignment = Alignment.Center,
     ) { Icon(icon, null, tint = MaterialTheme.colorScheme.primary) }
 }

@@ -7,7 +7,10 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -38,7 +41,10 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.toSize
+import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.sin
+import kotlin.random.Random
 import kotlin.math.min
 
 /** Zoom (1x..6x) and pan of the page viewer, in screen pixels relative to the centred fit. */
@@ -149,6 +155,17 @@ fun PageViewer(
     val beforeImg = remember(before) { before?.asImageBitmap() }
     val overlayImg = remember(overlay) { overlay?.asImageBitmap() }
     var holding by remember { mutableStateOf(false) }
+    // holding for the original briefly crinkles the page back into the photo
+    val crinkle = remember { Animatable(0f) }
+    val reduced = rememberReducedMotion()
+    LaunchedEffect(holding) {
+        if (holding && !reduced) {
+            crinkle.snapTo(1f)
+            crinkle.animateTo(0f, tween(420))
+        } else {
+            crinkle.snapTo(0f)
+        }
+    }
     var box by remember { mutableStateOf(Size.Zero) }
     // the rectangle being drawn, page pixels
     var drawFrom by remember { mutableStateOf<Offset?>(null) }
@@ -322,6 +339,8 @@ fun PageViewer(
             inPage {
                 drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null)
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
+                val c = crinkle.value
+                if (holding && c > 0.01f) drawCreases(pageWidth, pageHeight, c, 2.dp.toPx() / g.k)
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
                     val areaColor = when (areaMode) {
@@ -390,6 +409,29 @@ fun PageViewer(
             }
         }
     }
+}
+
+/** Crease lines across the page (fractions: x0, y0, x1, y1), a dark fold beside a lit one. */
+private val Creases = Random(11).let { r ->
+    List(14) {
+        val x = r.nextFloat()
+        val y = r.nextFloat()
+        val a = r.nextFloat() * Math.PI.toFloat()
+        val l = 0.25f + r.nextFloat() * 0.45f
+        floatArrayOf(x - cos(a) * l / 2, y - sin(a) * l / 2, x + cos(a) * l / 2, y + sin(a) * l / 2)
+    }
+}
+
+/** The creases of a crumpled sheet over a [pw] x [ph] page, at strength [k] (0..1). */
+private fun DrawScope.drawCreases(pw: Int, ph: Int, k: Float, width: Float) {
+    for (c in Creases) {
+        val a = Offset(c[0] * pw, c[1] * ph)
+        val b = Offset(c[2] * pw, c[3] * ph)
+        val n = Offset(-(b.y - a.y), b.x - a.x).let { it / max(1e-3f, it.getDistance()) } * width
+        drawLine(Color.Black.copy(alpha = 0.28f * k), a, b, strokeWidth = width * 1.5f, cap = StrokeCap.Round)
+        drawLine(Color.White.copy(alpha = 0.45f * k), a + n, b + n, strokeWidth = width, cap = StrokeCap.Round)
+    }
+    drawRect(Color(0xFF8A7A55).copy(alpha = 0.10f * k), size = Size(pw.toFloat(), ph.toFloat()))
 }
 
 /** Whether the page point (fractions) lies in one of the rectangles [x0, y0, x1, y1, ...]. */

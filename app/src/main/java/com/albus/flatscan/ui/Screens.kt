@@ -3,9 +3,7 @@ package com.albus.flatscan.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -50,7 +48,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Snackbar
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -67,7 +64,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -90,6 +86,20 @@ import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
 import com.albus.flatscan.Settings
 import kotlinx.coroutines.delay
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import kotlin.math.min
 
 @Composable
 fun HomeScreen(vm: ScanViewModel) {
@@ -110,22 +120,22 @@ fun HomeScreen(vm: ScanViewModel) {
                 IconButton(onClick = { vm.open(Screen.Settings) }) { Icon(Icons.Outlined.Settings, "Settings") }
             }
             Spacer(Modifier.height(28.dp))
-            Text("Flat, clean pages\nfrom any photo.", style = MaterialTheme.typography.headlineLarge)
+            HighlightedHeadline("Flat, clean pages\nfrom ", "any photo.")
             Spacer(Modifier.height(10.dp))
             Text(
                 "Bent, curled or shadowed: FlatScan finds the page, flattens it and whitens the paper.",
                 style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp), color = muted,
             )
             Spacer(Modifier.height(28.dp))
-            // the main action: a large accent card
-            Surface(
-                onClick = { vm.startCamera() },
-                shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.fillMaxWidth().height(168.dp),
+            // the main action: a ballpoint-blue card that presses down into its ink shadow
+            InkPressable(
+                onClick = { vm.startCamera() }, shape = RoundedCornerShape(12.dp), depth = 4.dp,
+                container = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.fillMaxWidth().height(172.dp),
             ) {
                 Column(Modifier.fillMaxSize().padding(22.dp), verticalArrangement = Arrangement.SpaceBetween) {
                     Box(
-                        Modifier.size(52.dp).background(LocalContentColor.current.copy(alpha = 0.16f), RoundedCornerShape(16.dp)),
+                        Modifier.size(52.dp).background(LocalContentColor.current.copy(alpha = 0.16f), RoundedCornerShape(10.dp)),
                         contentAlignment = Alignment.Center,
                     ) { Icon(Icons.Outlined.PhotoCamera, null, Modifier.size(28.dp)) }
                     Column {
@@ -134,14 +144,14 @@ fun HomeScreen(vm: ScanViewModel) {
                     }
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            Surface(
+            Spacer(Modifier.height(14.dp))
+            // an index card: white, a red rule along the top
+            PaperSurface(
                 onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLowest,
-                border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline),
                 modifier = Modifier.fillMaxWidth().height(64.dp),
             ) {
-                Row(Modifier.padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.fillMaxWidth().padding(top = 9.dp).height(1.dp).background(MaterialTheme.colorScheme.error.copy(alpha = 0.55f)))
+                Row(Modifier.fillMaxSize().padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(22.dp))
                     Spacer(Modifier.width(14.dp))
                     Text("Import photos", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold), modifier = Modifier.weight(1f))
@@ -159,6 +169,17 @@ fun HomeScreen(vm: ScanViewModel) {
                 }
                 Spacer(Modifier.height(4.dp))
                 DocumentCard(vm, onClick = { vm.open(Screen.Pages) })
+            } else {
+                Spacer(Modifier.height(36.dp))
+                // nothing scanned yet
+                Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CrumpledBall(Modifier.size(60.dp), paper = MaterialTheme.colorScheme.surfaceContainerLowest, ink = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(16.dp))
+                    Column {
+                        Text("Bring me a wrinkled page.", style = MaterialTheme.typography.titleMedium)
+                        Text("Folded, curled or crumpled: it comes out flat.", style = MaterialTheme.typography.bodyMedium, color = muted)
+                    }
+                }
             }
             Spacer(Modifier.weight(1f).heightIn(min = 24.dp))
             if (n > 0) {
@@ -203,7 +224,57 @@ private fun LogoMark(modifier: Modifier = Modifier) {
     }
 }
 
-/** The current document on the home screen: the first page over a second sheet, count and filter. */
+/** Shown once per launch: the highlighter swipes across the headline's last words. */
+private var highlighterSwiped = false
+
+/** The home headline: [lead] then [marked], which a highlighter swipes across (once per launch). */
+@Composable
+private fun HighlightedHeadline(lead: String, marked: String) {
+    val light = isPaperLight()
+    val marker = if (light) Palette.Highlighter else Graphite.Highlighter
+    val reduced = rememberReducedMotion()
+    val sweep = remember { Animatable(if (highlighterSwiped || reduced) 1f else 0f) }
+    LaunchedEffect(Unit) {
+        if (sweep.value < 1f) {
+            delay(250)
+            sweep.animateTo(1f, tween(650, easing = FastOutSlowInEasing))
+        }
+        highlighterSwiped = true
+    }
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val ink = MaterialTheme.colorScheme.onBackground
+    // on graphite the marked words turn dark as the yellow arrives under them
+    val markedInk = if (light) ink else lerp(ink, Graphite.Ground, sweep.value)
+    val text = buildAnnotatedString {
+        append(lead)
+        withStyle(SpanStyle(color = markedInk)) { append(marked) }
+    }
+    val pad = with(LocalDensity.current) { 4.dp.toPx() }
+    Text(
+        text, style = MaterialTheme.typography.headlineLarge, onTextLayout = { layout = it },
+        modifier = Modifier.drawBehind {
+            val l = layout ?: return@drawBehind
+            val end = lead.length + marked.length
+            var i = lead.length
+            while (i < end) {
+                val line = l.getLineForOffset(i)
+                val lineEnd = min(end, l.getLineEnd(line, visibleEnd = true))
+                if (lineEnd <= i) break
+                val left = l.getBoundingBox(i).left - pad
+                val right = l.getBoundingBox(lineEnd - 1).right + pad
+                val top = l.getLineTop(line)
+                val bottom = l.getLineBottom(line)
+                drawRect(
+                    marker, topLeft = Offset(left, top + (bottom - top) * 0.06f),
+                    size = Size((right - left) * sweep.value, (bottom - top) * 0.94f),
+                )
+                i = l.getLineEnd(line)
+            }
+        },
+    )
+}
+
+/** The current document on the home screen: the first page over the sheets behind it, count and filter. */
 @Composable
 private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
     val n = vm.pages.size
@@ -212,25 +283,22 @@ private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
     var thumb by remember(first) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(first, version) { thumb = first?.let { vm.thumbnail(it) } }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerLowest,
-        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outlineVariant),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
+    PaperSurface(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(92.dp, 96.dp)) {
-                val sheet = RoundedCornerShape(4.dp)
+            Box(Modifier.size(84.dp, 96.dp)) {
+                val sheet = RoundedCornerShape(2.dp)
                 val paper = Color.White
-                if (n > 1) {
+                val edge = Palette.Outline
+                // the sheets behind the first page, squared up like a stack on a desk
+                for (k in minOf(n - 1, 2) downTo 1) {
                     Box(
-                        Modifier.offset(22.dp, 2.dp).size(62.dp, 84.dp).rotate(6f)
-                            .background(paper, sheet).border(1.dp, Color(0xFFE2E0DA), sheet),
+                        Modifier.offset((4 + 7 * k).dp, (8 - 3 * k).dp).size(62.dp, 84.dp)
+                            .background(paper, sheet).border(1.dp, edge, sheet),
                     )
                 }
                 Box(
                     Modifier.offset(4.dp, 8.dp).size(62.dp, 84.dp)
-                        .shadow(4.dp, sheet).background(paper, sheet).border(1.dp, Color(0xFFD8D6D0), sheet).clip(sheet),
+                        .shadow(3.dp, sheet).background(paper, sheet).border(1.dp, edge, sheet).clip(sheet),
                     contentAlignment = Alignment.Center,
                 ) {
                     val t = thumb
@@ -247,7 +315,10 @@ private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
                 val ctx = androidx.compose.ui.platform.LocalContext.current
                 val name = remember(n, version) { com.albus.flatscan.DocumentName.get(ctx) }
                 if (name != null) Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                Text(if (n == 1) "1 page" else "$n pages", style = if (name != null) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium)
+                Text(
+                    if (n == 1) "1 page" else "$n pages",
+                    style = if (name != null) MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono) else MaterialTheme.typography.titleMedium,
+                )
                 Text(
                     if (vm.hasSession) vm.params.filter.label else "Tap to open",
                     style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = muted,
@@ -260,6 +331,7 @@ private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
 
 @Composable
 fun ProcessingScreen(vm: ScanViewModel) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val preview = vm.openingPreview
     if (preview != null) {
         // a stored page: its last rendering while its session is restored (no steps to report)
@@ -267,60 +339,31 @@ fun ProcessingScreen(vm: ScanViewModel) {
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Image(img, "The page", contentScale = ContentScale.Fit, modifier = Modifier.weight(1f).fillMaxWidth())
             Spacer(Modifier.height(12.dp))
-            LinearProgressIndicator(
-                trackColor = MaterialTheme.colorScheme.outlineVariant, gapSize = 0.dp,
-                modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-            )
+            Text("Opening the page", style = MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono), color = muted)
         }
         return
     }
     val photo = vm.photoDisplay
-    // the bar moves smoothly between the core's progress steps
-    val shown by animateFloatAsState(vm.progress, animationSpec = tween(400), label = "progress")
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(32.dp),
+        Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 32.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        if (photo != null) {
-            // the photo being flattened, a scan line down to the progress: it moves only when the core
-            // reports a step (no endless animation competing with processing on slow phones)
-            val img = remember(photo) { photo.asImageBitmap() }
-            val y = shown
-            val accent = MaterialTheme.colorScheme.primary
-            Box(
-                Modifier.heightIn(max = 300.dp).aspectRatio(photo.width.toFloat() / photo.height.coerceAtLeast(1))
-                    .clip(RoundedCornerShape(16.dp)),
-            ) {
-                Image(img, null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize().alpha(0.55f))
-                Canvas(Modifier.fillMaxSize()) {
-                    val yy = size.height * y
-                    drawRect(
-                        androidx.compose.ui.graphics.Brush.verticalGradient(
-                            listOf(Color.Transparent, accent.copy(alpha = 0.35f)), startY = yy - 60.dp.toPx(), endY = yy,
-                        ),
-                        topLeft = Offset(0f, yy - 60.dp.toPx()), size = androidx.compose.ui.geometry.Size(size.width, 60.dp.toPx()),
-                    )
-                    drawLine(accent, Offset(0f, yy), Offset(size.width, yy), strokeWidth = 3.dp.toPx())
-                }
-            }
-            Spacer(Modifier.height(28.dp))
-        }
+        // the photo arrives crumpled, unfolds with the core's steps and is ironed flat
+        PaperUnfold(
+            photo, vm.corners, vm.photo?.width ?: 0, vm.progress,
+            Modifier.widthIn(max = 340.dp).fillMaxWidth().aspectRatio(0.85f),
+        )
+        Spacer(Modifier.height(20.dp))
         Text(if (photo == null) "Opening the page" else "Flattening the page", style = MaterialTheme.typography.headlineSmall)
         if (vm.batch) {
             Spacer(Modifier.height(6.dp))
-            Text("Photo ${vm.importIndex} of ${vm.pendingTotal}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Photo ${vm.importIndex} of ${vm.pendingTotal}", style = MaterialTheme.typography.bodyMedium, color = muted)
         }
-        Spacer(Modifier.height(20.dp))
-        LinearProgressIndicator(
-            progress = { shown },
-            trackColor = MaterialTheme.colorScheme.outlineVariant, gapSize = 0.dp, drawStopIndicator = {},
-            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-        )
         Spacer(Modifier.height(14.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(vm.stage, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, modifier = Modifier.weight(1f))
-            Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(Modifier.widthIn(max = 340.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(vm.stage, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono), color = muted, maxLines = 2, modifier = Modifier.weight(1f))
+            Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontFamily = RecursiveMono), color = muted)
         }
     }
 }
@@ -354,22 +397,22 @@ fun SettingsScreen(vm: ScanViewModel) {
                 "The filter and strength you choose on a page become the default for the next one.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            RuledDivider(Modifier.padding(vertical = 8.dp))
             SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
             SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("Finding the page")
             SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
-            SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc) { uvDoc = it; s.uvDoc = it }
+            SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc, icon = PaperIcons.Iron) { uvDoc = it; s.uvDoc = it }
             if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc high-res only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
             SwitchRow("Remove shadows", "Shadow net: hand, object and leaf shadows; colours kept", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
             SwitchRow("Table rules (neural net)", "Rule net: straighten printed rules, not text rows or curves; off: rules from darkness alone", ruleNet) { ruleNet = it; s.ruleNet = it }
             SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
             SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("Output resolution")
             for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("Acceleration")
             for ((k, label) in Accel.CHOICES) Choice(label, accel == k) { accel = k; s.acceleration = k; if (k == Accel.GPU) vm.enableGpu() }
             Text(
@@ -393,12 +436,12 @@ fun SettingsScreen(vm: ScanViewModel) {
                 if (vm.batchRunning) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
             }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("About")
             Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(4.dp))
             Text(vm.gpuInfo, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("Self-test and benchmark")
             Text(
                 "Processes a bundled test page 6 times and checks the result against the reference implementation, then times the neural nets on it 6 times. Takes a few minutes.",
@@ -425,8 +468,15 @@ fun SettingsScreen(vm: ScanViewModel) {
                 Text(vm.selfTestStage, style = MaterialTheme.typography.bodySmall)
             }
             if (vm.selfTestReport.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                Text(vm.selfTestReport, style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono))
+                Spacer(Modifier.height(12.dp))
+                // printed on a till receipt with a torn edge
+                val receipt = ReceiptShape()
+                Text(
+                    vm.selfTestReport, style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.fillMaxWidth().shadow(2.dp, receipt).background(MaterialTheme.colorScheme.surfaceContainerLowest, receipt)
+                        .padding(start = 14.dp, end = 14.dp, top = 14.dp, bottom = 24.dp),
+                )
             }
             Spacer(Modifier.height(24.dp))
         }
@@ -434,11 +484,15 @@ fun SettingsScreen(vm: ScanViewModel) {
 }
 
 @Composable
-private fun SwitchRow(title: String, caption: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun SwitchRow(title: String, caption: String, checked: Boolean, icon: ImageVector? = null, onChange: (Boolean) -> Unit) {
     Row(
         Modifier.fillMaxWidth().toggleable(checked, role = Role.Switch, onValueChange = onChange).padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (icon != null) {
+            Icon(icon, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(14.dp))
+        }
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
             Text(caption, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -450,7 +504,7 @@ private fun SwitchRow(title: String, caption: String, checked: Boolean, onChange
 @Composable
 private fun Section(t: String) {
     Text(
-        t.uppercase(), style = MaterialTheme.typography.labelMedium.copy(fontSize = 13.sp, letterSpacing = 0.08.em),
+        t.uppercase(), style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 13.sp, letterSpacing = 0.06.em),
         color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 16.dp, bottom = 6.dp),
     )
 }
@@ -475,6 +529,34 @@ fun MessageHost(vm: ScanViewModel) {
         vm.message = null
     }
     Box(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), contentAlignment = Alignment.BottomCenter) {
-        Snackbar { Text(m) }
+        Snackbar(shape = MaterialTheme.shapes.small) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (m.startsWith("Saved")) {
+                    PaperPlaneLanding(m)
+                    Spacer(Modifier.width(12.dp))
+                }
+                Text(m)
+            }
+        }
     }
+}
+
+/** A paper airplane that swoops in from the left and lands beside the message. */
+@Composable
+private fun PaperPlaneLanding(key: Any) {
+    val reduced = rememberReducedMotion()
+    val t = remember(key) { Animatable(if (reduced) 1f else 0f) }
+    LaunchedEffect(key) { t.animateTo(1f, tween(700, easing = FastOutSlowInEasing)) }
+    val travel = with(LocalDensity.current) { 56.dp.toPx() }
+    Icon(
+        PaperIcons.PaperPlane, null,
+        Modifier.size(22.dp).graphicsLayer {
+            val k = 1f - t.value
+            translationX = -travel * k
+            translationY = -travel * 0.5f * kotlin.math.sin(k * Math.PI.toFloat())
+            rotationZ = -20f * k
+            alpha = min(1f, t.value * 2f)
+        },
+        tint = MaterialTheme.colorScheme.inversePrimary,
+    )
 }

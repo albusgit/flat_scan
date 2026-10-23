@@ -500,6 +500,36 @@ redo, a compare split view, apply to all pages, export options (paper size, marg
 reorder, the camera torch and a gallery button, processing progress, a landscape layout. Defaults give
 byte-identical pages; every feature was driven on the emulator without a crash.
 
+## Paper redesign: a new logo, Recursive, paper colours, the iron
+
+The layouts and flows are unchanged; the look moves from rounded and modern to printer paper on a graph-paper desk.
+
+- **Logo:** a sheet with a folded highlighter-yellow corner whose first line starts wavy and ends straight, on
+  ballpoint blue (adaptive launcher icon with a monochrome layer for Android 13 themed icons; `LogoMark` on Home).
+- **Type:** Recursive (SIL OFL, one variable font, `res/font/recursive.ttf`, Latin) replaces Manrope: a touch of
+  its Casual axis for headings, the plain style for text, its Mono axis for page counts, processing stages,
+  section labels and the self-test report.
+- **Colour:** white sheets on a cool graph-paper grey with ballpoint blue, a yellow highlighter and a red pen;
+  dark mode is neutral graphite; the camera, crop and result screens stay a dark ink well with the highlighter
+  as their accent. Corners are 4-16 dp (`Theme.kt`).
+- **Components** (`Components.kt`): buttons are 56 dp with 12 dp corners over a hard ink shadow that they press
+  into; `PaperSurface` (white sheet, soft shadow, faint grain, optional ruled lines and tape); ruled-line dividers.
+- **Processing** (`PaperUnfold.kt`): instead of the progress bar, the page cut from the photo starts as a
+  crumpled ball, unfolds with the core's steps (`Canvas.drawBitmapMesh`, 12 x 16 mesh, crease shading, seeded
+  from the photo) and an iron presses out the last creases at 85-92%. It moves only when the progress changes
+  (in the long 30-85% stage it creeps 70% of the way over 6 s, then holds); with system animations off a
+  still crumpled frame cross-fades to the flat page.
+- **Flatten tool:** the result screen's Lines tab is now **Flatten** with an iron icon (`Icons.kt`); "Unwarp
+  on / off" is "Iron on / off" (the off state shows the iron lifted) and "Flatten again" sends the iron across
+  the page before processing. Settings > Neural flattening carries the same icon.
+- **Small touches:** the highlighter swipes across "any photo." on Home (once per launch); empty states (a
+  crumpled ball on Home, the iron beside an empty sheet on Pages); a deleted page crumples into a ball; a saved
+  file lands on a paper airplane in the message; holding for the original briefly crinkles the page; the crop
+  outline is dashed with square highlighter handles and its warning sits on a sticky note; the camera shows a
+  tumbling paper ball while it takes the photo; the self-test report is printed on a torn receipt.
+- **Not changed:** the wrinkle map keeps its TURBO colours (they are made in the core, `overlay.cpp`, and the
+  legend has to match them).
+
 ## Acceleration: nets on the NPU / GPU, CPU stages beside the nets, more image stages on the GPU
 
 The nets now run inside the C++ core (`core/src/infer.*`, `core/src/nets.*`) on ONNX Runtime **1.22.0**
@@ -733,7 +763,7 @@ Analysis runs at 1600 px page width. The output-resolution setting (1240 / 1600 
 
 **App flow:** Home (camera / gallery) → Camera → Crop → Processing → Result → Save/Share.
 - **Crop:** auto-detected corners, 44 dp touch targets, a 3× magnifier loupe while dragging, and rotate 90°.
-- **Processing:** progress bar with the stage name.
+- **Processing:** the page unfolds from a crumpled ball and is ironed flat, with the stage name (see [Paper redesign](#paper-redesign-a-new-logo-recursive-paper-colours-the-iron)).
 - **Result:** Before/After toggle; Auto color / Grayscale; Solid colors; Rotate; Save (JPG or one-page A4 PDF through the system file picker) and Share; a details dialog with per-stage times.
 - **Settings:** default colour mode, solid colours, output resolution, Acceleration (Auto / CPU / NPU), an on-device self-test and the acceleration benchmark.
 

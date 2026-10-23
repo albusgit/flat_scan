@@ -57,7 +57,6 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SwapHoriz
-import androidx.compose.material.icons.outlined.Straighten
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
@@ -82,6 +81,15 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import kotlin.math.PI
+import kotlin.math.sin
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -114,6 +122,9 @@ import kotlin.math.roundToInt
 
 private enum class Sheet { None, Save, Share }
 
+/** A flatten the iron sweeps across the page before it starts ([perspective] as in [ScanViewModel.reflatten]). */
+private class IronRequest(val perspective: Boolean?)
+
 /** TURBO-like scale of the wrinkle map legend (blue -> cyan -> green -> yellow -> red). */
 private val TurboStops = listOf(
     Color(0xFF30123B), Color(0xFF4686FB), Color(0xFF1AE4B6), Color(0xFFA2FC3C), Color(0xFFFABA39), Color(0xFFE4460A), Color(0xFF7A0403),
@@ -130,6 +141,18 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
     val exporter = rememberExportActions(vm)
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
+    // "Flatten again": the iron sweeps across the page, then the processing screen takes over
+    var ironing by remember { mutableStateOf<IronRequest?>(null) }
+    val sweep = remember { Animatable(0f) }
+    val reduced = rememberReducedMotion()
+    LaunchedEffect(ironing) {
+        val r = ironing ?: return@LaunchedEffect
+        sweep.snapTo(0f)
+        if (!reduced) sweep.animateTo(1f, tween(750, easing = LinearEasing))
+        ironing = null
+        vm.reflatten(r.perspective)
+    }
+    val iron = { perspective: Boolean? -> if (ironing == null) ironing = IronRequest(perspective) }
     val viewer = remember(vm.currentId, vm.rotation) { ViewerState() }
     // before / after split (null: off)
     var compare by remember(vm.currentId) { mutableStateOf<Float?>(null) }
@@ -189,10 +212,14 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                         )
                     }
                     DropdownMenuItem(
-                        text = { Text("Unwarp") },
+                        text = { Text("Iron (unwarp)") },
+                        leadingIcon = { Icon(PaperIcons.Iron, null) },
                         trailingIcon = { Checkbox(checked = !vm.perspectiveOnly, onCheckedChange = null) },
-                        enabled = ready,
-                        onClick = { vm.reflatten(perspective = !vm.perspectiveOnly); menu = false },
+                        enabled = ready && ironing == null,
+                        onClick = {
+                            menu = false
+                            if (vm.perspectiveOnly) iron(false) else vm.reflatten(perspective = true)
+                        },
                     )
                     DropdownMenuItem(
                         text = { Text("Show wrinkle map") },
@@ -209,7 +236,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 }
             }
             Button(
-                onClick = { sheet = Sheet.Save }, enabled = ready,
+                onClick = { sheet = Sheet.Save }, enabled = ready, shape = ChipShape,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Editor.Text, contentColor = Editor.Ground,
                     disabledContainerColor = Editor.Text.copy(alpha = 0.3f), disabledContentColor = Editor.Ground.copy(alpha = 0.7f),
@@ -259,7 +286,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     "Press and hold to see the original",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
-                        .background(Editor.Text.copy(alpha = 0.12f), RoundedCornerShape(16.dp))
+                        .background(Editor.Text.copy(alpha = 0.12f), ChipShape)
                         .padding(horizontal = 14.dp, vertical = 7.dp),
                 )
             }
@@ -268,7 +295,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 visible = mode == AreaMode.None && (vm.history.canUndo || vm.history.canRedo),
                 enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopStart),
             ) {
-                Row(Modifier.padding(4.dp).background(Editor.Panel.copy(alpha = 0.88f), RoundedCornerShape(24.dp))) {
+                Row(Modifier.padding(4.dp).background(Editor.Panel.copy(alpha = 0.88f), RoundedCornerShape(10.dp))) {
                     IconButton(onClick = { vm.undo() }, enabled = vm.history.canUndo) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
                     IconButton(onClick = { vm.redo() }, enabled = vm.history.canRedo) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
                 }
@@ -287,6 +314,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     }
                 }
             }
+            if (ironing != null) IronSweep(sweep.value, Modifier.matchParentSize())
             if (compare != null && mode == AreaMode.None) {
                 Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     CompareLabel("Original")
@@ -299,7 +327,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
         if (mode == AreaMode.Protect) {
             ProtectPanel(vm, onDone = { tool = AreaMode.None })
         } else if (mode == AreaMode.Lines) {
-            LinesPanel(vm, onClose = closeTool)
+            LinesPanel(vm, onClose = closeTool, onIron = iron, ironing = ironing != null)
         } else if (mode == AreaMode.Erase) {
             ErasePanel(vm, onDone = { tool = AreaMode.None })
         } else if (vm.adjustOpen) {
@@ -365,14 +393,14 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
 }
 
-/** Six tools along the bottom: three tabs (filters, adjust, unwarp lines) and three actions. */
+/** Six tools along the bottom: three tabs (filters, adjust, flatten) and three actions. */
 @Composable
 private fun ToolDock(vm: ScanViewModel, linesOpen: Boolean, onLines: () -> Unit, onTab: () -> Unit) {
     HorizontalDivider(color = Editor.Divider)
     Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 10.dp)) {
         DockItem("Filters", Icons.Outlined.Palette, Modifier.weight(1f), selected = !vm.adjustOpen && !linesOpen) { onTab(); vm.openAdjust(false) }
         DockItem("Adjust", Icons.Outlined.Tune, Modifier.weight(1f), selected = vm.adjustOpen && !linesOpen) { onTab(); vm.openAdjust(true) }
-        DockItem("Lines", Icons.Outlined.Straighten, Modifier.weight(1f), selected = linesOpen) { onLines() }
+        DockItem("Flatten", PaperIcons.Iron, Modifier.weight(1f), selected = linesOpen) { onLines() }
         DockItem("Crop", Icons.Outlined.Crop, Modifier.weight(1f)) { vm.recrop() }
         DockItem("Rotate", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f)) { vm.rotateResult() }
         DockItem("Pages", Icons.Outlined.Collections, Modifier.weight(1f), badge = vm.pages.size) { vm.open(Screen.Pages) }
@@ -384,7 +412,7 @@ private fun ToolDock(vm: ScanViewModel, linesOpen: Boolean, onLines: () -> Unit,
 private fun DockItem(label: String, icon: ImageVector, modifier: Modifier, selected: Boolean? = null, badge: Int = 0, onClick: () -> Unit) {
     val color = if (selected == true) Editor.Accent else Editor.Inactive
     Column(
-        modifier.height(58.dp).clip(RoundedCornerShape(12.dp))
+        modifier.height(58.dp).clip(RoundedCornerShape(8.dp))
             .then(if (selected != null) Modifier.selectable(selected, role = Role.Tab, onClick = onClick) else Modifier.clickable(role = Role.Button, onClick = onClick)),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -411,7 +439,7 @@ private fun EditorChip(
     enabled: Boolean = true,
     role: Role = Role.Button,
 ) {
-    val shape = RoundedCornerShape(18.dp)
+    val shape = ChipShape
     Row(
         Modifier.minimumInteractiveComponentSize().height(36.dp).clip(shape)
             .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
@@ -457,15 +485,15 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
             val selected = f == p.filter
             Column(
                 // wide enough for "High contrast" (66 dp cut it to "High")
-                Modifier.width(80.dp).clip(RoundedCornerShape(10.dp))
+                Modifier.width(80.dp).clip(RoundedCornerShape(6.dp))
                     .selectable(selected, role = Role.RadioButton) { vm.selectFilter(f) },
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                val ring = RoundedCornerShape(10.dp)
+                val ring = RoundedCornerShape(6.dp)
                 Box(
                     Modifier.size(58.dp, 76.dp)
                         .border(if (selected) 2.5.dp else 1.dp, if (selected) Editor.Accent else Editor.Divider, ring)
-                        .padding(3.dp).clip(RoundedCornerShape(6.dp)).background(Editor.Ground),
+                        .padding(3.dp).clip(RoundedCornerShape(3.dp)).background(Editor.Ground),
                     contentAlignment = Alignment.Center,
                 ) {
                     val t = vm.thumbs[f]
@@ -537,7 +565,7 @@ private fun ErasePanel(vm: ScanViewModel, onDone: () -> Unit) {
             EditorChip("Restore all", onClick = { vm.clearErase() }, enabled = n > 0)
             Spacer(Modifier.weight(1f))
             Button(
-                onClick = onDone, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                onClick = onDone, shape = ChipShape, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
                 contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
             ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
         }
@@ -564,7 +592,7 @@ private fun ProtectPanel(vm: ScanViewModel, onDone: () -> Unit) {
             EditorChip("Remove all", onClick = { vm.clearProtect() }, enabled = n > 0)
             Spacer(Modifier.weight(1f))
             Button(
-                onClick = onDone, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                onClick = onDone, shape = ChipShape, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
                 contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
             ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
         }
@@ -572,28 +600,30 @@ private fun ProtectPanel(vm: ScanViewModel, onDone: () -> Unit) {
 }
 
 /**
- * The lines the unwarp straightened, drawn on the page: tap one it got wrong (a logo, a curved
- * drawing, a second sheet) to ignore it, or drag a box over an area; then flatten again. The
- * unwarp can also be turned off (perspective correction only).
+ * The Flatten tool: the lines the iron straightened, drawn on the page. Tap one it got wrong (a
+ * logo, a curved drawing, a second sheet) to ignore it, or drag a box over an area; then flatten
+ * again, which sends the iron across the page ([onIron]). The iron can also be lifted
+ * (perspective correction only).
  */
 @Composable
-private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit) {
+private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?) -> Unit, ironing: Boolean) {
     val n = vm.ignore.size / 4
     Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Outlined.Straighten, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
+            Icon(PaperIcons.Iron, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
             Spacer(Modifier.width(10.dp))
-            Text("Unwarp lines", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
+            Text("Flatten", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
             EditorChip(
-                if (vm.perspectiveOnly) "Unwarp off" else "Unwarp on", role = Role.Switch, selected = !vm.perspectiveOnly,
-                onClick = { vm.reflatten(perspective = !vm.perspectiveOnly) },
+                if (vm.perspectiveOnly) "Iron off" else "Iron on", role = Role.Switch, selected = !vm.perspectiveOnly,
+                icon = if (vm.perspectiveOnly) PaperIcons.IronLifted else PaperIcons.Iron, enabled = !ironing,
+                onClick = { if (vm.perspectiveOnly) onIron(false) else vm.reflatten(perspective = true) },
             )
         }
         Text(
             when {
-                vm.perspectiveOnly -> "Only the perspective is corrected. Turn the unwarp on to straighten curved lines."
+                vm.perspectiveOnly -> "The iron is lifted: only the perspective is corrected. Turn it on to straighten curved lines."
                 vm.lines.isEmpty() -> "No lines were found on this page: only its outline flattens it."
-                else -> "Tap a line that should not be straightened (a logo, a drawing, a second sheet), or drag a box over an area. Then flatten again."
+                else -> "Tap a line that should stay as it is (a logo, a drawing, a second sheet), or drag a box over an area. Then iron again."
             },
             style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
         )
@@ -608,18 +638,36 @@ private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit) {
             EditorChip("Use all lines", onClick = { vm.clearIgnore() }, enabled = n > 0 && !vm.perspectiveOnly)
             Spacer(Modifier.weight(1f))
             if (vm.ignoreChanged) {
-                TextButton(onClick = onClose) { Text("Cancel") }
+                TextButton(onClick = onClose, enabled = !ironing) { Text("Cancel") }
                 Button(
-                    onClick = { vm.reflatten() }, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
-                    contentPadding = PaddingValues(horizontal = 18.dp), modifier = Modifier.height(40.dp),
-                ) { Text("Flatten again", style = MaterialTheme.typography.titleSmall) }
+                    onClick = { onIron(null) }, enabled = !ironing, shape = ChipShape,
+                    colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                    contentPadding = PaddingValues(start = 14.dp, end = 18.dp), modifier = Modifier.height(40.dp),
+                ) {
+                    Icon(PaperIcons.Iron, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Flatten again", style = MaterialTheme.typography.titleSmall)
+                }
             } else {
                 Button(
-                    onClick = onClose, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                    onClick = onClose, shape = ChipShape, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
                     contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
                 ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
             }
         }
+    }
+}
+
+/** The iron crossing the page at [t] (0..1), leaving the paper behind it pressed. */
+@Composable
+private fun IronSweep(t: Float, modifier: Modifier) {
+    Canvas(modifier) {
+        val x = size.width * (t * 1.1f - 0.05f)
+        drawRect(Color.White.copy(alpha = 0.10f), size = Size(x.coerceIn(0f, size.width), size.height))
+        drawIron(
+            Offset(x, size.height * (0.5f + sin(t * PI.toFloat() * 4f) * 0.28f)),
+            size.minDimension / 260f,
+        )
     }
 }
 
@@ -658,7 +706,7 @@ private fun WrinkleLegend(maxPx: Float, ready: Boolean) {
 private fun CompareLabel(text: String) {
     Text(
         text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
-        modifier = Modifier.background(Editor.Panel.copy(alpha = 0.85f), RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 7.dp),
+        modifier = Modifier.background(Editor.Panel.copy(alpha = 0.85f), ChipShape).padding(horizontal = 14.dp, vertical = 7.dp),
     )
 }
 

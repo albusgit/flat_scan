@@ -148,7 +148,7 @@ fun AdjustPanel(vm: ScanViewModel) {
 private fun ToolChip(t: AdjustTool, selected: Boolean, changed: Boolean, onClick: () -> Unit) {
     val color = if (selected) Editor.Accent else Editor.Inactive
     Column(
-        Modifier.width(72.dp).clip(RoundedCornerShape(12.dp))
+        Modifier.width(72.dp).clip(RoundedCornerShape(8.dp))
             .selectable(selected, role = Role.Tab, onClick = onClick)
             .semantics { if (changed) stateDescription = "changed" }
             .padding(vertical = 6.dp),
@@ -198,7 +198,7 @@ private fun ShapeChooser(l: PageLook, onPick: (PageShape) -> Unit) {
             for (s in PageShape.entries) {
                 val on = s == l.shape
                 val enabled = s != PageShape.Measured || l.measuredHw > 0f
-                val shape = RoundedCornerShape(18.dp)
+                val shape = ChipShape
                 Box(
                     Modifier.minimumInteractiveComponentSize().height(36.dp).clip(shape)
                         .background(if (on) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)

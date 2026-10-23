@@ -40,7 +40,12 @@ import androidx.compose.material.icons.outlined.FlashOn
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.rotate
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -193,7 +198,12 @@ private fun CameraPreview(vm: ScanViewModel) {
                 },
             contentAlignment = Alignment.Center,
         ) {
-            if (busy) CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp, color = Editor.Accent)
+            if (busy) {
+                // a tiny crumpled ball tumbling while the photo is taken
+                val spin = rememberInfiniteTransition(label = "capture")
+                val turn by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(1400, easing = LinearEasing)), label = "turn")
+                CrumpledBall(Modifier.size(40.dp).rotate(turn), seed = 5)
+            }
         }
     }
 }

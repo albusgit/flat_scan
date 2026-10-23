@@ -59,7 +59,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.draw.alpha
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -108,6 +114,8 @@ fun PagesScreen(vm: ScanViewModel) {
     val exporter = rememberExportActions(vm)
     var sheet by remember { mutableStateOf(PagesSheet.None) }
     var confirmDelete by remember { mutableStateOf<String?>(null) }
+    // the page being crumpled away after its delete was confirmed
+    var crumpling by remember { mutableStateOf<String?>(null) }
     var menu by remember { mutableStateOf(false) }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
     val pickPhotos = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
@@ -125,7 +133,7 @@ fun PagesScreen(vm: ScanViewModel) {
         TopAppBar(
             title = {
                 Row(
-                    Modifier.clip(RoundedCornerShape(10.dp)).clickable(role = Role.Button, onClickLabel = "Rename the document") { renaming = true }
+                    Modifier.clip(RoundedCornerShape(6.dp)).clickable(role = Role.Button, onClickLabel = "Rename the document") { renaming = true }
                         .padding(end = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -185,6 +193,11 @@ fun PagesScreen(vm: ScanViewModel) {
                     onOpen = { vm.openPage(id) },
                     onDelete = { confirmDelete = id },
                     dragging = dragging,
+                    crumpling = crumpling == id,
+                    onCrumpled = {
+                        vm.deletePage(id)
+                        crumpling = null
+                    },
                     modifier = Modifier
                         .zIndex(if (dragging) 1f else 0f)
                         .graphicsLayer {
@@ -223,9 +236,10 @@ fun PagesScreen(vm: ScanViewModel) {
                         },
                 )
             }
+            if (n == 0) item(key = "empty", span = { GridItemSpan(maxLineSpan) }) { EmptyPages() }
             item(key = "add") { AddPageTile(onCamera = { vm.startCamera() }, onGallery = pickPhotos) }
         }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        RuledDivider()
         Row(
             Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -271,7 +285,7 @@ fun PagesScreen(vm: ScanViewModel) {
         AlertDialog(
             onDismissRequest = { confirmDelete = null },
             title = { Text("Delete page $number?") },
-            confirmButton = { TextButton(onClick = { vm.deletePage(id); confirmDelete = null }) { Text("Delete") } },
+            confirmButton = { TextButton(onClick = { crumpling = id; confirmDelete = null }) { Text("Delete") } },
             dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel") } },
         )
     }
@@ -282,8 +296,17 @@ private val CardHeight = 210.dp
 @Composable
 private fun PageCard(
     vm: ScanViewModel, id: String, index: Int, count: Int, onOpen: () -> Unit, onDelete: () -> Unit,
-    dragging: Boolean = false, modifier: Modifier = Modifier,
+    dragging: Boolean = false, crumpling: Boolean = false, onCrumpled: () -> Unit = {}, modifier: Modifier = Modifier,
 ) {
+    // deleting crumples the sheet into a ball that drops away
+    val crush = remember(id) { Animatable(0f) }
+    val reduced = rememberReducedMotion()
+    val done by rememberUpdatedState(onCrumpled)
+    LaunchedEffect(crumpling) {
+        if (!crumpling) return@LaunchedEffect
+        if (!reduced) crush.animateTo(1f, tween(420, easing = FastOutLinearInEasing))
+        done()
+    }
     val version = vm.pageVersions[id] ?: 0
     var thumb by remember(id) { mutableStateOf<Bitmap?>(null) }
     var loaded by remember(id) { mutableStateOf(false) }
@@ -293,12 +316,23 @@ private fun PageCard(
         loaded = true
     }
     val current = id == vm.currentId
-    val shape = RoundedCornerShape(14.dp)
+    val shape = RoundedCornerShape(4.dp)
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Column(modifier) {
+    Column(
+        modifier.graphicsLayer {
+            val t = crush.value
+            if (t > 0f) {
+                scaleX = 1f - 0.8f * t
+                scaleY = 1f - 0.8f * t
+                rotationZ = 35f * t
+                translationY = 40.dp.toPx() * t * t
+                alpha = 1f - t * t
+            }
+        },
+    ) {
         Box(
             Modifier.fillMaxWidth().height(CardHeight)
-                .shadow(if (dragging) 18.dp else 8.dp, shape, ambientColor = Palette.Ink.copy(alpha = 0.3f), spotColor = Palette.Ink.copy(alpha = 0.3f))
+                .shadow(if (dragging) 16.dp else 3.dp, shape, ambientColor = Palette.Ink.copy(alpha = 0.35f), spotColor = Palette.Ink.copy(alpha = 0.35f))
                 .clip(shape)
                 .background(Color.White)
                 .then(if (current || dragging) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier)
@@ -316,12 +350,13 @@ private fun PageCard(
                 Text("No preview", style = MaterialTheme.typography.bodySmall, color = muted)
             }
             Box(
-                Modifier.align(Alignment.BottomStart).padding(8.dp).defaultMinSize(minWidth = 26.dp).height(26.dp)
-                    .background(Palette.Ink, RoundedCornerShape(13.dp)).padding(horizontal = 8.dp),
+                Modifier.align(Alignment.BottomStart).padding(8.dp).defaultMinSize(minWidth = 26.dp).height(24.dp)
+                    .background(Palette.Ink, RoundedCornerShape(3.dp)).padding(horizontal = 7.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("${index + 1}", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.ExtraBold), color = Color.White)
+                Text("${index + 1}", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontWeight = FontWeight.Bold), color = Color.White)
             }
+            if (crush.value > 0f) CrumpledBall(Modifier.size(96.dp).alpha(crush.value), seed = id.hashCode())
         }
         Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -352,6 +387,21 @@ private fun PageCard(
     }
 }
 
+/** No pages: the iron beside an empty sheet. */
+@Composable
+private fun EmptyPages() {
+    Column(Modifier.fillMaxWidth().padding(vertical = 28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(verticalAlignment = Alignment.Bottom) {
+            PaperSurface(Modifier.size(54.dp, 72.dp), ruled = true) {}
+            Spacer(Modifier.width(10.dp))
+            Icon(PaperIcons.Iron, null, Modifier.size(44.dp), tint = MaterialTheme.colorScheme.onSurface)
+        }
+        Spacer(Modifier.height(14.dp))
+        Text("Nothing to press yet.", style = MaterialTheme.typography.titleMedium)
+        Text("Add a page from the camera or the gallery.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
 /** The dashed tile after the last page; it asks where the new page comes from. */
 @Composable
 private fun AddPageTile(onCamera: () -> Unit, onGallery: () -> Unit) {
@@ -360,12 +410,12 @@ private fun AddPageTile(onCamera: () -> Unit, onGallery: () -> Unit) {
     val dash = if (MaterialTheme.colorScheme.background.luminance() > 0.5f) Palette.Dashed else MaterialTheme.colorScheme.outline
     Box {
         Column(
-            Modifier.fillMaxWidth().height(CardHeight).clip(RoundedCornerShape(14.dp))
+            Modifier.fillMaxWidth().height(CardHeight).clip(RoundedCornerShape(4.dp))
                 .drawBehind {
                     val w = 2.dp.toPx()
                     drawRoundRect(
                         dash, topLeft = Offset(w / 2, w / 2), size = Size(size.width - w, size.height - w),
-                        cornerRadius = CornerRadius(14.dp.toPx()),
+                        cornerRadius = CornerRadius(4.dp.toPx()),
                         style = Stroke(w, pathEffect = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()))),
                     )
                 }
@@ -373,7 +423,7 @@ private fun AddPageTile(onCamera: () -> Unit, onGallery: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Box(Modifier.size(48.dp).background(MaterialTheme.colorScheme.primaryContainer, CircleShape), contentAlignment = Alignment.Center) {
+            Box(Modifier.size(48.dp).background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
                 Icon(Icons.Outlined.Add, null, tint = accent)
             }
             Spacer(Modifier.height(10.dp))

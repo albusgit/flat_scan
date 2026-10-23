@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -67,7 +68,6 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-private val Warning = Color(0xFFF2B84B)
 
 /**
  * Corner adjustment: draggable corners and edges (an edge slides along its neighbours), a
@@ -113,28 +113,29 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
         if (!vm.detecting && !circling && !noteClosed && vm.cropReasons.isNotEmpty()) {
             // quality gate: the automatic crop is doubtful (it will use the homography path); above the
             // photo, never over a corner
+            // on a yellow sticky note
+            val note = RoundedCornerShape(2.dp)
             Row(
                 Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 4.dp)
-                    .clip(RoundedCornerShape(14.dp)).background(Warning.copy(alpha = 0.12f))
-                    .border(1.dp, Warning.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                    .shadow(3.dp, note).background(Palette.Highlighter, note)
                     .padding(start = 12.dp, top = 4.dp, bottom = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons.Outlined.WarningAmber, null, tint = Warning, modifier = Modifier.size(18.dp))
+                Icon(Icons.Outlined.WarningAmber, null, tint = Palette.Ink, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(10.dp))
                 Text(
                     "Check the crop: " + vm.cropReasons.joinToString("; "),
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold), color = Palette.Ink,
                     maxLines = 2, modifier = Modifier.weight(1f),
                 )
                 IconButton(onClick = { noteClosed = true }, modifier = Modifier.size(40.dp)) {
-                    Icon(Icons.Outlined.Close, "Close", Modifier.size(18.dp))
+                    Icon(Icons.Outlined.Close, "Close", Modifier.size(18.dp), tint = Palette.Ink)
                 }
             }
         }
         Box(
             Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
-                .clip(RoundedCornerShape(18.dp)).background(Editor.Raised),
+                .clip(RoundedCornerShape(8.dp)).background(Editor.Raised),
             contentAlignment = Alignment.Center,
         ) {
             if (photo != null && display != null) {
@@ -150,7 +151,7 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
                     if (circling) "Draw around the page; it is found inside your loop" else "Drag a corner or an edge",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
                     modifier = Modifier.align(Alignment.BottomStart).padding(12.dp)
-                        .background(Editor.Ground.copy(alpha = 0.72f), RoundedCornerShape(16.dp))
+                        .background(Editor.Ground.copy(alpha = 0.72f), ChipShape)
                         .padding(horizontal = 12.dp, vertical = 7.dp),
                 )
             }
@@ -213,7 +214,7 @@ private fun CornerEditor(
     val edit by rememberUpdatedState(onEdit)
     val loopDone by rememberUpdatedState(onLoop)
     val loop = remember { mutableStateListOf<Offset>() }
-    val primary = Palette.Accent
+    val primary = Editor.Accent
     val density = LocalDensity.current
     val margin = with(density) { 28.dp.toPx() }
     val handleR = with(density) { 12.dp.toPx() }
@@ -308,7 +309,9 @@ private fun CornerEditor(
         val pts = corners.map { toScreen(it) }
         val quad = Path().apply { moveTo(pts[0].x, pts[0].y); pts.drop(1).forEach { lineTo(it.x, it.y) }; close() }
         drawPath(quad, Editor.Accent.copy(alpha = 0.10f))
-        drawPath(quad, primary, style = Stroke(width = 2.5.dp.toPx(), join = StrokeJoin.Round))
+        // a clean dashed outline over a dark rim (visible on white paper)
+        drawPath(quad, Editor.Ground.copy(alpha = 0.6f), style = Stroke(width = 4.dp.toPx(), join = StrokeJoin.Round))
+        drawPath(quad, primary, style = Stroke(width = 2.dp.toPx(), join = StrokeJoin.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8.dp.toPx(), 5.dp.toPx()))))
         // edge handles: short pills along each edge's middle
         for (k in 0 until 4) {
             val a = pts[k]
@@ -319,25 +322,16 @@ private fun CornerEditor(
             val w = (if (on) 34.dp else 28.dp).toPx()
             val h = (if (on) 10.dp else 8.dp).toPx()
             rotate(deg, pivot = mid) {
-                drawRoundRect(
-                    if (on) primary else Color.White, topLeft = mid - Offset(w / 2, h / 2), size = Size(w, h),
-                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(h / 2),
-                )
-                drawRoundRect(
-                    primary, topLeft = mid - Offset(w / 2, h / 2), size = Size(w, h),
-                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(h / 2), style = Stroke(width = 2.dp.toPx()),
-                )
+                drawRect(if (on) Color.White else primary, topLeft = mid - Offset(w / 2, h / 2), size = Size(w, h))
+                drawRect(Editor.Ground, topLeft = mid - Offset(w / 2, h / 2), size = Size(w, h), style = Stroke(width = 1.5.dp.toPx()))
             }
         }
         pts.forEachIndexed { i, p ->
-            // white handles with an accent ring; the one being dragged is filled and larger
-            if (i == active) {
-                drawCircle(primary, radius = handleR * 1.35f, center = p)
-                drawCircle(Color.White, radius = handleR * 1.35f, center = p, style = Stroke(width = 3.dp.toPx()))
-            } else {
-                drawCircle(Color.White, radius = handleR, center = p)
-                drawCircle(primary, radius = handleR, center = p, style = Stroke(width = 3.dp.toPx()))
-            }
+            // solid square tabs in the highlighter; the one being dragged turns white and grows
+            val r = if (i == active) handleR * 1.3f else handleR * 0.85f
+            val tl = p - Offset(r, r)
+            drawRect(if (i == active) Color.White else primary, topLeft = tl, size = Size(2 * r, 2 * r))
+            drawRect(Editor.Ground, topLeft = tl, size = Size(2 * r, 2 * r), style = Stroke(width = 2.dp.toPx()))
         }
         if (active >= 0) {
             // magnifier loupe above the finger (below it near the top edge), 3x the display scale; an
