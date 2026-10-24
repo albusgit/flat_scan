@@ -37,7 +37,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Licenses, Trash, Sync }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Licenses, Trash, Sync, Advanced, Storage }
 
 enum class ImportSource { Camera, Gallery }
 
@@ -85,6 +85,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val store = library.store
 
     var screen by mutableStateOf(Screen.Home)
+
+    /** The paper screens' theme (Settings > Appearance): Settings.THEME_LIGHT, THEME_DARK or THEME_SYSTEM. */
+    var themeMode by mutableStateOf(settings.themeMode)
+        private set
+
+    fun setTheme(mode: String) {
+        settings.themeMode = mode
+        themeMode = settings.themeMode
+    }
     private var returnTo = Screen.Home
     private var pagesReturnTo = Screen.Home
     var message by mutableStateOf<String?>(null)
@@ -823,6 +832,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             Screen.Licenses -> Screen.Settings
             Screen.Trash -> Screen.Home
             Screen.Sync -> Screen.Settings
+            Screen.Advanced -> Screen.Settings
+            Screen.Storage -> Screen.Settings
             else -> {
                 batch = false
                 Screen.Home
@@ -1136,6 +1147,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val d = detected ?: return true
         val tol = 0.003f * min(p.width, p.height)
         return corners.zip(d).any { (a, b) -> hypot(a.x - b.x, a.y - b.y) > tol }
+    }
+
+    /** Crop screen > Whole photo: the corners on the photo's corners (the photo is the page; homography path). */
+    fun cropWholePhoto() {
+        val p = photo ?: return
+        val w = p.width - 1f
+        val h = p.height - 1f
+        corners = listOf(Offset(0f, 0f), Offset(w, 0f), Offset(w, h), Offset(0f, h))
     }
 
     /** Rotate the photo 90 degrees clockwise (corners follow). Disables auto orientation. */
@@ -2430,6 +2449,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     fun rotateResult() {
         rotation = (rotation + 1) % 4
+        outVersion++
+    }
+
+    /** A quarter turn the other way (the result screen's Page tab). */
+    fun rotateResultLeft() {
+        rotation = (rotation + 3) % 4
         outVersion++
     }
 

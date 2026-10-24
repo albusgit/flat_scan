@@ -174,8 +174,24 @@ private val Shape = Shapes(
 )
 
 @Composable
-fun FlatScanTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) Dark else Light, typography = Type, shapes = Shape, content = content)
+fun FlatScanTheme(mode: String = com.albus.flatscan.Settings.THEME_SYSTEM, content: @Composable () -> Unit) {
+    val dark = when (mode) {
+        com.albus.flatscan.Settings.THEME_LIGHT -> false
+        com.albus.flatscan.Settings.THEME_DARK -> true
+        else -> isSystemInDarkTheme()
+    }
+    // the status and navigation bar icons follow the chosen theme, not only the phone's (enableEdgeToEdge's default)
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        androidx.compose.runtime.SideEffect {
+            val window = (view.context as? Activity)?.window ?: return@SideEffect
+            WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
+    MaterialTheme(colorScheme = if (dark) Dark else Light, typography = Type, shapes = Shape, content = content)
 }
 
 /**

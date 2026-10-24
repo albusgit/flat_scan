@@ -9,6 +9,8 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,12 +25,12 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.Gesture
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -50,6 +52,9 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.rotate
@@ -82,32 +87,28 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
     var noteClosed by remember(vm.cropReasons) { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(
-            Modifier.fillMaxWidth().height(64.dp).padding(start = 8.dp, end = 8.dp, top = 8.dp),
+            Modifier.fillMaxWidth().height(64.dp).padding(start = 4.dp, end = 12.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = { if (circling) circling = false else vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(if (circling) "Circle the page" else "Adjust corners", style = MaterialTheme.typography.titleMedium)
+            Column(Modifier.weight(1f)) {
+                Text(
+                    when {
+                        circling -> "Circle the page"
+                        vm.cropPageIndex == 1 -> "Crop the second page"
+                        else -> "Crop the page"
+                    },
+                    style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp, fontWeight = FontWeight.ExtraBold),
+                )
                 Text(
                     when {
                         vm.detecting -> "Finding the page"
-                        circling -> "Draw a loop around the whole page"
-                        vm.cropPageIndex == 1 -> "Second page of the book spread"
-                        else -> "Fit the corners to the page"
+                        circling -> "Draw a loop around the whole page; it is found inside it"
+                        vm.cropPageIndex == 1 -> "The other page of the book spread"
+                        else -> "Drag a corner or an edge onto the page's edge"
                     },
-                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-            }
-            IconButton(
-                onClick = { circling = !circling },
-                enabled = !vm.detecting && photo != null,
-                colors = if (circling) IconButtonDefaults.iconButtonColors(containerColor = Editor.Accent.copy(alpha = 0.2f), contentColor = Editor.Accent)
-                else IconButtonDefaults.iconButtonColors(),
-            ) {
-                Icon(Icons.Outlined.Gesture, "Circle the page to find it")
-            }
-            IconButton(onClick = { vm.rotatePhoto() }, enabled = !vm.detecting && photo != null && !circling) {
-                Icon(Icons.AutoMirrored.Outlined.RotateRight, "Rotate 90 degrees")
             }
         }
         if (!vm.detecting && !circling && !noteClosed && vm.cropReasons.isNotEmpty()) {
@@ -146,9 +147,9 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
                 )
             }
             if (vm.detecting) CircularProgressIndicator(color = Editor.Accent)
-            if (!vm.detecting && photo != null) {
+            if (!vm.detecting && photo != null && circling) {
                 Text(
-                    if (circling) "Draw around the page; it is found inside your loop" else "Drag a corner or an edge",
+                    "Draw around the page",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
                     modifier = Modifier.align(Alignment.BottomStart).padding(12.dp)
                         .background(Editor.Ground.copy(alpha = 0.72f), ChipShape)
@@ -156,8 +157,14 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
                 )
             }
         }
+        val tools = !vm.detecting && photo != null
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            CropTool(Icons.AutoMirrored.Outlined.RotateRight, "Rotate", enabled = tools && !circling) { vm.rotatePhoto() }
+            CropTool(Icons.Outlined.Gesture, "Circle the page", enabled = tools, on = circling) { circling = !circling }
+            CropTool(Icons.Outlined.Fullscreen, "Whole photo", enabled = tools && !circling) { vm.cropWholePhoto(); noteClosed = true }
+        }
         Row(
-            Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 20.dp),
+            Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             SecondaryPill(onClick = { vm.back() }, container = Editor.Raised, border = Editor.Outline, modifier = Modifier.weight(1f)) {
@@ -174,6 +181,27 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
                 Icon(Icons.AutoMirrored.Filled.ArrowForward, null, Modifier.size(18.dp))
             }
         }
+    }
+}
+
+/** A tool under the photo: an icon over its name, outlined; [on] while its mode is active. */
+@Composable
+private fun RowScope.CropTool(icon: ImageVector, label: String, enabled: Boolean, on: Boolean = false, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(10.dp)
+    val fg = when {
+        on -> Editor.Ground
+        enabled -> Editor.Text
+        else -> Editor.Text.copy(alpha = 0.4f)
+    }
+    Column(
+        Modifier.weight(1f).height(62.dp).clip(shape).background(if (on) Editor.Accent else Color.Transparent)
+            .border(1.dp, if (on) Editor.Accent else Editor.Outline, shape)
+            .toggleable(value = on, enabled = enabled, role = Role.Button, onValueChange = { onClick() }),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(icon, null, Modifier.size(21.dp), tint = fg)
+        Spacer(Modifier.height(4.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = fg, maxLines = 1)
     }
 }
 

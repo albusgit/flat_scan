@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,7 +39,6 @@ import androidx.compose.material.icons.outlined.AddAPhoto
 import androidx.compose.material.icons.outlined.AddPhotoAlternate
 import androidx.compose.material.icons.outlined.CallSplit
 import androidx.compose.material.icons.outlined.CheckCircle
-import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -63,6 +63,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -97,6 +98,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -112,6 +114,9 @@ private enum class PagesSheet { None, Save, Share }
 
 /** Where new pages come from (insert or add). */
 private enum class Source { Camera, Photos, Pdf }
+
+/** The Add pages sheet is open; new pages go before [before] (null: after the last page). */
+private data class AddTarget(val before: String?)
 
 /**
  * The page editor of the open document: open a page; hold and drag to reorder (the grid scrolls at its
@@ -132,6 +137,7 @@ fun PagesScreen(vm: ScanViewModel) {
     var selected by remember { mutableStateOf(setOf<String>()) }
     var moving by remember { mutableStateOf<Set<String>?>(null) }
     var pickDocFor by remember { mutableStateOf<Set<String>?>(null) }
+    var adding by remember { mutableStateOf<AddTarget?>(null) }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { if (it.isEmpty()) vm.insertBefore(null) else vm.importUris(it) }
     val pickPdf = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { if (it == null) vm.insertBefore(null) else vm.importPdf(it) }
     fun add(source: Source, before: String?) {
@@ -178,46 +184,27 @@ fun PagesScreen(vm: ScanViewModel) {
             },
             actions = {
                 IconButton(onClick = { vm.undoPages() }, enabled = vm.canUndoPages) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
-                IconButton(onClick = { vm.redoPages() }, enabled = vm.canRedoPages) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
+                if (vm.canRedoPages) IconButton(onClick = { vm.redoPages() }) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
                 if (selecting) {
                     TextButton(onClick = { selected = if (selected.size == n) emptySet() else vm.pages.toSet() }) { Text(if (selected.size == n) "None" else "All") }
-                } else Box {
-                    IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreVert, "More") }
-                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Select pages") }, leadingIcon = { Icon(Icons.Outlined.Checklist, null) }, enabled = n > 0,
-                            onClick = { selecting = true; menu = false },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Reverse page order") }, leadingIcon = { Icon(Icons.Outlined.SwapVert, null) }, enabled = n > 1,
-                            onClick = { vm.reversePages(); menu = false },
-                        )
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Add from camera") }, leadingIcon = { Icon(Icons.Outlined.AddAPhoto, null) },
-                            onClick = { menu = false; add(Source.Camera, null) },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Add photos") }, leadingIcon = { Icon(Icons.Outlined.AddPhotoAlternate, null) },
-                            onClick = { menu = false; add(Source.Photos, null) },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Add PDF pages") }, leadingIcon = { Icon(Icons.Outlined.PictureAsPdf, null) },
-                            onClick = { menu = false; add(Source.Pdf, null) },
-                        )
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Save as…") }, leadingIcon = { Icon(Icons.Outlined.SaveAlt, null) }, enabled = ready,
-                            onClick = { sheet = PagesSheet.Save; menu = false },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Rename") }, leadingIcon = { Icon(Icons.Outlined.Edit, null) },
-                            onClick = { renaming = true; menu = false },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Upload now") }, leadingIcon = { Icon(Icons.Outlined.CloudUpload, null) }, enabled = ready,
-                            onClick = { menu = false; vm.docId?.let { vm.uploadDocuments(listOf(it)) } },
-                        )
+                } else {
+                    TextButton(onClick = { selecting = true }, enabled = n > 0) { Text("Select", style = MaterialTheme.typography.labelLarge) }
+                    Box {
+                        IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreVert, "More") }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Reverse page order") }, leadingIcon = { Icon(Icons.Outlined.SwapVert, null) }, enabled = n > 1,
+                                onClick = { vm.reversePages(); menu = false },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Save as…") }, leadingIcon = { Icon(Icons.Outlined.SaveAlt, null) }, enabled = ready,
+                                onClick = { sheet = PagesSheet.Save; menu = false },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Upload now") }, leadingIcon = { Icon(Icons.Outlined.CloudUpload, null) }, enabled = ready,
+                                onClick = { menu = false; vm.docId?.let { vm.uploadDocuments(listOf(it)) } },
+                            )
+                        }
                     }
                 }
             },
@@ -231,7 +218,7 @@ fun PagesScreen(vm: ScanViewModel) {
             modifier = Modifier.weight(1f).fillMaxWidth(),
             footer = {
                 if (n == 0) item(key = "empty", span = { GridItemSpan(maxLineSpan) }) { EmptyPages() }
-                if (!selecting) item(key = "add") { AddPageTile(onAdd = { add(it, null) }) }
+                if (!selecting) item(key = "add") { AddPageTile { adding = AddTarget(null) } }
             },
         ) { id, i, dragging, m ->
             PageCard(
@@ -252,7 +239,7 @@ fun PagesScreen(vm: ScanViewModel) {
                 },
                 onRotate = { vm.rotatePages(setOf(id), 1) },
                 onDuplicate = { vm.duplicatePages(setOf(id)) },
-                onInsert = { add(it, id) },
+                onInsert = { adding = AddTarget(id) },
                 onSplit = { vm.splitAt(id) },
                 onMoveToDocument = { pickDocFor = setOf(id) },
             )
@@ -280,6 +267,14 @@ fun PagesScreen(vm: ScanViewModel) {
                 else PillText("Save")
             }
         }
+    }
+    adding?.let { target ->
+        AddPagesSheet(
+            note = target.before?.let { b -> "New pages go before page ${vm.pages.indexOf(b) + 1}." }
+                ?: if (n == 0) "New pages start the document." else "New pages go after page $n. To put them somewhere else, use a page's ··· menu.",
+            onPick = { adding = null; add(it, target.before) },
+            onDismiss = { adding = null },
+        )
     }
     if (sheet != PagesSheet.None) {
         val share = sheet == PagesSheet.Share
@@ -379,7 +374,7 @@ private fun PageCard(
     vm: ScanViewModel, id: String, index: Int, count: Int,
     selecting: Boolean, isSelected: Boolean, dragging: Boolean, modifier: Modifier,
     onOpen: () -> Unit, onDelete: () -> Unit, onRotate: () -> Unit, onDuplicate: () -> Unit,
-    onInsert: (Source) -> Unit, onSplit: () -> Unit, onMoveToDocument: () -> Unit,
+    onInsert: () -> Unit, onSplit: () -> Unit, onMoveToDocument: () -> Unit,
     crumpling: Boolean = false, onCrumpled: () -> Unit = {},
 ) {
     // deleting crumples the sheet into a ball that drops away
@@ -395,7 +390,6 @@ private fun PageCard(
     var thumb by remember(id) { mutableStateOf<Bitmap?>(null) }
     var loaded by remember(id) { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
-    var insertMenu by remember { mutableStateOf(false) }
     LaunchedEffect(id, version) {
         vm.thumbnail(id)?.let { thumb = it }
         loaded = true
@@ -462,15 +456,12 @@ private fun PageCard(
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Rotate") }, leadingIcon = { Icon(Icons.AutoMirrored.Outlined.RotateRight, null) }, onClick = { menu = false; onRotate() })
                     DropdownMenuItem(text = { Text("Duplicate") }, leadingIcon = { Icon(Icons.Outlined.ContentCopy, null) }, onClick = { menu = false; onDuplicate() })
-                    DropdownMenuItem(text = { Text("Insert pages before") }, leadingIcon = { Icon(Icons.Outlined.Add, null) }, onClick = { menu = false; insertMenu = true })
+                    DropdownMenuItem(text = { Text("Insert pages before") }, leadingIcon = { Icon(Icons.Outlined.Add, null) }, onClick = { menu = false; onInsert() })
                     DropdownMenuItem(text = { Text("Move to another document") }, leadingIcon = { Icon(Icons.AutoMirrored.Outlined.DriveFileMove, null) }, onClick = { menu = false; onMoveToDocument() })
                     if (index > 0) {
                         DropdownMenuItem(text = { Text("Split from here") }, leadingIcon = { Icon(Icons.Outlined.CallSplit, null) }, onClick = { menu = false; onSplit() })
                     }
                     DropdownMenuItem(text = { Text("Delete") }, leadingIcon = { Icon(Icons.Outlined.Delete, null) }, onClick = { menu = false; onDelete() })
-                }
-                DropdownMenu(expanded = insertMenu, onDismissRequest = { insertMenu = false }) {
-                    SourceItems { insertMenu = false; onInsert(it) }
                 }
             }
         }
@@ -492,42 +483,62 @@ private fun EmptyPages() {
     }
 }
 
+/** Add pages: the camera, photos or a PDF, as three big buttons, and where the pages will go. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SourceItems(onPick: (Source) -> Unit) {
-    DropdownMenuItem(text = { Text("Take a photo") }, leadingIcon = { Icon(Icons.Outlined.AddAPhoto, null) }, onClick = { onPick(Source.Camera) })
-    DropdownMenuItem(text = { Text("Import photos") }, leadingIcon = { Icon(Icons.Outlined.AddPhotoAlternate, null) }, onClick = { onPick(Source.Photos) })
-    DropdownMenuItem(text = { Text("Import PDF pages") }, leadingIcon = { Icon(Icons.Outlined.PictureAsPdf, null) }, onClick = { onPick(Source.Pdf) })
+private fun AddPagesSheet(note: String, onPick: (Source) -> Unit, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = MaterialTheme.colorScheme.surfaceContainerLowest) {
+        Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 24.dp)) {
+            Text("Add pages", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(14.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SourceButton(Icons.Outlined.AddAPhoto, "Camera") { onPick(Source.Camera) }
+                SourceButton(Icons.Outlined.AddPhotoAlternate, "Photos") { onPick(Source.Photos) }
+                SourceButton(Icons.Outlined.PictureAsPdf, "PDF pages") { onPick(Source.Pdf) }
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
 }
 
-/** The dashed tile after the last page; it asks where the new page comes from. */
 @Composable
-private fun AddPageTile(onAdd: (Source) -> Unit) {
-    var menu by remember { mutableStateOf(false) }
+private fun RowScope.SourceButton(icon: ImageVector, label: String, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(10.dp)
+    Column(
+        Modifier.weight(1f).height(96.dp).clip(shape).border(1.5.dp, MaterialTheme.colorScheme.onSurface, shape)
+            .clickable(role = Role.Button, onClick = onClick).testTag("add_${label.substringBefore(' ').lowercase()}"),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(icon, null, Modifier.size(26.dp), tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(8.dp))
+        Text(label, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+/** The dashed tile after the last page; it opens the Add pages sheet. */
+@Composable
+private fun AddPageTile(onClick: () -> Unit) {
     val accent = MaterialTheme.colorScheme.primary
     val dash = if (MaterialTheme.colorScheme.background.luminance() > 0.5f) Palette.Dashed else MaterialTheme.colorScheme.outline
-    Box {
-        Column(
-            Modifier.fillMaxWidth().height(CardHeight).clip(RoundedCornerShape(4.dp))
-                .drawBehind {
-                    val w = 2.dp.toPx()
-                    drawRoundRect(
-                        dash, topLeft = Offset(w / 2, w / 2), size = Size(size.width - w, size.height - w),
-                        cornerRadius = CornerRadius(4.dp.toPx()),
-                        style = Stroke(w, pathEffect = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()))),
-                    )
-                }
-                .clickable(role = Role.Button) { menu = true },
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-        ) {
-            Box(Modifier.size(48.dp).background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
-                Icon(Icons.Outlined.Add, null, tint = accent)
+    Column(
+        Modifier.fillMaxWidth().height(CardHeight).clip(RoundedCornerShape(4.dp))
+            .drawBehind {
+                val w = 2.dp.toPx()
+                drawRoundRect(
+                    dash, topLeft = Offset(w / 2, w / 2), size = Size(size.width - w, size.height - w),
+                    cornerRadius = CornerRadius(4.dp.toPx()),
+                    style = Stroke(w, pathEffect = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()))),
+                )
             }
-            Spacer(Modifier.height(10.dp))
-            Text("Add page", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = accent)
+            .clickable(role = Role.Button, onClick = onClick).testTag("add_page"),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Box(Modifier.size(48.dp).background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
+            Icon(Icons.Outlined.Add, null, tint = accent)
         }
-        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-            SourceItems { menu = false; onAdd(it) }
-        }
+        Spacer(Modifier.height(10.dp))
+        Text("Add page", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = accent)
     }
 }

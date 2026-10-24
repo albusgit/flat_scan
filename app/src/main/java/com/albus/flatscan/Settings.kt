@@ -124,7 +124,33 @@ class Settings(ctx: Context) {
 
     fun defaultParams() = RenderParams(filter = defaultFilter, strength = defaultStrength, solid = solidColors, screen = screenMode)
 
+    /** The paper screens' theme: [THEME_LIGHT], [THEME_DARK] or [THEME_SYSTEM] (the phone's dark mode setting). */
+    var themeMode: String
+        get() = p.getString("theme", THEME_SYSTEM).takeIf { it in THEMES } ?: THEME_SYSTEM
+        set(v) = p.edit().putString("theme", v).apply()
+
+    /** Home shows the documents as a list (false) or as their first pages laid out (true). */
+    var homePages: Boolean
+        get() = p.getBoolean("home_pages", false)
+        set(v) = p.edit().putBoolean("home_pages", v).apply()
+
+    /** Settings > Advanced > Restore the defaults: how pages are processed and where the nets run, as the app ships. */
+    fun restoreProcessingDefaults() {
+        p.edit().remove("page_finder_net").remove("uvdoc").remove("flat_nets").remove("neural_shadows").remove("rule_net")
+            .remove("solid").remove("acceleration").apply()
+    }
+
     companion object {
-        val OUTPUT_WIDTHS = listOf(1240 to "Compact (1240 px, 150 dpi)", 1600 to "Standard (1600 px)", 2480 to "High (2480 px, 300 dpi)")
+        const val THEME_LIGHT = "light"
+        const val THEME_DARK = "dark"
+        const val THEME_SYSTEM = "system"
+        val THEMES = listOf(THEME_LIGHT, THEME_DARK, THEME_SYSTEM)
+
+        /** Output widths with a short name and what the size is good for (Settings > Page quality). */
+        val OUTPUT_QUALITY = listOf(
+            Triple(1240, "Compact", "1240 px wide, 150 dpi: small files, fine for reading on screen."),
+            Triple(1600, "Standard", "1600 px wide: sharp on screen and fine for printing."),
+            Triple(2480, "High", "2480 px wide, 300 dpi: for printing and archiving; larger files."),
+        )
     }
 }

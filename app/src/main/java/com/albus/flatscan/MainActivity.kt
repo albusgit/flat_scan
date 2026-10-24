@@ -39,7 +39,9 @@ import com.albus.flatscan.ui.PagesScreen
 import com.albus.flatscan.ui.LicensesScreen
 import com.albus.flatscan.ui.ProcessingScreen
 import com.albus.flatscan.ui.ResultScreen
+import com.albus.flatscan.ui.AdvancedSettingsScreen
 import com.albus.flatscan.ui.SettingsScreen
+import com.albus.flatscan.ui.StorageScreen
 import com.albus.flatscan.ui.TrashScreen
 import com.albus.flatscan.ui.SyncScreen
 
@@ -50,7 +52,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            FlatScanTheme {
+            FlatScanTheme(vm.themeMode) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Box(Modifier.fillMaxSize().graphPaper()) { App(vm) }
                 }
@@ -120,7 +122,7 @@ class MainActivity : ComponentActivity() {
 private fun depth(s: Screen) = when (s) {
     Screen.Home -> 0
     Screen.Settings, Screen.Trash, Screen.Pages, Screen.Camera -> 1
-    Screen.Licenses, Screen.Sync, Screen.Crop -> 2
+    Screen.Licenses, Screen.Sync, Screen.Advanced, Screen.Storage, Screen.Crop -> 2
     Screen.Processing -> 3
     Screen.Result -> 4
 }
@@ -164,6 +166,8 @@ private fun App(vm: ScanViewModel) {
             Screen.Licenses -> LicensesScreen(vm)
             Screen.Trash -> TrashScreen(vm)
             Screen.Sync -> SyncScreen(vm)
+            Screen.Advanced -> AdvancedSettingsScreen(vm)
+            Screen.Storage -> StorageScreen(vm)
         }
         }
         MessageHost(vm)
