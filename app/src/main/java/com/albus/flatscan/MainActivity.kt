@@ -8,6 +8,18 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -17,6 +29,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
 import com.albus.flatscan.ui.CameraScreen
+import com.albus.flatscan.ui.graphPaper
+import com.albus.flatscan.ui.rememberReducedMotion
 import com.albus.flatscan.ui.CropScreen
 import com.albus.flatscan.ui.FlatScanTheme
 import com.albus.flatscan.ui.HomeScreen
@@ -38,7 +52,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             FlatScanTheme {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    App(vm)
+                    Box(Modifier.fillMaxSize().graphPaper()) { App(vm) }
                 }
             }
         }
@@ -102,6 +116,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** How deep a screen sits under Home: a deeper screen slides in from the right. */
+private fun depth(s: Screen) = when (s) {
+    Screen.Home -> 0
+    Screen.Settings, Screen.Trash, Screen.Pages, Screen.Camera -> 1
+    Screen.Licenses, Screen.Sync, Screen.Crop -> 2
+    Screen.Processing -> 3
+    Screen.Result -> 4
+}
+
 @Composable
 private fun App(vm: ScanViewModel) {
     BackHandler(enabled = vm.screen != Screen.Home && vm.screen != Screen.Processing) { vm.back() }
@@ -112,8 +135,25 @@ private fun App(vm: ScanViewModel) {
         view.keepScreenOn = busy
         onDispose { view.keepScreenOn = false }
     }
+    val reduced = rememberReducedMotion()
     Box(Modifier.fillMaxSize()) {
-        when (vm.screen) {
+        // screens slide like sheets: deeper screens come in from the right, going back slides them out; the
+        // flattened page grows into the result
+        AnimatedContent(
+            vm.screen,
+            transitionSpec = {
+                val fwd = depth(targetState) >= depth(initialState)
+                when {
+                    reduced -> EnterTransition.None togetherWith ExitTransition.None
+                    initialState == Screen.Processing && targetState == Screen.Result ->
+                        (fadeIn(tween(280, 60)) + scaleIn(tween(360, easing = FastOutSlowInEasing), initialScale = 0.94f)) togetherWith fadeOut(tween(200))
+                    else -> (slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) { w -> if (fwd) w / 3 else -w / 3 } + fadeIn(tween(240))) togetherWith
+                        (slideOutHorizontally(tween(320, easing = FastOutSlowInEasing)) { w -> if (fwd) -w / 6 else w / 3 } + fadeOut(tween(200)))
+                }.using(SizeTransform(clip = false))
+            },
+            label = "screen",
+        ) { screen ->
+        when (screen) {
             Screen.Home -> HomeScreen(vm)
             Screen.Camera -> CameraScreen(vm)
             Screen.Crop -> CropScreen(vm)
@@ -124,6 +164,7 @@ private fun App(vm: ScanViewModel) {
             Screen.Licenses -> LicensesScreen(vm)
             Screen.Trash -> TrashScreen(vm)
             Screen.Sync -> SyncScreen(vm)
+        }
         }
         MessageHost(vm)
     }

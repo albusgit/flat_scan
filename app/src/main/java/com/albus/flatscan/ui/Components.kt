@@ -75,6 +75,33 @@ fun inkShadow(): Color = if (isPaperLight()) Palette.Ink else Color.Black
 @Composable
 fun ruledColor(): Color = if (isPaperLight()) Palette.Ruled else MaterialTheme.colorScheme.outlineVariant
 
+/**
+ * The desk under the paper screens: graph paper, a fine 16 dp grid with a stronger line every 5
+ * squares (cool grey on paper, a faint lighter grey on graphite).
+ */
+@Composable
+fun Modifier.graphPaper(): Modifier {
+    val light = isPaperLight()
+    val minor = if (light) Color(0xFFE2E7EE) else Color(0xFF1C1D20)
+    val major = if (light) Color(0xFFD5DCE6) else Color(0xFF232428)
+    return drawBehind {
+        val step = 16.dp.toPx()
+        val w = 1.dp.toPx()
+        var i = 0
+        var x = 0f
+        while (x < size.width) {
+            drawLine(if (i % 5 == 0) major else minor, Offset(x, 0f), Offset(x, size.height), strokeWidth = w)
+            x += step; i++
+        }
+        i = 0
+        var y = 0f
+        while (y < size.height) {
+            drawLine(if (i % 5 == 0) major else minor, Offset(0f, y), Offset(size.width, y), strokeWidth = w)
+            y += step; i++
+        }
+    }
+}
+
 /** A divider in the ruled-line colour. */
 @Composable
 fun RuledDivider(modifier: Modifier = Modifier) {

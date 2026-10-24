@@ -39,6 +39,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -110,7 +111,7 @@ fun SyncScreen(vm: ScanViewModel) {
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
             title = { Text("Sync to your server", style = MaterialTheme.typography.titleLarge) },
-            colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
             navigationIcon = { IconButton(onClick = { save(); vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -119,70 +120,76 @@ fun SyncScreen(vm: ScanViewModel) {
                     "scans never leave the phone unless you set this up.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Section("Where to")
-            for (k in SyncKind.entries) RadioRow(k.label, kind == k) { kind = k; result = null }
-            when (kind) {
-                SyncKind.WebDav -> {
-                    OutlinedTextField(url, { url = it }, label = { Text("Folder URL") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("https://cloud.example.com/remote.php/dav/files/me/Scans/") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
-                    OutlinedTextField(user, { user = it }, label = { Text("User name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(secret, { secret = it }, label = { Text("Password or app password") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                        visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
-                    Hint("Nextcloud / ownCloud: Settings > WebDAV shows the address; use an app password.")
+            SettingsSheet("Where to") {
+                for (k in SyncKind.entries) RadioRow(k.label, kind == k) { kind = k; result = null }
+                when (kind) {
+                    SyncKind.WebDav -> {
+                        OutlinedTextField(url, { url = it }, label = { Text("Folder URL") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("https://cloud.example.com/remote.php/dav/files/me/Scans/") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
+                        OutlinedTextField(user, { user = it }, label = { Text("User name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(secret, { secret = it }, label = { Text("Password or app password") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                            visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+                        Hint("Nextcloud / ownCloud: Settings > WebDAV shows the address; use an app password.")
+                    }
+                    SyncKind.Paperless -> {
+                        OutlinedTextField(url, { url = it }, label = { Text("Server address") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("https://paperless.example.com") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
+                        OutlinedTextField(secret, { secret = it }, label = { Text("API token") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                            visualTransformation = PasswordVisualTransformation())
+                        OutlinedTextField(tags, { tags = it }, label = { Text("Tags for every upload (comma separated)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(corr, { corr = it }, label = { Text("Correspondent (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        Hint("The token is in paperless under your profile (My Profile > API Auth Token). The document's own tags are sent too.")
+                    }
+                    SyncKind.Folder -> {
+                        OutlinedButton(onClick = { pickFolder.launch(null) }) { Text(if (folder == null) "Pick a folder" else "Pick another folder") }
+                        folder?.let { Hint(Uri.parse(it).lastPathSegment ?: it) }
+                        Hint("Works with Syncthing, cloud-folder apps and SMB apps that offer a folder: no network access by FlatScan.")
+                    }
+                    SyncKind.Off -> {}
                 }
-                SyncKind.Paperless -> {
-                    OutlinedTextField(url, { url = it }, label = { Text("Server address") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("https://paperless.example.com") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
-                    OutlinedTextField(secret, { secret = it }, label = { Text("API token") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                        visualTransformation = PasswordVisualTransformation())
-                    OutlinedTextField(tags, { tags = it }, label = { Text("Tags for every upload (comma separated)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(corr, { corr = it }, label = { Text("Correspondent (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Hint("The token is in paperless under your profile (My Profile > API Auth Token). The document's own tags are sent too.")
+                if (kind == SyncKind.WebDav || kind == SyncKind.Paperless) {
+                    val norm = Http.normalizeUrl(url)
+                    if (norm != null && norm.startsWith("http://")) Text(
+                        "Plain http: the password and the documents travel unencrypted. Use https if the server has it.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                    )
                 }
-                SyncKind.Folder -> {
-                    OutlinedButton(onClick = { pickFolder.launch(null) }) { Text(if (folder == null) "Pick a folder" else "Pick another folder") }
-                    folder?.let { Hint(Uri.parse(it).lastPathSegment ?: it) }
-                    Hint("Works with Syncthing, cloud-folder apps and SMB apps that offer a folder: no network access by FlatScan.")
-                }
-                SyncKind.Off -> {}
-            }
-            if (kind == SyncKind.WebDav || kind == SyncKind.Paperless) {
-                val norm = Http.normalizeUrl(url)
-                if (norm != null && norm.startsWith("http://")) Text(
-                    "Plain http: the password and the documents travel unencrypted. Use https if the server has it.",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
-                )
-            }
-            if (kind != SyncKind.Off) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(onClick = { test() }, enabled = !testing) { Text("Test connection") }
-                    if (testing) {
-                        Spacer(Modifier.size(12.dp))
-                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                if (kind != SyncKind.Off) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedButton(onClick = { test() }, enabled = !testing) { Text("Test connection") }
+                        if (testing) {
+                            Spacer(Modifier.size(12.dp))
+                            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        }
+                    }
+                    Hint("The test uploads a small file and deletes it again, with your credentials, as a real upload would.")
+                    result?.let { (ok, msg) ->
+                        Text((if (ok) "Works: " else "Failed: ") + msg, color = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium)
                     }
                 }
-                Hint("The test uploads a small file and deletes it again, with your credentials, as a real upload would.")
-                result?.let { (ok, msg) ->
-                    Text((if (ok) "Works: " else "Failed: ") + msg, color = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodyMedium)
-                }
-                RuledDivider(Modifier.padding(vertical = 8.dp))
-                Section("Uploads")
-                SwitchLine("Upload automatically", "When you go back from a document you scanned or changed", auto) { auto = it }
-                if (kind != SyncKind.Folder) SwitchLine("Only on Wi-Fi", "Wait for an unmetered network", wifi) { wifi = it }
-                SwitchLine("Only while charging", "Wait until the phone is charging", charging) { charging = it }
-                Hint("Without automatic upload, upload a document from the history: long press, then Upload.")
+                Spacer(Modifier.height(10.dp))
             }
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("File names")
-            OutlinedTextField(template, { template = it }, label = { Text("Template") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            Hint("{title}, {date}, {time}, {pages}. A name already taken gets (2), (3)... nothing is overwritten.")
-            for (f in FileNameTemplate.DATE_FORMATS) RadioRow(f, dateFmt == f) { dateFmt = f }
-            Text(
-                "Example: " + FileNameTemplate.render(template, vm.docTitle ?: "Electricity bill", System.currentTimeMillis(), 3, dateFmt) + ".pdf",
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono),
-            )
+            if (kind != SyncKind.Off) {
+                SettingsSheet("Uploads") {
+                    SwitchLine("Upload automatically", "When you go back from a document you scanned or changed", auto) { auto = it }
+                    if (kind != SyncKind.Folder) SwitchLine("Only on Wi-Fi", "Wait for an unmetered network", wifi) { wifi = it }
+                    SwitchLine("Only while charging", "Wait until the phone is charging", charging) { charging = it }
+                    Hint("Without automatic upload, upload a document from the history: long press, then Upload.")
+                    Spacer(Modifier.height(10.dp))
+                }
+            }
+            SettingsSheet("File names") {
+                OutlinedTextField(template, { template = it }, label = { Text("Template") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Hint("{title}, {date}, {time}, {pages}. A name already taken gets (2), (3)... nothing is overwritten.")
+                for (f in FileNameTemplate.DATE_FORMATS) RadioRow(f, dateFmt == f) { dateFmt = f }
+                Text(
+                    "Example: " + FileNameTemplate.render(template, vm.docTitle ?: "Electricity bill", System.currentTimeMillis(), 3, dateFmt) + ".pdf",
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono),
+                    modifier = Modifier.padding(bottom = 10.dp),
+                )
+            }
             Spacer(Modifier.height(24.dp))
         }
     }

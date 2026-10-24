@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Spacer
@@ -233,91 +234,99 @@ fun SettingsScreen(vm: ScanViewModel) {
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         TopAppBar(
             title = { Text("Settings", style = MaterialTheme.typography.titleLarge) },
-            colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
             navigationIcon = { IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
-            Section("Default filter")
-            for (f in FilterKind.forMode(com.albus.flatscan.CaptureMode.Document)) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
-            Text(
-                "The filter and strength you choose on a page become the default for the next one.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
-            val ocrState = com.albus.flatscan.output.OcrPack.state
-            SwitchRow(
-                "Recognise text after scanning",
-                "Hebrew and English, on the phone: search finds documents by their text" +
-                    if (ocrState is com.albus.flatscan.output.OcrPack.State.Ready) "" else " (needs the text recognition download)",
-                ocrAfter,
-            ) {
-                ocrAfter = it
-                s.ocrAfterScan = it
-                if (it && ocrState !is com.albus.flatscan.output.OcrPack.State.Ready) vm.downloadOcr()
-            }
-            OcrPackRow(vm)
-            SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("Finding the page")
-            SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
-            SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc, icon = PaperIcons.Iron) { uvDoc = it; s.uvDoc = it }
-            if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc high-res only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
-            SwitchRow("Remove shadows", "Shadow net: hand, object and leaf shadows; colours kept", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
-            SwitchRow("Table rules (neural net)", "Rule net: printed rules and text lines (any script); off: rules from darkness, rows from ink", ruleNet) { ruleNet = it; s.ruleNet = it }
-            SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
-            SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("Output resolution")
-            for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("Acceleration")
-            for ((k, label) in Accel.CHOICES) Choice(label, accel == k) { accel = k; s.acceleration = k; if (k == Accel.GPU) vm.enableGpu() }
-            Text(
-                "Where the neural nets run. The CPU gives the reference results; Auto uses the GPU only for the nets " +
-                    "whose results match the CPU closely, and any net that fails on the GPU runs on the CPU. " +
-                    "${NetEnv.runtime}; GPU (full precision): ${if (NetEnv.gpuAvailable) "available" else "unavailable on this phone (${NetEnv.gpuWhy})"}.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (accel == Accel.AUTO) {
-                val plan = vm.currentPlan()
+            SettingsSheet("Pages") {
+                Text("Default filter", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 6.dp))
+                for (f in FilterKind.forMode(com.albus.flatscan.CaptureMode.Document)) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
                 Text(
-                    if (plan.note == "not benchmarked yet") "Auto has not chosen yet: the first processed page runs a one-time benchmark."
-                    else "Auto (${plan.note}): ${plan.summary()}.",
+                    "The filter and strength you choose on a page become the default for the next one.",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                RuledDivider(Modifier.padding(vertical = 8.dp))
+                SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
+                val ocrState = com.albus.flatscan.output.OcrPack.state
+                SwitchRow(
+                    "Recognise text after scanning",
+                    "Hebrew and English, on the phone: search finds documents by their text" +
+                        if (ocrState is com.albus.flatscan.output.OcrPack.State.Ready) "" else " (needs the text recognition download)",
+                    ocrAfter,
+                ) {
+                    ocrAfter = it
+                    s.ocrAfterScan = it
+                    if (it && ocrState !is com.albus.flatscan.output.OcrPack.State.Ready) vm.downloadOcr()
+                }
+                OcrPackRow(vm)
+                SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
             }
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(onClick = { vm.runAccelBenchmark() }, enabled = !vm.selfTestRunning) { Text("Run the acceleration benchmark") }
+            SettingsSheet("Finding and flattening the page") {
+                SwitchRow("Page finder (neural net)", "Off: the older colour-threshold detector", pageFinder) { pageFinder = it; s.pageFinderNet = it }
+                SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc, icon = PaperIcons.Iron) { uvDoc = it; s.uvDoc = it }
+                if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc high-res only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
+                SwitchRow("Remove shadows", "Shadow net: hand, object and leaf shadows; colours kept", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
+                SwitchRow("Table rules (neural net)", "Rule net: printed rules and text lines (any script); off: rules from darkness, rows from ink", ruleNet) { ruleNet = it; s.ruleNet = it }
+                SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
+                SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
+            }
+            SettingsSheet("Output resolution") {
+                for ((w, label) in Settings.OUTPUT_WIDTHS) Choice(label, width == w) { width = w; s.outputWidth = w }
+            }
+            SettingsSheet("Acceleration") {
+                for ((k, label) in Accel.CHOICES) Choice(label, accel == k) { accel = k; s.acceleration = k; if (k == Accel.GPU) vm.enableGpu() }
+                Text(
+                    "Where the neural nets run. The CPU gives the reference results; Auto uses the GPU only for the nets " +
+                        "whose results match the CPU closely, and any net that fails on the GPU runs on the CPU. " +
+                        "${NetEnv.runtime}; GPU (full precision): ${if (NetEnv.gpuAvailable) "available" else "unavailable on this phone (${NetEnv.gpuWhy})"}.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (accel == Accel.AUTO) {
+                    val plan = vm.currentPlan()
+                    Text(
+                        if (plan.note == "not benchmarked yet") "Auto has not chosen yet: the first processed page runs a one-time benchmark."
+                        else "Auto (${plan.note}): ${plan.summary()}.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = { vm.runAccelBenchmark() }, enabled = !vm.selfTestRunning, modifier = Modifier.padding(bottom = 8.dp)) { Text("Run the acceleration benchmark") }
+            }
             if (vm.batchStatus.isNotEmpty()) {
-                Section("Batch mode (debug)")
-                if (vm.batchRunning) LinearProgressIndicator(Modifier.fillMaxWidth())
-                Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
+                SettingsSheet("Batch mode (debug)") {
+                    if (vm.batchRunning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
+                }
             }
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("Sync")
-            val sc = vm.syncConfig
-            Text(
-                if (sc.configured) "Uploading to ${sc.kind.label}" + (if (sc.autoUpload) ", automatically" else ", by hand") else "Off: scans stay on this phone",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(onClick = { vm.open(Screen.Sync) }) { Text("Sync to your server") }
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            StorageSection(vm)
-            RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("About")
-            Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodyMedium)
-            Row(
-                Modifier.fillMaxWidth().clickable(role = Role.Button) { vm.open(Screen.Licenses) }.padding(vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Open-source licences", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-                Icon(Icons.Outlined.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            SettingsSheet("Sync") {
+                val sc = vm.syncConfig
+                Text(
+                    if (sc.configured) "Uploading to ${sc.kind.label}" + (if (sc.autoUpload) ", automatically" else ", by hand") else "Off: scans stay on this phone",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = { vm.open(Screen.Sync) }, modifier = Modifier.padding(bottom = 8.dp)) { Text("Sync to your server") }
             }
-            Spacer(Modifier.height(4.dp))
-            Text(vm.gpuInfo, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            RuledDivider(Modifier.padding(vertical = 8.dp))
+            SettingsSheet("Storage") { StorageSection(vm) }
+            SettingsSheet("About") {
+                Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    LogoMark(Modifier.size(28.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("FlatScan", style = MaterialTheme.typography.titleMedium)
+                        Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth().clickable(role = Role.Button) { vm.open(Screen.Licenses) }.padding(vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Open-source licences", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                    Icon(Icons.Outlined.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(vm.gpuInfo, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 10.dp))
+            }
             // the self-test is in debug builds only (its files: src/debug/assets); the report area also shows the
             // acceleration benchmark's report
             if (vm.hasSelfTest || vm.selfTestReport.isNotEmpty() || vm.selfTestRunning) Section(if (vm.hasSelfTest) "Self-test and benchmark" else "Benchmark report")
@@ -383,10 +392,24 @@ private fun SwitchRow(title: String, caption: String, checked: Boolean, icon: Im
 
 @Composable
 internal fun Section(t: String) {
+    val marker = if (isPaperLight()) Palette.Highlighter else Graphite.Highlighter.copy(alpha = 0.35f)
     Text(
         t.uppercase(), style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 13.sp, letterSpacing = 0.06.em),
-        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 16.dp, bottom = 6.dp),
+        color = MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier.padding(top = 22.dp, bottom = 8.dp).drawBehind {
+            // a highlighter stroke under the lower half of the label
+            drawRect(marker, topLeft = Offset(-3.dp.toPx(), size.height * 0.45f), size = Size(size.width + 6.dp.toPx(), size.height * 0.5f))
+        },
     )
+}
+
+/** A settings group: its label above a sheet of paper. */
+@Composable
+internal fun SettingsSheet(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Section(title)
+    PaperSurface(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 4.dp), content = content)
+    }
 }
 
 @Composable
@@ -491,7 +514,6 @@ internal fun OcrPackRow(vm: ScanViewModel) {
 private fun StorageSection(vm: ScanViewModel) {
     LaunchedEffect(Unit) { vm.measureStorage() }
     var days by remember { mutableStateOf<Int?>(null) }
-    Section("Storage")
     val u = vm.storage
     Text(
         if (u == null) "Measuring..." else "${com.albus.flatscan.formatBytes(u.total)} for ${u.documents} documents (${u.pages} pages); " +
@@ -507,6 +529,7 @@ private fun StorageSection(vm: ScanViewModel) {
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         for (d in listOf(30, 90, 365)) OutlinedButton(onClick = { days = d }) { Text(if (d == 365) "> 1 year" else "> $d days") }
     }
+    Spacer(Modifier.height(8.dp))
     days?.let { d ->
         AlertDialog(
             onDismissRequest = { days = null },

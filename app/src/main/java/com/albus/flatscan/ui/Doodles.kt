@@ -20,11 +20,11 @@ import kotlin.random.Random
 
 /**
  * The iron of the Flatten tool, drawn [s] times its 60-unit size with the middle of its soleplate
- * at [at]: white body, ink outline, ballpoint-blue soleplate, a highlighter dial and a soft shadow.
+ * at [at] (facing right, or left with [flip]): white body, ink outline, ballpoint-blue soleplate, a highlighter dial and a soft shadow.
  */
-fun DrawScope.drawIron(at: Offset, s: Float, alpha: Float = 1f) {
+fun DrawScope.drawIron(at: Offset, s: Float, alpha: Float = 1f, flip: Boolean = false) {
     translate(at.x, at.y) {
-        scale(s, s, pivot = Offset.Zero) {
+        scale(if (flip) -s else s, s, pivot = Offset.Zero) {
             val ink = Palette.Ink.copy(alpha = alpha)
             val line = Stroke(width = 2.4f, cap = StrokeCap.Round, join = StrokeJoin.Round)
             drawOval(Color(0xFF141928).copy(alpha = 0.22f * alpha), topLeft = Offset(-28f, 8f), size = Size(60f, 10f))

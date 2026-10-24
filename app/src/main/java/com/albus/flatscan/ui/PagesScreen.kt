@@ -221,7 +221,7 @@ fun PagesScreen(vm: ScanViewModel) {
                     }
                 }
             },
-            colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         )
         ReorderablePageGrid(
             pages = vm.pages,
