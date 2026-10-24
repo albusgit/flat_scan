@@ -1355,6 +1355,11 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         nets_fut = std::async(std::launch::async, run_nets);
     }
     report(opt, 2, "Finding the page");
+    // edited corners: the paper mask at the end still comes from a detection (if it agrees with the
+    // user's corners), which needs only the photo: made beside everything else
+    std::future<PageCorners> edited_detection;
+    if (opt.corners_edited)
+        edited_detection = std::async(std::launch::async, [&] { return detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index); });
     Unroll U;
     std::array<cv::Point2d, 4> corners;
     PageCorners pc;
@@ -1504,17 +1509,23 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         if (!ok.empty()) {
             size_t pick = 0;
             if (ok.size() == 2) {
-                // a half-size stage-1 page of each: text-row angle spread
+                // a half-size stage-1 page of each: text-row angle spread (the pages made here, where the
+                // GPU's context is; the two spreads side by side)
+                cv::Mat half[2];
                 for (size_t k = 0; k < 2; ++k) {
                     Unroll Us = Uh;
                     Us.mode = GeomMode::Neural;
                     Us.uv = ok[k].g;
                     Us.W = W / 2;
                     Us.H = H / 2;
-                    int rows = 0;
-                    r.uv_spread[k] = text_row_spread(remap_unroll(photo, Us, opt.use_gpu), &rows);
-                    if (rows < 5) r.uv_spread[k] = -1;
+                    half[k] = remap_unroll(photo, Us, opt.use_gpu);
                 }
+                int rows[2] = {0, 0};
+                auto spread1 = std::async(std::launch::async, [&] { return text_row_spread(half[1], &rows[1]); });
+                r.uv_spread[0] = text_row_spread(half[0], &rows[0]);
+                r.uv_spread[1] = spread1.get();
+                for (size_t k = 0; k < 2; ++k)
+                    if (rows[k] < 5) r.uv_spread[k] = -1;
                 if (r.uv_spread[0] >= 0 && r.uv_spread[1] >= 0 && r.uv_spread[1] < r.uv_spread[0] - opt.uv_prefer_margin) pick = 1;
             }
             if (ok[pick].own) {
@@ -1549,8 +1560,9 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                         double s = text_row_spread(remap_unroll(photo, Us), &rows);
                         return rows < 5 ? -1.0 : s;
                     };
+                    auto spread1 = std::async(std::launch::async, [&] { return spread(fine); });
                     r.uv_zoom_spread[0] = spread(U.uv);
-                    r.uv_zoom_spread[1] = spread(fine);
+                    r.uv_zoom_spread[1] = spread1.get();
                     if (agree >= need && r.uv_zoom_spread[0] >= 0 && r.uv_zoom_spread[1] >= 0 &&
                         r.uv_zoom_spread[1] <= r.uv_zoom_spread[0] + opt.zoom_max_worse) {
                         U.uv = std::move(fine);
@@ -1662,7 +1674,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     // paper mask: from this run's detection, or - when the corners were edited - from a fresh
     // detection if its corners agree with the user's (otherwise the outline is not trusted)
     if (opt.corners_edited) {
-        PageCorners pd = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
+        PageCorners pd = edited_detection.get();
         double diag = hypot_xy((double)photo.cols, (double)photo.rows), worst = 0;
         for (int k = 0; k < 4 && pd.ok; ++k) worst = std::max(worst, cv::norm(pd.pts[k] - corners[k]));
         if (pd.ok && worst < 0.03 * diag) pc = pd;
