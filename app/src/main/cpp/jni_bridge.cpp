@@ -489,12 +489,37 @@ std::vector<uint8_t> load_model(std::string file) {
     return v;
 }
 
+// assets/models/<file> in place: the APK's uncompressed asset (noCompress tflite), mapped while the view lives;
+// no data (missing, or the static-model .onnx names): load_model copies it instead
+ModelView map_model(const std::string& file) {
+    AAssetManager* mgr;
+    {
+        std::lock_guard<std::mutex> lk(g_nets_mu);
+        mgr = g_mgr;
+    }
+    ModelView v;
+    if (!mgr) return v;
+    AAsset* a = AAssetManager_open(mgr, ("models/" + file).c_str(), AASSET_MODE_BUFFER);
+    if (!a) return v;
+    const void* p = AAsset_getBuffer(a);
+    const off_t n = AAsset_getLength(a);
+    if (!p || n <= 0 || (uintptr_t)p % 4 != 0) {   // TFLite wants a 4-byte aligned buffer
+        AAsset_close(a);
+        return v;
+    }
+    v.data = (const uint8_t*)p;
+    v.size = (size_t)n;
+    v.keep = std::shared_ptr<const void>(a, [](const void* x) { AAsset_close((AAsset*)x); });
+    return v;
+}
+
 // caller holds g_nets_mu
 std::shared_ptr<NetGroup> make_group(const std::string& pref) {
     auto g = std::make_shared<NetGroup>();
     g->pref = pref;
     InferConfig c;
     c.load = load_model;
+    c.map = map_model;
     if (!parse_backends(pref, c.preference)) {
         LOGI("nets: unknown backend in \"%s\": CPU only", pref.c_str());
         c.preference.clear();

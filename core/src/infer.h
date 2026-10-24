@@ -17,8 +17,17 @@
 namespace fs {
 enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet, Inpaint };
 enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu };
+// A model file in place (Android: an uncompressed asset of the APK, AAsset_getBuffer), valid while keep lives.
+struct ModelView {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    std::shared_ptr<const void> keep;
+};
 struct InferConfig {
     std::function<std::vector<uint8_t>(const std::string& file)> load;  // model bytes (Android: AAssetManager)
+    // optional: the LiteRT backends read the model files in place instead of a copy on the heap (not ShadeNet's
+    // and the rule net's, which are rewritten per input shape); no data: load instead
+    std::function<ModelView(const std::string& file)> map;
     std::vector<Backend> preference;   // tried in order per net; CPU is always appended last
     std::string cache_dir;             // compiled-model cache (QNN context binaries, LiteRT GPU kernels)
     bool fp16 = true;                  // accelerators only; CPU stays fp32

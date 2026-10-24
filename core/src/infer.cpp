@@ -197,7 +197,7 @@ std::string dims_nchw(const std::vector<int64_t>& d) {
 
 #if defined(FS_ORT_QNN) || defined(FS_LITERT)
 // SHA-256 (FIPS 180-4), for the compiled-model cache key
-std::string sha256_hex(const std::vector<uint8_t>& data) {
+std::string sha256_hex(const uint8_t* data, size_t size) {
     static const uint32_t K[64] = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
         0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa,
@@ -207,15 +207,18 @@ std::string sha256_hex(const std::vector<uint8_t>& data) {
         0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
     uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
     auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
-    std::vector<uint8_t> m(data);
-    const uint64_t bits = (uint64_t)data.size() * 8;
-    m.push_back(0x80);
-    while (m.size() % 64 != 56) m.push_back(0);
-    for (int i = 7; i >= 0; --i) m.push_back((uint8_t)(bits >> (8 * i)));
-    for (size_t off = 0; off < m.size(); off += 64) {
+    // the whole blocks in place, the padded tail in a copy (a model is not copied whole)
+    const size_t whole = size / 64 * 64;
+    std::vector<uint8_t> tail(data + whole, data + size);
+    const uint64_t bits = (uint64_t)size * 8;
+    tail.push_back(0x80);
+    while (tail.size() % 64 != 56) tail.push_back(0);
+    for (int i = 7; i >= 0; --i) tail.push_back((uint8_t)(bits >> (8 * i)));
+    for (size_t off = 0; off < whole + tail.size(); off += 64) {
+        const uint8_t* m = off < whole ? data + off : tail.data() + (off - whole);
         uint32_t w[64];
         for (int i = 0; i < 16; ++i)
-            w[i] = (uint32_t)m[off + 4 * i] << 24 | (uint32_t)m[off + 4 * i + 1] << 16 | (uint32_t)m[off + 4 * i + 2] << 8 | m[off + 4 * i + 3];
+            w[i] = (uint32_t)m[4 * i] << 24 | (uint32_t)m[4 * i + 1] << 16 | (uint32_t)m[4 * i + 2] << 8 | m[4 * i + 3];
         for (int i = 16; i < 64; ++i) {
             uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
             uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
@@ -233,6 +236,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data) {
     for (int i = 0; i < 8; ++i) std::snprintf(s + 8 * i, 9, "%08x", h[i]);
     return s;
 }
+
+std::string sha256_hex(const std::vector<uint8_t>& data) { return sha256_hex(data.data(), data.size()); }
 
 // The SoC for the compiled-model cache key (Android 12+: ro.soc.model, else the board platform).
 std::string soc_name() {
@@ -467,7 +472,10 @@ struct LrtProbe {
 // One net's interpreter with the GPU delegate, for one input shape; used on the LiteRT thread only.
 struct LrtSession {
     const LrtApi* api = nullptr;
-    std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it)
+    std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it) ...
+    ModelView view;                       // ... or the file in place (InferConfig::map)
+    const uint8_t* model_data() const { return view.data ? view.data : bytes.data(); }
+    size_t model_size() const { return view.data ? view.size : bytes.size(); }
     std::vector<int64_t> in_shape;        // NCHW, as run() gets it
     bool reshaped = false;                // bytes rewritten for in_shape (tflite_shape): allocate before delegating
     std::string cache_dir, token;         // serialisation folder and key (kept alive for the delegate)
@@ -591,9 +599,9 @@ std::string build_fingerprint() {
 
 // The serialisation key: the model, and the device (SoC, system build: GPU driver updates come with
 // it) with the LiteRT version and the fp32 options.
-std::string litert_token(const LrtApi& api, const std::vector<uint8_t>& model) {
+std::string litert_token(const LrtApi& api, const uint8_t* model, size_t size) {
     const std::string dev = soc_name() + "|" + build_fingerprint() + "|litert" + api.version + "|fp32";
-    return "fs_" + sha256_hex(model).substr(0, 16) + "_" + sha256_hex(std::vector<uint8_t>(dev.begin(), dev.end())).substr(0, 8);
+    return "fs_" + sha256_hex(model, size).substr(0, 16) + "_" + sha256_hex(std::vector<uint8_t>(dev.begin(), dev.end())).substr(0, 8);
 }
 
 std::string dims_str(const LrtApi& api, const TfLiteTensor* t) {
@@ -607,7 +615,7 @@ bool litert_open(LrtSession& s, bool serialize, std::string& why) {
     const LrtApi& api = *s.api;
     s.close();
     s.log.clear();
-    if (!s.model && !(s.model = api.TfLiteModelCreate(s.bytes.data(), s.bytes.size()))) {
+    if (!s.model && !(s.model = api.TfLiteModelCreate(s.model_data(), s.model_size()))) {
         why = "not a TFLite model";
         return false;
     }
@@ -806,7 +814,10 @@ bool litert_run(LrtSession& s, const Tensor& in, std::vector<Tensor>& out, doubl
 // thread.
 struct LrtCpu {
     const LrtApi* api = nullptr;
-    std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it)
+    std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it) ...
+    ModelView view;                       // ... or the file in place (InferConfig::map)
+    const uint8_t* model_data() const { return view.data ? view.data : bytes.data(); }
+    size_t model_size() const { return view.data ? view.size : bytes.size(); }
     TfLiteModel* model = nullptr;
     TfLiteInterpreterOptions* opts = nullptr;
     TfLiteInterpreter* interp = nullptr;
@@ -842,7 +853,7 @@ bool lrt_cpu_open(LrtCpu& s, std::string& why) {
     const LrtApi& api = *s.api;
     s.close();
     s.log.clear();
-    if (!s.model && !(s.model = api.TfLiteModelCreate(s.bytes.data(), s.bytes.size()))) {
+    if (!s.model && !(s.model = api.TfLiteModelCreate(s.model_data(), s.model_size()))) {
         why = "not a TFLite model";
         return false;
     }
@@ -998,13 +1009,19 @@ struct Inference::Impl {
     }
 
     // model bytes for net on backend b and an input of shape `shape`; file: the name used; per_shape: the
-    // file named is the model of this input shape only (a missing one leaves the other shapes on b)
-    std::vector<uint8_t> model_bytes(NetId net, Backend b, const std::vector<int64_t>& shape, std::string& file, bool* per_shape = nullptr) const {
+    // file named is the model of this input shape only (a missing one leaves the other shapes on b). view (the
+    // LiteRT backends): set instead when the file is read in place (InferConfig::map), the bytes then empty.
+    std::vector<uint8_t> model_bytes(NetId net, Backend b, const std::vector<int64_t>& shape, std::string& file, bool* per_shape = nullptr,
+                                     ModelView* view = nullptr) const {
         if (per_shape) *per_shape = false;
         if (!cfg.load) return {};
         std::vector<uint8_t> bytes;
         auto load = [&](const std::string& f) {
             file = f;
+            if (view && cfg.map && net != NetId::ShadeNet && net != NetId::RuleNet) {
+                try { *view = cfg.map(f); } catch (...) { *view = ModelView(); }
+                if (view->data) return true;
+            }
             try { bytes = cfg.load(f); } catch (...) { bytes.clear(); }
             return !bytes.empty();
         };
@@ -1206,8 +1223,8 @@ struct Inference::Impl {
         std::string file;
         auto s = std::make_unique<LrtSession>();
         s->api = api;
-        s->bytes = model_bytes(net, Backend::LiteRtGpu, shape, file, &per_shape);
-        if (s->bytes.empty()) {
+        s->bytes = model_bytes(net, Backend::LiteRtGpu, shape, file, &per_shape, &s->view);
+        if (s->bytes.empty() && !s->view.data) {
             why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
             return false;
         }
@@ -1217,7 +1234,7 @@ struct Inference::Impl {
         s->reshaped = (net == NetId::ShadeNet || net == NetId::RuleNet) && tflite_input_hw(s->bytes, h0, w0) && shape.size() == 4 &&
                       (shape[2] != h0 || shape[3] != w0);
         s->cache_dir = cfg.cache_dir;
-        s->token = litert_token(*api, s->bytes);
+        s->token = litert_token(*api, s->model_data(), s->model_size());
 #ifdef FS_LITERT_TEST_XNNPACK
         s->lib_dir = cfg.litert_dir;
 #endif
@@ -1275,8 +1292,8 @@ struct Inference::Impl {
         std::string file;
         auto s = std::make_unique<LrtCpu>();
         s->api = api;
-        s->bytes = model_bytes(net, Backend::CPU, shape, file);
-        if (s->bytes.empty()) {
+        s->bytes = model_bytes(net, Backend::CPU, shape, file, nullptr, &s->view);
+        if (s->bytes.empty() && !s->view.data) {
             why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
             return false;
         }
