@@ -64,6 +64,8 @@ private const val APACHE = "Apache-2.0.txt"
  * which follows the Maven AAR's build: oneTBB, libjpeg-turbo, libpng, cpufeatures, Carotene and KleidiCV HALs;
  * zlib is Android's system libz, not in the APK). Our own models (ShadeNet, rule net) are not listed.
  */
+// TODO Tesseract4Android also ships Leptonica (BSD-2-Clause style), libjpeg and libpng in its own .so files: add
+//  their licence texts and versions from its build (README "Licences")
 // TODO page finder: origin/licence not documented (pagefinder.tflite ships in the APK; list it once its origin,
 //  licence and training data are known, see README "Licences")
 val OssComponents = listOf(
@@ -131,6 +133,22 @@ val OssComponents = listOf(
             "Lifecycle 2.9.0, CameraX 1.4.2, ExifInterface 1.4.1; Kotlin standard library 2.1.21",
         "Copyright The Android Open Source Project; Copyright JetBrains s.r.o. and Kotlin Programming Language contributors",
         "Apache-2.0", "https://developer.android.com/jetpack/androidx", listOf(APACHE),
+    ),
+    OssComponent(
+        "Tesseract OCR (Tesseract4Android)", "4.8.0 (Tesseract 5)", "Copyright the Tesseract and Tesseract4Android authors",
+        "Apache-2.0", "https://github.com/adaptech-cz/Tesseract4Android", listOf(APACHE),
+    ),
+    OssComponent(
+        "Tesseract models: English and Hebrew", "tessdata_fast", "Copyright Google LLC and the Tesseract authors", "Apache-2.0",
+        "https://github.com/tesseract-ocr/tessdata_fast", listOf(APACHE),
+    ),
+    OssComponent(
+        "OkHttp and Okio", "OkHttp 4.12.0", "Copyright Square, Inc.", "Apache-2.0", "https://square.github.io/okhttp/", listOf(APACHE),
+    ),
+    OssComponent(
+        "AndroidX Room, WorkManager and Security (with Google Tink)", "Room 2.7.2, WorkManager 2.10.5, Security-crypto 1.1.0",
+        "Copyright The Android Open Source Project; Copyright Google LLC (Tink)", "Apache-2.0",
+        "https://developer.android.com/jetpack/androidx", listOf(APACHE),
     ),
     OssComponent(
         "LLVM libc++ (Android NDK r27c)", "LLVM 18 (clang r522817c)", "Copyright the LLVM Project contributors",

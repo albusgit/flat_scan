@@ -1,4 +1,5 @@
 #include "cleanup.h"
+#include "board.h"
 
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
@@ -310,6 +311,8 @@ const char* filter_name(Filter f) {
         case Filter::HighContrast: return "High contrast";
         case Filter::BlackWhite: return "Black & white";
         case Filter::Scan: return "Scan";
+        case Filter::Whiteboard: return "Whiteboard";
+        case Filter::ProjectorDark: return "Dark slide";
     }
     return "?";
 }
@@ -722,6 +725,7 @@ static inline void scan_px(const Curve& c, const float* v, float l, float tint, 
 }
 
 cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, const Adjust& adj) {
+    if (is_board(f)) return board_filter(img, f == Filter::ProjectorDark, s);
     if (f == Filter::Original && adj.identity()) return img.clone();
     Curve c = filter_curve(f, p.sigma, p.ink);
     AdjustK ak = adjust_constants(adj, c.specks);
@@ -848,6 +852,12 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
     const Filter f = rp.filter;
     const float strength = rp.strength;
     auto t0 = std::chrono::steady_clock::now();
+    if (is_board(f)) {
+        // whiteboard mode: no paper fill (a board has no paper outline), no Solid colors, CPU
+        cv::Mat out = board_filter(page, f == Filter::ProjectorDark, strength);
+        s.ms_filter = ms_since(t0);
+        return out;
+    }
     cv::Mat src = apply_paper(page, paper, p);
     bool sol = rp.solid && f != Filter::BlackWhite;
     // Solid colors in Grayscale: fill in colour, then desaturate

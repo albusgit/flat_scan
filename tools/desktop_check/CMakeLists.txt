@@ -117,3 +117,10 @@ if(NOT FS_DESKTOP_GPU STREQUAL "OFF")
     endforeach()
   endif()
 endif()
+
+# whiteboard mode (core/src/board.cpp) on synthetic photos
+add_executable(board_test board_test.cpp)
+target_link_libraries(board_test PRIVATE core_nogpu)
+# the finger fill (core/src/pipeline.cpp) on synthetic pages
+add_executable(finger_test finger_test.cpp)
+target_link_libraries(finger_test PRIVATE core_nogpu)

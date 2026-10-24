@@ -96,6 +96,21 @@ class Settings(ctx: Context) {
 
     private val appLanguageRtl = TextUtils.getLayoutDirectionFromLocale(ctx.resources.configuration.locales[0]) == View.LAYOUT_DIRECTION_RTL
 
+    /** Recognise the text of a document's pages in the background when it is finished (history search). */
+    var ocrAfterScan: Boolean
+        get() = p.getBoolean("ocr_after_scan", true)
+        set(v) = p.edit().putBoolean("ocr_after_scan", v).apply()
+
+    /** Document or whiteboard mode for new scans (the camera screen's switch; imports follow it). */
+    var captureMode: CaptureMode
+        get() = CaptureMode.entries.firstOrNull { it.name == p.getString("capture_mode", null) } ?: CaptureMode.Document
+        set(v) = p.edit().putString("capture_mode", v.name).apply()
+
+    /** The document open when the app was last used (reopened at start), or null. */
+    var lastDocument: String?
+        get() = p.getString("last_document", null)
+        set(v) = p.edit().apply { if (v == null) remove("last_document") else putString("last_document", v) }.apply()
+
     /** The one-time "Press and hold to see the original" hint was dismissed. */
     var holdHintShown: Boolean
         get() = p.getBoolean("hold_hint_shown", false)

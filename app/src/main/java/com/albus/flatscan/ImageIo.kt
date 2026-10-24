@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import androidx.exifinterface.media.ExifInterface
+import java.io.File
+import java.io.InputStream
 import kotlin.math.hypot
 import kotlin.math.max
 
@@ -20,20 +22,28 @@ const val MAX_PHOTO_SIDE = 4096
  * diagonal), else from [focalMmPerLongSide] (camera sensor data), else 0 (the core then uses
  * the reference default 0.72 x long side).
  */
-fun loadPhoto(ctx: Context, uri: Uri, focalMmPerLongSide: Float = 0f): LoadedPhoto {
-    val cr = ctx.contentResolver
+fun loadPhoto(ctx: Context, uri: Uri, focalMmPerLongSide: Float = 0f): LoadedPhoto =
+    decodePhoto({ ctx.contentResolver.openInputStream(uri) ?: error("cannot open $uri") }, focalMmPerLongSide)
+
+/**
+ * A stored original ([DocumentStore.saveOriginal]) decoded as [loadPhoto] decodes it: a new scan and a
+ * later re-edit of the same page start from the same pixels.
+ */
+fun loadPhotoFile(f: File, focalMmPerLongSide: Float = 0f): LoadedPhoto = decodePhoto({ f.inputStream() }, focalMmPerLongSide)
+
+private fun decodePhoto(open: () -> InputStream, focalMmPerLongSide: Float): LoadedPhoto {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    cr.openInputStream(uri).use { BitmapFactory.decodeStream(it, null, bounds) }
+    open().use { BitmapFactory.decodeStream(it, null, bounds) }
     var sample = 1
     while (max(bounds.outWidth, bounds.outHeight) / sample > MAX_PHOTO_SIDE) sample *= 2
     val opts = BitmapFactory.Options().apply {
         inSampleSize = sample
         inPreferredConfig = Bitmap.Config.ARGB_8888
     }
-    var bmp = cr.openInputStream(uri).use { BitmapFactory.decodeStream(it, null, opts) }
+    var bmp = open().use { BitmapFactory.decodeStream(it, null, opts) }
         ?: error("cannot decode image")
     var focal = 0f
-    cr.openInputStream(uri)?.use { s ->
+    open().use { s ->
         val exif = ExifInterface(s)
         val m = Matrix()
         when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
@@ -66,4 +76,50 @@ fun Bitmap.forDisplay(maxSide: Int = 2048): Bitmap {
     val s = maxSide.toFloat() / max(width, height)
     if (s >= 1f) return this
     return Bitmap.createScaledBitmap(this, (width * s).toInt().coerceAtLeast(1), (height * s).toInt().coerceAtLeast(1), true)
+}
+
+/** The file extension of an image [uri] (from its MIME type, else its path), "jpg" when unknown. */
+fun extensionOf(ctx: Context, uri: Uri): String {
+    val mime = runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
+    val fromMime = mime?.let { android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+    val fromPath = uri.lastPathSegment?.substringAfterLast('.', "")?.takeIf { it.length in 2..5 }
+    return (fromMime ?: fromPath ?: "jpg").lowercase().let { if (it == "jpeg") "jpg" else it }
+}
+
+/** 1536 -> "1.5 KB" (base 1024, one decimal below 10). */
+fun formatBytes(n: Long): String {
+    if (n < 1024) return "$n B"
+    val units = listOf("KB", "MB", "GB", "TB")
+    var v = n / 1024.0
+    var i = 0
+    while (v >= 1024 && i < units.lastIndex) { v /= 1024; i++ }
+    return if (v < 10) "%.1f %s".format(java.util.Locale.US, v, units[i]) else "%.0f %s".format(java.util.Locale.US, v, units[i])
+}
+
+/**
+ * The pages of a PDF ([uri]) as PNG files in cacheDir/pdf_import/ (the folder is emptied first), white
+ * background, at 200 dpi with the long side capped at 3508 px (A4 at 300 dpi). For importing PDF pages.
+ */
+fun renderPdfPages(ctx: Context, uri: Uri): List<File> {
+    val dir = File(ctx.cacheDir, "pdf_import").apply { deleteRecursively(); mkdirs() }
+    val out = mutableListOf<File>()
+    ctx.contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+        android.graphics.pdf.PdfRenderer(fd).use { r ->
+            for (i in 0 until r.pageCount) {
+                r.openPage(i).use { page ->
+                    val k = minOf(200f / 72f, 3508f / max(page.width, page.height))
+                    val w = (page.width * k).toInt().coerceAtLeast(1)
+                    val h = (page.height * k).toInt().coerceAtLeast(1)
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    b.eraseColor(android.graphics.Color.WHITE)
+                    page.render(b, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                    val f = File(dir, "page_%04d.png".format(java.util.Locale.US, i + 1))
+                    f.outputStream().buffered().use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    b.recycle()
+                    out += f
+                }
+            }
+        }
+    } ?: error("cannot open $uri")
+    return out
 }

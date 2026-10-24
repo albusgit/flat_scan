@@ -3,6 +3,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/photo.hpp>
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -355,11 +356,87 @@ bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<fl
 // (YCrCb skin box). They are filled with the paper colour around them (a smooth Telea fill at
 // 1/4 size, so a line crossing the edge fades instead of ending in a hard cut) and marked as
 // paper. Text under a finger is not invented: it is paper. Returns the share of the page filled.
-double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
+// Skin colour sampled from the photo around the page (finger rule 2): the largest skin-like region outside
+// the page's footprint (the hand and arm holding it), as a Gaussian in CrCb plus its luma range.
+struct SkinModel {
+    bool ok = false;
+    double cr = 0, cb = 0, icov[3] = {0, 0, 0};   // mean, inverse covariance (a, b, c of [[a, b], [b, c]])
+    double ymin = 0, ymax = 255;
+    double ring_share = 0;   // share of a band around the page in this colour: high = a table or wall, not a hand
+    bool skin(double y, double cr_, double cb_) const {
+        double dr = cr_ - cr, db = cb_ - cb;
+        return y >= ymin && y <= ymax && icov[0] * dr * dr + 2 * icov[1] * dr * db + icov[2] * db * db < 9.0;
+    }
+};
+
+SkinModel skin_model_outside(const cv::Mat& photo_bgr, const GridMap& g) {
+    SkinModel m;
+    const double k = 512.0 / std::max(photo_bgr.cols, photo_bgr.rows);
+    cv::Mat small, ycc;
+    cv::resize(photo_bgr, small, cv::Size(), k, k, cv::INTER_AREA);
+    cv::cvtColor(small, ycc, cv::COLOR_BGR2YCrCb);
+    cv::Mat foot = cv::Mat::zeros(small.size(), CV_8U);
+    for (int i = 0; i + 1 < g.gh; i += 2)
+        for (int j = 0; j + 1 < g.gw; j += 2) {
+            int i1 = std::min(g.gh - 1, i + 2), j1 = std::min(g.gw - 1, j + 2);
+            std::vector<cv::Point> q;
+            for (auto [ii, jj] : {std::pair{i, j}, {i, j1}, {i1, j1}, {i1, j}})
+                q.emplace_back((int)std::lround(g.x[(size_t)ii * g.gw + jj] * k), (int)std::lround(g.y[(size_t)ii * g.gw + jj] * k));
+            cv::fillConvexPoly(foot, q, cv::Scalar(255));
+        }
+    int d = std::max(3, (int)(0.03 * std::max(small.cols, small.rows)));
+    cv::dilate(foot, foot, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * d + 1, 2 * d + 1)));
+    cv::Mat cand;
+    cv::inRange(ycc, cv::Scalar(40, 135, 80), cv::Scalar(250, 180, 130), cand);
+    cand.setTo(0, foot);
+    for (int y = 0; y < ycc.rows; ++y)
+        for (int x = 0; x < ycc.cols; ++x) {
+            const cv::Vec3b& p = ycc.at<cv::Vec3b>(y, x);
+            if (std::abs(p[1] - 128) + std::abs(p[2] - 128) < 12) cand.at<uint8_t>(y, x) = 0;   // near grey: not skin
+        }
+    cv::Mat lab, st, cen;
+    int n = cv::connectedComponentsWithStats(cand, lab, st, cen, 8);
+    int best = 0, best_area = 0;
+    for (int i = 1; i < n; ++i)
+        if (st.at<int>(i, 4) > best_area) best_area = st.at<int>(i, 4), best = i;
+    if (best_area < 0.003 * small.total()) return m;
+    {
+        cv::Mat outer, ring;
+        cv::dilate(foot, outer, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * d + 1, 2 * d + 1)));
+        ring = outer & ~foot;
+        const double n_ring = cv::countNonZero(ring);
+        m.ring_share = n_ring > 0 ? cv::countNonZero((lab == best) & ring) / n_ring : 1.0;
+    }
+    std::vector<double> crs, cbs, ys;
+    for (int y = 0; y < lab.rows; ++y)
+        for (int x = 0; x < lab.cols; ++x)
+            if (lab.at<int>(y, x) == best) {
+                const cv::Vec3b& p = ycc.at<cv::Vec3b>(y, x);
+                ys.push_back(p[0]); crs.push_back(p[1]); cbs.push_back(p[2]);
+            }
+    auto mean = [](const std::vector<double>& v) { double s = 0; for (double x : v) s += x; return s / v.size(); };
+    m.cr = mean(crs); m.cb = mean(cbs);
+    double a = 0, b = 0, c = 0;
+    for (size_t i = 0; i < crs.size(); ++i) {
+        double dr = crs[i] - m.cr, db = cbs[i] - m.cb;
+        a += dr * dr; b += dr * db; c += db * db;
+    }
+    a = a / crs.size() + 4; b /= crs.size(); c = c / crs.size() + 4;   // + a floor: noise, JPEG
+    double det = a * c - b * b;
+    if (det <= 0) return m;
+    m.icov[0] = c / det; m.icov[1] = -b / det; m.icov[2] = a / det;
+    std::sort(ys.begin(), ys.end());
+    m.ymin = 0.6 * ys[ys.size() / 20];
+    m.ymax = std::min(255.0, 1.25 * ys[ys.size() * 19 / 20]);
+    m.ok = true;
+    return m;
+}
+
+double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper, cv::Mat* mask_out, int rules, const SkinModel* model) {
     const int w = page_bgra.cols, h = page_bgra.rows;
     cv::Mat hole = paper < 128;
     int n_hole = cv::countNonZero(hole);
-    if (n_hole == 0 || n_hole > 0.25 * w * h) return 0;
+    if ((n_hole == 0 && !(rules & kFingerSkinRegion)) || n_hole > 0.25 * w * h) return 0;
     cv::Mat bgr, ycc;
     cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
     cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
@@ -370,14 +447,42 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
     cv::Scalar pc = cv::mean(ycc, paper_px);
     cv::Mat skin;
     cv::inRange(ycc, cv::Scalar(40, std::max(140.0, pc[1] + 7), 77), cv::Scalar(255, 180, std::min(125.0, pc[2] - 4)), skin);
+    if ((rules & kFingerAdaptiveSkin) && model && model->ok) {
+        // the holding hand's own colour (sampled outside the page), still redder / less blue than this paper
+        skin.setTo(0);
+        for (int y = 0; y < h; ++y) {
+            const cv::Vec3b* q = ycc.ptr<cv::Vec3b>(y);
+            uint8_t* o = skin.ptr<uint8_t>(y);
+            for (int x = 0; x < w; ++x)
+                if (q[x][1] >= pc[1] + 7 && q[x][2] <= pc[2] - 4 && model->skin(q[x][0], q[x][1], q[x][2])) o[x] = 255;
+        }
+    }
     // fingers are smooth: ink strokes (text, rules) inside a candidate mean it is page content
     cv::Mat gray, edges;
     cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
     cv::Canny(gray, edges, 60, 150);
     cv::Mat lab, st, cen;
     int n = cv::connectedComponentsWithStats(hole, lab, st, cen, 8);
-    cv::Mat fill = cv::Mat::zeros(h, w, CV_8U);
     const int border = std::max(4, w / 100);
+    cv::Mat fill = cv::Mat::zeros(h, w, CV_8U);
+    // kFingerHandColour: a candidate is kept only if it is, on average, clearly redder and less blue than the
+    // paper; and hands hold a page from at most two sides: candidates coming in from three or four sides are the
+    // table, a box's flaps or a coloured frame around the page, and none is filled
+    int sides = 0;
+    auto accept = [&](int x, int y, int bw, int bh, const cv::Mat& comp) {
+        if (rules & kFingerHandColour) {
+            cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
+            if (cm[1] - pc[1] < 10 || cm[2] - pc[2] > -10) return;
+            // the side it comes in from: of the sides it touches, the one it runs along furthest (a hand along
+            // the whole bottom edge touches the left and right sides too)
+            int side = 0, run = -1;
+            const int touch[4] = {x <= border ? bh : -1, y <= border ? bw : -1, x + bw >= w - border ? bh : -1, y + bh >= h - border ? bw : -1};
+            for (int k = 0; k < 4; ++k)
+                if (touch[k] > run) run = touch[k], side = 1 << k;
+            sides |= side;
+        }
+        fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
+    };
     for (int i = 1; i < n; ++i) {
         int x = st.at<int>(i, 0), y = st.at<int>(i, 1), bw = st.at<int>(i, 2), bh = st.at<int>(i, 3), area = st.at<int>(i, 4);
         bool at_border = x <= border || y <= border || x + bw >= w - border || y + bh >= h - border;
@@ -394,18 +499,84 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
         if (std::getenv("FS_DEBUG_FINGERS")) {
             cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
             double whole = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & comp) / area;
-            std::fprintf(stderr, "finger cand %d,%d %dx%d area %d skin %.3f reach %d edge %.4f whole %.4f dY %.1f dCr %.1f dCb %.1f\n", x, y, bw, bh, area,
-                         skin_frac, reach, edge_frac, whole, cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2]);
+            cv::Mat dist;
+            cv::distanceTransform(comp, dist, cv::DIST_L2, 3);
+            double mx;
+            cv::minMaxLoc(dist, nullptr, &mx);
+            std::fprintf(stderr, "finger cand %d,%d %dx%d area %d skin %.3f reach %d edge %.4f whole %.4f dY %.1f dCr %.1f dCb %.1f thick %.3f\n", x, y, bw, bh, area,
+                         skin_frac, reach, edge_frac, whole, cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2], 2 * mx / w);
         }
         // skin >= 35%: the hole often takes in the background strip beside the finger too (receipt: 0.499)
         if (skin_frac < 0.35 || reach < 2 * border || edge_frac > 0.03) continue;
-        fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
+        if (rules & kFingerContact) {
+            // location prior: a finger comes in over the page edge, so the candidate itself (not just its
+            // bounding box) lies along the border for at least 1.5 border widths
+            cv::Mat band = cv::Mat::zeros(h, w, CV_8U);
+            cv::rectangle(band, cv::Rect(0, 0, w, h), cv::Scalar(255), 2 * border);
+            cv::Mat touch = band(cv::Rect(x, y, bw, bh)) & comp;
+            cv::Rect tb = cv::boundingRect(touch);
+            if (std::max(tb.width, tb.height) < 1.5 * border) continue;
+        }
+        if (rules & kFingerShape) {
+            // a finger's width: its thickest point (twice the largest distance to its outline) between 2 and
+            // 16 % of the page width; wider skin-coloured areas are a picture, a table, a sleeve
+            cv::Mat dist;
+            cv::distanceTransform(comp, dist, cv::DIST_L2, 3);
+            double mx;
+            cv::minMaxLoc(dist, nullptr, &mx);
+            double thick = 2 * mx / w;
+            if (thick < 0.02 || thick > 0.16) continue;
+        }
+        accept(x, y, bw, bh, comp);
     }
+    if (std::getenv("FS_DEBUG_FINGERS") && model) std::fprintf(stderr, "skin model ok %d ring share %.2f\n", (int)model->ok, model->ring_share);
+    // (a page lying on a wooden table or held against a skin-coloured wall: that colour is all around the
+    // page, and the hand's colour cannot be told from it)
+    if ((rules & kFingerSkinRegion) && model && model->ok && model->ring_share < 0.4) {
+        // a finger the page mask took for paper: an area of the hand's own colour (sampled outside the page,
+        // so a hand must be in the photo), smooth, coming in over the page border
+        cv::Mat hand = cv::Mat::zeros(h, w, CV_8U);
+        for (int y = 0; y < h; ++y) {
+            const cv::Vec3b* q = ycc.ptr<cv::Vec3b>(y);
+            uint8_t* o = hand.ptr<uint8_t>(y);
+            for (int x = 0; x < w; ++x)
+                if (q[x][1] >= pc[1] + 7 && q[x][2] <= pc[2] - 4 && model->skin(q[x][0], q[x][1], q[x][2])) o[x] = 255;
+        }
+        const cv::Mat k_open = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(border | 1, border | 1));
+        cv::morphologyEx(hand, hand, cv::MORPH_OPEN, k_open);
+        cv::morphologyEx(hand, hand, cv::MORPH_CLOSE, k_open);
+        hand.setTo(0, fill);
+        int m = cv::connectedComponentsWithStats(hand, lab, st, cen, 8);
+        cv::Mat band = cv::Mat::zeros(h, w, CV_8U);
+        cv::rectangle(band, cv::Rect(0, 0, w, h), cv::Scalar(255), 2 * border);
+        for (int i = 1; i < m; ++i) {
+            int x = st.at<int>(i, 0), y = st.at<int>(i, 1), bw = st.at<int>(i, 2), bh = st.at<int>(i, 3), area = st.at<int>(i, 4);
+            if (area < 0.002 * w * h || area > 0.25 * w * h) continue;
+            cv::Mat comp = lab(cv::Rect(x, y, bw, bh)) == i;
+            cv::Rect tb = cv::boundingRect(band(cv::Rect(x, y, bw, bh)) & comp);
+            if (std::max(tb.width, tb.height) < 1.5 * border) continue;   // does not come in over the border
+            int reach = std::min(std::min(x + bw, w - x), std::min(y + bh, h - y));
+            cv::Mat inner;
+            cv::erode(comp, inner, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
+            int n_inner = cv::countNonZero(inner);
+            if (n_inner < 0.2 * area) continue;
+            double edge_frac = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & inner) / n_inner;
+            if (std::getenv("FS_DEBUG_FINGERS")) {
+                cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
+                std::fprintf(stderr, "skin region %d,%d %dx%d area %d reach %d edge %.4f dY %.1f dCr %.1f dCb %.1f\n", x, y, bw, bh, area, reach, edge_frac,
+                             cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2]);
+            }
+            if (reach < 2 * border || edge_frac > 0.03) continue;
+            accept(x, y, bw, bh, comp);
+        }
+    }
+    if ((rules & kFingerHandColour) && std::bitset<32>((unsigned)sides).count() >= 3) fill.setTo(0);
     int n_fill = cv::countNonZero(fill);
     if (n_fill == 0) return 0;
     // the fringe of the finger (shadow, blurred edge) goes with it
     cv::dilate(fill, fill, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
-    fill_with_paper(page_bgra, fill, &paper);
+    if (mask_out) *mask_out = fill.clone();
+    fill_finger(page_bgra, fill, &paper);
     return (double)n_fill / (w * h);
 }
 
@@ -1339,7 +1510,18 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         if (r.paper.empty()) r.paper = cv::Mat(r.page.size(), CV_8U, cv::Scalar(255));
         r.paper.setTo(0, b);
     }
-    if (opt.erase_fingers && !r.paper.empty()) r.fingers_erased = erase_fingers(r.page, r.paper);
+    if (opt.erase_fingers && !r.paper.empty()) {
+        // the page as it was, for the app's finger brush (add / remove areas, PipelineOptions::keep_unerased)
+        if (opt.keep_unerased) {
+            r.page_unerased = r.page.clone();
+            r.paper_unerased = r.paper.clone();
+        }
+        SkinModel sm;
+        if (opt.finger_rules & (kFingerAdaptiveSkin | kFingerSkinRegion)) sm = skin_model_outside(photo, r.render_map);
+        r.fingers_erased = erase_fingers(r.page, r.paper, &r.finger_mask, opt.finger_rules, &sm);
+        if (r.finger_mask.empty()) r.page_unerased.release(), r.paper_unerased.release();
+        else r.fingers_over_text = finger_over_text(r.page_unerased.empty() ? r.page : r.page_unerased, r.finger_mask, r.paper);
+    }
     // before page: perspective only, same rotation and size (made beside the nets when they kept both)
     if (!spec.before.empty() && same_homography(Uh, spec.Uh) && r.rot == spec.o.rot) {
         r.before = spec.before;
@@ -1401,6 +1583,105 @@ void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper) {
             if (pa) pa[x] = std::max(pa[x], a[x]);
         }
     }
+}
+
+namespace {
+// The paper around [mask] (page px), with print taken out: a 1/4-size copy whose dark marks are lifted by a
+// 5x5 max filter, filled into the mask from the paper around it only (normalized convolution at growing
+// scales, so each spot gets its nearest paper).
+cv::Mat paper_behind(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat* paper) {
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    cv::Size ss(std::max(1, w / 4), std::max(1, h / 4));
+    cv::Mat bgr, small, sm, known;
+    cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
+    cv::resize(bgr, small, ss, 0, 0, cv::INTER_AREA);
+    cv::dilate(small, small, cv::Mat::ones(5, 5, CV_8U));   // print out: the paper's own colour
+    cv::resize(mask, sm, ss, 0, 0, cv::INTER_AREA);
+    cv::dilate(sm > 0, sm, cv::Mat::ones(5, 5, CV_8U));
+    known = sm == 0;
+    if (paper && !paper->empty()) {
+        cv::Mat ps;
+        cv::resize(*paper, ps, ss, 0, 0, cv::INTER_AREA);
+        known &= ps > 200;
+    }
+    cv::Mat src, k32, out = cv::Mat::zeros(ss, CV_32FC3), done = known.clone();
+    small.convertTo(src, CV_32FC3);
+    known.convertTo(k32, CV_32F, 1 / 255.0);
+    src.copyTo(out, known);
+    for (double sigma : {2.0, 4.0, 8.0, 16.0, 32.0, 64.0}) {
+        cv::Mat num, den, s3;
+        cv::Mat k3;
+        cv::merge(std::vector<cv::Mat>{k32, k32, k32}, k3);
+        cv::GaussianBlur(src.mul(k3), num, cv::Size(0, 0), sigma);
+        cv::GaussianBlur(k32, den, cv::Size(0, 0), sigma);
+        for (int y = 0; y < ss.height; ++y)
+            for (int x = 0; x < ss.width; ++x)
+                if (!done.at<uint8_t>(y, x) && den.at<float>(y, x) > 0.02f) {
+                    out.at<cv::Vec3f>(y, x) = num.at<cv::Vec3f>(y, x) / den.at<float>(y, x);
+                    done.at<uint8_t>(y, x) = 255;
+                }
+        if (cv::countNonZero(done) == ss.area()) break;
+    }
+    cv::Mat full;
+    cv::resize(out, full, cv::Size(w, h), 0, 0, cv::INTER_LINEAR);
+    full.convertTo(full, CV_8UC3);
+    return full;
+}
+}  // namespace
+
+bool finger_over_text(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat& paper) {
+    if (mask.empty() || cv::countNonZero(mask) == 0) return false;
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    int r = std::max(4, w / 60);
+    cv::Mat ring;
+    cv::dilate(mask, ring, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * r + 1, 2 * r + 1)));
+    ring &= ~mask;
+    if (!paper.empty()) ring &= paper > 200;
+    // away from the page border (the border itself is not text)
+    int b = std::max(4, w / 100);
+    cv::rectangle(ring, cv::Rect(0, 0, w, h), cv::Scalar(0), 2 * b);
+    int n = cv::countNonZero(ring);
+    if (n < 50) return false;
+    cv::Mat gray, bg;
+    cv::cvtColor(page_bgra, gray, cv::COLOR_BGRA2GRAY);
+    cv::dilate(gray, bg, cv::Mat::ones(15, 15, CV_8U));
+    cv::Mat ink = gray < bg - 60;
+    return (double)cv::countNonZero(ink & ring) / n > 0.02;
+}
+
+void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper, bool mark) {
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    if (mask.empty() || mask.size() != page_bgra.size() || cv::countNonZero(mask) == 0) return;
+    bool over_text = mark && finger_over_text(page_bgra, mask, paper ? *paper : cv::Mat());
+    cv::Mat fill = paper_behind(page_bgra, mask, paper);
+    cv::Mat soft;
+    cv::GaussianBlur(mask, soft, cv::Size(0, 0), 1.5);
+    soft = cv::max(soft, mask);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* p = page_bgra.ptr<uint8_t>(y);
+        const uint8_t* f = fill.ptr<uint8_t>(y);
+        const uint8_t* a = soft.ptr<uint8_t>(y);
+        uint8_t* pa = paper && !paper->empty() ? paper->ptr<uint8_t>(y) : nullptr;
+        for (int x = 0; x < w; ++x) {
+            if (!a[x]) continue;
+            float t = a[x] / 255.f;
+            for (int k = 0; k < 3; ++k) p[4 * x + k] = (uint8_t)std::lround(p[4 * x + k] * (1 - t) + f[3 * x + k] * t);
+            if (pa) pa[x] = std::max(pa[x], a[x]);
+        }
+    }
+    if (!over_text) return;
+    // text ran under the finger: the filled area is outlined (dashed grey) instead of looking like blank
+    // paper, so a reader knows something is missing there; the stretch along the page border is left out
+    std::vector<std::vector<cv::Point>> cs;
+    cv::findContours(mask.clone(), cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    const int th = std::max(2, w / 600), dash = std::max(8, w / 120), b = std::max(4, w / 100);
+    for (auto& c : cs)
+        for (size_t i = 0; i + 1 < c.size(); ++i) {
+            cv::Point q = c[i];
+            if (q.x < b || q.y < b || q.x >= w - b || q.y >= h - b) continue;
+            if ((i / dash) % 2) continue;
+            cv::line(page_bgra, c[i], c[i + 1], cv::Scalar(140, 140, 140, 255), th, cv::LINE_AA);
+        }
 }
 
 PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {

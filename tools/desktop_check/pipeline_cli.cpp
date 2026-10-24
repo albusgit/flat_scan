@@ -40,6 +40,7 @@
 #include "cleanup.h"
 #include "nets.h"
 #include "pipeline.h"
+#include "board.h"
 #ifdef FS_DESKTOP_GPU
 #include "gpu.h"
 #include "resample.h"
@@ -183,6 +184,7 @@ int main(int argc, char** argv) {
     if (std::getenv("FS_NO_SOFTEN")) o.max_local_rescale = 0;
     if (const char* st = std::getenv("FS_SOFTEN_THR")) o.max_local_rescale = std::atof(st);
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
+    if (const char* fr = std::getenv("FS_FINGER_RULES")) o.finger_rules = std::atoi(fr);   // kFinger* bits
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
     // FS_FRAME_CORNERS=1: the photo's frame is the page, as if set by hand (benchmarks whose photos are
     // cropped to the page, e.g. DocUNet); FS_NO_ORIENT=1: no 0/90/180/270 decision
@@ -192,6 +194,26 @@ int main(int argc, char** argv) {
         o.corners = {cv::Point2d(0, 0), cv::Point2d(img.cols - 1, 0), cv::Point2d(img.cols - 1, img.rows - 1), cv::Point2d(0, img.rows - 1)};
     }
     o.auto_orient = std::getenv("FS_NO_ORIENT") == nullptr;
+    // FS_BOARD=1 (or =dark): whiteboard mode as the app runs it: the board's corners (find_board; the whole
+    // frame when none is reliable), perspective only, no finger erase, no orientation decision; with
+    // FS_RENDER the Whiteboard (Dark slide) filter at 0.7 goes to OUT.jpg.board.jpg
+    const char* board_env = std::getenv("FS_BOARD");
+    BoardQuad board;
+    if (board_env) {
+        const int64 t_board = cv::getTickCount();
+        board = find_board(img);
+        const double board_ms = (cv::getTickCount() - t_board) * 1000.0 / cv::getTickFrequency();
+        o.corners_edited = true;
+        o.corners = board.ok ? board.pts
+                             : std::array<cv::Point2d, 4>{cv::Point2d(1, 1), cv::Point2d(img.cols - 2, 1), cv::Point2d(img.cols - 2, img.rows - 2), cv::Point2d(1, img.rows - 2)};
+        o.perspective_only = true;
+        o.erase_fingers = false;
+        o.auto_orient = false;
+        std::fprintf(stderr, "board: %.1f ms\n", board_ms);
+        std::fprintf(stderr, "board: ok %d method %s confidence %.2f area %.2f dark %d corners %.0f,%.0f %.0f,%.0f %.0f,%.0f %.0f,%.0f\n", board.ok, board.method,
+                     board.confidence, board.area, (int)board_is_dark(img, board), o.corners[0].x, o.corners[0].y, o.corners[1].x, o.corners[1].y,
+                     o.corners[2].x, o.corners[2].y, o.corners[3].x, o.corners[3].y);
+    }
     o.scan_flattened = std::getenv("FS_SCAN_FLAT") != nullptr;   // with FS_SCAN=1: the input was flattened by a net
     o.orient_true_aspect = std::getenv("FS_ORIENT_A4") == nullptr;   // FS_ORIENT_A4=1: decide on the A4-shaped page (round 7)
     // FS_UV_MIN_AGREE=x: the page-outline agreement a net's grid needs (0: always used)
@@ -529,6 +551,30 @@ int main(int argc, char** argv) {
         cv::Mat bgr;
         cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);
         cv::imwrite(argv[2], bgr, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // FS_FINGER_OUT=PREFIX: for the finger evaluation (tools/fingers/eval.py), in the PHOTO's frame:
+        // PREFIX_footprint.png (the photo pixels the page shows) and PREFIX_fingers.png (those it filled as a
+        // finger), each page grid cell (4 px) drawn as the quad it comes from
+        if (const char* fo = std::getenv("FS_FINGER_OUT")) {
+            const GridMap& g = r.render_map;
+            cv::Mat foot = cv::Mat::zeros(img.size(), CV_8U), fing = cv::Mat::zeros(img.size(), CV_8U);
+            for (int i = 0; i + 1 < g.gh; ++i)
+                for (int j = 0; j + 1 < g.gw; ++j) {
+                    std::vector<cv::Point> q;
+                    for (auto [di, dj] : {std::pair{0, 0}, {0, 1}, {1, 1}, {1, 0}}) {
+                        int ii = i + di, jj = j + dj;
+                        q.emplace_back((int)std::lround(g.x[(size_t)ii * g.gw + jj]), (int)std::lround(g.y[(size_t)ii * g.gw + jj]));
+                    }
+                    cv::fillConvexPoly(foot, q, cv::Scalar(255));
+                    if (!r.finger_mask.empty()) {
+                        int y0 = i * g.stride, x0 = j * g.stride;
+                        cv::Rect cell(x0, y0, g.stride, g.stride);
+                        cell &= cv::Rect(0, 0, r.finger_mask.cols, r.finger_mask.rows);
+                        if (cell.area() > 0 && cv::countNonZero(r.finger_mask(cell)) * 2 >= cell.area()) cv::fillConvexPoly(fing, q, cv::Scalar(255));
+                    }
+                }
+            cv::imwrite(std::string(fo) + "_footprint.png", foot);
+            cv::imwrite(std::string(fo) + "_fingers.png", fing);
+        }
         // FS_PAGE_PNG=PREFIX: the flattened page and its paper alpha, lossless (tools/filters/)
         if (const char* pg = std::getenv("FS_PAGE_PNG")) {
             cv::imwrite(std::string(pg) + "_page.png", bgr);
@@ -543,7 +589,17 @@ int main(int argc, char** argv) {
                           cv::Scalar(0, 140, 255), 4);
         cv::imwrite(std::string(argv[2]) + ".lines.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 80});
         // FS_RENDER=1: the page as the app shows it by default (Auto color 0.7) -> OUT.jpg.auto.jpg
-        if (std::getenv("FS_RENDER")) {
+        if (std::getenv("FS_RENDER") && board_env) {
+            PageParams pp = page_params(r.page, false);
+            RenderParams rp;
+            // as the app: the Dark slide filter when the screen is mostly dark (FS_BOARD=dark forces it)
+            bool dark = std::string(board_env) == "dark" || board_is_dark(img, board);
+            rp.filter = dark ? Filter::ProjectorDark : Filter::Whiteboard;
+            rp.strength = 0.7f;
+            cv::Mat shown = render_page(r.page, r.paper, pp, rp, {}, false);
+            cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);
+            cv::imwrite(std::string(argv[2]) + ".board.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 88});
+        } else if (std::getenv("FS_RENDER")) {
             PageParams pp = page_params(r.page, false);
             cv::Mat shown = render_page(r.page, r.paper, pp, Filter::AutoColor, 0.7f, false, {}, false);
             cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);

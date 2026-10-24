@@ -102,110 +102,9 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import kotlin.math.min
 
-@Composable
-fun HomeScreen(vm: ScanViewModel) {
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
-    var confirmNew by remember { mutableStateOf(false) }
-    val n = vm.pages.size
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    // scrolls on short screens; otherwise "Start a new document" sits at the bottom
-    BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
-        Column(
-            Modifier.verticalScroll(rememberScrollState()).heightIn(min = maxHeight)
-                .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 20.dp),
-        ) {
-            Row(Modifier.fillMaxWidth().height(48.dp), verticalAlignment = Alignment.CenterVertically) {
-                LogoMark(Modifier.size(26.dp))
-                Spacer(Modifier.width(10.dp))
-                Text("FlatScan", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                IconButton(onClick = { vm.open(Screen.Settings) }) { Icon(Icons.Outlined.Settings, "Settings") }
-            }
-            Spacer(Modifier.height(28.dp))
-            HighlightedHeadline("Flat, clean pages\nfrom ", "any photo.")
-            Spacer(Modifier.height(10.dp))
-            Text(
-                "Bent, curled or shadowed: FlatScan finds the page, flattens it and whitens the paper.",
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp), color = muted,
-            )
-            Spacer(Modifier.height(28.dp))
-            // the main action: a ballpoint-blue card that presses down into its ink shadow
-            InkPressable(
-                onClick = { vm.startCamera() }, shape = RoundedCornerShape(12.dp), depth = 4.dp,
-                container = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.fillMaxWidth().height(172.dp),
-            ) {
-                Column(Modifier.fillMaxSize().padding(22.dp), verticalArrangement = Arrangement.SpaceBetween) {
-                    Box(
-                        Modifier.size(52.dp).background(LocalContentColor.current.copy(alpha = 0.16f), RoundedCornerShape(10.dp)),
-                        contentAlignment = Alignment.Center,
-                    ) { Icon(Icons.Outlined.PhotoCamera, null, Modifier.size(28.dp)) }
-                    Column {
-                        Text("Scan with camera", style = MaterialTheme.typography.headlineSmall)
-                        Text("Hold the phone above the page", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.alpha(0.85f))
-                    }
-                }
-            }
-            Spacer(Modifier.height(14.dp))
-            // an index card: white, a red rule along the top
-            PaperSurface(
-                onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                modifier = Modifier.fillMaxWidth().height(64.dp),
-            ) {
-                Box(Modifier.fillMaxWidth().padding(top = 9.dp).height(1.dp).background(MaterialTheme.colorScheme.error.copy(alpha = 0.55f)))
-                Row(Modifier.fillMaxSize().padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(22.dp))
-                    Spacer(Modifier.width(14.dp))
-                    Text("Import photos", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold), modifier = Modifier.weight(1f))
-                    Text("Several at once", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium), color = muted)
-                }
-            }
-            if (n > 0) {
-                Spacer(Modifier.height(32.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "CURRENT DOCUMENT", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 13.sp, letterSpacing = 0.08.em),
-                        color = muted, modifier = Modifier.weight(1f),
-                    )
-                    TextButton(onClick = { vm.open(Screen.Pages) }) { Text("Open") }
-                }
-                Spacer(Modifier.height(4.dp))
-                DocumentCard(vm, onClick = { vm.open(Screen.Pages) })
-            } else {
-                Spacer(Modifier.height(36.dp))
-                // nothing scanned yet
-                Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    CrumpledBall(Modifier.size(60.dp), paper = MaterialTheme.colorScheme.surfaceContainerLowest, ink = MaterialTheme.colorScheme.onSurface)
-                    Spacer(Modifier.width(16.dp))
-                    Column {
-                        Text("Bring me a wrinkled page.", style = MaterialTheme.typography.titleMedium)
-                        Text("Folded, curled or crumpled: it comes out flat.", style = MaterialTheme.typography.bodyMedium, color = muted)
-                    }
-                }
-            }
-            Spacer(Modifier.weight(1f).heightIn(min = 24.dp))
-            if (n > 0) {
-                TextButton(
-                    onClick = { confirmNew = true },
-                    colors = ButtonDefaults.textButtonColors(contentColor = muted),
-                    modifier = Modifier.align(Alignment.CenterHorizontally).height(44.dp),
-                ) { Text("Start a new document", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)) }
-            }
-        }
-    }
-    if (confirmNew) {
-        AlertDialog(
-            onDismissRequest = { confirmNew = false },
-            title = { Text("Start a new document?") },
-            text = { Text(if (n == 1) "The current page will be removed from the app. Save it first if you need it." else "The current $n pages will be removed from the app. Save them first if you need them.") },
-            confirmButton = { TextButton(onClick = { vm.newDocument(); confirmNew = false }) { Text("New document") } },
-            dismissButton = { TextButton(onClick = { confirmNew = false }) { Text("Cancel") } },
-        )
-    }
-}
-
 /** The app mark: a page with a folded corner; its first accent line starts wavy and ends straight. */
 @Composable
-private fun LogoMark(modifier: Modifier = Modifier) {
+internal fun LogoMark(modifier: Modifier = Modifier) {
     val ink = MaterialTheme.colorScheme.onSurface
     val accent = MaterialTheme.colorScheme.primary
     Canvas(modifier) {
@@ -230,7 +129,7 @@ private var highlighterSwiped = false
 
 /** The home headline: [lead] then [marked], which a highlighter swipes across (once per launch). */
 @Composable
-private fun HighlightedHeadline(lead: String, marked: String) {
+internal fun HighlightedHeadline(lead: String, marked: String) {
     val light = isPaperLight()
     val marker = if (light) Palette.Highlighter else Graphite.Highlighter
     val reduced = rememberReducedMotion()
@@ -273,61 +172,6 @@ private fun HighlightedHeadline(lead: String, marked: String) {
             }
         },
     )
-}
-
-/** The current document on the home screen: the first page over the sheets behind it, count and filter. */
-@Composable
-private fun DocumentCard(vm: ScanViewModel, onClick: () -> Unit) {
-    val n = vm.pages.size
-    val first = vm.pages.firstOrNull()
-    val version = first?.let { vm.pageVersions[it] } ?: 0
-    var thumb by remember(first) { mutableStateOf<android.graphics.Bitmap?>(null) }
-    LaunchedEffect(first, version) { thumb = first?.let { vm.thumbnail(it) } }
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    PaperSurface(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(84.dp, 96.dp)) {
-                val sheet = RoundedCornerShape(2.dp)
-                val paper = Color.White
-                val edge = Palette.Outline
-                // the sheets behind the first page, squared up like a stack on a desk
-                for (k in minOf(n - 1, 2) downTo 1) {
-                    Box(
-                        Modifier.offset((4 + 7 * k).dp, (8 - 3 * k).dp).size(62.dp, 84.dp)
-                            .background(paper, sheet).border(1.dp, edge, sheet),
-                    )
-                }
-                Box(
-                    Modifier.offset(4.dp, 8.dp).size(62.dp, 84.dp)
-                        .shadow(3.dp, sheet).background(paper, sheet).border(1.dp, edge, sheet).clip(sheet),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    val t = thumb
-                    if (t != null) {
-                        val img = remember(t) { t.asImageBitmap() }
-                        Image(img, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                    } else {
-                        Icon(Icons.Outlined.Description, null, tint = Color(0xFFB9B7B1))
-                    }
-                }
-            }
-            Spacer(Modifier.width(14.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                val ctx = androidx.compose.ui.platform.LocalContext.current
-                val name = remember(n, version) { com.albus.flatscan.DocumentName.get(ctx) }
-                if (name != null) Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
-                Text(
-                    if (n == 1) "1 page" else "$n pages",
-                    style = if (name != null) MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono) else MaterialTheme.typography.titleMedium,
-                )
-                Text(
-                    if (vm.hasSession) vm.params.filter.label else "Tap to open",
-                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = muted,
-                )
-            }
-            Icon(Icons.Outlined.ChevronRight, null, tint = muted)
-        }
-    }
 }
 
 @Composable
@@ -376,6 +220,7 @@ fun SettingsScreen(vm: ScanViewModel) {
     var filter by remember { mutableStateOf(s.defaultFilter) }
     var solid by remember { mutableStateOf(s.solidColors) }
     var autoRotate by remember { mutableStateOf(s.autoRotate) }
+    var ocrAfter by remember { mutableStateOf(s.ocrAfterScan) }
     var pageFinder by remember { mutableStateOf(s.pageFinderNet) }
     var uvDoc by remember { mutableStateOf(s.uvDoc) }
     var flatNets by remember { mutableIntStateOf(s.flatNets) }
@@ -393,13 +238,14 @@ fun SettingsScreen(vm: ScanViewModel) {
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
             Section("Default filter")
-            for (f in FilterKind.entries) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
+            for (f in FilterKind.forMode(com.albus.flatscan.CaptureMode.Document)) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
             Text(
                 "The filter and strength you choose on a page become the default for the next one.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             RuledDivider(Modifier.padding(vertical = 8.dp))
             SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
+            SwitchRow("Recognise text after scanning", "Hebrew and English, on the phone: search finds documents by their text", ocrAfter) { ocrAfter = it; s.ocrAfterScan = it }
             SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
             RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("Finding the page")
@@ -407,7 +253,7 @@ fun SettingsScreen(vm: ScanViewModel) {
             SwitchRow("Neural flattening", "UVDoc and SyntheticDoc high-res; off: flatten from the page outline only", uvDoc, icon = PaperIcons.Iron) { uvDoc = it; s.uvDoc = it }
             if (uvDoc) for ((k, label) in listOf(0 to "Both nets: keep the straighter page", 1 to "UVDoc only", 2 to "SyntheticDoc high-res only")) Choice(label, flatNets == k) { flatNets = k; s.flatNets = k }
             SwitchRow("Remove shadows", "Shadow net: hand, object and leaf shadows; colours kept", neuralShadows) { neuralShadows = it; s.neuralShadows = it }
-            SwitchRow("Table rules (neural net)", "Rule net: straighten printed rules, not text rows or curves; off: rules from darkness alone", ruleNet) { ruleNet = it; s.ruleNet = it }
+            SwitchRow("Table rules (neural net)", "Rule net: printed rules and text lines (any script); off: rules from darkness, rows from ink", ruleNet) { ruleNet = it; s.ruleNet = it }
             SwitchRow("Check every crop", "Off: only doubtful crops stop at the crop screen", reviewCrops) { reviewCrops = it; s.reviewCrops = it }
             SwitchRow("Book spreads: right page first", "For Hebrew and Arabic books; off: left page first", bookRtl) { bookRtl = it; s.bookRightToLeft = it }
             RuledDivider(Modifier.padding(vertical = 8.dp))
@@ -437,6 +283,17 @@ fun SettingsScreen(vm: ScanViewModel) {
                 if (vm.batchRunning) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(vm.batchStatus, style = MaterialTheme.typography.bodySmall)
             }
+            RuledDivider(Modifier.padding(vertical = 8.dp))
+            Section("Sync")
+            val sc = vm.syncConfig
+            Text(
+                if (sc.configured) "Uploading to ${sc.kind.label}" + (if (sc.autoUpload) ", automatically" else ", by hand") else "Off: scans stay on this phone",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { vm.open(Screen.Sync) }) { Text("Sync to your server") }
+            RuledDivider(Modifier.padding(vertical = 8.dp))
+            StorageSection(vm)
             RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("About")
             Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodyMedium)
@@ -510,7 +367,7 @@ private fun SwitchRow(title: String, caption: String, checked: Boolean, icon: Im
 }
 
 @Composable
-private fun Section(t: String) {
+internal fun Section(t: String) {
     Text(
         t.uppercase(), style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 13.sp, letterSpacing = 0.06.em),
         color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 16.dp, bottom = 6.dp),
@@ -567,4 +424,36 @@ private fun PaperPlaneLanding(key: Any) {
         },
         tint = MaterialTheme.colorScheme.inversePrimary,
     )
+}
+
+/** Settings > Storage: what the scans take, and removing the original photos of old documents. */
+@Composable
+private fun StorageSection(vm: ScanViewModel) {
+    LaunchedEffect(Unit) { vm.measureStorage() }
+    var days by remember { mutableStateOf<Int?>(null) }
+    Section("Storage")
+    val u = vm.storage
+    Text(
+        if (u == null) "Measuring..." else "${com.albus.flatscan.formatBytes(u.total)} for ${u.documents} documents (${u.pages} pages); " +
+            "original photos: ${com.albus.flatscan.formatBytes(u.originals)}",
+        style = MaterialTheme.typography.bodyMedium,
+    )
+    Text(
+        "Every page keeps its original photo, so a crop or the unwarp can be changed later without losing quality. " +
+            "Removing the originals of old documents frees space; their pages can still be filtered, rotated and exported, but not re-cropped.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        for (d in listOf(30, 90, 365)) OutlinedButton(onClick = { days = d }) { Text(if (d == 365) "> 1 year" else "> $d days") }
+    }
+    days?.let { d ->
+        AlertDialog(
+            onDismissRequest = { days = null },
+            title = { Text("Remove original photos?") },
+            text = { Text("The original photos of documents not changed in the last ${if (d == 365) "year" else "$d days"} are deleted. Their pages stay, but can no longer be re-cropped.") },
+            confirmButton = { TextButton(onClick = { vm.dropOriginals(d); days = null }) { Text("Remove") } },
+            dismissButton = { TextButton(onClick = { days = null }) { Text("Cancel") } },
+        )
+    }
 }

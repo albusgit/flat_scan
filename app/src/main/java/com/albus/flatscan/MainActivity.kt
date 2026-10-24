@@ -26,6 +26,8 @@ import com.albus.flatscan.ui.LicensesScreen
 import com.albus.flatscan.ui.ProcessingScreen
 import com.albus.flatscan.ui.ResultScreen
 import com.albus.flatscan.ui.SettingsScreen
+import com.albus.flatscan.ui.TrashScreen
+import com.albus.flatscan.ui.SyncScreen
 
 class MainActivity : ComponentActivity() {
     private val vm: ScanViewModel by viewModels()
@@ -112,6 +114,8 @@ private fun App(vm: ScanViewModel) {
             Screen.Pages -> PagesScreen(vm)
             Screen.Settings -> SettingsScreen(vm)
             Screen.Licenses -> LicensesScreen(vm)
+            Screen.Trash -> TrashScreen(vm)
+            Screen.Sync -> SyncScreen(vm)
         }
         MessageHost(vm)
     }

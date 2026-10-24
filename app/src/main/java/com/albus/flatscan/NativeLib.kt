@@ -17,7 +17,21 @@ enum class FilterKind(val id: Int, val label: String) {
     Grayscale(3, "Grayscale"),
     HighContrast(4, "High contrast"),
     BlackWhite(5, "B&W"),
+    Whiteboard(7, "Whiteboard"),         // whiteboard mode: board white, marker colours kept and boosted (core/src/board.cpp)
+    ProjectorDark(8, "Dark slide"),      // whiteboard mode: a projected slide with a dark background
+    ;
+
+    companion object {
+        /** The filters offered for a page of [mode]. */
+        fun forMode(mode: CaptureMode): List<FilterKind> = when (mode) {
+            CaptureMode.Document -> listOf(Original, Scan, Lighten, AutoColor, Grayscale, HighContrast, BlackWhite)
+            CaptureMode.Whiteboard -> listOf(Whiteboard, ProjectorDark, Original, AutoColor)
+        }
+    }
 }
+
+/** What is being scanned: a document (the full pipeline) or a whiteboard / projector screen (perspective only, its own cleanup). */
+enum class CaptureMode(val label: String) { Document("Document"), Whiteboard("Whiteboard") }
 
 /**
  * Everything the user can change on the result screen; switching any of these never re-runs
@@ -50,6 +64,9 @@ object NativeLib {
     init {
         System.loadLibrary("flatscan")
     }
+
+    /** A one-channel JPEG of [bitmap] (ARGB_8888) at [quality] (export, grayscale pages); null on failure. */
+    @JvmStatic external fun encodeGrayJpeg(bitmap: Bitmap, quality: Int): ByteArray?
 
     /** Which backend the heavy image passes use, with the GLES driver string. */
     @JvmStatic external fun gpuInfo(): String
@@ -108,8 +125,14 @@ object NativeLib {
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, listener: ProgressListener?,
+        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, board: Boolean, listener: ProgressListener?,
     ): Long
+
+    /**
+     * Whiteboard mode: the board or screen in [photo] (core/src/board.cpp): [x0, y0 .. x3, y3 (TL, TR, BR,
+     * BL), confidence, area share, dark (1: a dark slide)], or null when no reliable quadrilateral is found.
+     */
+    @JvmStatic external fun detectBoard(photo: Bitmap): FloatArray?
 
     /**
      * JSON: ok, error, mode, fell_back, fit_median_px, rot, gpu_resample, legend_px (wrinkle
@@ -152,7 +175,13 @@ object NativeLib {
      * Erase tool: the page as processed with every rectangle (page fractions [x0, y0, x1, y1, ...])
      * filled with the paper around it; an empty array restores the page. Re-render afterwards.
      */
-    @JvmStatic external fun setErase(handle: Long, rects: FloatArray): Boolean
+    @JvmStatic external fun setEdits(handle: Long, rects: FloatArray, fingersAuto: Boolean, strokes: FloatArray): Boolean
+
+    /**
+     * The finger brush's view: [out] (ARGB) filled with the mask a render with these settings fills, translucent
+     * orange on transparent. Returns the share of the page in the mask.
+     */
+    @JvmStatic external fun fingerOverlay(handle: Long, fingersAuto: Boolean, strokes: FloatArray, out: Bitmap): Float
 
     /**
      * The lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...], ends as page fractions;

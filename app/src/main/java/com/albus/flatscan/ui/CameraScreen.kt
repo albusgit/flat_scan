@@ -21,6 +21,7 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.Collections
@@ -138,6 +140,9 @@ private fun CameraPreview(vm: ScanViewModel) {
         Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Editor.Text) }
             Box(Modifier.weight(1f))
+            // document or whiteboard / projector screen (remembered; imports follow it)
+            ModeSwitch(vm.captureMode, onPick = { vm.chooseCaptureMode(it) }, dark = true)
+            Box(Modifier.weight(1f))
             // the torch for dim rooms (a flash would glare on glossy paper)
             val hasTorch = camera?.cameraInfo?.hasFlashUnit() == true
             if (hasTorch) {
@@ -203,6 +208,31 @@ private fun CameraPreview(vm: ScanViewModel) {
                 val spin = rememberInfiniteTransition(label = "capture")
                 val turn by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(1400, easing = LinearEasing)), label = "turn")
                 CrumpledBall(Modifier.size(40.dp).rotate(turn), seed = 5)
+            }
+        }
+    }
+}
+
+/** Document / Whiteboard: what the next scans are (camera screen, home). */
+@Composable
+fun ModeSwitch(mode: com.albus.flatscan.CaptureMode, onPick: (com.albus.flatscan.CaptureMode) -> Unit, dark: Boolean, modifier: Modifier = Modifier) {
+    val fg = if (dark) Editor.Text else androidx.compose.material3.MaterialTheme.colorScheme.onSurface
+    val accent = if (dark) Editor.Accent else androidx.compose.material3.MaterialTheme.colorScheme.primary
+    Row(
+        modifier.background(if (dark) Editor.Panel.copy(alpha = 0.7f) else androidx.compose.material3.MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(10.dp))
+            .then(if (dark) Modifier else Modifier.border(1.dp, androidx.compose.material3.MaterialTheme.colorScheme.outline, RoundedCornerShape(10.dp)))
+            .padding(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        for (m in com.albus.flatscan.CaptureMode.entries) {
+            val on = m == mode
+            Box(
+                Modifier.clip(ChipShape).background(if (on) accent else Color.Transparent)
+                    .clickable { onPick(m) }.padding(horizontal = 14.dp, vertical = 8.dp)
+                    .semantics { contentDescription = m.label + if (on) " mode, selected" else " mode" },
+            ) {
+                Text(m.label, color = if (on) (if (dark) Editor.Ground else androidx.compose.material3.MaterialTheme.colorScheme.onPrimary) else fg,
+                    style = androidx.compose.material3.MaterialTheme.typography.labelLarge)
             }
         }
     }
