@@ -1,9 +1,12 @@
+import java.security.MessageDigest
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
 }
 
 val localProps = Properties().apply { rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) } }
@@ -17,7 +20,8 @@ val localProps = Properties().apply { rootProject.file("local.properties").takeI
 // .onnx models are no longer in the app (Round 11, docs/results/r11/runtime.md); the desktop builds
 // (tools/desktop_check) keep them, and the .onnx files stay in app/src/main/assets/models/ for those builds only.
 // -PlitertModels=DIR: the .tflite files from DIR instead of app/src/main/litert/models (same file names: pagefinder,
-// uvdoc_static, syntheticdoc_hr_static, shadenet (dynamic H x W, the CPU's), shadenet_512x352 (the GPU's)).
+// uvdoc_static, syntheticdoc_hr_static, shadenet (512 x 352) and rulenet (1152 x 800): one file per net; the core rewrites
+// the last two for each input size, core/src/tflite_shape.h).
 val litertVersion = "1.4.0"
 val litertAars: Configuration by configurations.creating { isTransitive = false }
 val litertLibs = listOf("libtensorflowlite_jni.so", "libtensorflowlite_gpu_jni.so")
@@ -47,9 +51,68 @@ val syncLitert by tasks.registering(Sync::class) {
         require(models.isNotEmpty()) { "no .tflite models in $litertModels" }
     }
 }
+
+// Text recognition (output/Ocr.kt, OcrPack.kt) is a download, not part of the APK: Tesseract4Android's native
+// libraries and the heb + eng tessdata_fast models (ocr/tessdata/) go into one zip per ABI,
+// build/ocrpack/packs/flatscan-ocr-<ocrPackVersion>-<ABI>.zip (lib/*.so, tessdata/*.traineddata; reproducible: no
+// timestamps, fixed order), to be published as assets of the GitHub release tagged ocr-pack-<ocrPackVersion>
+// (ocrPackBase). The APK carries each zip's SHA-256 and size (assets/ocr_pack.json) and leaves the libraries out
+// (packaging.jniLibs.excludes); Tesseract4Android's Java classes stay in it. A new pack (other libraries or
+// models): raise ocrPackVersion and publish its zips under the new tag.
+val ocrPackVersion = 1
+val ocrPackBase = "https://github.com/albusgit/flat_scan/releases/download/ocr-pack-$ocrPackVersion/"
+val ocrLibs = listOf("libjpeg.so", "libpngx.so", "libleptonica.so", "libtesseract.so")
+val tessAar: Configuration by configurations.creating { isTransitive = false }
+val ocrPackDir = layout.buildDirectory.dir("ocrpack")
+val ocrPacks = abis.map { abi ->
+    tasks.register<Zip>("ocrPack_" + abi.replace("-", "_")) {
+        archiveFileName.set("flatscan-ocr-$ocrPackVersion-$abi.zip")
+        destinationDirectory.set(ocrPackDir.map { it.dir("packs") })
+        isPreserveFileTimestamps = false
+        isReproducibleFileOrder = true
+        from({ tessAar.files.map { zipTree(it) } }) {
+            include(ocrLibs.map { "jni/$abi/$it" })
+            eachFile { path = "lib/$name" }
+        }
+        from("ocr/tessdata") {
+            include("*.traineddata")
+            into("tessdata")
+        }
+        includeEmptyDirs = false
+    }
+}
+val ocrPackInfo by tasks.registering {
+    val packs = ocrPacks.map { t -> t.flatMap { it.archiveFile } }
+    inputs.files(packs)
+    val out = ocrPackDir.map { it.file("assets/ocr_pack.json") }
+    outputs.file(out)
+    val version = ocrPackVersion
+    val base = ocrPackBase
+    val names = abis
+    doLast {
+        val entries = names.zip(packs).joinToString(",\n") { (abi, p) ->
+            val f = p.get().asFile
+            ZipFile(f).use { z ->
+                val got = z.entries().toList().map { it.name }.toSet()
+                for (lib in ocrLibs) require("lib/$lib" in got) { "${f.name}: no lib/$lib (Tesseract4Android AAR, $abi)" }
+                require(got.any { it.startsWith("tessdata/") }) { "${f.name}: no tessdata" }
+            }
+            val sha = MessageDigest.getInstance("SHA-256").digest(f.readBytes()).joinToString("") { "%02x".format(it) }
+            "    \"$abi\": {\"file\": \"${f.name}\", \"sha256\": \"$sha\", \"size\": ${f.length()}}"
+        }
+        out.get().asFile.apply { parentFile.mkdirs() }.writeText("{\"version\": $version, \"base\": \"$base\", \"packs\": {\n$entries\n}}\n")
+    }
+}
+tasks.register("ocrPacks") {
+    group = "build"
+    description = "The text recognition packs to publish (build/ocrpack/packs) and their pins (assets/ocr_pack.json)"
+    dependsOn(ocrPackInfo)
+}
 tasks.configureEach {
     if (name.startsWith("merge") && (name.endsWith("JniLibFolders") || name.endsWith("Assets") || name.endsWith("NativeLibs")) ||
         name.contains("lint", ignoreCase = true) || name.startsWith("generate") && name.endsWith("Assets")) dependsOn(syncLitert)
+    if (name.startsWith("merge") && name.endsWith("Assets") || name.contains("lint", ignoreCase = true) ||
+        name.startsWith("generate") && name.endsWith("Assets")) dependsOn(ocrPackInfo)
 }
 
 // OpenCV 4.11.0 for the core. opencv.min.dir in local.properties (or -PopencvMin=DIR): the slim static build of
@@ -123,6 +186,7 @@ android {
     }
     sourceSets["main"].jniLibs.srcDir(litertDir.map { it.dir("jni") })
     sourceSets["main"].assets.srcDir(litertDir.map { it.dir("assets") })
+    sourceSets["main"].assets.srcDir(ocrPackDir.map { it.dir("assets") })
     buildFeatures {
         compose = true
         prefab = opencvMin == null
@@ -132,6 +196,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    testOptions {
+        // JVM tests run on Robolectric (Room, Compose UI, real bitmap decoding with native graphics)
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all { it.maxHeapSize = "3g" }
+    }
+    // the Room schemas as assets of debug builds: the migration tests (Robolectric) read them from there
+    sourceSets["debug"].assets.srcDir("$projectDir/schemas")
     packaging {
         jniLibs {
             // uncompressed in the APK (loaded in place, not copied out at install: less space on the phone; Play
@@ -140,11 +211,60 @@ android {
             // OpenCV's AAR bundles an older, 4 KB-aligned libc++_shared; the NDK's own copy
             // (built by externalNativeBuild) is 16 KB-aligned and ABI-compatible
             pickFirsts += "**/libc++_shared.so"
+            // Tesseract4Android's native libraries: in the text recognition pack, not the APK (ocrPacks)
+            excludes += ocrLibs.map { "**/$it" }
         }
     }
 }
 
+ksp {
+    // the Room schema of every version is kept in app/schemas (migration tests read them)
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+// Robolectric's Android runtime jar, fetched by Gradle (which retries; Robolectric's own download does not)
+// and handed to the tests offline
+val robolectricRuntime: Configuration by configurations.creating { isTransitive = false }
+val robolectricJars = layout.buildDirectory.dir("robolectric-jars")
+val syncRobolectric by tasks.registering(Sync::class) {
+    from(robolectricRuntime)
+    into(robolectricJars)
+}
+tasks.withType<Test>().configureEach {
+    dependsOn(syncRobolectric)
+    // the sync integration tests (tools/sync_it/run.sh) find their servers through these; unset: skipped
+    for (k in listOf("FS_WEBDAV_URL", "FS_WEBDAV_USER", "FS_WEBDAV_PASS", "FS_WEBDAV_ROOT", "FS_PAPERLESS_URL", "FS_PAPERLESS_TOKEN")) {
+        System.getenv(k)?.let { environment(k, it) }
+    }
+    systemProperty("robolectric.offline", "true")
+    systemProperty("robolectric.dependency.dir", robolectricJars.get().asFile.absolutePath)
+}
+
+val roomVersion = "2.7.2"
 dependencies {
+    // sync (feature 6): HTTP for WebDAV / paperless-ngx, queued uploads, encrypted credentials
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.work:work-runtime-ktx:2.10.5")
+    implementation("androidx.security:security-crypto:1.1.0")
+    testImplementation("androidx.work:work-testing:2.10.5")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    // OCR (feature 3): Tesseract 5 for Android, Apache-2.0: its Java classes in the APK, its native libraries and the
+    // heb + eng tessdata_fast models (ocr/tessdata) in the downloaded text recognition pack (ocrPacks)
+    implementation("com.github.adaptech-cz.Tesseract4Android:tesseract4android:4.8.0")
+    tessAar("com.github.adaptech-cz.Tesseract4Android:tesseract4android:4.8.0@aar")
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.17")
+    robolectricRuntime("org.robolectric:android-all-instrumented:15-robolectric-13954326-i7")
+    testImplementation("androidx.test:core-ktx:1.6.1")
+    testImplementation("androidx.test.ext:junit-ktx:1.2.1")
+    testImplementation("androidx.room:room-testing:$roomVersion")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    testImplementation(platform("androidx.compose:compose-bom:2025.05.00"))
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     if (opencvMin == null) implementation("org.opencv:opencv:4.11.0")
     // the nets' runtime, copied out by syncLitert (not linked, no Java API used)
     litertAars("com.google.ai.edge.litert:litert:$litertVersion@aar")

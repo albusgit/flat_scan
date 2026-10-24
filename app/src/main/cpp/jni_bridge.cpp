@@ -1,6 +1,7 @@
 // JNI bridge: Android Bitmaps (RGBA_8888) <-> the C++ core (BGR / BGRA cv::Mat).
 // Implements app/src/main/java/com/albus/flatscan/NativeLib.kt exactly.
 #include <android/asset_manager_jni.h>
+#include "board.h"
 #include <android/bitmap.h>
 #include <jni.h>
 #include <opencv2/imgcodecs.hpp>
@@ -141,6 +142,7 @@ Session* session(jlong h) { return reinterpret_cast<Session*>(h); }
 // process()), so a snapshot is cheap to take and can be written on another thread.
 struct Snapshot {
     cv::Mat page, paper, before;
+    cv::Mat page_unerased, paper_unerased, finger_mask;   // the finger brush's base (empty: no finger found)
     GridMap disp;
     std::vector<std::array<float, 5>> lines;
     float legend_px = 1.f;
@@ -227,6 +229,12 @@ bool write_snapshot(const Snapshot& s, const std::string& dir) {
         if (s.before.channels() == 4) cv::cvtColor(s.before, bgr, cv::COLOR_BGRA2BGR);
         else bgr = s.before;
         if (!cv::imwrite(dir + "/before.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 90})) return false;
+    }
+    if (!s.finger_mask.empty() && !s.page_unerased.empty()) {
+        cv::cvtColor(s.page_unerased, bgr, cv::COLOR_BGRA2BGR);
+        if (!cv::imwrite(dir + "/page_unerased.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 95})) return false;
+        if (!cv::imwrite(dir + "/fingers.png", s.finger_mask, {cv::IMWRITE_PNG_COMPRESSION, 1})) return false;
+        if (!s.paper_unerased.empty() && !cv::imwrite(dir + "/paper_unerased.png", s.paper_unerased, {cv::IMWRITE_PNG_COMPRESSION, 1})) return false;
     }
     const GridMap& g = s.disp;
     if (!write_floats(dir + "/disp.bin", {g.out_w, g.out_h, g.gw, g.gh, g.stride}, {&g.x, &g.y})) return false;
@@ -578,6 +586,48 @@ std::vector<double> grid_px(const std::vector<float>& a, const std::vector<float
 
 extern "C" {
 
+// Whiteboard mode: the board or projector screen in the photo (board.cpp find_board). Returns
+// [x0, y0, ... x3, y3 (TL, TR, BR, BL, photo px), confidence, area share, dark (1: a dark slide)] or null
+// when no reliable quadrilateral is found (the app then offers the whole frame for manual corners).
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_detectBoard(JNIEnv* env, jclass, jobject bmp) {
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    if (bgr.empty()) return nullptr;
+    BoardQuad q = find_board(bgr);
+    if (!q.ok) return nullptr;
+    bool dark = board_is_dark(bgr, q);
+    float out[11];
+    for (int i = 0; i < 4; ++i) { out[2 * i] = (float)q.pts[i].x; out[2 * i + 1] = (float)q.pts[i].y; }
+    out[8] = (float)q.confidence;
+    out[9] = (float)q.area;
+    out[10] = dark ? 1.f : 0.f;
+    jfloatArray a = env->NewFloatArray(11);
+    env->SetFloatArrayRegion(a, 0, 11, out);
+    return a;
+}
+
+// Export (feature 3): a one-channel (grayscale) JPEG of an RGBA_8888 bitmap at [quality]; Android's own
+// encoder writes only three-channel JPEGs. Luma as in the BT.601 conversion of cv::cvtColor. Null on failure.
+JNIEXPORT jbyteArray JNICALL Java_com_albus_flatscan_NativeLib_encodeGrayJpeg(JNIEnv* env, jclass, jobject bitmap, jint quality) {
+    AndroidBitmapInfo info;
+    void* px = nullptr;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &px) != ANDROID_BITMAP_RESULT_SUCCESS) return nullptr;
+    std::vector<uchar> buf;
+    bool ok = false;
+    try {
+        cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, px, info.stride), gray;
+        cv::cvtColor(rgba, gray, cv::COLOR_RGBA2GRAY);
+        ok = cv::imencode(".jpg", gray, buf, {cv::IMWRITE_JPEG_QUALITY, (int)quality});
+    } catch (const std::exception& e) {
+        LOGI("encodeGrayJpeg failed: %s", e.what());
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+    if (!ok) return nullptr;
+    jbyteArray out = env->NewByteArray((jsize)buf.size());
+    env->SetByteArrayRegion(out, 0, (jsize)buf.size(), reinterpret_cast<const jbyte*>(buf.data()));
+    return out;
+}
+
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env, jclass) {
     bool ok = Gpu::instance().available();
     std::string s = (ok ? "GPU (OpenGL ES 3.1 compute): " : "CPU fallback (GPU unavailable): ") + Gpu::instance().info();
@@ -694,7 +744,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jboolean flatten, jint flat_nets, jboolean shadows, jboolean rules,
-                                                                  jobject listener) {
+                                                                  jboolean board, jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -720,6 +770,9 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.perspective_only = perspective_only;
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
     o.auto_orient = auto_orient;
+    // whiteboard mode: a board is not held by fingers (and skin-coloured drawings must stay)
+    if (board) o.erase_fingers = false;
+    o.keep_unerased = true;   // the finger brush (setEdits) starts from the page before the fill
     o.render_w = render_w;
     o.use_gpu = use_gpu;
     Progress progress(env, listener);
@@ -813,7 +866,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
       << ", \"uv_agreement\": " << json_num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
-      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
+      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"fingers_over_text\": " << (r.fingers_over_text ? "true" : "false") << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
       << ", \"screen\": {\"detected\": " << (s->screen.screen ? "true" : "false") << ", \"score\": " << json_num(s->screen.score)
@@ -938,19 +991,61 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_release(JNIEnv*, jclass
 
 // Erase tool: the page as processed, then every rectangle (page fractions [x0, y0, x1, y1, ...])
 // filled with the paper around it. An empty array restores the page.
-JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setErase(JNIEnv* env, jclass, jlong h, jfloatArray rects) {
+// Finger brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ... x(n-1), y(n-1)]
+// repeated, points as page fractions; drawn into [mask] (255 add, 0 remove) in order.
+void draw_strokes(JNIEnv* env, jfloatArray strokes, cv::Mat& mask) {
+    if (!strokes) return;
+    jsize n = env->GetArrayLength(strokes);
+    std::vector<float> v(n);
+    if (n) env->GetFloatArrayRegion(strokes, 0, n, v.data());
+    size_t i = 0;
+    while (i + 3 <= v.size()) {
+        bool add = v[i] > 0.5f;
+        int th = std::max(1, (int)std::lround(2 * v[i + 1] * mask.cols));
+        size_t np = (size_t)std::max(0.f, v[i + 2]);
+        i += 3;
+        if (i + 2 * np > v.size()) break;
+        cv::Scalar c(add ? 255 : 0);
+        for (size_t k = 0; k < np; ++k) {
+            cv::Point p((int)std::lround(v[i + 2 * k] * mask.cols), (int)std::lround(v[i + 2 * k + 1] * mask.rows));
+            cv::circle(mask, p, th / 2, c, cv::FILLED);
+            if (k + 1 < np) {
+                cv::Point q((int)std::lround(v[i + 2 * k + 2] * mask.cols), (int)std::lround(v[i + 2 * k + 3] * mask.rows));
+                cv::line(mask, p, q, c, th);
+            }
+        }
+        i += 2 * np;
+    }
+}
+
+// The finger mask a render uses: the automatic one (unless [auto_on] is false) with the brush strokes.
+cv::Mat finger_mask_for(JNIEnv* env, const PipelineResult& r, cv::Size size, bool auto_on, jfloatArray strokes) {
+    cv::Mat m = auto_on && !r.finger_mask.empty() && r.finger_mask.size() == size ? r.finger_mask.clone() : cv::Mat::zeros(size, CV_8U);
+    draw_strokes(env, strokes, m);
+    return m;
+}
+
+// The page's edits after processing: the finger mask (the automatic one when [fingers_auto], plus brush
+// [strokes]) filled with paper (fill_finger), then the Erase tool's rectangles [rects] (page fractions).
+// Starts from the page before any finger fill, so removing a stroke or turning the automatic mask off
+// brings the photo's pixels back.
+JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setEdits(JNIEnv* env, jclass, jlong h, jfloatArray rects, jboolean fingers_auto, jfloatArray strokes) {
     Session* s = session(h);
     if (!s || !s->result.ok) return JNI_FALSE;
     std::vector<Rect01> rs = parse_protect(env, rects);
     PipelineResult& r = s->result;
     try {
         if (s->page_orig.empty()) {
-            if (rs.empty()) return JNI_TRUE;
             s->page_orig = r.page.clone();
             s->paper_orig = r.paper.clone();
         }
-        r.page = s->page_orig.clone();
-        r.paper = s->paper_orig.clone();
+        const bool has_base = !r.page_unerased.empty();
+        r.page = (has_base ? r.page_unerased : s->page_orig).clone();
+        r.paper = (has_base ? r.paper_unerased : s->paper_orig).clone();
+        if (has_base || (strokes && env->GetArrayLength(strokes) > 0)) {
+            cv::Mat fm = finger_mask_for(env, r, r.page.size(), fingers_auto, strokes);
+            if (cv::countNonZero(fm) > 0) fill_finger(r.page, fm, r.paper.empty() ? nullptr : &r.paper);
+        }
         if (!rs.empty()) {
             cv::Mat mask = cv::Mat::zeros(r.page.size(), CV_8U);
             for (const Rect01& q : rs) {
@@ -964,10 +1059,28 @@ JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setErase(JNIEnv* en
         s->pp = page_params(r.page, s->use_gpu);
         s->page_changed();   // screen detection; drops the downscaled and descreened caches
     } catch (const std::exception& e) {
-        LOGI("setErase failed: %s", e.what());
+        LOGI("setEdits failed: %s", e.what());
         return JNI_FALSE;
     }
     return JNI_TRUE;
+}
+
+// The finger brush's view: [out] (page size, ARGB) cleared, the mask a render with these settings fills
+// painted translucent orange. Returns the share of the page in the mask.
+JNIEXPORT jfloat JNICALL Java_com_albus_flatscan_NativeLib_fingerOverlay(JNIEnv* env, jclass, jlong h, jboolean fingers_auto, jfloatArray strokes, jobject out) {
+    Session* s = session(h);
+    if (!s || !s->result.ok) return 0.f;
+    AndroidBitmapInfo info;
+    void* px = nullptr;
+    if (AndroidBitmap_getInfo(env, out, &info) != ANDROID_BITMAP_RESULT_SUCCESS || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return 0.f;
+    cv::Mat m = finger_mask_for(env, s->result, s->result.page.size(), fingers_auto, strokes);
+    if (m.cols != (int)info.width || m.rows != (int)info.height) cv::resize(m, m, cv::Size(info.width, info.height), 0, 0, cv::INTER_NEAREST);
+    if (AndroidBitmap_lockPixels(env, out, &px) != ANDROID_BITMAP_RESULT_SUCCESS) return 0.f;
+    cv::Mat o((int)info.height, (int)info.width, CV_8UC4, px, info.stride);
+    o.setTo(cv::Scalar(0, 0, 0, 0));
+    o.setTo(cv::Scalar(255, 140, 40, 120), m);   // RGBA memory order
+    AndroidBitmap_unlockPixels(env, out);
+    return (float)cv::countNonZero(m) / std::max(1, m.cols * m.rows);
 }
 
 // lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...] as page fractions (PipelineResult::lines)
@@ -989,6 +1102,9 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_snapshot(JNIEnv*, jcla
     sn->page = s->result.page;
     sn->paper = s->result.paper;
     sn->before = s->before_page();
+    sn->page_unerased = s->result.page_unerased;
+    sn->paper_unerased = s->result.paper_unerased;
+    sn->finger_mask = s->result.finger_mask;
     sn->disp = s->result.disp;
     sn->lines = s->result.lines;
     sn->legend_px = s->legend_px;
@@ -1026,6 +1142,15 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv*
         if (!r.paper.empty() && r.paper.size() != r.page.size()) r.paper.release();
         // the before page: on first use (compare, the next snapshot)
         if (std::ifstream(path + "/before.jpg").good()) s->before_file = path + "/before.jpg";
+        if (std::ifstream(path + "/fingers.png").good()) {
+            r.finger_mask = cv::imread(path + "/fingers.png", cv::IMREAD_GRAYSCALE);
+            r.page_unerased = read_bgra(path + "/page_unerased.jpg");
+            if (std::ifstream(path + "/paper_unerased.png").good()) r.paper_unerased = cv::imread(path + "/paper_unerased.png", cv::IMREAD_GRAYSCALE);
+            if (r.finger_mask.size() != r.page.size() || r.page_unerased.size() != r.page.size()) {
+                r.finger_mask.release(); r.page_unerased.release(); r.paper_unerased.release();
+            }
+            if (!r.paper_unerased.empty() && r.paper_unerased.size() != r.page.size()) r.paper_unerased.release();
+        }
         std::vector<int32_t> head;
         std::vector<float> data;
         if (read_floats(path + "/disp.bin", head, 5, data) && head[2] > 0 && head[3] > 0 &&
@@ -1252,7 +1377,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             in.push_back({"shadenet", NetId::ShadeNet, BENCH_SHADE, std::move(t)});
         }
         {
-            // the rule net's GPU shape (rulenet_1152x800): the page through the found corners, else the photo
+            // the rule net's GPU shape (1152 x 800, infer.cpp kRuleGpuHw): the page through the found corners, else the photo
             const int rw = 800, rh = 1152;
             cv::Mat pg;
             if (pc.ok) {

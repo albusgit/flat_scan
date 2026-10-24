@@ -117,3 +117,13 @@ if(NOT FS_DESKTOP_GPU STREQUAL "OFF")
     endforeach()
   endif()
 endif()
+
+# whiteboard mode (core/src/board.cpp) on synthetic photos
+add_executable(board_test board_test.cpp)
+target_link_libraries(board_test PRIVATE core_nogpu)
+# the finger fill (core/src/pipeline.cpp) on synthetic pages
+# the app loader's .tflite size rewrite (core/src/tflite_shape.cpp), for tools/litert/check_resize.py
+add_executable(tflite_shape_cli tflite_shape_cli.cpp)
+target_link_libraries(tflite_shape_cli PRIVATE core_nogpu)
+add_executable(finger_test finger_test.cpp)
+target_link_libraries(finger_test PRIVATE core_nogpu)

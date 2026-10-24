@@ -68,6 +68,13 @@ struct FlatNetGrids {
 using NetCornersFn = std::function<const std::array<cv::Point2d, 4>*()>;
 using FlatNetsFn = std::function<FlatNetGrids(const NetCornersFn& corners)>;
 
+// Finger detection rules on top of the base test (skin share, reach, smoothness), PipelineOptions::finger_rules
+const int kFingerContact = 1;       // the candidate lies along the page border (not only its bounding box)
+const int kFingerAdaptiveSkin = 2;  // skin colour sampled from the hand outside the page, not a fixed box
+const int kFingerShape = 4;         // finger width: 2-16 % of the page width
+const int kFingerSkinRegion = 8;    // also skin areas the page mask counted as paper (needs the hand outside the page)
+const int kFingerHandColour = 16;   // redder / less blue than the paper on average; from at most two sides
+
 struct PipelineOptions {
     bool corners_edited = false;      // user moved a corner -> homography path
     bool force_homography = false;    // the quality gate flagged the crop: homography path
@@ -109,9 +116,13 @@ struct PipelineOptions {
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
     bool colour_edges = true;         // neural pages: long straight boundaries between colour areas are lines too (warpmap colour_edges)
-    bool second_line_pass = true;     // neural pages: the line stage again on its own output, kept if the rules come out straighter
+    bool second_line_pass = false;    // neural pages: the line stage again on its own output, kept if the rules come out straighter
+                                      // (off since the text-line net: real35 kept it on 2 of 24 pages, straightness the same without it,
+                                      // the warp map 24 % faster; 1.6 s of a 5.4 s page on the S24 FE)
     bool faint_lines = true;          // also find and trace printed rules too pale for the darkness-45 threshold (warpmap faint_rules)
     bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
+    int finger_rules = kFingerSkinRegion | kFingerHandColour;   // finger tests (kFinger* bits; tools/fingers/eval.py measures each)
+    bool keep_unerased = false;       // keep the page before the finger fill (PipelineResult::page_unerased; the app's brush)
     double max_local_rescale = 0.35;  // neural pages: line corrections that rescale a spot by more than this are faded out there (0: off;
                                       // 0.15 also faded real crease corrections, 0.5 left part of a bump)
     double max_line_distortion = 0.2;        // UVDoc pages: line refinement kept only below these
@@ -194,6 +205,9 @@ struct PipelineResult {
     double line_straightness[2] = {-1, -1};    // ... the traced rules' mean p95 deviation (px): on the page as it is / through the kept map
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it
+    cv::Mat finger_mask;              // CV_8U page size, 255 = filled as a finger (empty: none)
+    bool fingers_over_text = false;   // ... and text runs into it (outlined, not invented)
+    cv::Mat page_unerased, paper_unerased;   // with keep_unerased: page and paper before the finger fill
     bool shadows_removed = false;     // the shading map was applied to the page
     bool shade_net = false;           // ... the shadow net's map (ShadeNet)
     bool rule_net = false;            // the rule net ran in the line stage (RuleNet)
@@ -235,6 +249,11 @@ PipelineResult run_photo(const cv::Mat& photo_bgr, const PipelineOptions& opt);
 // erase, the app's Erase tool): a smooth fill, not invented content. paper (optional, CV_8U page
 // size): marked as paper there.
 void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper);
+// Fingers: [mask] filled with the paper around it, print taken out of that paper first (not inpainted: no
+// stroke is continued into the hole); with [mark], where text runs into the area it is outlined dashed grey.
+void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper, bool mark = true);
+// Whether print runs into [mask] from the page around it (ink in a ring outside it, away from the border).
+bool finger_over_text(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat& paper);
 // Flatbed scan: warp map only (warpmap.py on the scan itself).
 PipelineResult run_scan(const cv::Mat& scan_bgr, const PipelineOptions& opt);
 

@@ -19,8 +19,28 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.sp
+import com.albus.flatscan.CaptureMode
+import com.albus.flatscan.Screen
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,14 +52,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.FlashOff
 import androidx.compose.material.icons.outlined.FlashOn
 import androidx.compose.material.icons.outlined.PhotoLibrary
-import androidx.compose.material3.Badge
-import androidx.compose.material3.BadgedBox
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -47,7 +64,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.ui.draw.rotate
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -133,77 +149,147 @@ private fun CameraPreview(vm: ScanViewModel) {
         }, ContextCompat.getMainExecutor(ctx))
         onDispose { runCatching { future.get().unbindAll() } }
     }
+    val shoot = {
+        busy = true
+        ctx.cacheDir.listFiles { f -> f.name.startsWith("capture_") }?.forEach { it.delete() }
+        val file = File(ctx.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+        capture.takePicture(
+            ImageCapture.OutputFileOptions.Builder(file).build(),
+            ContextCompat.getMainExecutor(ctx),
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    vm.loadUri(Uri.fromFile(file), focalMmPerLongSide)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    busy = false
+                    vm.message = "Capture failed"
+                }
+            },
+        )
+    }
     Box(Modifier.fillMaxSize().background(Editor.Ground)) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
-        Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Editor.Text) }
-            Box(Modifier.weight(1f))
+        // top: close, a hint, the torch
+        Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            RoundButton(onClick = { vm.back() }) { Icon(Icons.Outlined.Close, "Close the camera", tint = Editor.Text) }
+            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                Text(
+                    if (vm.captureMode == CaptureMode.Whiteboard) "Fit the whole board in view" else "Fit the whole page in view",
+                    style = MaterialTheme.typography.labelLarge, color = Editor.Text,
+                    modifier = Modifier.clip(RoundedCornerShape(17.dp)).background(Editor.Ground.copy(alpha = 0.6f)).padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+            }
             // the torch for dim rooms (a flash would glare on glossy paper)
-            val hasTorch = camera?.cameraInfo?.hasFlashUnit() == true
-            if (hasTorch) {
-                IconButton(onClick = {
+            if (camera?.cameraInfo?.hasFlashUnit() == true) {
+                RoundButton(onClick = {
                     torch = !torch
                     camera?.cameraControl?.enableTorch(torch)
-                }) { Icon(if (torch) Icons.Outlined.FlashOn else Icons.Outlined.FlashOff, if (torch) "Torch off" else "Torch on", tint = Editor.Text) }
+                }, on = torch) { Icon(if (torch) Icons.Outlined.FlashOn else Icons.Outlined.FlashOff, if (torch) "Torch off" else "Torch on", tint = if (torch) Editor.Ground else Editor.Text) }
+            } else {
+                Box(Modifier.size(48.dp))
             }
         }
-        // gallery import on the left, the document's pages on the right of the shutter
-        Row(
-            Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding().padding(bottom = 40.dp, start = 28.dp, end = 28.dp),
-            verticalAlignment = Alignment.CenterVertically,
+        // bottom: what is being scanned, then photos / shutter / the document so far
+        Column(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .background(Brush.verticalGradient(0f to Color.Transparent, 0.3f to Editor.Ground.copy(alpha = 0.85f)))
+                .safeDrawingPadding().padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 22.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            IconButton(
-                onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                enabled = !busy, modifier = Modifier.size(56.dp).background(Editor.Panel.copy(alpha = 0.7f), CircleShape),
-            ) { Icon(Icons.Outlined.PhotoLibrary, "Import from gallery", tint = Editor.Text) }
-            Box(Modifier.weight(1f))
-            Box(Modifier.size(80.dp))
-            Box(Modifier.weight(1f))
-            val n = vm.pages.size
-            if (n > 0) {
-                IconButton(
-                    onClick = { vm.open(com.albus.flatscan.Screen.Pages) }, enabled = !busy,
-                    modifier = Modifier.size(56.dp).background(Editor.Panel.copy(alpha = 0.7f), CircleShape),
-                ) {
-                    BadgedBox(badge = { Badge(containerColor = Editor.Accent, contentColor = Editor.Ground) { Text("$n") } }) {
-                        Icon(Icons.Outlined.Collections, if (n == 1) "The document: 1 page" else "The document: $n pages", tint = Editor.Text)
+            // document or whiteboard / projector screen (remembered; imports follow it)
+            ModePills(vm.captureMode) { vm.chooseCaptureMode(it) }
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                    LabelledButton("Photos", enabled = !busy, onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }) {
+                        Box(Modifier.size(52.dp).background(Editor.Panel.copy(alpha = 0.8f), CircleShape), contentAlignment = Alignment.Center) {
+                            Icon(Icons.Outlined.PhotoLibrary, null, tint = Editor.Text)
+                        }
                     }
                 }
-            } else {
-                Box(Modifier.size(56.dp))
+                Box(
+                    Modifier.size(80.dp).border(4.dp, Color.White, CircleShape).padding(8.dp).background(Color.White, CircleShape)
+                        .semantics { contentDescription = "Take photo" }.testTag("shutter")
+                        .clickable(enabled = !busy) { shoot() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (busy) {
+                        // a tiny crumpled ball tumbling while the photo is taken
+                        val spin = rememberInfiniteTransition(label = "capture")
+                        val turn by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(1400, easing = LinearEasing)), label = "turn")
+                        CrumpledBall(Modifier.size(40.dp).rotate(turn), seed = 5)
+                    }
+                }
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                    val n = vm.pages.size
+                    if (n > 0) {
+                        LabelledButton(
+                            "Done", enabled = !busy, description = if (n == 1) "Done: the document, 1 page" else "Done: the document, $n pages",
+                            onClick = { vm.open(Screen.Pages) },
+                        ) { PagesStack(vm, vm.pages.last(), n) }
+                    }
+                }
             }
         }
-        Box(
-            Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 28.dp).size(80.dp)
-                .border(4.dp, Color.White, CircleShape).padding(8.dp).background(Color.White, CircleShape)
-                .semantics { contentDescription = "Take photo" }
-                .clickable(enabled = !busy) {
-                    busy = true
-                    ctx.cacheDir.listFiles { f -> f.name.startsWith("capture_") }?.forEach { it.delete() }
-                    val file = File(ctx.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
-                    capture.takePicture(
-                        ImageCapture.OutputFileOptions.Builder(file).build(),
-                        ContextCompat.getMainExecutor(ctx),
-                        object : ImageCapture.OnImageSavedCallback {
-                            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                                vm.loadUri(Uri.fromFile(file), focalMmPerLongSide)
-                            }
+    }
+}
 
-                            override fun onError(exception: ImageCaptureException) {
-                                busy = false
-                                vm.message = "Capture failed"
-                            }
-                        },
-                    )
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            if (busy) {
-                // a tiny crumpled ball tumbling while the photo is taken
-                val spin = rememberInfiniteTransition(label = "capture")
-                val turn by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(1400, easing = LinearEasing)), label = "turn")
-                CrumpledBall(Modifier.size(40.dp).rotate(turn), seed = 5)
-            }
+/** A 48 dp round button on the camera picture; [on] fills it with the accent. */
+@Composable
+private fun RoundButton(onClick: () -> Unit, on: Boolean = false, content: @Composable () -> Unit) {
+    Box(
+        Modifier.size(48.dp).clip(CircleShape).background(if (on) Editor.Accent else Editor.Ground.copy(alpha = 0.55f)).clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) { content() }
+}
+
+/** A round control with its name under it. */
+@Composable
+private fun LabelledButton(label: String, enabled: Boolean, onClick: () -> Unit, description: String? = null, icon: @Composable () -> Unit) {
+    Column(
+        Modifier.clip(RoundedCornerShape(12.dp)).clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(4.dp)
+            .then(if (description != null) Modifier.semantics(mergeDescendants = true) { contentDescription = description } else Modifier),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        icon()
+        Spacer(Modifier.height(6.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium, color = Editor.Text)
+    }
+}
+
+/** The pages scanned so far: the last one on a second sheet, with the count. */
+@Composable
+private fun PagesStack(vm: ScanViewModel, last: String, n: Int) {
+    var thumb by remember(last) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(last, vm.pageVersions[last]) { thumb = vm.thumbnail(last) }
+    val sheet = RoundedCornerShape(2.dp)
+    Box(Modifier.size(54.dp)) {
+        if (n > 1) Box(Modifier.offset(14.dp, 4.dp).size(34.dp, 44.dp).rotate(7f).background(Color(0xFFE8ECF2), sheet))
+        Box(Modifier.offset(8.dp, 7.dp).size(34.dp, 44.dp).shadow(4.dp, sheet).background(Color.White, sheet).clip(sheet)) {
+            thumb?.let { Image(remember(it) { it.asImageBitmap() }, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
+        }
+        Text(
+            "$n", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.ExtraBold), color = Editor.Ground, textAlign = TextAlign.Center,
+            modifier = Modifier.align(Alignment.TopEnd).size(22.dp).background(Editor.Accent, CircleShape).padding(top = 2.dp),
+        )
+    }
+}
+
+/** Document / Whiteboard, as two pills over the camera picture. */
+@Composable
+private fun ModePills(mode: CaptureMode, onPick: (CaptureMode) -> Unit) {
+    Row(Modifier.selectableGroup(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        for (m in CaptureMode.entries) {
+            val on = m == mode
+            Text(
+                m.label.uppercase(),
+                style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, letterSpacing = 0.04.em, fontWeight = if (on) FontWeight.ExtraBold else FontWeight.SemiBold),
+                color = if (on) Editor.Ground else Editor.Text,
+                modifier = Modifier.clip(RoundedCornerShape(18.dp)).background(if (on) Editor.Accent else Editor.Panel.copy(alpha = 0.7f))
+                    .selectable(selected = on, role = Role.RadioButton) { onPick(m) }
+                    .padding(horizontal = 16.dp, vertical = 9.dp),
+            )
         }
     }
 }

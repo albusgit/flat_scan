@@ -2,20 +2,20 @@ package com.albus.flatscan.ui
 
 import android.graphics.Bitmap
 import android.graphics.Paint
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearOutSlowInEasing
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -36,6 +36,8 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -48,13 +50,17 @@ private const val GX = 12
 private const val GY = 16
 private const val TEX_MAX = 640
 
+/** The core's progress steps (Screens: stage names); the animation flows towards the next one between reports. */
+private val STEPS = floatArrayOf(0.02f, 0.05f, 0.08f, 0.14f, 0.2f, 0.3f, 0.85f, 0.9f, 0.92f, 0.95f, 1f)
+
 /**
- * The processing animation: [photo] (the page cut from it with [corners], photo pixels of a
- * [photoWidth]-wide photo) starts as a crumpled ball, unfolds as [progress] rises and an iron
- * presses out the last creases at 85-92%. It only moves when the progress changes (in the long
- * 30-85% stage it creeps about 70% of the way over 6 s, then holds), so nothing animates
- * endlessly while the core works. With system animations off, a still crumpled frame cross-fades
- * to the flat page.
+ * The processing animation, drawn every frame while the page is processed: [photo] (the page cut
+ * from it with [corners], photo pixels of a [photoWidth]-wide photo) drops in as a crumpled ball
+ * that tumbles and breathes, unfolds as [progress] rises (between the core's reports it keeps
+ * flowing towards the next step), and through the long line-solving stage an iron glides over the
+ * sheet row by row, steam behind it, pressing out the creases it passes. At the end the sheet is
+ * pressed flat and whitens. With system animations off, a still crumpled frame cross-fades to the
+ * flat page.
  */
 @Composable
 fun PaperUnfold(
@@ -69,23 +75,24 @@ fun PaperUnfold(
         value = withContext(Dispatchers.Default) { runCatching { pageTexture(photo, corners, photoWidth) }.getOrNull() }
     }
     val tex = texture
-    val mesh = remember(tex) { tex?.let { Crumple(seedOf(it)) } }
-    val shown = remember(tex) { Animatable(0f) }
-    val drop = remember(tex) { Animatable(if (reduced) 1f else 0f) }
-    LaunchedEffect(tex) { if (tex != null && !reduced) drop.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessLow)) }
-    LaunchedEffect(tex, progress) {
-        val target = max(progress, shown.value)            // never runs backwards
-        if (reduced) {
-            shown.snapTo(target)
-            return@LaunchedEffect
-        }
-        // the iron's stretch moves slower so the sweep reads as a sweep
-        shown.animateTo(target, tween(if (target in 0.85f..0.93f) 800 else 450, easing = FastOutSlowInEasing))
-        if (target >= 0.3f && target < 0.85f) {
-            shown.animateTo(target + (0.85f - target) * 0.7f, tween(6000, easing = LinearOutSlowInEasing))
+    val sim = remember(tex) { tex?.let { Unfold(seedOf(it)) } }
+    val target by rememberUpdatedState(progress)
+    var frame by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(sim, reduced) {
+        val s = sim ?: return@LaunchedEffect
+        var last = -1L
+        while (true) {
+            withFrameNanos { now ->
+                val dt = if (last < 0) 0f else ((now - last) / 1e9f).coerceAtMost(0.05f)
+                last = now
+                s.step(dt, target, reduced)
+                frame = now
+            }
         }
     }
-    val accent = if (isPaperLight()) Palette.Accent else Graphite.Accent
+    val light = isPaperLight()
+    val accent = if (light) Palette.Accent else Graphite.Accent
+    val ink = MaterialTheme.colorScheme.onSurface
     val paint = remember { Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG) }
     Canvas(
         modifier.semantics {
@@ -93,13 +100,14 @@ fun PaperUnfold(
             progressBarRangeInfo = ProgressBarRangeInfo(progress.coerceIn(0f, 1f), 0f..1f)
         },
     ) {
-        if (tex == null || mesh == null) return@Canvas
+        frame                                              // redraw on every frame of the simulation
+        if (tex == null || sim == null) return@Canvas
         if (reduced) {
-            val p = shown.value
-            mesh.draw(this, tex, paint, 0.08f, 1f, accent, alpha = 1f - p)
-            mesh.draw(this, tex, paint, 1f, 1f, accent, alpha = p)
+            val p = sim.shown
+            sim.draw(this, tex, paint, accent, ink, still = 0.08f, alpha = 1f - p)
+            sim.draw(this, tex, paint, accent, ink, still = 1f, alpha = p)
         } else {
-            mesh.draw(this, tex, paint, shown.value, drop.value, accent)
+            sim.draw(this, tex, paint, accent, ink)
         }
     }
 }
@@ -145,13 +153,19 @@ private fun seedOf(b: Bitmap): Int {
     return h
 }
 
-private fun ease(t: Float) = if (t < 0.5f) 4 * t * t * t else 1 - (-2 * t + 2).pow(3) / 2
 /** Fast first: the big folds let go as soon as the core starts. */
 private fun easeOut(t: Float) = 1 - (1 - t).pow(3)
+private fun easeInOut(t: Float) = if (t < 0.5f) 4 * t * t * t else 1 - (-2 * t + 2).pow(3) / 2
 private fun clamp01(x: Float) = x.coerceIn(0f, 1f)
 
-/** The crumple of one page: where each mesh vertex sits in the ball and how high it is. */
-private class Crumple(seed: Int) {
+/** One steam puff behind the iron: where it left the iron (page fractions) and how old it is. */
+private class Puff(val u: Float, val v: Float, var age: Float, val drift: Float)
+
+/**
+ * One page's crumple and the state of its animation: the shown progress, the drop, the iron's
+ * path and the creases it has pressed.
+ */
+private class Unfold(seed: Int) {
     private val n = (GX + 1) * (GY + 1)
     private val u = FloatArray(n)
     private val v = FloatArray(n)
@@ -159,9 +173,26 @@ private class Crumple(seed: Int) {
     private val cy = FloatArray(n)
     private val z = FloatArray(n)
     private val wz = FloatArray(n)
+    private val phase = FloatArray(n)
     private val delay = FloatArray(n)
+    private val pressed = FloatArray(n)
     private val verts = FloatArray(2 * n)
     private val zs = FloatArray(n)
+    private val puffs = ArrayList<Puff>()
+
+    var shown = 0f
+        private set
+    private var time = 0f
+    private var reported = 0f
+    private var reportedAt = 0f
+    private var drop = 0f
+    private var dropV = 0f
+    private var ironT = 0f
+    private var ironU = -0.2f
+    private var ironV = 0.2f
+    private var ironLeft = false
+    private var ironAlpha = 0f
+    private var puffClock = 0f
 
     init {
         val r = Random(seed)
@@ -179,60 +210,133 @@ private class Crumple(seed: Int) {
             cy[k] = sin(a) * rad * 1.1f + (r.nextFloat() - 0.5f) * 0.1f
             z[k] = (r.nextFloat() - 0.5f) * 2
             wz[k] = r.nextFloat() - 0.5f
+            phase[k] = r.nextFloat() * 2 * PI.toFloat()
             delay[k] = dist * 0.55f + r.nextFloat() * 0.12f
         }
     }
 
-    /** Draws the page at progress [p] (0..1), [drop] (0..1) of the way down from above. */
-    fun draw(scope: DrawScope, tex: Bitmap, paint: Paint, p: Float, drop: Float, accent: Color, alpha: Float = 1f) = with(scope) {
+    /** Advances the animation by [dt] s; [target] is the core's last reported progress. */
+    fun step(dt: Float, target: Float, reduced: Boolean) {
+        time += dt
+        if (target > reported) {
+            reported = target
+            reportedAt = time
+        }
+        if (reduced) {
+            shown = reported
+            drop = 1f
+            return
+        }
+        // between reports the page keeps moving towards the next step (80% of the way, slower in the long solve)
+        val next = STEPS.firstOrNull { it > reported + 1e-4f } ?: 1f
+        val tau = if (reported >= 0.3f && reported < 0.85f) 10f else 2.5f
+        val goal = reported + (next - reported) * 0.8f * (1 - exp(-(time - reportedAt) / tau))
+        shown += (max(goal, shown) - shown) * (1 - exp(-dt * 4f))
+        if (reported >= 1f && shown > 0.995f) shown = 1f
+        // the drop: a damped spring that lands with a small bounce
+        dropV += ((1 - drop) * 110f - dropV * 9f) * dt
+        drop += dropV * dt
+        // the iron glides over the sheet in rows (boustrophedon), from the solve stage until the page is flat
+        val active = shown in 0.26f..0.94f
+        ironAlpha = (ironAlpha + (if (active) dt else -dt) * 4f).coerceIn(0f, 1f)
+        if (active || ironAlpha > 0f) {
+            ironT += dt
+            val pass = 1.6f
+            val rows = floatArrayOf(0.2f, 0.42f, 0.64f, 0.84f, 0.53f, 0.31f)
+            val idx = floor(ironT / pass).toInt()
+            val f = (ironT - idx * pass) / pass
+            val row = rows[idx % rows.size]
+            val prev = rows[(idx + rows.size - 1) % rows.size]
+            ironLeft = idx % 2 == 1
+            // steady along the row, easing only into the turns
+            val along = -0.06f + 1.12f * (0.2f * easeInOut(f) + 0.8f * f)
+            ironU = if (ironLeft) 1f - along else along
+            ironV = prev + (row - prev) * easeInOut(clamp01(f / 0.18f))
+            if (active) {
+                for (k in 0 until n) {
+                    val du = abs(u[k] - ironU)
+                    val dv = abs(v[k] - ironV)
+                    if (du < 0.15f && dv < 0.15f) pressed[k] = min(1f, pressed[k] + dt * 6f * (1 - du / 0.15f))
+                }
+                puffClock += dt
+                if (puffClock > 0.16f) {
+                    puffClock = 0f
+                    puffs += Puff(ironU + (if (ironLeft) 0.12f else -0.12f), ironV, 0f, (Random.nextFloat() - 0.5f))
+                }
+            }
+        }
+        for (pf in puffs) pf.age += dt
+        puffs.removeAll { it.age > 1.2f }
+    }
+
+    /**
+     * Draws the page; [still] (with system animations off) draws that progress without motion, at [alpha].
+     */
+    fun draw(scope: DrawScope, tex: Bitmap, paint: Paint, accent: Color, ink: Color, still: Float = -1f, alpha: Float = 1f) = with(scope) {
         if (alpha <= 0.01f) return@with
+        val p = if (still >= 0f) still else shown
+        val live = if (still >= 0f) 0f else 1f
         val aspect = tex.width.toFloat() / tex.height
         val pw = min(size.width * 0.86f, size.height * 0.84f * aspect)
         val ph = pw / aspect
-        val ox = size.width / 2
-        val oy = size.height / 2 - (1 - drop) * size.height * 0.45f
         val unit = pw / 230f
-        val sweep = clamp01((p - 0.85f) / 0.07f)              // the iron's way across the sheet
+        val open = clamp01((p - 0.02f) / 0.3f)
+        val ball = 1 - open
+        // the ball tumbles, bobs and breathes while it waits to open
+        val angle = live * ball * (0.28f * sin(time * 1.15f) + 0.1f * sin(time * 2.7f))
+        val breathe = 1 + live * ball * 0.04f * sin(time * 3.2f)
+        val ox = size.width / 2
+        val oy = size.height / 2 - (1 - (if (still >= 0f) 1f else drop)) * size.height * 0.6f +
+            live * ball * sin(time * 2.3f) * pw * 0.025f
+        val ca = cos(angle)
+        val sa = sin(angle)
+        val flatten = clamp01((p - 0.86f) / 0.08f)           // the final press: every crease out
+        val relax = clamp01((p - 0.2f) / 0.6f)
+        // the opening runs from 2% to 30%: the middle first, the outer folds follow, every fold moving all along
+        val q = clamp01((p - 0.02f) / 0.28f)
         for (k in 0 until n) {
-            val t = easeOut(clamp01((p - 0.02f - delay[k] * 0.3f) / (0.36f - delay[k] * 0.3f)))
+            val t = easeOut(clamp01((q - delay[k] * 0.5f) / (1 - delay[k] * 0.5f)))
             val fx = (u[k] - 0.5f) * pw
             val fy = (v[k] - 0.5f) * ph
-            val bx = cx[k] * pw * 1.15f
-            val by = cy[k] * pw * 1.15f
-            // creases relax with the long stage but only the iron presses them out
-            var wr = (1 - 0.7f * clamp01((p - 0.3f) / 0.52f)) * (1 - t * 0.5f)
-            wr *= clamp01((u[k] - sweep * 1.15f + 0.08f) / 0.1f)
-            verts[2 * k] = ox + bx + (fx - bx) * t + wz[k] * 6 * wr * unit
-            verts[2 * k + 1] = oy + by + (fy - by) * t + wz[k] * 4 * wr * unit
-            zs[k] = (z[k] * (1 - t) * 40 + wz[k] * 16 * wr) * unit
+            val rx = cx[k] * pw * 1.35f * breathe
+            val ry = cy[k] * pw * 1.35f * breathe
+            val bx = rx * ca - ry * sa
+            val by = rx * sa + ry * ca
+            // creases: relax a little by themselves, the iron presses them out; they stir while the paper is loose
+            val wr = (1 - 0.5f * t) * (1 - 0.35f * relax) * (1 - pressed[k]) * (1 - flatten)
+            val stir = 1 + live * 0.3f * sin(time * 1.4f + phase[k])
+            verts[2 * k] = ox + bx + (fx - bx) * t + wz[k] * 7 * wr * stir * unit
+            verts[2 * k + 1] = oy + by + (fy - by) * t + wz[k] * 5 * wr * stir * unit
+            zs[k] = (z[k] * (1 - t) * 40 + wz[k] * 18 * wr * stir) * unit
         }
         val flat = clamp01((p - 0.3f) / 0.55f)
-        // the shadow on the desk widens as the sheet opens
-        val sw = pw * (0.25f + 0.3f * flat)
-        val sh = ph * (0.07f + 0.2f * flat)
-        val sc = Offset(ox, oy + ph * (0.18f + 0.3f * flat))
+        // the shadow on the desk: small under the ball, wide under the sheet
+        val sw = pw * (0.28f + 0.27f * open)
+        val sh = ph * (0.06f + 0.2f * open)
+        val sc = Offset(ox, size.height / 2 + ph * (0.16f + 0.32f * open))
+        val shadowA = 0.24f * alpha * (0.4f + 0.6f * (if (still >= 0f) 1f else drop))
         scale(1f, sh / sw, pivot = sc) {
-            drawCircle(
-                Brush.radialGradient(listOf(Color(0xFF141928).copy(alpha = 0.22f * alpha), Color.Transparent), center = sc, radius = sw * 1.2f),
-                radius = sw * 1.2f, center = sc,
-            )
+            drawCircle(Brush.radialGradient(listOf(Color(0xFF141928).copy(alpha = shadowA), Color.Transparent), center = sc, radius = sw * 1.2f), radius = sw * 1.2f, center = sc)
         }
         paint.alpha = (alpha * 255).toInt()
         drawIntoCanvas { it.nativeCanvas.drawBitmapMesh(tex, GX, GY, verts, 0, null, 0, paint) }
         shade(alpha)
+        val gridA = sin(flat * PI).toFloat() * 0.22f * alpha
+        if (gridA > 0.01f) grid(accent.copy(alpha = gridA))
         // the paper whitens at the end (shadow and colour cast removal); the sheet is flat by then
         val white = clamp01((p - 0.92f) / 0.07f)
-        if (white > 0f) drawRect(Color.White.copy(alpha = 0.3f * white * alpha), Offset(ox - pw / 2, oy - ph / 2), androidx.compose.ui.geometry.Size(pw, ph))
-        val gridA = sin(flat * PI).toFloat() * 0.35f * alpha
-        if (gridA > 0.01f) grid(accent.copy(alpha = gridA))
-        if (p > 0.845f && p < 0.93f) {
-            val a = clamp01((p - 0.845f) / 0.01f) * clamp01((0.93f - p) / 0.01f) * alpha
+        if (white > 0f) drawRect(Color.White.copy(alpha = 0.3f * white * alpha), Offset(ox - pw / 2, oy - ph / 2), Size(pw, ph))
+        if (still < 0f && ironAlpha > 0f) {
             val left = ox - pw / 2
             val top = oy - ph / 2
-            drawIron(
-                Offset(left + pw * (sweep * 1.1f - 0.02f), top + ph * (0.5f + sin(sweep * PI * 5).toFloat() * 0.28f)),
-                pw / 230f, a,
-            )
+            for (pf in puffs) {
+                val a = (1 - pf.age / 1.2f) * 0.3f * ironAlpha * alpha
+                val c = Offset(left + pf.u * pw + pf.drift * pf.age * 14.dp.toPx(), top + pf.v * ph - 14.dp.toPx() - pf.age * 34.dp.toPx())
+                drawCircle(ink.copy(alpha = a), radius = (3f + pf.age * 6f).dp.toPx() * unit.coerceAtMost(1.4f), center = c, style = Stroke(1.5.dp.toPx()))
+            }
+            // the iron lifts a little where it turns at the end of a row
+            val lift = (1 - min(1f, min(abs(ironU + 0.06f), abs(ironU - 1.06f)) / 0.1f)) * 6.dp.toPx()
+            drawIron(Offset(left + ironU * pw, top + ironV * ph - lift), unit * 1.35f, ironAlpha * alpha, flip = ironLeft)
         }
     }
 

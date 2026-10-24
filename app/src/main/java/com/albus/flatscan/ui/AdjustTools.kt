@@ -69,9 +69,8 @@ private enum class AdjustTool(val label: String, val icon: ImageVector) {
     Contrast("Contrast", Icons.Outlined.Contrast),
     Saturation("Saturation", Icons.Outlined.InvertColors),
     Warmth("Warmth", Icons.Outlined.Thermostat),
-    Cleanup("Cleanup", Icons.Outlined.CleaningServices),
+    Cleanup("Background", Icons.Outlined.CleaningServices),
     Levels("Levels", Icons.Outlined.BarChart),
-    Shape("Page shape", Icons.Outlined.AspectRatio),
 }
 
 private fun AdjustTool.changed(p: RenderParams, l: PageLook): Boolean {
@@ -83,7 +82,6 @@ private fun AdjustTool.changed(p: RenderParams, l: PageLook): Boolean {
         AdjustTool.Warmth -> l.warmth != 0f
         AdjustTool.Cleanup -> p.bgCleanup != d.bgCleanup
         AdjustTool.Levels -> p.black != d.black || p.white != d.white || p.gamma != d.gamma
-        AdjustTool.Shape -> l.shape != PageShape.AsScanned
     }
 }
 
@@ -100,7 +98,7 @@ fun AdjustPanel(vm: ScanViewModel) {
     Column(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp)) {
         Row(Modifier.padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Adjust", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
-            val any = AdjustTool.entries.any { it != AdjustTool.Shape && it.changed(p, l) }
+            val any = AdjustTool.entries.any { it.changed(p, l) }
             TextButton(onClick = { vm.resetAdjustments(); vm.updateLook(l.copy(brightness = 0f, contrast = 0f, saturation = 0f, warmth = 0f)) }, enabled = any) {
                 Text("Reset")
             }
@@ -138,7 +136,6 @@ fun AdjustPanel(vm: ScanViewModel) {
                     }
                     LevelsEditor(vm.histogram, p.black, p.white, p.gamma, onChange = { b, w, g -> vm.setLevels(b, w, g) })
                 }
-                AdjustTool.Shape -> ShapeChooser(l) { vm.updateLook(l.copy(shape = it)) }
             }
         }
     }
@@ -191,8 +188,9 @@ private fun Bipolar(label: String, value: Float, caption: String, onChange: (Flo
     }
 }
 
+/** The page's shape (the result screen's Page tab). */
 @Composable
-private fun ShapeChooser(l: PageLook, onPick: (PageShape) -> Unit) {
+internal fun ShapeChooser(l: PageLook, onPick: (PageShape) -> Unit) {
     Column {
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             for (s in PageShape.entries) {

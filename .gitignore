@@ -11,3 +11,4 @@ app/build/
 __pycache__/
 .claude/
 build-host-win/
+docs/results/whiteboard/work/

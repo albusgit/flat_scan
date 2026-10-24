@@ -1,0 +1,36 @@
+search words: 119 Hebrew, 191 English (Tesseract confidence >= 80, 4+ letters)
+
+PASS qpdf --check both_bw_flate.pdf: errors that qpdf cannot detect
+PASS qpdf --check both_bw_g4.pdf: errors that qpdf cannot detect
+PASS qpdf --check both_color.pdf: errors that qpdf cannot detect
+PASS qpdf --check english.pdf: errors that qpdf cannot detect
+PASS qpdf --check hebrew_logical.pdf: errors that qpdf cannot detect
+PASS qpdf --check hebrew_visual.pdf: errors that qpdf cannot detect
+PASS qpdf --check xref.pdf: errors that qpdf cannot detect
+
+PASS poppler search hebrew_visual.pdf: 119/119 Hebrew words found (100%)
+PASS pdfium search hebrew_visual.pdf: 119/119 Hebrew words found (100%)
+PASS pdf.js search hebrew_visual.pdf: 119/119 Hebrew words found (100%)
+INFO poppler  hebrew_logical.pdf: 0/119 Hebrew words found (0%) [the variant not used]
+INFO pdfium   hebrew_logical.pdf: 0/119 Hebrew words found (0%) [the variant not used]
+INFO pdf.js   hebrew_logical.pdf: 0/119 Hebrew words found (0%) [the variant not used]
+PASS poppler search english.pdf: 191/191 English words found (100%)
+PASS pdfium search english.pdf: 191/191 English words found (100%)
+PASS pdf.js search english.pdf: 191/191 English words found (100%)
+PASS poppler search both_bw_g4.pdf: 310/310 both words found (100%)
+PASS pdfium search both_bw_g4.pdf: 310/310 both words found (100%)
+PASS pdf.js search both_bw_g4.pdf: 310/310 both words found (100%)
+PASS pdf.js reads the Hebrew title: 'חשבון בדיקה'
+PASS pdfinfo: Creator, Producer, dates: Title:           חשבון בדיקה | Creator:         FlatScan | Producer:        FlatScan PDF writer | CreationDate:    Fri Oct 23 22:59:11 2026 UTC
+
+PASS search highlight on the word, english.pdf: centre offset median 1.15 pt, p95 2.05 pt, max 2.85 pt over 191 words (1 pt = 0.35 mm)
+PASS search highlight on the word, hebrew_visual.pdf: centre offset median 0.50 pt, p95 1.99 pt, max 9.74 pt over 123 words (1 pt = 0.35 mm)
+
+PASS poppler renders english.pdf as its image: mean |diff| 0.66 levels
+PASS PDFium renders english.pdf as its image: mean |diff| 0.65 levels
+PASS poppler renders hebrew_visual.pdf as its image: mean |diff| 1.30 levels
+PASS PDFium renders hebrew_visual.pdf as its image: mean |diff| 1.28 levels
+PASS CCITT G4 decodes (libtiff) to the same pixels: 0 pixels differ
+PASS G4 and Flate pages render the same (poppler): mean |diff| 0.000
+
+ALL PASSED

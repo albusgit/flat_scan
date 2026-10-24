@@ -64,8 +64,12 @@
 
 namespace fs {
 
-enum class Filter : int { Original = 0, Lighten = 1, AutoColor = 2, Grayscale = 3, HighContrast = 4, BlackWhite = 5, Scan = 6 };
-const int kFilterCount = 7;
+enum class Filter : int { Original = 0, Lighten = 1, AutoColor = 2, Grayscale = 3, HighContrast = 4, BlackWhite = 5, Scan = 6,
+                          Whiteboard = 7, ProjectorDark = 8 };
+const int kFilterCount = 9;
+// Whiteboard mode's filters (board.h board_filter): their own cleanup, no paper model, no adjustments
+// except strength; the document filters above are untouched by them.
+inline bool is_board(Filter f) { return f == Filter::Whiteboard || f == Filter::ProjectorDark; }
 const char* filter_name(Filter f);
 
 struct PageParams {

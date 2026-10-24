@@ -15,6 +15,8 @@ data class EditState(
     val rotation: Int,
     val protect: List<Float>,
     val erase: List<Float>,
+    val fingersAuto: Boolean = true,
+    val fingerStrokes: List<Float> = emptyList(),
 )
 
 /**

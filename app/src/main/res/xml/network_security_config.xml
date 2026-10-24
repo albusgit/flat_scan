@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sync (feature 6): HTTPS with the system's certificate authorities; a self-signed certificate is accepted
+     only when the user pinned its fingerprint (sync/Http.kt, trust on first use). Plain http is allowed because
+     many home servers have no certificate, and only when the user types an http:// address (the settings
+     screen warns); addresses without a scheme get https://. User-installed CAs are not trusted. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

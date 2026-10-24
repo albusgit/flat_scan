@@ -1,0 +1,18 @@
+# Local WebDAV server for the sync integration tests (tools/sync_it/run.sh): basic auth, one share.
+host: 127.0.0.1
+port: 8433
+ssl_certificate: ./work/cert.pem
+ssl_private_key: ./work/key.pem
+provider_mapping:
+  "/dav": ./work/dav
+http_authenticator:
+  domain_controller: null
+  accept_basic: true
+  accept_digest: false
+  default_to_digest: false
+simple_dc:
+  user_mapping:
+    "*":
+      "scanner":
+        password: "s3cret-pass"
+verbose: 1
