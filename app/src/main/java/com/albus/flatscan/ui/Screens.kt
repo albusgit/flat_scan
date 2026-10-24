@@ -7,6 +7,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -439,6 +440,13 @@ fun SettingsScreen(vm: ScanViewModel) {
             RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("About")
             Text("Version ${BuildConfigInfo.VERSION}", style = MaterialTheme.typography.bodyMedium)
+            Row(
+                Modifier.fillMaxWidth().clickable(role = Role.Button) { vm.open(Screen.Licenses) }.padding(vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Open-source licences", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                Icon(Icons.Outlined.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Spacer(Modifier.height(4.dp))
             Text(vm.gpuInfo, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             RuledDivider(Modifier.padding(vertical = 8.dp))

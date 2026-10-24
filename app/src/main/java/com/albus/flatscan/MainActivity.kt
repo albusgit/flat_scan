@@ -22,6 +22,7 @@ import com.albus.flatscan.ui.FlatScanTheme
 import com.albus.flatscan.ui.HomeScreen
 import com.albus.flatscan.ui.MessageHost
 import com.albus.flatscan.ui.PagesScreen
+import com.albus.flatscan.ui.LicensesScreen
 import com.albus.flatscan.ui.ProcessingScreen
 import com.albus.flatscan.ui.ResultScreen
 import com.albus.flatscan.ui.SettingsScreen
@@ -110,6 +111,7 @@ private fun App(vm: ScanViewModel) {
             Screen.Result -> ResultScreen(vm)
             Screen.Pages -> PagesScreen(vm)
             Screen.Settings -> SettingsScreen(vm)
+            Screen.Licenses -> LicensesScreen(vm)
         }
         MessageHost(vm)
     }
