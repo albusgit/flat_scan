@@ -72,6 +72,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
@@ -175,12 +176,24 @@ fun HomeScreen(vm: ScanViewModel) {
             when {
                 docs == null -> {}
                 docs!!.isEmpty() -> item("empty") {
-                    Row(Modifier.fillMaxWidth().padding(top = 28.dp, start = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        CrumpledBall(Modifier.size(60.dp), paper = MaterialTheme.colorScheme.surfaceContainerLowest, ink = MaterialTheme.colorScheme.onSurface)
-                        Spacer(Modifier.width(16.dp))
-                        Column {
+                    // nothing scanned yet: how it works, on a ruled sheet
+                    PaperSurface(Modifier.fillMaxWidth().padding(top = 18.dp), tape = true) {
+                        Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 18.dp, bottom = 14.dp)) {
                             Text("Bring me a wrinkled page.", style = MaterialTheme.typography.titleMedium)
                             Text("Folded, curled or crumpled: it comes out flat. Your scans appear here.", style = MaterialTheme.typography.bodyMedium, color = muted)
+                            HowItWorks(
+                                Modifier.fillMaxWidth().height(116.dp).padding(top = 10.dp),
+                                ink = MaterialTheme.colorScheme.onSurface, paper = MaterialTheme.colorScheme.surfaceContainerLowest,
+                                accent = MaterialTheme.colorScheme.primary, marker = if (isPaperLight()) Palette.Highlighter else Graphite.Highlighter,
+                            )
+                            Row(Modifier.fillMaxWidth()) {
+                                for (t in listOf("Snap it", "Iron it", "Flat and clean")) {
+                                    Text(
+                                        t, style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono), color = muted,
+                                        textAlign = TextAlign.Center, modifier = Modifier.weight(1f),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -234,6 +247,11 @@ private fun ScanCard(tall: Boolean, onClick: () -> Unit) {
         container = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary,
         modifier = Modifier.fillMaxWidth().height(if (tall) 172.dp else 128.dp),
     ) {
+        // line art of the iron on a sheet, faint, on the right of the card
+        IronOnSheet(
+            Modifier.align(Alignment.CenterEnd).padding(end = 12.dp).size(if (tall) 132.dp else 104.dp),
+            color = LocalContentColor.current.copy(alpha = 0.32f),
+        )
         Column(Modifier.fillMaxSize().padding(22.dp), verticalArrangement = Arrangement.SpaceBetween) {
             Box(
                 Modifier.size(52.dp).background(LocalContentColor.current.copy(alpha = 0.16f), RoundedCornerShape(10.dp)),

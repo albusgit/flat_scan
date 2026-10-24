@@ -82,8 +82,8 @@ fun ruledColor(): Color = if (isPaperLight()) Palette.Ruled else MaterialTheme.c
 @Composable
 fun Modifier.graphPaper(): Modifier {
     val light = isPaperLight()
-    val minor = if (light) Color(0xFFE2E7EE) else Color(0xFF1C1D20)
-    val major = if (light) Color(0xFFD5DCE6) else Color(0xFF232428)
+    val minor = if (light) Color(0xFFE2E7EE) else Color(0xFF1E1F22)
+    val major = if (light) Color(0xFFD5DCE6) else Color(0xFF292A2F)
     return drawBehind {
         val step = 16.dp.toPx()
         val w = 1.dp.toPx()

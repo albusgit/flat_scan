@@ -195,24 +195,24 @@ private fun LicenseList(onOpen: (OssComponent) -> Unit) {
             )
         }
         items(OssComponents, key = { it.name }) { c ->
-            Row(
-                Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Show the licence") { onOpen(c) }
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(c.name, style = MaterialTheme.typography.titleMedium)
-                    Text(c.version, style = MaterialTheme.typography.bodySmall, color = muted)
-                    Text(c.copyright, style = MaterialTheme.typography.bodySmall, color = muted)
-                    Text(
-                        c.license, style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono),
-                        color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 2.dp),
-                    )
-                    Text(c.url, style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            PaperSurface(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp), onClick = { onOpen(c) }) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(c.name, style = MaterialTheme.typography.titleMedium)
+                        Text(c.version, style = MaterialTheme.typography.bodySmall, color = muted)
+                        Text(c.copyright, style = MaterialTheme.typography.bodySmall, color = muted)
+                        Text(
+                            c.license, style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono),
+                            color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 2.dp),
+                        )
+                        Text(c.url, style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Icon(Icons.Outlined.ChevronRight, null, tint = muted)
                 }
-                Icon(Icons.Outlined.ChevronRight, null, tint = muted)
             }
-            RuledDivider(Modifier.padding(horizontal = 16.dp))
         }
     }
 }

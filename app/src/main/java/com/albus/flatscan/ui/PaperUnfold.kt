@@ -248,19 +248,20 @@ private class Unfold(seed: Int) {
             val row = rows[idx % rows.size]
             val prev = rows[(idx + rows.size - 1) % rows.size]
             ironLeft = idx % 2 == 1
-            val along = -0.1f + 1.2f * easeInOut(f)
+            // steady along the row, easing only into the turns
+            val along = -0.06f + 1.12f * (0.2f * easeInOut(f) + 0.8f * f)
             ironU = if (ironLeft) 1f - along else along
             ironV = prev + (row - prev) * easeInOut(clamp01(f / 0.18f))
             if (active) {
                 for (k in 0 until n) {
                     val du = abs(u[k] - ironU)
                     val dv = abs(v[k] - ironV)
-                    if (du < 0.12f && dv < 0.14f) pressed[k] = min(1f, pressed[k] + dt * 5f * (1 - du / 0.12f))
+                    if (du < 0.15f && dv < 0.15f) pressed[k] = min(1f, pressed[k] + dt * 6f * (1 - du / 0.15f))
                 }
                 puffClock += dt
                 if (puffClock > 0.16f) {
                     puffClock = 0f
-                    puffs += Puff(ironU + (if (ironLeft) 0.09f else -0.09f), ironV, 0f, (Random.nextFloat() - 0.5f))
+                    puffs += Puff(ironU + (if (ironLeft) 0.12f else -0.12f), ironV, 0f, (Random.nextFloat() - 0.5f))
                 }
             }
         }
@@ -291,8 +292,10 @@ private class Unfold(seed: Int) {
         val sa = sin(angle)
         val flatten = clamp01((p - 0.86f) / 0.08f)           // the final press: every crease out
         val relax = clamp01((p - 0.2f) / 0.6f)
+        // the opening runs from 2% to 30%: the middle first, the outer folds follow, every fold moving all along
+        val q = clamp01((p - 0.02f) / 0.28f)
         for (k in 0 until n) {
-            val t = easeOut(clamp01((p - 0.02f - delay[k] * 0.3f) / (0.36f - delay[k] * 0.3f)))
+            val t = easeOut(clamp01((q - delay[k] * 0.5f) / (1 - delay[k] * 0.5f)))
             val fx = (u[k] - 0.5f) * pw
             val fy = (v[k] - 0.5f) * ph
             val rx = cx[k] * pw * 1.35f * breathe
@@ -332,8 +335,8 @@ private class Unfold(seed: Int) {
                 drawCircle(ink.copy(alpha = a), radius = (3f + pf.age * 6f).dp.toPx() * unit.coerceAtMost(1.4f), center = c, style = Stroke(1.5.dp.toPx()))
             }
             // the iron lifts a little where it turns at the end of a row
-            val lift = (1 - min(1f, min(abs(ironU + 0.1f), abs(ironU - 1.1f)) / 0.12f)) * 6.dp.toPx()
-            drawIron(Offset(left + ironU * pw, top + ironV * ph - lift), unit, ironAlpha * alpha, flip = ironLeft)
+            val lift = (1 - min(1f, min(abs(ironU + 0.06f), abs(ironU - 1.06f)) / 0.1f)) * 6.dp.toPx()
+            drawIron(Offset(left + ironU * pw, top + ironV * ph - lift), unit * 1.35f, ironAlpha * alpha, flip = ironLeft)
         }
     }
 
