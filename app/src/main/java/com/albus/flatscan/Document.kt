@@ -34,11 +34,17 @@ data class PageMeta(
     val look: PageLook = PageLook(),          // light, colour and page shape (Kotlin, after the core's render)
     val mode: CaptureMode = CaptureMode.Document,   // whiteboard mode: perspective only, board filters
     val fingersAuto: Boolean = true,          // the automatic finger removal applies (off: the photo's pixels there)
-    // finger brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ...] repeated
+    // finger brush strokes: [mode (1 add, 0 remove; 2 / 3 an outlined area added / removed), radius (page-width
+    // fraction), n, x0, y0, ...] repeated
     val fingerStrokes: FloatArray = FloatArray(0),
+    val removeShadows: Boolean = true,        // the page's shadows are removed (off: left as photographed)
+    val fingerFill: Int = 0,                  // removed fingers: 0 the paper around them, 1 painted in by the inpainting net
+    // lines drawn along rules the line stage missed: [group, n, x0, y0, ...] repeated, output-page fractions
+    // (group k drawn on the page the groups before it made; kept only while the corners are unchanged)
+    val userLines: FloatArray = FloatArray(0),
 ) {
     /** Edits after processing beyond the automatic ones (setEdits needed when a page is opened). */
-    val hasEdits: Boolean get() = erase.isNotEmpty() || !fingersAuto || fingerStrokes.isNotEmpty()
+    val hasEdits: Boolean get() = erase.isNotEmpty() || !fingersAuto || fingerStrokes.isNotEmpty() || fingerFill != 0
 
     /**
      * Everything the processed geometry depends on: a stored session (DocumentStore.saveSession)
@@ -47,7 +53,8 @@ data class PageMeta(
     fun geometryKey(renderWidth: Int, autoOrient: Boolean, net: Boolean): String = listOf(
         corners.joinToString(","), detected?.joinToString(",") ?: "-", cropRotation, userRotated, focalPx, pageIndex,
         forceHomography, ignore.joinToString(","), perspectiveOnly, renderWidth, autoOrient, net,
-    ).joinToString("|") + if (mode == CaptureMode.Document) "" else "|mode=${mode.name}"
+    ).joinToString("|") + (if (mode == CaptureMode.Document) "" else "|mode=${mode.name}") +
+        (if (removeShadows) "" else "|shadows=kept") + (if (userLines.isEmpty()) "" else "|drawn=" + userLines.joinToString(","))
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -78,6 +85,9 @@ data class PageMeta(
         if (mode != CaptureMode.Document) put("mode", mode.name)
         if (!fingersAuto) put("fingers_auto", false)
         if (fingerStrokes.isNotEmpty()) put("finger_strokes", fingerStrokes.toJson())
+        if (!removeShadows) put("remove_shadows", false)
+        if (fingerFill == 1) put("finger_fill", "ai")
+        if (userLines.isNotEmpty()) put("user_lines", userLines.toJson())
     }
 
     companion object {
@@ -113,6 +123,9 @@ data class PageMeta(
                 mode = CaptureMode.entries.firstOrNull { it.name == j.optString("mode") } ?: CaptureMode.Document,
                 fingersAuto = j.optBoolean("fingers_auto", true),
                 fingerStrokes = j.optJSONArray("finger_strokes")?.toFloats() ?: FloatArray(0),
+                removeShadows = j.optBoolean("remove_shadows", true),
+                fingerFill = if (j.optString("finger_fill") == "ai") 1 else 0,
+                userLines = j.optJSONArray("user_lines")?.toFloats() ?: FloatArray(0),
             )
         }
 

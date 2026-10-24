@@ -60,6 +60,7 @@ struct Session {
     std::string before_file;  // restored sessions: the before page, read on first use (before_page)
     std::vector<std::pair<cv::Size, cv::Mat>> small;   // paper-filled page, INTER_AREA, by size
     cv::Mat page_orig, paper_orig;   // the page before the Erase tool (kept from its first use)
+    cv::Mat ai_mask, ai_page;        // the finger mask the AI fill last painted, and the page it made (setEdits)
     bool use_gpu = true;
     std::string accel;        // the nets' timings and backends: the members of info()'s "accel" object
 
@@ -456,6 +457,7 @@ struct NetGroup {
 
 std::mutex g_nets_mu;             // guards everything below
 std::shared_ptr<NetGroup> g_finder, g_flat, g_hr, g_shade, g_rule;
+std::shared_ptr<NetGroup> g_inpaint;   // the finger AI fill (MI-GAN): CPU only, its own Inference
 jobject g_assets = nullptr;       // global reference: keeps the AAssetManager alive
 AAssetManager* g_mgr = nullptr;
 std::string g_cache_dir;          // compiled-model cache (the LiteRT GPU's serialised kernels)
@@ -744,7 +746,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jboolean flatten, jint flat_nets, jboolean shadows, jboolean rules,
-                                                                  jboolean board, jobject listener) {
+                                                                  jboolean board, jboolean remove_shadows, jfloatArray user_lines, jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -769,6 +771,25 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     o.force_homography = force_homography;
     o.perspective_only = perspective_only;
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
+    // the line editor's drawn lines: [group, n, x0, y0, ... x(n-1), y(n-1)] repeated, output-page fractions
+    if (user_lines) {
+        jsize n = env->GetArrayLength(user_lines);
+        std::vector<float> v(n);
+        if (n) env->GetFloatArrayRegion(user_lines, 0, n, v.data());
+        size_t i = 0;
+        while (i + 2 <= v.size()) {
+            PipelineOptions::UserLine l;
+            l.group = (int)std::lround(v[i]);
+            size_t np = (size_t)std::max(0.f, v[i + 1]);
+            i += 2;
+            if (i + 2 * np > v.size()) break;
+            for (size_t k = 0; k < np; ++k) l.pts.emplace_back(v[i + 2 * k], v[i + 2 * k + 1]);
+            i += 2 * np;
+            if (l.pts.size() >= 2) o.user_lines.push_back(std::move(l));
+        }
+    }
+    // the page's Remove shadows switch: off, neither the shading map nor the shadow net
+    o.remove_shadows = remove_shadows;
     o.auto_orient = auto_orient;
     // whiteboard mode: a board is not held by fingers (and skin-coloured drawings must stay)
     if (board) o.erase_fingers = false;
@@ -866,7 +887,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
       << ", \"uv_agreement\": " << json_num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
-      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"fingers_over_text\": " << (r.fingers_over_text ? "true" : "false") << ", \"uv_model\": " << r.uv_model
+      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"fingers_over_text\": " << (r.fingers_over_text ? "true" : "false") << ", \"user_lines_used\": " << r.user_lines_used << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
       << ", \"screen\": {\"detected\": " << (s->screen.screen ? "true" : "false") << ", \"score\": " << json_num(s->screen.score)
@@ -992,7 +1013,8 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_release(JNIEnv*, jclass
 // Erase tool: the page as processed, then every rectangle (page fractions [x0, y0, x1, y1, ...])
 // filled with the paper around it. An empty array restores the page.
 // Finger brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ... x(n-1), y(n-1)]
-// repeated, points as page fractions; drawn into [mask] (255 add, 0 remove) in order.
+// repeated, points as page fractions; drawn into [mask] (255 add, 0 remove) in order. Modes 2 (add) and 3
+// (remove): the points outline an area (smart select), filled; the radius is not used.
 void draw_strokes(JNIEnv* env, jfloatArray strokes, cv::Mat& mask) {
     if (!strokes) return;
     jsize n = env->GetArrayLength(strokes);
@@ -1000,12 +1022,20 @@ void draw_strokes(JNIEnv* env, jfloatArray strokes, cv::Mat& mask) {
     if (n) env->GetFloatArrayRegion(strokes, 0, n, v.data());
     size_t i = 0;
     while (i + 3 <= v.size()) {
-        bool add = v[i] > 0.5f;
+        const int mode = (int)std::lround(v[i]);
+        const bool add = mode == 1 || mode == 2;
         int th = std::max(1, (int)std::lround(2 * v[i + 1] * mask.cols));
         size_t np = (size_t)std::max(0.f, v[i + 2]);
         i += 3;
         if (i + 2 * np > v.size()) break;
         cv::Scalar c(add ? 255 : 0);
+        if (mode >= 2) {
+            std::vector<cv::Point> poly;
+            for (size_t k = 0; k < np; ++k) poly.emplace_back((int)std::lround(v[i + 2 * k] * mask.cols), (int)std::lround(v[i + 2 * k + 1] * mask.rows));
+            if (poly.size() >= 3) cv::fillPoly(mask, std::vector<std::vector<cv::Point>>{poly}, c, cv::LINE_8);
+            i += 2 * np;
+            continue;
+        }
         for (size_t k = 0; k < np; ++k) {
             cv::Point p((int)std::lround(v[i + 2 * k] * mask.cols), (int)std::lround(v[i + 2 * k + 1] * mask.rows));
             cv::circle(mask, p, th / 2, c, cv::FILLED);
@@ -1026,10 +1056,12 @@ cv::Mat finger_mask_for(JNIEnv* env, const PipelineResult& r, cv::Size size, boo
 }
 
 // The page's edits after processing: the finger mask (the automatic one when [fingers_auto], plus brush
-// [strokes]) filled with paper (fill_finger), then the Erase tool's rectangles [rects] (page fractions).
+// [strokes]) filled with paper (fill_finger) - [fill] 1: then painted in by the inpainting net (inpaint_fill) -,
+// then the Erase tool's rectangles [rects] (page fractions).
 // Starts from the page before any finger fill, so removing a stroke or turning the automatic mask off
 // brings the photo's pixels back.
-JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setEdits(JNIEnv* env, jclass, jlong h, jfloatArray rects, jboolean fingers_auto, jfloatArray strokes) {
+JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setEdits(JNIEnv* env, jclass, jlong h, jfloatArray rects, jboolean fingers_auto, jfloatArray strokes,
+                                                                   jint fill) {
     Session* s = session(h);
     if (!s || !s->result.ok) return JNI_FALSE;
     std::vector<Rect01> rs = parse_protect(env, rects);
@@ -1044,7 +1076,23 @@ JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setEdits(JNIEnv* en
         r.paper = (has_base ? r.paper_unerased : s->paper_orig).clone();
         if (has_base || (strokes && env->GetArrayLength(strokes) > 0)) {
             cv::Mat fm = finger_mask_for(env, r, r.page.size(), fingers_auto, strokes);
-            if (cv::countNonZero(fm) > 0) fill_finger(r.page, fm, r.paper.empty() ? nullptr : &r.paper);
+            if (cv::countNonZero(fm) > 0) {
+                fill_finger(r.page, fm, r.paper.empty() ? nullptr : &r.paper);
+                // fill 1: the AI fill over the paper fill (the same mask again: its last result)
+                if (fill == 1) {
+                    cv::Mat diff;
+                    if (!s->ai_mask.empty() && s->ai_mask.size() == fm.size() && s->ai_page.size() == r.page.size()) cv::bitwise_xor(fm, s->ai_mask, diff);
+                    if (!diff.empty() && cv::countNonZero(diff) == 0) {
+                        s->ai_page.copyTo(r.page);
+                    } else {
+                        auto g = group(g_inpaint);
+                        if (inpaint_fill(r.page, fm, *g->inf, r.paper_unerased.empty() ? nullptr : &r.paper_unerased)) {
+                            s->ai_mask = fm.clone();
+                            s->ai_page = r.page.clone();
+                        }
+                    }
+                }
+            }
         }
         if (!rs.empty()) {
             cv::Mat mask = cv::Mat::zeros(r.page.size(), CV_8U);
@@ -1081,6 +1129,74 @@ JNIEXPORT jfloat JNICALL Java_com_albus_flatscan_NativeLib_fingerOverlay(JNIEnv*
     o.setTo(cv::Scalar(255, 140, 40, 120), m);   // RGBA memory order
     AndroidBitmap_unlockPixels(env, out);
     return (float)cv::countNonZero(m) / std::max(1, m.cols * m.rows);
+}
+
+// The finger tool's smart select: the area around page point (fx, fy) (fractions) that belongs with it - a
+// finger, a thumb - on the page before any finger fill: GrabCut in a box around the tap, the tap itself
+// certain, the colour-alike area flood-filled from it likely, the rest of the box unsure. The piece joined
+// to the tap, holes filled, 2 px wider (the finger's soft edge). Returns its outline as page fractions
+// [x0, y0, x1, y1, ...]; empty when nothing was found or it would cover more than a quarter of the page
+// (a tap on blank paper).
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_fingerSelect(JNIEnv* env, jclass, jlong h, jfloat fx, jfloat fy) {
+    std::vector<float> out;
+    Session* s = session(h);
+    if (s && s->result.ok) {
+        try {
+            const PipelineResult& r = s->result;
+            const cv::Mat& src = !r.page_unerased.empty() ? r.page_unerased : (!s->page_orig.empty() ? s->page_orig : r.page);
+            cv::Mat bgr;
+            if (src.channels() == 4) cv::cvtColor(src, bgr, cv::COLOR_BGRA2BGR);
+            else bgr = src.clone();
+            const double k = std::min(1.0, 700.0 / std::max(bgr.cols, bgr.rows));
+            if (k < 1) cv::resize(bgr, bgr, cv::Size(), k, k, cv::INTER_AREA);
+            const int W = bgr.cols, H = bgr.rows;
+            cv::Point seed(std::min(W - 1, std::max(0, (int)(fx * W))), std::min(H - 1, std::max(0, (int)(fy * H))));
+            cv::Mat lab, smooth;
+            cv::GaussianBlur(bgr, smooth, cv::Size(5, 5), 0);
+            cv::cvtColor(smooth, lab, cv::COLOR_BGR2Lab);
+            cv::Mat ff = cv::Mat::zeros(H + 2, W + 2, CV_8U);
+            cv::floodFill(lab, ff, seed, cv::Scalar(), nullptr, cv::Scalar(5, 4, 4), cv::Scalar(5, 4, 4), 4 | cv::FLOODFILL_MASK_ONLY | (255 << 8));
+            cv::Mat alike = ff(cv::Rect(1, 1, W, H)).clone();
+            if (cv::countNonZero(alike) > 0.25 * W * H) return env->NewFloatArray(0);   // blank paper
+            const int half = std::max(W, H) / 7;
+            cv::Rect box = cv::Rect(seed.x - half, seed.y - half, 2 * half, 2 * half) | cv::boundingRect(alike);
+            box &= cv::Rect(0, 0, W, H);
+            cv::Mat gc(H, W, CV_8U, cv::Scalar(cv::GC_BGD));
+            gc(box).setTo(cv::GC_PR_BGD);
+            gc.setTo(cv::GC_PR_FGD, alike);
+            cv::circle(gc, seed, std::max(2, W / 120), cv::Scalar(cv::GC_FGD), cv::FILLED);
+            cv::Mat bgd, fgd;
+            cv::grabCut(bgr, gc, box, bgd, fgd, 4, cv::GC_INIT_WITH_MASK);
+            cv::Mat fg = (gc == cv::GC_FGD) | (gc == cv::GC_PR_FGD);
+            cv::morphologyEx(fg, fg, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+            cv::Mat lbl;
+            cv::connectedComponents(fg, lbl, 8, CV_32S);
+            const int keep = lbl.at<int>(seed);
+            if (keep == 0) return env->NewFloatArray(0);
+            fg = lbl == keep;
+            std::vector<std::vector<cv::Point>> cs;
+            cv::findContours(fg, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            if (cs.empty()) return env->NewFloatArray(0);
+            cv::Mat filled = cv::Mat::zeros(H, W, CV_8U);
+            cv::drawContours(filled, cs, -1, cv::Scalar(255), cv::FILLED);
+            cv::dilate(filled, filled, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+            if (cv::countNonZero(filled) > 0.25 * W * H) return env->NewFloatArray(0);
+            cs.clear();
+            cv::findContours(filled, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            size_t big = 0;
+            for (size_t i = 1; i < cs.size(); ++i)
+                if (cv::contourArea(cs[i]) > cv::contourArea(cs[big])) big = i;
+            std::vector<cv::Point> poly;
+            cv::approxPolyDP(cs[big], poly, 1.0, true);
+            for (const auto& q : poly) { out.push_back((q.x + 0.5f) / W); out.push_back((q.y + 0.5f) / H); }
+        } catch (const std::exception& e) {
+            LOGI("fingerSelect failed: %s", e.what());
+            out.clear();
+        }
+    }
+    jfloatArray a = env->NewFloatArray((jsize)out.size());
+    if (!out.empty()) env->SetFloatArrayRegion(a, 0, (jsize)out.size(), out.data());
+    return a;
 }
 
 // lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...] as page fractions (PipelineResult::lines)

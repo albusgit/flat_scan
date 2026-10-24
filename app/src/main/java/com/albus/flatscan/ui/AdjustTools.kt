@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
@@ -145,10 +146,10 @@ fun AdjustPanel(vm: ScanViewModel) {
 private fun ToolChip(t: AdjustTool, selected: Boolean, changed: Boolean, onClick: () -> Unit) {
     val color = if (selected) Editor.Accent else Editor.Inactive
     Column(
-        Modifier.width(72.dp).clip(RoundedCornerShape(8.dp))
+        Modifier.widthIn(min = 72.dp).clip(RoundedCornerShape(8.dp))
             .selectable(selected, role = Role.Tab, onClick = onClick)
             .semantics { if (changed) stateDescription = "changed" }
-            .padding(vertical = 6.dp),
+            .padding(horizontal = 6.dp, vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Box {
@@ -162,7 +163,7 @@ private fun ToolChip(t: AdjustTool, selected: Boolean, changed: Boolean, onClick
             if (changed) Box(Modifier.align(Alignment.TopEnd).size(9.dp).background(Editor.Accent, CircleShape).border(1.5.dp, Editor.Panel, CircleShape))
         }
         Spacer(Modifier.height(4.dp))
-        Text(t.label, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1, textAlign = TextAlign.Center)
+        Text(t.label, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1, softWrap = false, textAlign = TextAlign.Center)
     }
 }
 

@@ -255,6 +255,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         private set
     /** The ignore areas differ from the ones the current page was flattened with. */
     val ignoreChanged: Boolean get() = ignore != (sessionGeomState?.ignore?.toList() ?: emptyList<Float>())
+    /** Lines drawn along rules the unwarp missed (PageMeta.userLines layout, being edited). */
+    var userLines by mutableStateOf(listOf<Float>())
+        private set
+    /** The line editor has changes to flatten with: ignore areas or drawn lines. */
+    val lineEditsChanged: Boolean get() = ignoreChanged || userLines != (sessionGeomState?.userLines?.toList() ?: emptyList<Float>())
+    /** The page's shadows are removed (Page panel switch). */
+    val removeShadows: Boolean get() = sessionGeomState?.removeShadows != false
     /** The user turned the unwarp off for the current page (perspective correction only). */
     val perspectiveOnly: Boolean get() = sessionGeomState?.perspectiveOnly == true
     /** The page was flattened again from the line editor: the result screen opens it again. */
@@ -529,7 +536,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val detectMs = msSince(td)
             val c = FloatArray(8) { i -> if (i % 2 == 0) pg.corners[i / 2].x else pg.corners[i / 2].y }
             val h = NativeLib.process(
-                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, false, null,
+                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, false, true, null, null,
             )
             val pageMs = msSince(t0)
             val info = if (h != 0L) JSONObject(NativeLib.info(h)).also { NativeLib.release(h) } else null
@@ -1061,6 +1068,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         detecting = false
         if (found == null && !(batch && !settings.reviewCrops)) message = "Board not found - drag the corners"
         if (auto && !settings.reviewCrops && (found != null || batch)) process()
+    }
+
+    /** Page panel: the page's shadows removed or left as photographed (processed again). */
+    fun setRemoveShadows(on: Boolean) {
+        val g = sessionGeomState ?: return
+        if (g.removeShadows == on || !sourceAvailable(g.id)) return
+        sessionGeomState = g.copy(removeShadows = on)
+        reflatten()
     }
 
     /** Switches the page on the result screen between document and whiteboard processing (processed again). */
@@ -1842,7 +1857,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * Processes the photo on the crop screen. [ignoreAreas] / [perspective]: the line editor's
      * settings; null keeps the page's own (its ignore areas only while the corners are unchanged).
      */
-    fun process(ignoreAreas: List<Float>? = null, perspective: Boolean? = null) {
+    fun process(ignoreAreas: List<Float>? = null, perspective: Boolean? = null, drawnLines: List<Float>? = null) {
         val p = photo ?: return
         val id = photoPageId ?: return
         if (corners.size != 4) return
@@ -1854,9 +1869,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val same = id == currentId
         val stored = cropMeta?.takeIf { it.id == id }
         val prev = if (same) sessionGeom else stored
-        val ig = ignoreAreas
-            ?: prev?.takeIf { it.corners.contentEquals(c) && it.cropRotation == cropRotation }?.ignore?.toList()
-            ?: emptyList()
+        val samePlace = prev?.takeIf { it.corners.contentEquals(c) && it.cropRotation == cropRotation }
+        val ig = ignoreAreas ?: samePlace?.ignore?.toList() ?: emptyList()
+        // drawn lines sit where the user saw them on this crop: a new crop drops them
+        val drawn = (if (samePlace != null) drawnLines ?: samePlace.userLines.toList() else null) ?: emptyList()
+        val removeSh = prev?.removeShadows ?: true
         // the page's mode: a page keeps its own (setPageMode changes it); a new page takes the crop's
         val mode = prev?.mode ?: cropMode
         val board = mode == CaptureMode.Whiteboard
@@ -1868,7 +1885,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             params = RenderParams(), protect = FloatArray(0), rotation = 0,
             pageIndex = pageIndex, forceHomography = force,
             spreadWith = spread?.firstId ?: stored?.spreadWith ?: (if (same) sessionGeom?.spreadWith else null),
-            ignore = ig.toFloatArray(), perspectiveOnly = po, mode = mode,
+            ignore = ig.toFloatArray(), perspectiveOnly = po, mode = mode, removeShadows = removeSh, userLines = drawn.toFloatArray(),
         )
         val key = geometryKey(geom)
         val defaults = settings.defaultParams()
@@ -1902,7 +1919,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val width = settings.outputWidth
         val useUv = settings.uvDoc && !board
         val nets = settings.flatNets
-        val shadows = settings.neuralShadows && !board
+        val shadows = settings.neuralShadows && !board && removeSh
         val rules = settings.ruleNet && !board
         val focal = focalPx
         recropBackup = null
@@ -1929,6 +1946,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     CrashGuard.guard(getApplication(), "processing a page", gpu = !plan.cpuOnly) {
                         NativeLib.process(
                             p, c, edited || board, focal, autoOrient, width, true, if (board) null else logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules, board,
+                            removeSh, drawn.toFloatArray(),
                         ) { pct, s ->
                             viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                         }
@@ -1979,6 +1997,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 message = "Book spread: added as 2 pages (${if (settings.bookRightToLeft) "right" else "left"} page first)"
             }
             val text = describe(info, edited, force, po, ig.size / 4)
+            val drawnCount = countDrawnLines(drawn)
+            if (!po && drawnCount > info.optInt("user_lines_used", drawnCount)) {
+                message = if (drawnCount == 1) "The drawn line found no printed line to follow" else "A drawn line found no printed line to follow"
+            }
             // the processed page is kept on disk: opening it again needs no re-processing
             storeSession(id, key, info, text, withContext(nativeCtx) { if (h == nativeHandle) NativeLib.snapshot(h) else 0L })
             activate(h, geomL, startParams, startProtect, startRotation, text, restored = false)
@@ -2006,16 +2028,19 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         look = geom.look
         lines = ln
         ignore = geom.ignore.toList()
+        userLines = geom.userLines.toList()
         erase = geom.erase.toList()
         fingersAuto = geom.fingersAuto
         fingerStrokes = geom.fingerStrokes.toList()
+        fingerFill = geom.fingerFill
         fingerOverlay = null
         fingersOverText = runCatching { JSONObject(withContext(nativeCtx) { NativeLib.info(h) }).optBoolean("fingers_over_text") }.getOrDefault(false)
         if (geom.hasEdits) {
             val rects = erase.toFloatArray()
             val fa = fingersAuto
             val st = fingerStrokes.toFloatArray()
-            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, rects, fa, st) }
+            val ff = fingerFill
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, rects, fa, st, ff) }
         }
         outVersion++
         details = text
@@ -2057,10 +2082,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val geom = currentMeta() ?: return
         if (!sourceAvailable(id)) return
         val areas = ignore
+        val drawn = userLines
         reopenLines = true
         val p = photo
         if (photoPageId == id && p != null && recropBackup == null) {
-            process(areas, perspective)
+            process(areas, perspective, drawn)
             return
         }
         viewModelScope.launch {
@@ -2072,7 +2098,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 discardStaging()
                 recropBackup = null
                 setCrop(geom, bmp)
-                process(areas, perspective)
+                process(areas, perspective, drawn)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "reflatten failed", e)
@@ -2129,10 +2155,69 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         ignore = emptyList()
     }
 
-    /** Line editor closed without flattening again: back to the areas the page uses. */
+    /** Line editor closed without flattening again: back to the areas and drawn lines the page uses. */
     fun revertIgnore() {
         ignore = sessionGeomState?.ignore?.toList() ?: emptyList()
+        userLines = sessionGeomState?.userLines?.toList() ?: emptyList()
     }
+
+    /**
+     * Line editor > Add line: a line drawn along a rule the unwarp missed ([points]: page fractions x0, y0, ...).
+     * Lines drawn since the page was last flattened share a group (they were all drawn on the same page).
+     */
+    fun addUserLine(points: List<Float>) {
+        if (points.size < 4) return
+        val xs = points.filterIndexed { i, _ -> i % 2 == 0 }
+        val ys = points.filterIndexed { i, _ -> i % 2 == 1 }
+        if (maxOf(xs.max() - xs.min(), ys.max() - ys.min()) < 0.04f) return   // a tap or a short wiggle
+        val group = 1 + (drawnLineGroups(sessionGeomState?.userLines?.toList() ?: emptyList()).maxOrNull() ?: 0)
+        // at most 64 points along it
+        val n = points.size / 2
+        val step = maxOf(1, (n + 63) / 64)
+        val kept = (0 until n step step).toMutableList().also { if (it.last() != n - 1) it += n - 1 }
+        userLines = userLines + listOf(group.toFloat(), kept.size.toFloat()) + kept.flatMap { listOf(points[2 * it], points[2 * it + 1]) }
+    }
+
+    /** Line editor: removes the last drawn line. */
+    fun undoUserLine() {
+        val starts = drawnLineStarts(userLines)
+        if (starts.isNotEmpty()) userLines = userLines.take(starts.last())
+    }
+
+    /** Line editor: removes every drawn line. */
+    fun clearUserLines() {
+        userLines = emptyList()
+    }
+
+    /** Line editor: removes the drawn line nearest the page point (a tap on a straightened drawn line). */
+    fun removeUserLineNear(x: Float, y: Float) {
+        val l = userLines
+        val starts = drawnLineStarts(l)
+        var best = -1
+        var bestD = Float.MAX_VALUE
+        for ((k, s) in starts.withIndex()) {
+            val n = l[s + 1].toInt()
+            for (i in 0 until n) {
+                val dx = l[s + 2 + 2 * i] - x
+                val dy = l[s + 3 + 2 * i] - y
+                val d = dx * dx + dy * dy
+                if (d < bestD) { bestD = d; best = k }
+            }
+        }
+        if (best < 0) return
+        val a = starts[best]
+        val b = starts.getOrNull(best + 1) ?: l.size
+        userLines = l.take(a) + l.drop(b)
+    }
+
+    /** Drawn lines not flattened yet (page fractions x0, y0, ... each): the line editor draws them as drawn. */
+    val pendingUserLines: List<FloatArray>
+        get() {
+            val stored = sessionGeomState?.userLines?.toList() ?: emptyList()
+            val done = drawnLineGroups(stored).maxOrNull() ?: 0
+            val l = userLines
+            return drawnLineStarts(l).filter { l[it].toInt() > done }.map { s -> l.subList(s + 2, s + 2 + 2 * l[s + 1].toInt()).toFloatArray() }
+        }
 
     /**
      * The processing details' "accel" object: the core's (nets: per net, keys of [NET_LABELS], run_ms,
@@ -2216,7 +2301,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private fun currentMeta(): PageMeta? =
         sessionGeom?.copy(
             params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray(), look = look,
-            fingersAuto = fingersAuto, fingerStrokes = fingerStrokes.toFloatArray(),
+            fingersAuto = fingersAuto, fingerStrokes = fingerStrokes.toFloatArray(), fingerFill = fingerFill,
         )
 
     /**
@@ -2372,6 +2457,27 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     var fingerShare by mutableFloatStateOf(0f)
         private set
 
+    /**
+     * Finger tool > Smart select: the finger (or other area) under the page point ([x], [y], fractions) is found
+     * and filled ([add]) or brought back.
+     */
+    fun smartSelectFinger(x: Float, y: Float, add: Boolean) {
+        val h = handle
+        if (h == 0L) return
+        viewModelScope.launch {
+            rendering = true
+            val poly = withContext(nativeCtx) { if (h == nativeHandle) NativeLib.fingerSelect(h, x, y) else FloatArray(0) }
+            rendering = false
+            if (handle != h) return@launch
+            if (poly.size < 6) {
+                message = "Nothing to select there: tap on the finger"
+                return@launch
+            }
+            fingerStrokes = fingerStrokes + listOf(if (add) 2f else 3f, 0f, (poly.size / 2).toFloat()) + poly.toList()
+            applyPageEdits()
+        }
+    }
+
     /** A brush stroke over the page ([points]: page fractions x0, y0, ...): [add] fills it as a finger, else brings the photo back there. */
     fun addFingerStroke(add: Boolean, radius: Float, points: List<Float>) {
         if (points.size < 2) return
@@ -2389,6 +2495,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearFingerStrokes() {
         if (fingerStrokes.isNotEmpty()) { fingerStrokes = emptyList(); applyPageEdits() }
+    }
+
+    /** Removed fingers: 0 filled with the paper around them, 1 painted in by the inpainting net (MI-GAN). */
+    var fingerFill by mutableStateOf(0)
+        private set
+
+    fun chooseFingerFill(f: Int) {
+        if (f != fingerFill) { fingerFill = f; applyPageEdits() }
     }
 
     fun setFingersAutoOn(on: Boolean) {
@@ -2427,10 +2541,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val arr = erase.toFloatArray()
         val fa = fingersAuto
         val st = fingerStrokes.toFloatArray()
+        val ff = fingerFill
         val overlayShown = fingerOverlay != null
         viewModelScope.launch {
             rendering = true
-            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, arr, fa, st) }
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, arr, fa, st, ff) }
             if (overlayShown) refreshFingerOverlay()
             if (handle != h) return@launch
             thumbKey = null
@@ -2473,7 +2588,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The edits [history] tracks, as they are now. */
-    fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes)
+    fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes, fingerFill)
 
     fun undo() {
         // a change still inside the debounce is the one to undo
@@ -2495,10 +2610,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             rotation = s.rotation
             outVersion++
         }
-        if (s.erase != erase || s.fingersAuto != fingersAuto || s.fingerStrokes != fingerStrokes) {
+        if (s.erase != erase || s.fingersAuto != fingersAuto || s.fingerStrokes != fingerStrokes || s.fingerFill != fingerFill) {
             erase = s.erase
             fingersAuto = s.fingersAuto
             fingerStrokes = s.fingerStrokes
+            fingerFill = s.fingerFill
             applyPageEdits()
         }
     }
@@ -2544,7 +2660,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val h = NativeLib.restoreSession(dir.absolutePath, true)
             if (h == 0L) return@withContext null
             try {
-                if (m.hasEdits) NativeLib.setEdits(h, m.erase, m.fingersAuto, m.fingerStrokes)
+                if (m.hasEdits) NativeLib.setEdits(h, m.erase, m.fingersAuto, m.fingerStrokes, m.fingerFill)
                 val size = NativeLib.pageSize(h)
                 val b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
                 val ok = JSONObject(NativeLib.render(h, p.toArray(), m.protect, true, b)).optBoolean("ok")
@@ -2744,3 +2860,20 @@ fun Bitmap.rotatedCopy(q: Int): Bitmap {
     val n = ((q % 4) + 4) % 4
     return if (n == 0) copy(Bitmap.Config.ARGB_8888, false) else rotatedQuarterTurns(n)
 }
+
+/** Where each drawn line starts in a PageMeta.userLines list ([group, n, x0, y0, ...] repeated). */
+internal fun drawnLineStarts(l: List<Float>): List<Int> {
+    val out = ArrayList<Int>()
+    var i = 0
+    while (i + 2 <= l.size) {
+        val n = l[i + 1].toInt()
+        if (n < 0 || i + 2 + 2 * n > l.size) break
+        out += i
+        i += 2 + 2 * n
+    }
+    return out
+}
+
+internal fun drawnLineGroups(l: List<Float>): List<Int> = drawnLineStarts(l).map { l[it].toInt() }
+
+internal fun countDrawnLines(l: List<Float>): Int = drawnLineStarts(l).size

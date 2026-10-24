@@ -77,6 +77,13 @@ std::function<bool(std::vector<float>&, int, int)> shade_net_fn(Inference& inf, 
 // PipelineOptions::rule_net: the rule net on the half-size stage-1 page (planar BGR [0, 1], 3 x h x w,
 // sides multiples of 32), replaced by its 2 x h x w rule probabilities. ms (optional): accumulates the run time.
 RuleNetFn rule_net_fn(Inference& inf, double* ms = nullptr);
+// The finger tool's AI fill: each area of mask (CV_8U, page size, non-zero = fill) of the BGRA page painted
+// in by the inpainting net (MI-GAN 512, tools/inpaint: what the page around it suggests, not the paper's
+// average), from a crop around it at most 512 px across the net's input (larger crops are scaled down and
+// back), blended in with a 1-px feather. paper (optional, CV_8U page size): what is not paper (the desk
+// beyond the page's edge) is shown to the net as plain paper, so it does not continue the desk into the
+// page. False if the net did not run (the page is then unchanged). ms (optional): accumulates the run time.
+bool inpaint_fill(cv::Mat& page_bgra, const cv::Mat& mask, Inference& inf, const cv::Mat* paper = nullptr, double* ms = nullptr);
 // PipelineOptions::uv_net (the zoomed pass): model 0 UVDoc, 2 SyntheticDoc high-res.
 UvNetFn uv_net_fn(Inference& inf);
 

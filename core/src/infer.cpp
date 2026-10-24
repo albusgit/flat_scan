@@ -159,11 +159,12 @@ const char* net_str(NetId n) {
         case NetId::SynthDocHR: return "syntheticdoc_hr";
         case NetId::ShadeNet: return "shadenet";
         case NetId::RuleNet: return "rulenet";
+        case NetId::Inpaint: return "inpaint";
     }
     return "?";
 }
 
-constexpr int N_NETS = 5;
+constexpr int N_NETS = 6;
 
 }  // namespace
 
@@ -976,6 +977,7 @@ struct Inference::Impl {
     std::array<Slot, N_NETS> slots;
 
     static bool accelerator_allowed(NetId net, Backend b) {
+        if (net == NetId::Inpaint) return false;   // MI-GAN (finger fill): the CPU only, on demand
         if (net == NetId::RuleNet) return b != Backend::QNN_HTP && b != Backend::NNAPI;   // the LiteRT GPU: its fixed-shape copies
         return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
     }
@@ -1031,6 +1033,7 @@ struct Inference::Impl {
             else if (net == NetId::SynthDocHR) load("syntheticdoc_hr_static.tflite");
             else if (net == NetId::ShadeNet) load("shadenet.tflite");
             else if (net == NetId::RuleNet) load("rulenet.tflite");
+            else if (net == NetId::Inpaint) load("migan_512.tflite");
             return bytes;
         }
         if (b != Backend::CPU) {

@@ -10,6 +10,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <set>
 #include <thread>
 
 #include "gpu.h"
@@ -1012,6 +1013,162 @@ cv::Point2d map_at(const GridMap& g, double x, double y) {
     return {bil(g.x), bil(g.y)};
 }
 
+// samples (along, ideal, disp) of a line the user drew near a rule on D (darkness_fast of the page):
+// along the drawn path every 4 px, the darkest column of 3 px within r px across it, kept where it is
+// dark enough and agrees with its neighbours (a running median of the offsets: a letter beside the
+// rule is not followed). Empty if too little of it lies on ink. hz: a horizontal line (along x).
+std::vector<std::array<double, 3>> snap_user_line(const cv::Mat& D, std::vector<cv::Point2d> pts, bool hz, int r) {
+    std::vector<std::array<double, 3>> out;
+    if (pts.size() < 2) return out;
+    auto along = [hz](const cv::Point2d& p) { return hz ? p.x : p.y; };
+    auto across = [hz](const cv::Point2d& p) { return hz ? p.y : p.x; };
+    std::sort(pts.begin(), pts.end(), [&](const cv::Point2d& a, const cv::Point2d& b) { return along(a) < along(b); });
+    const int len = hz ? D.cols : D.rows, wid = hz ? D.rows : D.cols;
+    auto dark = [&](int a, int c) {   // a: along, c: across
+        float s = 0;
+        for (int k = -1; k <= 1; ++k) {
+            int aa = std::min(std::max(a + k, 0), len - 1);
+            s += hz ? D.at<float>(c, aa) : D.at<float>(aa, c);
+        }
+        return s / 3;
+    };
+    std::vector<double> as, cs, off;
+    size_t seg = 0;
+    const int a0 = std::max(0, (int)std::ceil(along(pts.front()))), a1 = std::min(len - 1, (int)std::floor(along(pts.back())));
+    for (int a = a0; a <= a1; a += 4) {
+        while (seg + 2 < pts.size() && along(pts[seg + 1]) < a) ++seg;
+        const cv::Point2d &p = pts[seg], &q = pts[seg + 1];
+        double t = along(q) - along(p) > 1e-6 ? (a - along(p)) / (along(q) - along(p)) : 0;
+        double c0 = across(p) + (across(q) - across(p)) * std::min(1.0, std::max(0.0, t));
+        // the user says a rule is here: it only has to stand out from the band around it (a pale grid
+        // line on a shaded page is ~20 darker than the paper; the detector's faint rules start at 25)
+        int best = -1;
+        float bv = -1e9f;
+        std::vector<float> band;
+        for (int c = std::max(0, (int)std::lround(c0) - r); c <= std::min(wid - 1, (int)std::lround(c0) + r); ++c) {
+            float d = dark(a, c);
+            band.push_back(d);
+            float v = d - 0.15f * std::fabs(c - c0);   // the nearer of two equal rules
+            if (v > bv) { bv = v; best = c; }
+        }
+        if (best < 0) continue;
+        std::nth_element(band.begin(), band.begin() + band.size() / 2, band.end());
+        const float peak = dark(a, best);
+        if (peak < 8.f || peak - band[band.size() / 2] < 6.f) continue;
+        as.push_back(a); cs.push_back(best); off.push_back(best - c0);
+    }
+    const int n = (int)as.size();
+    if (n < 8 || n * 4 < (a1 - a0) / 2) return out;   // less than half of the drawn stretch on ink
+    std::vector<double> keep_a, keep_c;
+    for (int i = 0; i < n; ++i) {
+        std::vector<double> w;
+        for (int k = std::max(0, i - 4); k <= std::min(n - 1, i + 4); ++k) w.push_back(off[k]);
+        std::nth_element(w.begin(), w.begin() + w.size() / 2, w.end());
+        if (std::fabs(off[i] - w[w.size() / 2]) <= 3) { keep_a.push_back(as[i]); keep_c.push_back(cs[i]); }
+    }
+    if (keep_a.size() < 8) return out;
+    std::vector<double> sorted = keep_c;
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    const double ideal = sorted[sorted.size() / 2];
+    for (size_t i = 0; i < keep_a.size(); ++i) out.push_back({keep_a[i], ideal, keep_c[i] - ideal});
+    return out;
+}
+
+// The lines the user drew (PipelineOptions::user_lines), after the line stage: group by group, each
+// snapped to the rule it was drawn along on the page as the warp map so far leaves it (the page the
+// user saw), straightened by a smooth field that holds every line already straight where it is (the
+// stage's lines, the earlier groups), and the field composed into warp4 (stage-1 frame, W x H). A
+// group whose field would move the page by more than 6 % of its long side is left out. Their
+// straightened positions join r.lines (kind 3).
+void apply_user_lines(const cv::Mat& stage1, GridMap& warp4, const std::vector<PipelineOptions::UserLine>& ul, int W, int H, int rot,
+                      PipelineResult& r) {
+    if (ul.empty()) return;
+    const bool swap = rot == cv::ROTATE_90_CLOCKWISE || rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+    const double Wr = swap ? H : W, Hr = swap ? W : H;
+    std::set<int> groups;
+    for (const auto& l : ul) groups.insert(l.group);
+    for (int g : groups) {
+        cv::Mat page = resample_cpu(stage1, warp4);
+        if (page.channels() == 4) cv::cvtColor(page, page, cv::COLOR_BGRA2BGR);
+        cv::Mat D = darkness_fast(page);
+        std::vector<std::array<double, 2>> xy_h, xy_v;   // Fy samples (horizontal lines), Fx samples (vertical)
+        Vec val_h, val_v, w_h, w_v;
+        std::vector<std::array<float, 5>> drawn;
+        const int rad = std::max(10, W / 100);
+        for (const auto& l : ul) {
+            if (l.group != g || l.pts.size() < 2) continue;
+            std::vector<cv::Point2d> pts;
+            double x0 = 1e300, x1 = -1e300, y0 = 1e300, y1 = -1e300;
+            for (const auto& f : l.pts) {
+                cv::Point2d p = unrotate_pt(f.x * Wr, f.y * Hr, W, H, rot);
+                pts.push_back(p);
+                x0 = std::min(x0, p.x); x1 = std::max(x1, p.x); y0 = std::min(y0, p.y); y1 = std::max(y1, p.y);
+            }
+            const bool hz = x1 - x0 >= y1 - y0;
+            auto s = snap_user_line(D, pts, hz, rad);
+            if (s.empty()) continue;
+            // part of the rule was found (a piece the stage straightened, in line with the drawn one): the
+            // drawn line is straightened to that piece's position, so the two join instead of pulling apart
+            double best_ov = 0, ideal = s.front()[1];
+            for (const auto& L : r.lines) {
+                cv::Point2d a = unrotate_pt(L[1] * Wr, L[2] * Hr, W, H, rot), b = unrotate_pt(L[3] * Wr, L[4] * Hr, W, H, rot);
+                if ((std::fabs(b.x - a.x) >= std::fabs(b.y - a.y)) != hz) continue;
+                const double la = std::min(hz ? a.x : a.y, hz ? b.x : b.y), lb = std::max(hz ? a.x : a.y, hz ? b.x : b.y);
+                const double pos = hz ? (a.y + b.y) / 2 : (a.x + b.x) / 2;
+                std::vector<double> near;
+                for (const auto& q : s)
+                    if (q[0] >= la - 3 * rad && q[0] <= lb + 3 * rad) near.push_back(q[1] + q[2]);
+                if (near.empty()) continue;
+                std::nth_element(near.begin(), near.begin() + near.size() / 2, near.end());
+                const double ov = (double)near.size();
+                if (std::fabs(near[near.size() / 2] - pos) < 0.5 * rad && ov > best_ov) { best_ov = ov; ideal = pos; }
+            }
+            for (auto& q : s) { q[2] += q[1] - ideal; q[1] = ideal; }
+            for (const auto& q : s) {
+                if (hz) { xy_h.push_back({q[0], q[1]}); val_h.push_back(q[2]); w_h.push_back(4.0); }
+                else { xy_v.push_back({q[1], q[0]}); val_v.push_back(q[2]); w_v.push_back(4.0); }
+            }
+            const double a = s.front()[0], b = s.back()[0], c = s.front()[1];
+            cv::Point2d e0 = hz ? rotate_pt(a, c, W, H, rot) : rotate_pt(c, a, W, H, rot);
+            cv::Point2d e1 = hz ? rotate_pt(b, c, W, H, rot) : rotate_pt(c, b, W, H, rot);
+            drawn.push_back({3.f, (float)(e0.x / Wr), (float)(e0.y / Hr), (float)(e1.x / Wr), (float)(e1.y / Hr)});
+        }
+        if (drawn.empty()) continue;
+        // the lines already straight hold still: zero across them every 16 px (on the output page,
+        // rotated frame, back to the stage-1 frame)
+        for (const auto& L : r.lines) {
+            cv::Point2d a = unrotate_pt(L[1] * Wr, L[2] * Hr, W, H, rot), b = unrotate_pt(L[3] * Wr, L[4] * Hr, W, H, rot);
+            const bool hz = std::fabs(b.x - a.x) >= std::fabs(b.y - a.y);
+            const double len = cv::norm(b - a);
+            for (double t = 0; t <= len; t += 16) {
+                cv::Point2d p = a + (b - a) * (len > 0 ? t / len : 0.0);
+                if (hz) { xy_h.push_back({p.x, p.y}); val_h.push_back(0); w_h.push_back(1.0); }
+                else { xy_v.push_back({p.x, p.y}); val_v.push_back(0); w_v.push_back(1.0); }
+            }
+        }
+        const int G = 16, gw = W / G + 2, gh = H / G + 2;
+        Field Fy = val_h.empty() || std::all_of(val_h.begin(), val_h.end(), [](double v) { return v == 0; }) ? zeros_field(gw, gh, G)
+                                                                                                              : solve_field_at(xy_h, val_h, &w_h, gw, gh, G);
+        Field Fx = val_v.empty() || std::all_of(val_v.begin(), val_v.end(), [](double v) { return v == 0; }) ? zeros_field(gw, gh, G)
+                                                                                                              : solve_field_at(xy_v, val_v, &w_v, gw, gh, G);
+        double most = 0;
+        for (double v : Fy.v) most = std::max(most, std::fabs(v));
+        for (double v : Fx.v) most = std::max(most, std::fabs(v));
+        if (most > 0.06 * std::max(W, H)) continue;
+        GridMap m = warp4;
+        for (int i = 0; i < m.gh; ++i)
+            for (int j = 0; j < m.gw; ++j) {
+                double x = j * m.stride, y = i * m.stride;
+                cv::Point2d q = map_at(warp4, x + Fx.sample(x, y), y + Fy.sample(x, y));
+                m.x[(size_t)i * m.gw + j] = (float)q.x;
+                m.y[(size_t)i * m.gw + j] = (float)q.y;
+            }
+        warp4 = std::move(m);
+        r.user_lines_used += (int)drawn.size();
+        r.lines.insert(r.lines.end(), drawn.begin(), drawn.end());
+    }
+}
+
 // How straight those rules come out through map m (null: the page as it is): each point's output
 // position (m inverted by fixed-point steps from the point itself; the line stage moves the page
 // by tens of px at most), per line the p95 distance from its straight fit across the line,
@@ -1451,6 +1608,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                                opt.rule_net ? &opt.rule_net : nullptr);
         }
         r.lines = fitted_lines(r.warp, W, H, r.rot);
+        apply_user_lines(stage1, warp4, opt.user_lines, W, H, r.rot, r);
     }
     r.rule_net = !r.warp.PH.empty();
     r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_joined = r.warp.net.joined; r.net_kept = r.warp.S2.n_net_kept;
@@ -1660,10 +1818,9 @@ bool finger_over_text(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::M
     return (double)cv::countNonZero(ink & ring) / n > 0.02;
 }
 
-void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper, bool mark) {
+void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper) {
     const int w = page_bgra.cols, h = page_bgra.rows;
     if (mask.empty() || mask.size() != page_bgra.size() || cv::countNonZero(mask) == 0) return;
-    bool over_text = mark && finger_over_text(page_bgra, mask, paper ? *paper : cv::Mat());
     cv::Mat fill = paper_behind(page_bgra, mask, paper);
     cv::Mat soft;
     cv::GaussianBlur(mask, soft, cv::Size(0, 0), 1.5);
@@ -1680,19 +1837,6 @@ void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper, bool m
             if (pa) pa[x] = std::max(pa[x], a[x]);
         }
     }
-    if (!over_text) return;
-    // text ran under the finger: the filled area is outlined (dashed grey) instead of looking like blank
-    // paper, so a reader knows something is missing there; the stretch along the page border is left out
-    std::vector<std::vector<cv::Point>> cs;
-    cv::findContours(mask.clone(), cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    const int th = std::max(2, w / 600), dash = std::max(8, w / 120), b = std::max(4, w / 100);
-    for (auto& c : cs)
-        for (size_t i = 0; i + 1 < c.size(); ++i) {
-            cv::Point q = c[i];
-            if (q.x < b || q.y < b || q.x >= w - b || q.y >= h - b) continue;
-            if ((i / dash) % 2) continue;
-            cv::line(page_bgra, c[i], c[i + 1], cv::Scalar(140, 140, 140, 255), th, cv::LINE_AA);
-        }
 }
 
 PipelineResult run_scan(const cv::Mat& scan, const PipelineOptions& opt) {

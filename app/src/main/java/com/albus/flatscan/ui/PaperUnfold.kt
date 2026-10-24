@@ -57,7 +57,7 @@ private val STEPS = floatArrayOf(0.02f, 0.05f, 0.08f, 0.14f, 0.2f, 0.3f, 0.85f, 
  * The processing animation, drawn every frame while the page is processed: [photo] (the page cut
  * from it with [corners], photo pixels of a [photoWidth]-wide photo) drops in as a crumpled ball
  * that tumbles and breathes, unfolds as [progress] rises (between the core's reports it keeps
- * flowing towards the next step), and through the long line-solving stage an iron glides over the
+ * flowing towards the next step; in any case it is open within ~3 s), and from then on an iron glides over the
  * sheet row by row, steam behind it, pressing out the creases it passes. At the end the sheet is
  * pressed flat and whitens. With system animations off, a still crumpled frame cross-fades to the
  * flat page.
@@ -232,6 +232,11 @@ private class Unfold(seed: Int) {
         val tau = if (reported >= 0.3f && reported < 0.85f) 10f else 2.5f
         val goal = reported + (next - reported) * 0.8f * (1 - exp(-(time - reportedAt) / tau))
         shown += (max(goal, shown) - shown) * (1 - exp(-dt * 4f))
+        // the unwrapping plays out in the first seconds whatever the core reports (a slow first step, the
+        // page finder or the surface fit on a slow phone, left a ball on screen): open by ~3 s, then the
+        // iron works the sheet while the core finishes
+        val byTime = 0.02f + 0.27f * easeInOut(clamp01((time - 0.5f) / 2.4f))
+        if (shown < byTime) shown = byTime
         if (reported >= 1f && shown > 0.995f) shown = 1f
         // the drop: a damped spring that lands with a small bounce
         dropV += ((1 - drop) * 110f - dropV * 9f) * dt

@@ -2097,4 +2097,10 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     return compose_maps(d, w, h);
 }
 
+Field solve_field_at(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh, int G) {
+    return solve_field(xy, values, weights, gw, gh, G, nullptr, nullptr);
+}
+
+Field zeros_field(int gw, int gh, int g) { return zero_field(gw, gh, g); }
+
 }  // namespace fs

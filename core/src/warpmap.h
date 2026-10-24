@@ -116,6 +116,10 @@ double warp_cg_rtol();
 bool text_net_rows_enabled();
 
 // Building blocks exposed for the stage tests.
+// warpmap.solve: values at the (straightened) positions xy, a smooth field on a G-px grid (gw x gh);
+// weights optional; warm: a start for the solver; iters: its iterations (optional)
+Field solve_field_at(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh, int G);
+Field zeros_field(int gw, int gh, int g);
 cv::Mat darkness_fast(const cv::Mat& bgr);
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint = false, const cv::Mat* PH = nullptr, const cv::Mat* PV = nullptr,
                NetLineStats* stats = nullptr);

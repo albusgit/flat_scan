@@ -114,7 +114,9 @@ private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int, colorF
 /** What the page viewer edits besides zooming: nothing, protected pictures or the unwarp's lines. */
 enum class AreaMode { None, Protect, Lines, Erase, Fingers }
 
-private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF))   // ruled, text row, grid
+/** Lines the user drew in the line editor (Add line). */
+val DrawnLineColor = Color(0xFFFFE15A)
+private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF), DrawnLineColor)   // ruled, text row, grid, drawn
 private val IgnoreColor = Color(0xFFFF6B5E)
 private val EraseColor = Color(0xFFF2B84B)
 
@@ -128,7 +130,8 @@ private val EraseColor = Color(0xFFF2B84B)
  * from the bitmap's (PageLook shape): the bitmap is stretched over the page. [colorFilter] (PageLook
  * colours) applies to the cleaned page only. [compare] (0..1, the split across the page): the
  * original on the left of the split, the cleaned page on the right; a one-finger drag moves it
- * ([onCompare]).
+ * ([onCompare]). With [drawStrokes] a one-finger drag is a stroke ([onStroke]) instead of a rectangle:
+ * the finger brush, or a line drawn in [AreaMode.Lines] (shown thin, with the [pendingLines] not yet used).
  */
 @Composable
 fun PageViewer(
@@ -154,6 +157,8 @@ fun PageViewer(
     brushOverlay: Bitmap? = null,
     brushRadius: Float = 0.02f,
     onStroke: (List<Float>) -> Unit = {},
+    drawStrokes: Boolean = areaMode == AreaMode.Fingers,
+    pendingLines: List<FloatArray> = emptyList(),
 ) {
     val protectMode = areaMode != AreaMode.None
     val pageImg = remember(page) { page?.asImageBitmap() }
@@ -179,7 +184,7 @@ fun PageViewer(
     var stroke by remember { mutableStateOf(listOf<Offset>()) }
     val brushImg = remember(brushOverlay) { brushOverlay?.asImageBitmap() }
     val strokeDone by rememberUpdatedState(onStroke)
-    val brushing by rememberUpdatedState(areaMode == AreaMode.Fingers)
+    val brushing by rememberUpdatedState(drawStrokes)
 
     val geomNow = { PageGeometry(pageWidth, pageHeight, rotation, box, state.scale, state.pan) }
     val geometry by rememberUpdatedState(geomNow)
@@ -376,6 +381,21 @@ fun PageViewer(
                         ))
                     }
                 }
+                if (areaMode == AreaMode.Lines) {
+                    // drawn lines not flattened yet, and the one being drawn
+                    val lw = 3.dp.toPx() / g.k
+                    fun polyline(pts: List<Offset>) {
+                        if (pts.size < 2) return
+                        val path = androidx.compose.ui.graphics.Path().apply {
+                            moveTo(pts[0].x, pts[0].y)
+                            for (q in pts.drop(1)) lineTo(q.x, q.y)
+                        }
+                        drawPath(path, Color.Black.copy(alpha = 0.45f), style = Stroke(lw * 2.2f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                        drawPath(path, DrawnLineColor, style = Stroke(lw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                    }
+                    for (f in pendingLines) polyline(List(f.size / 2) { Offset(f[2 * it] * pageWidth, f[2 * it + 1] * pageHeight) })
+                    polyline(stroke)
+                }
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
                     val areaColor = when (areaMode) {
@@ -395,7 +415,7 @@ fun PageViewer(
                                 drawLine(IgnoreColor, a, b, strokeWidth = lw, cap = StrokeCap.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(3 * lw, 2 * lw)))
                             } else {
                                 drawLine(Color.Black.copy(alpha = 0.35f), a, b, strokeWidth = lw * 1.8f, cap = StrokeCap.Round)
-                                drawLine(LineColors[lines[5 * j].toInt().coerceIn(0, 2)], a, b, strokeWidth = lw, cap = StrokeCap.Round)
+                                drawLine(LineColors[lines[5 * j].toInt().coerceIn(0, 3)], a, b, strokeWidth = lw, cap = StrokeCap.Round)
                             }
                             j++
                         }

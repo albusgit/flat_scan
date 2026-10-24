@@ -27,7 +27,7 @@ int main() {
 
     check(finger_over_text(page, mask, paper), "text runs under the thumb");
     cv::Mat filled = page.clone(), pf = paper.clone();
-    fill_finger(filled, mask, &pf, true);
+    fill_finger(filled, mask, &pf);
     // inside, away from the outline: paper colour, no stroke continued into it
     cv::Mat inner;
     cv::erode(mask, inner, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(41, 41)));
@@ -51,7 +51,7 @@ int main() {
     blank.setTo(cv::Scalar(120, 150, 205, 255), mask);
     check(!finger_over_text(blank, mask, paper), "no text: not reported");
     cv::Mat bf = blank.clone();
-    fill_finger(bf, mask, nullptr, true);
+    fill_finger(bf, mask, nullptr);
     cv::inRange(bf, cv::Scalar(120, 120, 120, 0), cv::Scalar(160, 160, 160, 255), grey);
     check(cv::countNonZero(grey) == 0, "no text: no outline");
     std::printf("%s\n", failures ? "FAILED" : "ALL PASSED");

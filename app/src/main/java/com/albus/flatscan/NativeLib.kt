@@ -119,14 +119,23 @@ object NativeLib {
      * 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc high-res only. shadows: the shadow
      * net on the flattened page. rules: the rule net (rulenet.onnx, Settings > Table rules) in the line
      * refinement, on the CPU. The nets run on [configureNets]' backends; their timings and backends
-     * are in [info]'s "accel".
+     * are in [info]'s "accel". removeShadows: false leaves the page's shadows (neither the shading map
+     * nor the shadow net). userLines: the line editor's drawn lines, [group, n, x0, y0, ...] repeated as
+     * output-page fractions (PageMeta.userLines), straightened after the line stage.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, board: Boolean, listener: ProgressListener?,
+        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, board: Boolean, removeShadows: Boolean, userLines: FloatArray?,
+        listener: ProgressListener?,
     ): Long
+
+    /**
+     * The finger tool's smart select: the outline of the area around page point ([x], [y], fractions) that
+     * belongs with it (a finger, a thumb), page fractions [x0, y0, x1, y1, ...]; empty if none was found.
+     */
+    @JvmStatic external fun fingerSelect(handle: Long, x: Float, y: Float): FloatArray
 
     /**
      * Whiteboard mode: the board or screen in [photo] (core/src/board.cpp): [x0, y0 .. x3, y3 (TL, TR, BR,
@@ -175,7 +184,7 @@ object NativeLib {
      * Erase tool: the page as processed with every rectangle (page fractions [x0, y0, x1, y1, ...])
      * filled with the paper around it; an empty array restores the page. Re-render afterwards.
      */
-    @JvmStatic external fun setEdits(handle: Long, rects: FloatArray, fingersAuto: Boolean, strokes: FloatArray): Boolean
+    @JvmStatic external fun setEdits(handle: Long, rects: FloatArray, fingersAuto: Boolean, strokes: FloatArray, fill: Int): Boolean
 
     /**
      * The finger brush's view: [out] (ARGB) filled with the mask a render with these settings fills, translucent

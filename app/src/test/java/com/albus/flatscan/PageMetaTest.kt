@@ -46,6 +46,31 @@ class PageMetaTest {
     }
 
     @Test
+    fun drawnLinesShadowsAndAiFillRoundTrip() {
+        // two lines: group 1 with 2 points, group 2 with 3 points
+        val drawn = floatArrayOf(1f, 2f, 0.1f, 0.5f, 0.9f, 0.52f, 2f, 3f, 0.3f, 0.1f, 0.31f, 0.5f, 0.3f, 0.9f)
+        val m = meta().copy(userLines = drawn, removeShadows = false, fingerFill = 1)
+        val back = PageMeta.fromJson(JSONObject(m.toJson().toString()))
+        assertTrue(drawn.contentEquals(back.userLines))
+        assertFalse(back.removeShadows)
+        assertEquals(1, back.fingerFill)
+        assertTrue(back.hasEdits)   // the AI fill is applied after processing, like the brush
+        assertEquals(listOf(0, 6), drawnLineStarts(drawn.toList()))
+        assertEquals(listOf(1, 2), drawnLineGroups(drawn.toList()))
+        // both re-process the page; a page without them keeps the key it had (stored sessions stay valid)
+        val plain = meta().geometryKey(1600, true, true)
+        assertTrue(plain != meta().copy(userLines = drawn).geometryKey(1600, true, true))
+        assertTrue(plain != meta().copy(removeShadows = false).geometryKey(1600, true, true))
+        assertEquals(plain, meta().copy(fingerFill = 1).geometryKey(1600, true, true))
+        assertFalse(meta().toJson().has("user_lines") || meta().toJson().has("remove_shadows") || meta().toJson().has("finger_fill"))
+    }
+
+    @Test
+    fun aCutOffDrawnLineListIsReadUpToTheLastWholeLine() {
+        assertEquals(listOf(0), drawnLineStarts(listOf(1f, 2f, 0.1f, 0.1f, 0.2f, 0.1f, 1f, 5f, 0.3f)))
+    }
+
+    @Test
     fun filtersOfferedPerMode() {
         assertFalse(FilterKind.Whiteboard in FilterKind.forMode(CaptureMode.Document))
         assertEquals(FilterKind.Whiteboard, FilterKind.forMode(CaptureMode.Whiteboard).first())

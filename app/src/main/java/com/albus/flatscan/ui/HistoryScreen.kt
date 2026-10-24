@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -336,24 +337,27 @@ private fun CarryOnCard(vm: ScanViewModel, d: DocumentSummary, onAdd: () -> Unit
                     pageCount(d.pageCount) + " · " + relativeDate(d.modifiedAt),
                     style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // with large text the two buttons do not fit side by side: Open goes under Add a page
+                FlowRow(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     InkPressable(
                         onClick = onAdd, shape = RoundedCornerShape(9.dp), depth = 2.dp,
                         container = MaterialTheme.colorScheme.surfaceContainerLowest, contentColor = MaterialTheme.colorScheme.onSurface,
                         border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.onSurface), shadow = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.height(42.dp).testTag("carry_on_add"),
+                        modifier = Modifier.heightIn(min = 42.dp).testTag("carry_on_add"),
                     ) {
-                        Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Outlined.Add, null, Modifier.size(17.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("Add a page", style = MaterialTheme.typography.labelLarge)
+                            Text("Add a page", style = MaterialTheme.typography.labelLarge, maxLines = 1, softWrap = false)
                         }
                     }
                     InkPressable(
                         onClick = onOpen, shape = RoundedCornerShape(9.dp), depth = 2.dp,
                         container = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier.height(42.dp),
-                    ) { Text("Open", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(horizontal = 18.dp)) }
+                        modifier = Modifier.heightIn(min = 42.dp),
+                    ) {
+                        Text("Open", style = MaterialTheme.typography.labelLarge, maxLines = 1, softWrap = false, modifier = Modifier.padding(horizontal = 18.dp, vertical = 6.dp))
+                    }
                 }
             }
         }
@@ -466,9 +470,9 @@ private fun LedgerRow(
 ) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Row(
-        Modifier.fillMaxWidth().height(68.dp)
+        Modifier.fillMaxWidth().heightIn(min = 68.dp)
             .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f) else Color.Transparent)
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(end = 14.dp).testTag("doc_${d.id}"),
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(end = 14.dp, top = 6.dp, bottom = 6.dp).testTag("doc_${d.id}"),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -488,8 +492,8 @@ private fun LedgerRow(
         when {
             selecting -> CheckDot(selected)
             open -> Text(
-                "Open", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold), color = Palette.Ink,
-                modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Palette.Highlighter).padding(horizontal = 7.dp, vertical = 3.dp),
+                "Open", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold), color = Palette.Ink, maxLines = 1, softWrap = false,
+                modifier = Modifier.padding(start = 6.dp).clip(RoundedCornerShape(4.dp)).background(Palette.Highlighter).padding(horizontal = 7.dp, vertical = 3.dp),
             )
         }
     }

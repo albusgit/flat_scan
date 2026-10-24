@@ -17,6 +17,7 @@ data class EditState(
     val erase: List<Float>,
     val fingersAuto: Boolean = true,
     val fingerStrokes: List<Float> = emptyList(),
+    val fingerFill: Int = 0,
 )
 
 /**

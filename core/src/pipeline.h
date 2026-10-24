@@ -147,6 +147,11 @@ struct PipelineOptions {
     int max_analysis_side = 2400;     // detection / fit run on a copy no larger than this (reference inputs: 2212-2300 px)
     std::vector<std::array<float, 4>> ignore;   // app: areas whose lines the warp map must not use, as
                                                 // fractions [x0, y0, x1, y1] of the output page (rotated frame)
+    // app: lines the user drew along rules the line stage missed (the line editor's Add line): points as
+    // fractions of the output page (rotated frame) as the user saw it. Group k was drawn on the page the
+    // groups before it made; each is straightened in turn after the line stage (apply_user_lines).
+    struct UserLine { int group = 0; std::vector<cv::Point2f> pts; };
+    std::vector<UserLine> user_lines;
     std::function<void(int, const char*)> progress;   // percent, stage name
     // The shadow net (ShadeNet, tools/shadow_net): called with the flattened page at shade_long_side
     // (portrait; planar BGR in [0, 1], 3 x h x w, sides multiples of 32), it replaces the buffer with
@@ -206,7 +211,8 @@ struct PipelineResult {
     double bumps_faded = 0;           // ... share of the page where a local rescale was faded out (soften_bumps)
     double fingers_erased = 0;        // share of the page filled where fingers held it
     cv::Mat finger_mask;              // CV_8U page size, 255 = filled as a finger (empty: none)
-    bool fingers_over_text = false;   // ... and text runs into it (outlined, not invented)
+    bool fingers_over_text = false;   // ... and text runs into it
+    int user_lines_used = 0;          // the user's lines (user_lines) that found ink and were straightened
     cv::Mat page_unerased, paper_unerased;   // with keep_unerased: page and paper before the finger fill
     bool shadows_removed = false;     // the shading map was applied to the page
     bool shade_net = false;           // ... the shadow net's map (ShadeNet)
@@ -229,7 +235,8 @@ struct PipelineResult {
     WarpDebug warp;
     // the lines the warp map was fitted to, for the app's line editor: [kind, x0, y0, x1, y1] with
     // the ends as fractions of the output page; kind 0 = ruled line, 1 = text row, 2 = grid line
-    // seen by the global stage only. Positions are the straightened ones (on the output page).
+    // seen by the global stage only, 3 = a line the user drew (user_lines). Positions are the
+    // straightened ones (on the output page).
     std::vector<std::array<float, 5>> lines;
 };
 
@@ -250,8 +257,8 @@ PipelineResult run_photo(const cv::Mat& photo_bgr, const PipelineOptions& opt);
 // size): marked as paper there.
 void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper);
 // Fingers: [mask] filled with the paper around it, print taken out of that paper first (not inpainted: no
-// stroke is continued into the hole); with [mark], where text runs into the area it is outlined dashed grey.
-void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper, bool mark = true);
+// stroke is continued into the hole).
+void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper);
 // Whether print runs into [mask] from the page around it (ink in a ring outside it, away from the border).
 bool finger_over_text(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat& paper);
 // Flatbed scan: warp map only (warpmap.py on the scan itself).

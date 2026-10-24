@@ -131,6 +131,17 @@ import com.albus.flatscan.ImportSource
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.ScreenMode
 import com.albus.flatscan.Screen
+import com.albus.flatscan.countDrawnLines
+import androidx.compose.material.icons.outlined.Draw
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
+import kotlin.math.max
+import kotlin.math.min
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.style.TextOverflow
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -142,6 +153,9 @@ private enum class Sheet { None, Save, Share }
  * (crop, turns, size, document or whiteboard).
  */
 private enum class ResultTab { Look, Adjust, Clean, Flatten, Page }
+
+/** What the editor panel shows: a tab's tools, or the tool open on the page. */
+private enum class PanelKind { Look, Adjust, Clean, Page, Lines, Fingers, Erase, Protect }
 
 /** A flatten the iron sweeps across the page before it starts ([perspective] as in [ScanViewModel.reflatten]). */
 private class IronRequest(val perspective: Boolean?)
@@ -159,6 +173,10 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     // the finger brush: Remove (add to the mask) or Keep, and its radius (page-width fraction)
     var brushAdd by remember { mutableStateOf(true) }
     var brushRadius by remember { mutableFloatStateOf(0.02f) }
+    // the finger tool's smart select (a tap selects the finger) instead of the brush
+    var smartSelect by remember { mutableStateOf(false) }
+    // the line editor's Add line: a drag draws a line along a rule the unwarp missed
+    var drawingLine by remember { mutableStateOf(false) }
     var tool by remember {
         // back from flattening again in the line editor: show the new lines
         mutableStateOf(if (vm.reopenLines) AreaMode.Lines else AreaMode.None).also { vm.reopenLines = false }
@@ -201,6 +219,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     val closeTool = {
         if (tool == AreaMode.Lines) vm.revertIgnore()
         tool = AreaMode.None
+        drawingLine = false
     }
     BackHandler(enabled = mode != AreaMode.None) { closeTool() }
 
@@ -284,7 +303,8 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 },
                 onTap = { x, y, line ->
                     when {
-                        mode == AreaMode.Fingers -> {}
+                        mode == AreaMode.Fingers -> if (smartSelect) vm.smartSelectFinger(x, y, brushAdd)
+                        mode == AreaMode.Lines && line >= 0 && vm.lines.getOrNull(5 * line)?.toInt() == 3 -> vm.removeUserLineNear(x, y)
                         mode == AreaMode.Protect -> vm.removeProtectAt(x, y)
                         mode == AreaMode.Erase -> vm.removeEraseAt(x, y)
                         line >= 0 -> vm.toggleLine(line)
@@ -297,12 +317,15 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 onCompare = { compare = it },
                 brushOverlay = if (mode == AreaMode.Fingers) vm.fingerOverlay else null,
                 brushRadius = brushRadius,
-                onStroke = { pts -> vm.addFingerStroke(brushAdd, brushRadius, pts) },
+                onStroke = { pts -> if (mode == AreaMode.Lines) vm.addUserLine(pts) else vm.addFingerStroke(brushAdd, brushRadius, pts) },
+                drawStrokes = (mode == AreaMode.Fingers && !smartSelect) || (mode == AreaMode.Lines && drawingLine),
+                pendingLines = if (mode == AreaMode.Lines) vm.pendingUserLines else emptyList(),
             )
             if (mode == AreaMode.None && vm.showHoldHint && vm.page != null && compare == null) {
                 Text(
-                    "Press and hold to see the original",
+                    "Hold to see the original",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
                         .background(Editor.Text.copy(alpha = 0.12f), ChipShape)
                         .padding(horizontal = 14.dp, vertical = 7.dp),
@@ -341,22 +364,34 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             }
         }
     }
-    val panel: @Composable ColumnScope.() -> Unit = {
-        if (mode == AreaMode.Protect) {
-            ProtectPanel(vm, onDone = { tool = AreaMode.None })
-        } else if (mode == AreaMode.Lines) {
-            LinesPanel(vm, onClose = closeTool, onIron = iron, ironing = ironing != null)
-        } else if (mode == AreaMode.Erase) {
-            ErasePanel(vm, onDone = { tool = AreaMode.None })
-        } else if (mode == AreaMode.Fingers) {
-            FingerPanel(vm, brushAdd, { brushAdd = it }, brushRadius, { brushRadius = it }, onDone = { tool = AreaMode.None })
-        } else {
-            when (tab) {
-                ResultTab.Adjust -> AdjustPanel(vm)
-                ResultTab.Clean -> CleanPanel(vm, onErase = { tool = AreaMode.Erase }, onFingers = { tool = AreaMode.Fingers }, onProtect = { tool = AreaMode.Protect })
-                ResultTab.Page -> PagePanel(vm)
-                else -> FilterPanel(vm)
-            }
+    val shownPanel = when (mode) {
+        AreaMode.Protect -> PanelKind.Protect
+        AreaMode.Lines -> PanelKind.Lines
+        AreaMode.Erase -> PanelKind.Erase
+        AreaMode.Fingers -> PanelKind.Fingers
+        else -> when (tab) {
+            ResultTab.Adjust -> PanelKind.Adjust
+            ResultTab.Clean -> PanelKind.Clean
+            ResultTab.Page -> PanelKind.Page
+            else -> PanelKind.Look
+        }
+    }
+    if (mode == AreaMode.Fingers) {
+        LaunchedEffect(Unit) { vm.refreshFingerOverlay() }
+        DisposableEffect(Unit) { onDispose { vm.closeFingerTool() } }
+    }
+    val panelOf: @Composable ColumnScope.(PanelKind) -> Unit = { k ->
+        when (k) {
+            PanelKind.Protect -> ProtectPanel(vm, onDone = { tool = AreaMode.None })
+            PanelKind.Lines -> LinesPanel(vm, onClose = closeTool, onIron = iron, ironing = ironing != null, drawing = drawingLine, onDrawing = { drawingLine = it })
+            PanelKind.Erase -> ErasePanel(vm, onDone = { tool = AreaMode.None })
+            PanelKind.Fingers -> FingerPanel(
+                vm, brushAdd, { brushAdd = it }, brushRadius, { brushRadius = it }, smartSelect, { smartSelect = it }, onDone = { tool = AreaMode.None },
+            )
+            PanelKind.Adjust -> AdjustPanel(vm)
+            PanelKind.Clean -> CleanPanel(vm, onErase = { tool = AreaMode.Erase }, onFingers = { tool = AreaMode.Fingers }, onProtect = { tool = AreaMode.Protect })
+            PanelKind.Page -> PagePanel(vm)
+            PanelKind.Look -> FilterPanel(vm)
         }
     }
     val dock: @Composable () -> Unit = {
@@ -374,6 +409,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         // landscape phones and tablets: the panel beside the page (below it, the page would get a sliver)
         val wide = maxWidth > maxHeight && maxWidth >= 600.dp
+        val panelCap = maxHeight * 0.5f
         if (wide) {
             Column(Modifier.fillMaxSize()) {
                 topBar()
@@ -386,7 +422,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                         Modifier.width(400.dp).fillMaxHeight().padding(end = 8.dp)
                             .clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding(),
                     ) {
-                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { panel() }
+                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { panelOf(shownPanel) }
                         dock()
                     }
                 }
@@ -398,7 +434,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
                 // the editor panel: the tool of the selected tab over the tool dock
                 Column(Modifier.fillMaxWidth().clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding()) {
-                    panel()
+                    SteadyPanel(shownPanel, cap = panelCap, panel = panelOf)
                     dock()
                 }
             }
@@ -415,6 +451,34 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             title = { Text("Processing details") },
             text = { Text(vm.details, style = MaterialTheme.typography.bodySmall, modifier = Modifier.verticalScroll(rememberScrollState())) },
         )
+    }
+}
+
+/**
+ * The editor panel at one height whichever tab or tool is open, so the page above it keeps its size: the
+ * tallest of every panel (measured, not shown) and of what was shown so far, at most [cap]; a shorter panel
+ * leaves space below it, a taller one scrolls.
+ */
+@Composable
+private fun SteadyPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScope.(PanelKind) -> Unit) {
+    // not state: the height found while measuring is only read by the next measure (measured again from
+    // scratch when the text size or the display size changes)
+    val density = LocalDensity.current
+    val tallest = remember(density.density, density.fontScale) { intArrayOf(0) }
+    val scroll = rememberScrollState()
+    SubcomposeLayout(Modifier.fillMaxWidth()) { cs ->
+        val w = cs.maxWidth
+        val capPx = cap.roundToPx()
+        val free = Constraints(minWidth = w, maxWidth = w)
+        for (k in PanelKind.entries) {
+            for (m in subcompose(k) { Column(Modifier.fillMaxWidth()) { panel(k) } }) tallest[0] = max(tallest[0], m.measure(free).height)
+        }
+        val minH = min(tallest[0], capPx)
+        val placeables = subcompose(Unit) { Column(Modifier.fillMaxWidth().verticalScroll(scroll)) { panel(shown) } }
+            .map { it.measure(Constraints(minWidth = w, maxWidth = w, minHeight = minH, maxHeight = max(minH, capPx))) }
+        val h = placeables.maxOfOrNull { it.height } ?: minH
+        tallest[0] = max(tallest[0], h)
+        layout(w, h) { placeables.forEach { it.place(0, 0) } }
     }
 }
 
@@ -440,7 +504,7 @@ private fun ToolDock(selected: ResultTab, onSelect: (ResultTab) -> Unit) {
 private fun DockItem(label: String, icon: ImageVector, modifier: Modifier, selected: Boolean? = null, badge: Int = 0, onClick: () -> Unit) {
     val color = if (selected == true) Editor.Accent else Editor.Inactive
     Column(
-        modifier.height(58.dp).clip(RoundedCornerShape(8.dp))
+        modifier.heightIn(min = 58.dp).clip(RoundedCornerShape(8.dp))
             .then(if (selected != null) Modifier.selectable(selected, role = Role.Tab, onClick = onClick) else Modifier.clickable(role = Role.Button, onClick = onClick)),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -664,12 +728,13 @@ private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> 
 @Composable
 private fun PageAction(label: String, icon: ImageVector, modifier: Modifier, onClick: () -> Unit) {
     Column(
-        modifier.height(64.dp).clip(ChipShape).border(1.dp, Editor.Outline, ChipShape).clickable(role = Role.Button, onClick = onClick),
+        modifier.heightIn(min = 64.dp).clip(ChipShape).border(1.dp, Editor.Outline, ChipShape).clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
         Icon(icon, null, Modifier.size(20.dp))
         Spacer(Modifier.height(5.dp))
-        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center)
     }
 }
 
@@ -681,26 +746,43 @@ private fun PagePanel(vm: ScanViewModel) {
         Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PageAction("Crop", Icons.Outlined.Crop, Modifier.weight(1f)) { vm.recrop() }
-            PageAction("Rotate left", Icons.AutoMirrored.Outlined.RotateLeft, Modifier.weight(1f)) { vm.rotateResultLeft() }
-            PageAction("Rotate right", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f)) { vm.rotateResult() }
+        Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PageAction("Crop", Icons.Outlined.Crop, Modifier.weight(1f).fillMaxHeight()) { vm.recrop() }
+            PageAction("Rotate left", Icons.AutoMirrored.Outlined.RotateLeft, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResultLeft() }
+            PageAction("Rotate right", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult() }
             // there is no automatic 180-degree turn: one tap for an upside-down page
-            PageAction("Turn 180°", Icons.Outlined.Cached, Modifier.weight(1f)) { vm.rotateResult180() }
+            PageAction("Turn 180°", Icons.Outlined.Cached, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult180() }
         }
         Column {
             Text("PAGE SIZE", style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono), color = Editor.Muted, modifier = Modifier.padding(bottom = 6.dp))
             ShapeChooser(l) { vm.updateLook(l.copy(shape = it)) }
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f).padding(end = 10.dp)) {
-                Text("This page is a", style = MaterialTheme.typography.titleSmall)
-                Text("Changing it processes the page again.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted)
+        if (vm.pageMode == CaptureMode.Document) {
+            // shadows of the hand and the phone divided out of the page (core: the shading map, the shadow net)
+            Row(
+                Modifier.fillMaxWidth().clip(ChipShape).toggleable(vm.removeShadows, role = Role.Switch) { vm.setRemoveShadows(it) }.padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                    Text("Remove shadows", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        if (vm.removeShadows) "Hand and phone shadows are lifted off the page." else "The page keeps the light it was photographed in.",
+                        style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                    )
+                }
+                Switch(checked = vm.removeShadows, onCheckedChange = null)
             }
-            // document or whiteboard processing for this page (processed again from its photo)
-            EditorSegments("Kind of page", listOf(CaptureMode.Document to "Document", CaptureMode.Whiteboard to "Whiteboard"), vm.pageMode) {
-                if (it != vm.pageMode) vm.setPageMode(it)
+        }
+        Column {
+            // with large text the choice goes under its label
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("This page is a", style = MaterialTheme.typography.titleSmall, modifier = Modifier.align(Alignment.CenterVertically))
+                // document or whiteboard processing for this page (processed again from its photo)
+                EditorSegments("Kind of page", listOf(CaptureMode.Document to "Document", CaptureMode.Whiteboard to "Whiteboard"), vm.pageMode) {
+                    if (it != vm.pageMode) vm.setPageMode(it)
+                }
             }
+            Text("Changing these processes the page again.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 4.dp))
         }
         if (vm.spreadPartner != null) {
             EditorChip("Swap the two book pages", onClick = { vm.swapSpread() }, icon = Icons.Outlined.SwapHoriz)
@@ -715,10 +797,9 @@ private fun PagePanel(vm: ScanViewModel) {
  */
 @Composable
 private fun FingerPanel(
-    vm: ScanViewModel, add: Boolean, onAdd: (Boolean) -> Unit, radius: Float, onRadius: (Float) -> Unit, onDone: () -> Unit,
+    vm: ScanViewModel, add: Boolean, onAdd: (Boolean) -> Unit, radius: Float, onRadius: (Float) -> Unit,
+    smart: Boolean, onSmart: (Boolean) -> Unit, onDone: () -> Unit,
 ) {
-    LaunchedEffect(Unit) { vm.refreshFingerOverlay() }
-    DisposableEffect(Unit) { onDispose { vm.closeFingerTool() } }
     Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Outlined.TouchApp, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
@@ -727,18 +808,36 @@ private fun FingerPanel(
             Text(if (vm.fingerShare <= 0f) "none removed" else "%.1f%% of the page".format(100 * vm.fingerShare), style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
         }
         Text(
-            "Orange is filled with the paper around it. Paint over a finger the app missed, or switch to Keep and paint where it took too much." +
-                if (vm.fingersOverText) " Text ran under a finger: that area is outlined, not guessed." else "",
+            (if (smart) "Tap a finger the app missed: it is found and filled with the paper around it."
+            else "Orange is filled with the paper around it. Paint over a finger the app missed.") +
+                " Switch to Keep to bring back what it took by mistake." +
+                if (vm.fingersOverText) " Text ran under a finger: what it hid can't be brought back." else "",
             style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
         )
-        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            EditorChip("Remove", onClick = { onAdd(true) }, selected = add)
-            EditorChip("Keep", onClick = { onAdd(false) }, selected = !add)
+        FlowRow(
+            Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            EditorSegments("Tool", listOf(true to "Smart select", false to "Brush"), smart, onSmart)
+            EditorSegments("Remove or keep", listOf(true to "Remove", false to "Keep"), add, onAdd)
             EditorChip(if (vm.fingersAuto) "Automatic: on" else "Automatic: off", onClick = { vm.setFingersAutoOn(!vm.fingersAuto) }, selected = vm.fingersAuto)
         }
-        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Brush", style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
-            Slider(value = radius, onValueChange = onRadius, valueRange = 0.005f..0.06f, modifier = Modifier.weight(1f).padding(horizontal = 10.dp))
+        // how a removed finger is filled: the paper around it, or the inpainting net (content-aware, on the phone)
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                Text("Fill with", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    if (vm.fingerFill == 1) "AI: continues what is around it, on the phone. Takes a few seconds." else "The plain paper around it.",
+                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                )
+            }
+            EditorSegments("Fill with", listOf(0 to "Paper", 1 to "AI"), vm.fingerFill) { vm.chooseFingerFill(it) }
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp).alpha(if (smart) 0.4f else 1f), verticalAlignment = Alignment.CenterVertically) {
+            Text("Brush size", style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+            Slider(
+                value = radius, onValueChange = onRadius, valueRange = 0.005f..0.06f, enabled = !smart, colors = editorSliderColors(),
+                modifier = Modifier.weight(1f).padding(horizontal = 10.dp).semantics { contentDescription = "Brush size" },
+            )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
             EditorChip("Undo", onClick = { vm.undoFingerStroke() }, enabled = vm.fingerStrokes.isNotEmpty())
@@ -813,8 +912,11 @@ private fun ProtectPanel(vm: ScanViewModel, onDone: () -> Unit) {
  * (perspective correction only).
  */
 @Composable
-private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?) -> Unit, ironing: Boolean) {
+private fun LinesPanel(
+    vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?) -> Unit, ironing: Boolean, drawing: Boolean, onDrawing: (Boolean) -> Unit,
+) {
     val n = vm.ignore.size / 4
+    val drawn = countDrawnLines(vm.userLines)
     Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(PaperIcons.Iron, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
@@ -829,8 +931,9 @@ private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?
         Text(
             when {
                 vm.perspectiveOnly -> "The iron is lifted: only the perspective is corrected. Turn it on to straighten curved lines."
-                vm.lines.isEmpty() -> "No lines were found on this page: only its outline flattens it."
-                else -> "Tap a line that should stay as it is (a logo, a drawing, a second sheet), or drag a box over an area. Then iron again."
+                drawing -> "Draw along a printed line the iron missed, end to end. It is straightened when you flatten again; tap a yellow line to remove it."
+                vm.lines.isEmpty() -> "No lines were found on this page. Add a line along a printed rule, or only its outline flattens it."
+                else -> "Tap a line that should stay as it is (a logo, a drawing, a second sheet), or drag a box over an area. Missed a rule? Add line. Then iron again."
             },
             style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
         )
@@ -839,12 +942,19 @@ private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?
                 LegendDot(Color(0xFF8FB0FF), "Ruled lines")
                 LegendDot(Color(0xFF5BD18B), "Text rows")
                 LegendDot(Color(0xFFFF6B5E), "Ignored")
+                if (drawn > 0) LegendDot(DrawnLineColor, "Drawn")
+            }
+        }
+        if (!vm.perspectiveOnly) {
+            FlowRow(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                EditorChip("Add line", onClick = { onDrawing(!drawing) }, icon = Icons.Outlined.Draw, selected = drawing, role = Role.Switch)
+                if (drawn > 0) EditorChip("Undo line", onClick = { vm.undoUserLine() }, enabled = !ironing)
+                if (n > 0) EditorChip("Use all lines", onClick = { vm.clearIgnore() }, enabled = !ironing)
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            EditorChip("Use all lines", onClick = { vm.clearIgnore() }, enabled = n > 0 && !vm.perspectiveOnly)
             Spacer(Modifier.weight(1f))
-            if (vm.ignoreChanged) {
+            if (vm.lineEditsChanged) {
                 TextButton(onClick = onClose, enabled = !ironing) { Text("Cancel") }
                 Button(
                     onClick = { onIron(null) }, enabled = !ironing, shape = ChipShape,

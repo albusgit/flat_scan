@@ -18,7 +18,7 @@
 // GPU stage policy's defaults, FS_GPU_DENSE=1 adds the dense stage); the JSON then has "gpu".
 // FS_RULE_NET=1 | MODEL.onnx: the rule net in the line stage, in-process as the other nets (JSON "nets" has "rulenet");
 // FS_RULE_NET_PY=1 with it: through tools/shadow_net/run_onnx.py and FS_PYTHON instead (Round 10's way).
-// FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
+// FS_USER_LINES: see below (Add line). FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
 // Prints one JSON line: the crop-screen assessment of every page (assess_pages) and the
 // processing result of page 0 (run_photo) without user edits; OUT.jpg = the page (or "-").
 #include <opencv2/imgcodecs.hpp>
@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
             std::string shade = shade_model ? shade_model : "";
             cfg.load = [models, shade, rule_file](const std::string& file) {
                 if (file == "rulenet.onnx" && !rule_file.empty()) return read_file(rule_file);
+                if (file == "inpaint.onnx" && std::getenv("FS_INPAINT")) return read_file(std::getenv("FS_INPAINT"));
                 return read_file(file == "shadenet.onnx" && !shade.empty() ? shade : models + "/" + file);
             };
             if (const char* t = std::getenv("FS_ORT_THREADS")) cfg.threads = std::atoi(t);
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
     if (std::getenv("FS_NO_SOFTEN")) o.max_local_rescale = 0;
     if (const char* st = std::getenv("FS_SOFTEN_THR")) o.max_local_rescale = std::atof(st);
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
+    o.keep_unerased = std::getenv("FS_INPAINT") != nullptr;
     if (const char* fr = std::getenv("FS_FINGER_RULES")) o.finger_rules = std::atoi(fr);   // kFinger* bits
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
     // FS_FRAME_CORNERS=1: the photo's frame is the page, as if set by hand (benchmarks whose photos are
@@ -279,6 +281,23 @@ int main(int argc, char** argv) {
             if (std::sscanf(spec.substr(p, q - p).c_str(), "%f,%f,%f,%f", &a[0], &a[1], &a[2], &a[3]) == 4) o.ignore.push_back(a);
             if (q == std::string::npos) break;
             p = q + 1;
+        }
+    }
+    // FS_USER_LINES="g:x,y x,y ...;g:x,y ..." (output-page fractions): lines drawn in the line editor (Add line)
+    if (const char* ul = std::getenv("FS_USER_LINES")) {
+        std::stringstream ss(ul);
+        std::string item;
+        while (std::getline(ss, item, ';')) {
+            PipelineOptions::UserLine l;
+            size_t c = item.find(':');
+            if (c == std::string::npos) continue;
+            l.group = std::atoi(item.substr(0, c).c_str());
+            std::stringstream ps(item.substr(c + 1));
+            std::string pt;
+            float x, y;
+            while (ps >> pt)
+                if (std::sscanf(pt.c_str(), "%f,%f", &x, &y) == 2) l.pts.emplace_back(x, y);
+            if (l.pts.size() >= 2) o.user_lines.push_back(l);
         }
     }
     // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
@@ -413,7 +432,7 @@ int main(int argc, char** argv) {
       << geom_mode_name(r.mode) << "\", \"fit_median_full_px\": "
       << num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1) << ", \"needs_manual_crop\": " << strs(r.needs_manual_crop)
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
-      << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
+      << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"user_lines_used\": " << r.user_lines_used << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
       << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
@@ -551,6 +570,16 @@ int main(int argc, char** argv) {
         cv::Mat bgr;
         cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);
         cv::imwrite(argv[2], bgr, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // FS_INPAINT=MIGAN.onnx: the found fingers painted in by the inpainting net (the app's AI fill) -> OUT.jpg.ai.jpg
+        if (std::getenv("FS_INPAINT") && !r.finger_mask.empty() && !r.page_unerased.empty()) {
+            cv::Mat ai = r.page_unerased.clone();
+            fill_finger(ai, r.finger_mask, nullptr);
+            auto t0 = std::chrono::steady_clock::now();
+            bool ok = inpaint_fill(ai, r.finger_mask, inference(), r.paper_unerased.empty() ? nullptr : &r.paper_unerased);
+            std::fprintf(stderr, "inpaint %s, %.0f ms\n", ok ? "ok" : "FAILED", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            cv::cvtColor(ai, ai, cv::COLOR_BGRA2BGR);
+            cv::imwrite(std::string(argv[2]) + ".ai.jpg", ai, {cv::IMWRITE_JPEG_QUALITY, 90});
+        }
         // FS_FINGER_OUT=PREFIX: for the finger evaluation (tools/fingers/eval.py), in the PHOTO's frame:
         // PREFIX_footprint.png (the photo pixels the page shows) and PREFIX_fingers.png (those it filled as a
         // finger), each page grid cell (4 px) drawn as the quad it comes from
@@ -580,10 +609,10 @@ int main(int argc, char** argv) {
             cv::imwrite(std::string(pg) + "_page.png", bgr);
             if (!r.paper.empty()) cv::imwrite(std::string(pg) + "_paper.png", r.paper);
         }
-        const cv::Scalar col[3] = {{0, 0, 255}, {0, 160, 0}, {255, 0, 0}};
+        const cv::Scalar col[4] = {{0, 0, 255}, {0, 160, 0}, {255, 0, 0}, {0, 200, 255}};
         for (const auto& l : r.lines)
             cv::line(bgr, cv::Point((int)(l[1] * bgr.cols), (int)(l[2] * bgr.rows)), cv::Point((int)(l[3] * bgr.cols), (int)(l[4] * bgr.rows)),
-                     col[std::min(2, std::max(0, (int)l[0]))], 3);
+                     col[std::min(3, std::max(0, (int)l[0]))], 3);
         for (const auto& a : o.ignore)
             cv::rectangle(bgr, cv::Point((int)(a[0] * bgr.cols), (int)(a[1] * bgr.rows)), cv::Point((int)(a[2] * bgr.cols), (int)(a[3] * bgr.rows)),
                           cv::Scalar(0, 140, 255), 4);
