@@ -205,7 +205,7 @@ RuleNetFn rule_net_fn(Inference& inf, double* ms) {
             LOGI("rule net: %s", err.c_str());
             return false;
         }
-        if (y.empty() || y[0].data.size() != (size_t)2 * w * h) return false;
+        if (y.empty() || (y[0].data.size() != (size_t)2 * w * h && y[0].data.size() != (size_t)4 * w * h)) return false;   // rules (+ text lines)
         io = std::move(y[0].data);
         if (ms) *ms += inf.last_ms(NetId::RuleNet);
         return true;

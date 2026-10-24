@@ -1,7 +1,8 @@
 """RuleNet checkpoint -> ONNX for the app: input 'page' 1 x 3 x H x W BGR [0, 1] (H, W dynamic
 multiples of 32), output 'rules' 1 x 2 x H x W probabilities [horizontal, vertical] (the sigmoid is
-in the graph), fp16 weights with fp32 compute (Cast nodes), like the other nets.
-  python export.py CKPT.pt OUT.onnx    (train.py state dicts or train2.py checkpoints)"""
+in the graph), fp16 weights with fp32 compute (Cast nodes), like the other nets. The rule + text-line
+net (tools/text_net checkpoints, n_out 4): 1 x 4 x H x W [rule h, rule v, text line h, text line v].
+  python export.py CKPT.pt OUT.onnx    (train.py state dicts, train2.py or text_net checkpoints)"""
 import os, sys
 import numpy as np, torch, onnx
 from onnx import numpy_helper, helper, TensorProto
@@ -21,7 +22,7 @@ class Probs(torch.nn.Module):
 ck, out = sys.argv[1], sys.argv[2]
 sd = torch.load(ck, map_location='cpu')
 if 'state' in sd:   # round 11 checkpoints (train2.py): {'ch': widths, 'state': state_dict}
-    net = RuleNet(tuple(sd['ch'])).eval(); net.load_state_dict(sd['state'])
+    net = RuleNet(tuple(sd['ch']), sd.get('n_out', 2)).eval(); net.load_state_dict(sd['state'])
 else:
     net = RuleNet().eval(); net.load_state_dict(sd)
 m_ = Probs(net).eval()

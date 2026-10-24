@@ -437,6 +437,16 @@ net on, the 34 round-4 photos and 25 DocUNet pages (1_1..10_2 and the pages Roun
 the same pages and JSON as Round 10's own build. With it off, the 25 DocUNet pages match Round 10's
 rule-net-off run. On the x86_64 emulator, the debug batch mode runs it (`rule_net` true, its counts).
 
+**Round 12: rules + text lines (`tools/text_net`, `docs/results/textnet.md`).** The model behind the same file
+names is now a 4-output RuleNet (0.52 M parameters, 1.0 MB): the two rule maps and a horizontal and a vertical
+text-line map, trained on synthetic pages in 380 languages / 28 scripts. Its rule maps are better than the old
+net's on held-out synthetic pages (F1 0.896 / 0.892 vs 0.704 / 0.582 on text pages). The line stage turns its
+text-line maps into text rows (`text_rows_net`, any script, in place of the ink-blob rows), vertical text into
+vertical samples, and straightens pages of text without rules too. Its line fit follows curled line ends and keeps
+lines bending up to 40 px. On the real photos (29 scored in every run) the text rows' angle spread went from 1.59
+to 1.29 deg and row deviation p90 from 6.64 to 6.49 px against the old rule net. `FS_NO_TEXT_ROWS=1` (desktop)
+turns the text lines off.
+
 ### Literature
 
 No published method was found that is a classical straightening stage on top of neural

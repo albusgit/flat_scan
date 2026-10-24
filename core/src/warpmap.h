@@ -26,7 +26,9 @@ struct Field {
 
 // App: the rule net (tools/rule_net, RuleNet). io in: the page at half size, 3 x h x w planar BGR
 // in [0, 1] (w, h multiples of 32); out (the same vector, resized): 2 x h x w probabilities that a
-// pixel belongs to a printed straight rule, [horizontal, vertical]. False: not available.
+// pixel belongs to a printed straight rule, [horizontal, vertical], or 4 x h x w from the rule +
+// text-line net (tools/text_net): + [horizontal text line, vertical text line] (a band along each
+// printed line's core, any script). False: not available.
 using RuleNetFn = std::function<bool(std::vector<float>& io, int w, int h)>;
 
 // get_lines' use of the rule net (counts, for the processing details)
@@ -72,6 +74,10 @@ struct WarpDebug {
     Field GX, GY, Fx1, Fy1, Fx, Fy;
     cv::Mat A_img, D;
     cv::Mat PH, PV;                               // app: rule net probabilities on A_img (CV_32F), empty without it
+    cv::Mat TH, TV;                               // app: text-line probabilities on A_img (the 4-output net), else empty
+    bool text_net = false;                        // T (and TVs) are the net's text lines (text_rows_net), not ink blobs
+    std::vector<std::array<double, 3>> TVs;       // app: vertical text lines from the net (along y, ideal x, disp)
+    int n_text_v = 0;
     NetLineStats net;
     std::vector<std::pair<std::string, double>> ms;   // stage timings
     int cg_iters[6] = {0, 0, 0, 0, 0, 0};
@@ -105,13 +111,20 @@ GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::M
 // the default. The app never sets it.
 void set_warp_cg_rtol(double rtol);
 double warp_cg_rtol();
+// The text-line net's lines in the line stage: on; FS_NO_TEXT_ROWS=1 in the environment turns them off
+// (desktop A/B). The app never sets it.
+bool text_net_rows_enabled();
 
 // Building blocks exposed for the stage tests.
 cv::Mat darkness_fast(const cv::Mat& bgr);
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint = false, const cv::Mat* PH = nullptr, const cv::Mat* PV = nullptr,
                NetLineStats* stats = nullptr);
-// the rule net's probabilities on a page (CV_32F, page size); false if the net did not run
-bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& PV);
+// the rule net's probabilities on a page (CV_32F, page size); false if the net did not run. TH / TV
+// (optional): the text-line maps of the 4-output net (released when the net gives only rules)
+bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& PV, cv::Mat* TH = nullptr, cv::Mat* TV = nullptr);
+// text lines from the text-line net's map P (CV_32F): samples (along, ideal, disp) as text_rows; hz
+// false: vertical lines (along y, ideal x). nrows: the lines used
+std::vector<std::array<double, 3>> text_rows_net(const cv::Mat& P, bool hz, int& nrows, double step = 6);
 // clean.segments / clean.short_segments (morphological axis-aligned line segments)
 Lines clean_segments(const cv::Mat& ink, bool hz, int klen = 100, int minlen = 150);
 Lines clean_short_segments(const cv::Mat& ink, bool hz, const Lines& long_segs, const Lines& perp);

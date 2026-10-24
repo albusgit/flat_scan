@@ -1621,6 +1621,13 @@ GridMap compose_maps(const WarpDebug& d, int w, int h) {
 void set_warp_cg_rtol(double rtol) { cg_rtol_store() = rtol > 0 ? rtol : kCgRtol; }
 double warp_cg_rtol() { return cg_rtol_store().load(); }
 
+// The text-line net's lines in the line stage (warpmap.h: text_net_rows_enabled): on, FS_NO_TEXT_ROWS=1 in the
+// environment turns them off (desktop A/B: the net's rule maps stay)
+bool text_net_rows_enabled() {
+    static const bool on = [] { const char* e = std::getenv("FS_NO_TEXT_ROWS"); return !(e && *e == '1'); }();
+    return on;
+}
+
 // App, neural pages: a rule whose trace stops short of a rule it ends at, where collect's junction
 // bridge does not join them because the other rule's found segment ends before it (a table border
 // found short and traced on into a curled corner, where the rows end). That corner was never placed
@@ -1688,7 +1695,9 @@ int corner_junctions(Samples& S, const Lines& H, const Lines& V) {
 
 // the page at half size (INTER_AREA), padded to multiples of 32 (edge pixels repeated), through the
 // net; its two maps cropped and scaled back to the page (bilinear)
-bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& PV) {
+bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& PV, cv::Mat* TH, cv::Mat* TV) {
+    if (TH) TH->release();
+    if (TV) TV->release();
     if (!net || bgr.empty()) return false;
     const int w2 = (bgr.cols + 1) / 2, h2 = (bgr.rows + 1) / 2, pw = (w2 + 31) / 32 * 32, ph = (h2 + 31) / 32 * 32;
     cv::Mat small, pad;
@@ -1701,12 +1710,81 @@ bool rule_probs(const cv::Mat& bgr, const RuleNetFn& net, cv::Mat& PH, cv::Mat& 
         for (int x = 0; x < pw; ++x)
             for (int k = 0; k < 3; ++k) io[k * plane + (size_t)y * pw + x] = r[3 * x + k] / 255.f;
     }
-    if (!net(io, pw, ph) || io.size() != 2 * plane) return false;
-    for (int k = 0; k < 2; ++k) {
+    if (!net(io, pw, ph) || (io.size() != 2 * plane && io.size() != 4 * plane)) return false;
+    const int nk = io.size() == 4 * plane && TH && TV ? 4 : 2;
+    cv::Mat* dst[4] = {&PH, &PV, TH, TV};
+    for (int k = 0; k < nk; ++k) {
         cv::Mat m(ph, pw, CV_32F, io.data() + k * plane);
-        cv::resize(m(cv::Rect(0, 0, w2, h2)), k ? PV : PH, bgr.size(), 0, 0, cv::INTER_LINEAR);
+        cv::resize(m(cv::Rect(0, 0, w2, h2)), *dst[k], bgr.size(), 0, 0, cv::INTER_LINEAR);
     }
     return true;
+}
+
+// App: text lines from the text-line net (tools/text_net) instead of ink blobs (text_rows): the net
+// marks a band along the core of each printed line in any script (joined Arabic, CJK, Devanagari's
+// headline, tall stacks) and not rules, pictures or table borders. P > 0.5, joined along the line
+// over gaps < 15 px; a band >= 120 px long, >= 6x as long as tall and <= 40 px tall (two lines run
+// together are taller) gives its centre every 8 px (probability-weighted over 16 px), a polynomial
+// through them and, if it bends <= 40 px, samples (along, ideal, disp) every `step` px. hz false:
+// vertical lines (P transposed: along y, ideal x). Unlike text_rows' fit, it follows a curled line
+// end: degree 1 - 5 by length (one per ~300 px), and 3 rounds leaving out only centres > 3x the
+// median residual and > 2.5 px off (text_rows: degree <= 2, > 2x the median and > 1.5 px, which
+// dropped the curled ends as outliers and left them curled), and a bend up to 40 px (text_rows: 15,
+// which left out the most curved lines of a page).
+std::vector<std::array<double, 3>> text_rows_net(const cv::Mat& P_in, bool hz, int& nrows, double step) {
+    nrows = 0;
+    std::vector<std::array<double, 3>> rows;
+    if (P_in.empty()) return rows;
+    cv::Mat P = hz ? P_in : P_in.t();
+    cv::Mat band = P > 0.5f;
+    cv::morphologyEx(band, band, cv::MORPH_CLOSE, rect(15, 1));
+    cv::Mat lab, st, cen;
+    int n = cv::connectedComponentsWithStats(band, lab, st, cen, 8);
+    for (int i = 1; i < n; ++i) {
+        int x = st.at<int>(i, 0), y = st.at<int>(i, 1), ww = st.at<int>(i, 2), hh = st.at<int>(i, 3);
+        if (ww < 120 || ww < 6 * hh || hh > 40) continue;
+        Vec xs, cs;
+        for (int cx = 0; cx + 8 < ww; cx += 8) {
+            double sw = 0, sy = 0;
+            for (int r = 0; r < hh; ++r) {
+                const int* lr = lab.ptr<int>(y + r);
+                const float* pr = P.ptr<float>(y + r);
+                for (int c = x + cx; c < x + std::min(cx + 16, ww); ++c)
+                    if (lr[c] == i) { sw += pr[c]; sy += pr[c] * r; }
+            }
+            if (sw < 8) continue;
+            xs.push_back(x + std::min(cx + 8, ww - 1));
+            cs.push_back(y + sy / sw);
+        }
+        if (xs.size() < 10) continue;
+        const int deg = ww < 300 ? 1 : ww < 600 ? 2 : ww < 900 ? 3 : ww < 1200 ? 4 : 5;
+        const double xm = 0.5 * (xs.front() + xs.back()), xsc = std::max(1.0, 0.5 * (xs.back() - xs.front()));
+        Vec us(xs.size());
+        for (size_t k = 0; k < xs.size(); ++k) us[k] = (xs[k] - xm) / xsc;   // fit in [-1, 1]
+        std::vector<char> keep(xs.size(), 1);
+        Vec p;
+        for (int it = 0; it < 3; ++it) {
+            Vec ku, kc;
+            for (size_t k = 0; k < xs.size(); ++k)
+                if (keep[k]) { ku.push_back(us[k]); kc.push_back(cs[k]); }
+            if ((int)ku.size() <= deg + 2) break;
+            p = polyfit(ku, kc, deg);
+            Vec r(xs.size());
+            for (size_t k = 0; k < xs.size(); ++k) r[k] = std::fabs(polyval(p, us[k]) - cs[k]);
+            double thr = std::max(2.5, 3.0 * median(r));
+            for (size_t k = 0; k < xs.size(); ++k) keep[k] = r[k] < thr;
+        }
+        if (p.empty()) continue;
+        long nt = (long)std::ceil(((xs.back() + 1) - xs.front()) / step);
+        Vec tt(nt), yc(nt);
+        for (long k = 0; k < nt; ++k) { tt[k] = xs.front() + k * step; yc[k] = polyval(p, (tt[k] - xm) / xsc); }
+        double ideal = np_mean(yc), mxd = 0;
+        for (double v : yc) mxd = std::max(mxd, std::fabs(v - ideal));
+        if (mxd > 40) continue;
+        for (long k = 0; k < nt; ++k) rows.push_back({tt[k], ideal, yc[k] - ideal});
+        ++nrows;
+    }
+    return rows;
 }
 
 GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges,
@@ -1752,9 +1830,10 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     std::vector<DLine> Hs, Vs;
     std::vector<cv::Point2d> sp, dp;
     // the rule net on the page as given (its maps follow the global stage's remap below)
-    cv::Mat P0h, P0v;
+    cv::Mat P0h, P0v, P0th, P0tv;   // + the text-line maps of the 4-output net
     if (faint && rule_net && *rule_net) {
-        if (!rule_probs(src, *rule_net, P0h, P0v)) { P0h.release(); P0v.release(); }
+        if (!rule_probs(src, *rule_net, P0h, P0v, &P0th, &P0tv)) { P0h.release(); P0v.release(); P0th.release(); P0tv.release(); }
+        if (!text_net_rows_enabled()) { P0th.release(); P0tv.release(); }
         d.ms.emplace_back("rule net", ms_since(t0));
         t0 = Clock::now();
     }
@@ -1828,6 +1907,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     if (skip_global) {
         d.A_img = src.clone();
         d.PH = P0h; d.PV = P0v;
+        d.TH = P0th; d.TV = P0tv;
     } else if (P0h.empty() && gpu_stages_enabled() && remap_offset_gpu(src, gx, gy, gw, gh, GG, d.A_img)) {
         // the same map and bicubic on the GPU, byte-identical (resample.h); with the rule net's maps
         // (remapped with the page below) the CPU path runs
@@ -1858,6 +1938,12 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
                 cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
                 cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
             }
+            if (!P0th.empty()) {
+                if (d.TH.empty()) { d.TH.create(h, w, CV_32F); d.TV.create(h, w, CV_32F); }
+                cv::Mat th = d.TH.rowRange(y0, y1), tv = d.TV.rowRange(y0, y1);
+                cv::remap(P0th, th, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                cv::remap(P0tv, tv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+            }
         }
     }
     d.D = darkness_fast(d.A_img);
@@ -1867,13 +1953,20 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
     const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
     get_lines(d.D, d.H, d.V, faint, PH, PV, &d.net);
+    // app: the text lines from the text-line net (any script; ink blobs otherwise, text_rows below)
+    if (!d.TH.empty()) {
+        d.text_net = true;
+        d.T = text_rows_net(d.TH, true, d.n_text);
+        d.TVs = text_rows_net(d.TV, false, d.n_text_v);
+    }
     const int GC = 16, GF = 8;
     // (app: lines of one direction alone are straightened too - a ruled sheet, a receipt with only
     // horizontal rules, a page whose vertical "rules" the rule net found to be picture edges; the
     // other direction gets a zero field. The reference needs both.)
-    if (faint ? (d.H.empty() && d.V.empty()) : (d.H.empty() || d.V.empty())) {
+    // (app, with the text-line net: its text lines alone are straightened too - a page of text)
+    if (faint ? (d.H.empty() && d.V.empty() && d.T.empty() && d.TVs.empty()) : (d.H.empty() || d.V.empty())) {
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
-        // pages then get the surface model only.
+        // pages then get the surface model only (without the text-line net).
         d.n_text = 0;
         d.Fx = d.Fy = d.Fx1 = d.Fy1 = zero_field(w / GF + 2, h / GF + 2, GF);
         d.ms.emplace_back("lines (none: zero field)", ms_since(t0));
@@ -1882,7 +1975,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
     d.S1 = collect(D, d.H, d.V, nullptr, nullptr, threads, share_rows, faint, PH, PV);
     if (share_rows && faint) corner_junctions(d.S1, d.H, d.V);
-    d.T = text_rows(d.D, d.H, d.V, d.n_text);
+    if (!d.text_net) d.T = text_rows(d.D, d.H, d.V, d.n_text);
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
         drop(d.M, false);
@@ -1902,9 +1995,11 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
+    drop(d.TVs, false);
     drop_whole(d.S1.h, true);
     drop_whole(d.S1.v, false);
     drop_whole(d.T, true);
+    drop_whole(d.TVs, false);
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
     Field Fx_prev, Fy_prev;
@@ -1943,7 +2038,8 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         std::vector<std::array<double, 2>> xyv;
         Vec valv;
         for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
-                                                              (const std::vector<std::array<double, 3>>*)&d.EV})
+                                                              (const std::vector<std::array<double, 3>>*)&d.EV,
+                                                              (const std::vector<std::array<double, 3>>*)&d.TVs})
             for (const auto& r : *src) {
                 double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
                 xyv.push_back({r[1], ys}); valv.push_back(r[2]);

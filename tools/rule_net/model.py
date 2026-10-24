@@ -39,7 +39,7 @@ class Up(nn.Module):
 
 
 class RuleNet(nn.Module):
-    def __init__(self, ch=(8, 16, 24, 32, 48, 64)):
+    def __init__(self, ch=(8, 16, 24, 32, 48, 64), n_out=2):
         super().__init__()
         c0, c1, c2, c3, c4, c5 = ch
         self.stem = cbr(3, c0)                                        # 1/1
@@ -54,7 +54,7 @@ class RuleNet(nn.Module):
         self.d2 = Up(c3, c2, c2)
         self.d1 = Up(c2, c1, c1)
         self.d0 = cbr(c1 + c0 + 3, c0)                               # one light conv at full size
-        self.out = nn.Conv2d(c0, 2, 3, 1, 1)
+        self.out = nn.Conv2d(c0, n_out, 3, 1, 1)   # n_out 4: + text lines (tools/text_net)
         nn.init.constant_(self.out.bias, -3.0)
 
     def forward(self, x):

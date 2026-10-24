@@ -812,6 +812,20 @@ PageTraces page_traces(const WarpDebug& d) {
         for (auto& kv : lines)
             if (kv.second.size() >= 10) { T.pts.push_back(std::move(kv.second)); T.hz.push_back((char)hz); }
     }
+    // the text-line net's lines count too (a page of text has no rules to judge a map by)
+    if (d.text_net)
+        for (int hz = 1; hz >= 0; --hz) {
+            std::map<double, std::vector<cv::Point2d>> lines;
+            size_t k = 0;
+            for (const auto& r : hz ? d.T : d.TVs) {
+                if (k++ % 2) continue;
+                double x = hz ? r[0] : r[1] + r[2], y = hz ? r[1] + r[2] : r[0];
+                if (glob) { double gx = d.GX.sample(x, y), gy = d.GY.sample(x, y); x += gx; y += gy; }
+                lines[r[1]].push_back({x, y});
+            }
+            for (auto& kv : lines)
+                if (kv.second.size() >= 10) { T.pts.push_back(std::move(kv.second)); T.hz.push_back((char)hz); }
+        }
     return T;
 }
 

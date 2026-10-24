@@ -543,7 +543,8 @@ def rule_static(src, work, hw, gpu):
     tfl32 = os.path.join(work, 'rule_' + tag, 'rule_%s_fp32_float32.tflite' % tag)
     static = os.path.join(work, 'rulenet_%s.tflite' % tag)
     summary = rewrite(tfl32, static, bn_convs(m, w16), m.graph.output[0].name)
-    lines, text = check(static, [1] + list(hw) + [3], [1] + list(hw) + [2], gpu=gpu)
+    nout = m.graph.output[0].type.tensor_type.shape.dim[1].dim_value   # 2 (rules) or 4 (+ text lines: tools/text_net)
+    lines, text = check(static, [1] + list(hw) + [3], [1] + list(hw) + [nout], gpu=gpu)
     print(f'rule net {src}: static {hw[0]} x {hw[1]} {os.path.getsize(static)} bytes; {summary}')
     for s in lines:
         print('  ' + s, flush=True)

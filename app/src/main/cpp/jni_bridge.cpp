@@ -1490,7 +1490,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
             f << ", \"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << r.error << "\", \"mode\": \"" << geom_mode_name(r.mode)
               << "\", \"fit_median_full_px\": " << cli_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
               << ", \"needs_manual_crop\": " << cli_strs(r.needs_manual_crop) << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl
-              << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size() << "], \"text_rows\": " << r.warp.n_text
+              << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size() << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false")
               << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << cli_num(r.uv_agreement)
               << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false") << ", \"line_distortion\": " << cli_num(r.line_distortion)
               << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << cli_num(r.fingers_erased)
