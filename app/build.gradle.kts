@@ -122,6 +122,13 @@ tasks.configureEach {
 val opencvMin: String? = (project.findProperty("opencvMin") as String? ?: localProps.getProperty("opencv.min.dir"))
     ?.takeIf { it.isNotBlank() && it != "aar" }
     ?.also { require(file("$it/sdk/native/jni/OpenCVConfig.cmake").isFile) { "opencvMin: no sdk/native/jni/OpenCVConfig.cmake in $it" } }
+// A release without the slim build would ship the AAR's libraries without a word (native libraries 16.3 MB
+// instead of 5.9 MB): it stops unless -PopencvMin=aar asks for the AAR.
+val opencvAarAsked = (project.findProperty("opencvMin") as String?) == "aar"
+tasks.configureEach {
+    if (opencvMin == null && !opencvAarAsked && name.startsWith("pre") && name.endsWith("ReleaseBuild"))
+        doFirst { throw GradleException("release build without the slim OpenCV: set opencv.min.dir in local.properties (tools/opencv_min/build_opencv_min.sh) or pass -PopencvMin=aar") }
+}
 
 android {
     namespace = "com.albus.flatscan"
