@@ -1060,8 +1060,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * processing would run no flattening nets, nor before Auto's benchmark has chosen the backends
      * (processing runs it first). Registers them before it returns, so that processing cannot miss them.
      */
+    /** Debug builds (MainActivity `--ez no_ahead true`): [netsAhead] off, for A/B checks. */
+    var netsAheadOff = false
+
     private suspend fun netsAhead(p: Bitmap) {
-        if (!settings.uvDoc || cropMode == CaptureMode.Whiteboard) return
+        if (netsAheadOff || !settings.uvDoc || cropMode == CaptureMode.Whiteboard) return
         if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) return
         val nets = settings.flatNets
         val plan = withContext(Dispatchers.Default) {

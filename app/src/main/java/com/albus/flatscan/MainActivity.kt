@@ -93,6 +93,8 @@ class MainActivity : ComponentActivity() {
             vm.open(Screen.Settings)
             return
         }
+        // `--ez no_ahead true` with any extra: the flattening nets do not start ahead of processing (A/B checks)
+        if (i.hasExtra("no_ahead")) vm.netsAheadOff = i.getBooleanExtra("no_ahead", false)
         i.getStringExtra("open_test")?.let { set ->
             vm.runOpenTest(set, java.io.File(getExternalFilesDir(null), "batch_out/open_report.txt"))
             return
