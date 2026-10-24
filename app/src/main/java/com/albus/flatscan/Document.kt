@@ -32,7 +32,14 @@ data class PageMeta(
     val perspectiveOnly: Boolean = false,     // the user turned the unwarp off for this page
     val erase: FloatArray = FloatArray(0),    // Erase tool rectangles (page fractions), applied after processing
     val look: PageLook = PageLook(),          // light, colour and page shape (Kotlin, after the core's render)
+    val mode: CaptureMode = CaptureMode.Document,   // whiteboard mode: perspective only, board filters
+    val fingersAuto: Boolean = true,          // the automatic finger removal applies (off: the photo's pixels there)
+    // finger brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ...] repeated
+    val fingerStrokes: FloatArray = FloatArray(0),
 ) {
+    /** Edits after processing beyond the automatic ones (setEdits needed when a page is opened). */
+    val hasEdits: Boolean get() = erase.isNotEmpty() || !fingersAuto || fingerStrokes.isNotEmpty()
+
     /**
      * Everything the processed geometry depends on: a stored session (DocumentStore.saveSession)
      * is reused only while this key is unchanged.
@@ -40,7 +47,7 @@ data class PageMeta(
     fun geometryKey(renderWidth: Int, autoOrient: Boolean, net: Boolean): String = listOf(
         corners.joinToString(","), detected?.joinToString(",") ?: "-", cropRotation, userRotated, focalPx, pageIndex,
         forceHomography, ignore.joinToString(","), perspectiveOnly, renderWidth, autoOrient, net,
-    ).joinToString("|")
+    ).joinToString("|") + if (mode == CaptureMode.Document) "" else "|mode=${mode.name}"
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -68,6 +75,9 @@ data class PageMeta(
         put("perspective_only", perspectiveOnly)
         put("erase", erase.toJson())
         if (look != PageLook()) put("look", look.toJson())
+        if (mode != CaptureMode.Document) put("mode", mode.name)
+        if (!fingersAuto) put("fingers_auto", false)
+        if (fingerStrokes.isNotEmpty()) put("finger_strokes", fingerStrokes.toJson())
     }
 
     companion object {
@@ -100,6 +110,9 @@ data class PageMeta(
                 perspectiveOnly = j.optBoolean("perspective_only"),
                 erase = j.optJSONArray("erase")?.toFloats() ?: FloatArray(0),
                 look = PageLook.fromJson(j.optJSONObject("look")),
+                mode = CaptureMode.entries.firstOrNull { it.name == j.optString("mode") } ?: CaptureMode.Document,
+                fingersAuto = j.optBoolean("fingers_auto", true),
+                fingerStrokes = j.optJSONArray("finger_strokes")?.toFloats() ?: FloatArray(0),
             )
         }
 

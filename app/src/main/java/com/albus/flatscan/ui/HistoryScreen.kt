@@ -138,6 +138,11 @@ fun HomeScreen(vm: ScanViewModel) {
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (!searching && selected.isEmpty()) {
+                item("mode") {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                        ModeSwitch(vm.captureMode, onPick = { vm.chooseCaptureMode(it) }, dark = false)
+                    }
+                }
                 item("actions") {
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 8.dp)) {
                         ActionCard("Scan", "New document", Icons.Outlined.PhotoCamera, primary = true, modifier = Modifier.weight(1f)) { vm.scanNew() }

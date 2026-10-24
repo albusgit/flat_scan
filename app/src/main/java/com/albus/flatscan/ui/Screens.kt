@@ -185,7 +185,7 @@ fun SettingsScreen(vm: ScanViewModel) {
         )
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
             Section("Default filter")
-            for (f in FilterKind.entries) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
+            for (f in FilterKind.forMode(com.albus.flatscan.CaptureMode.Document)) Choice(f.label, filter == f) { filter = f; s.defaultFilter = f }
             Text(
                 "The filter and strength you choose on a page become the default for the next one.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,

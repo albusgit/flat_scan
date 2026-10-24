@@ -31,6 +31,140 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
 - **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
 
+## Better finger detection (Phase 1, feature 5)
+
+**Result screen › Fingers** shows what was filled, in orange over the page. From there:
+- **Remove** brush: paint over a finger the app missed.
+- **Keep** brush: paint where the app took too much.
+- **Automatic: on/off**: switches the automatic detection on or off.
+- **Undo** and **Clear**, plus a brush-size slider.
+
+Strokes are stored with the page, in page coordinates, and are re-applied when the page is re-processed.
+
+A filled area takes the paper around it, not a flat colour. The fill uses a local paper estimate (a
+max-filter, then a normalised-convolution fill). Text is never invented: if text ran under the finger, the
+area gets a thin dashed grey outline, and the panel says so.
+
+### What changed in detection (`core/src/pipeline.cpp`, `erase_fingers`)
+
+The old test only looked at holes in the page mask. A hole is an area at the page border that the
+segmentation net did not count as paper. On the test photos the net usually counts the finger as paper, so
+nothing was found (5 of 32 photos). Two rules are now on by default (`PipelineOptions::finger_rules`):
+
+- **`kFingerSkinRegion`** catches fingers the page mask took for paper. It samples the hand's own colour
+  outside the page (`skin_model_outside`, a Cr/Cb Gaussian) and looks for areas of that colour on the
+  page. Such an area must be smooth (no ink inside), come in over the page border and reach into the page.
+  The rule runs only if a hand-coloured area exists outside the page. It does not run if that colour covers
+  40 % or more of a band around the page: then it is a table or a wall, not a hand.
+- **`kFingerHandColour`** applies to every candidate. On average, the candidate must be clearly redder and
+  less blue than the paper (Cr ≥ +10, Cb ≤ −10). Each candidate's entry side is the side it runs along
+  furthest. If candidates come in from three or four sides, nothing is filled: that is a box's flaps, a
+  table or a coloured frame, not hands.
+
+### Measured (`tools/fingers/eval.py`; app settings: nets, rule net, shadow net)
+
+Test photos:
+- 33 finger photos with hand-drawn masks (`testdata/fingers`, one has no finger on the detected page).
+- 46 control photos with skin-like colours but no hands (`testdata/control`): orange or beige paper,
+  printed faces, wood, kraft, cardboard.
+
+All are from Wikimedia Commons; licences are in the manifests. The IoU is taken inside the page's
+footprint. A control photo counts as a false positive when more than 0.05 % of its page is filled.
+
+| rules | mean IoU (32) | pooled IoU | photos with a detection | control false positives | control area filled |
+|---|---|---|---|---|---|
+| **before** (holes only) | 0.077 | 0.047 | 5 | 6 / 46 (13.0 %) | 0.72 % |
+| + contact (candidate along the border) | 0.077 | 0.047 | 5 | 6 / 47* (12.8 %) | 0.71 % |
+| + finger width 2–16 % | 0.012 | 0.001 | 1 | 2 / 46 (4.3 %) | 0.03 % |
+| + skin regions | 0.127 | 0.167 | 11 | 7 / 46 (15.2 %) | 1.20 % |
+| + skin regions + width | 0.064 | 0.131 | 8 | 3 / 46 (6.5 %) | 0.51 % |
+| colour + sides only | 0.064 | 0.046 | 4 | 3 / 46 (6.5 %) | 0.08 % |
+| **skin regions + colour + sides (default)** | **0.136** | **0.167** | **11** | **3 / 46 (6.5 %)** | **0.08 %** |
+
+\* That run still included `control_04`, later dropped: its Commons title did not match what the photo shows.
+
+The default meets the plan's bar: IoU above the baseline (mean 0.077 → 0.136, pooled 0.047 → 0.167), and a
+false-positive rate below it (13.0 % → 6.5 %). The rules were picked by looking at these same photos, so the
+numbers are optimistic. There is no held-out set.
+
+The absolute IoU is still low: 21 of 32 finger photos get nothing. Many of them are stock photos where the
+page is a small part of the frame, or the hand sits on a dark book cover. A typical scanner photo, with the
+page filling the frame and fingers at its edge, is the easier case, but this set does not measure it
+separately. The brush exists for the misses.
+
+**Document path:** with the finger erase off, the flattened and rendered pages are byte-identical to the
+previous build on all 79 photos. With it on (`doc_identity.py --fingers`), 40 of the 46 control photos are identical. The 6 that differ are exactly the
+old build's 6 false positives: the new build leaves 3 of them untouched, and fills the other 3 with the new
+paper fill.
+
+Tests:
+- `tools/desktop_check/finger_test.cpp`: fill with the paper colour; no text invented inside; filled area
+  marked as paper; outline only when text ran under the finger; text-under detection.
+- `PageMetaTest`: brush strokes and the automatic on/off survive save and load.
+
+**Not verified on a phone:** the brush (touch accuracy, speed of re-applying strokes on a large page),
+and detection on photos taken by a phone user rather than stock photos.
+
+## Whiteboard mode (Phase 1, feature 4)
+
+A **Document / Whiteboard** switch on the camera screen and on Home sets what the next scans are; the result
+screen has a **Whiteboard** chip that switches one page after the fact (it is re-processed from its original).
+In whiteboard mode:
+
+- **Corners:** `find_board` (`core/src/board.cpp`) looks for the board or the lit screen, not a page. It
+  combines three candidate sources: the largest bright region, closed outlines, and quads built from long
+  straight Hough lines. For a board wider than the photo, the photo's own edges stand in for the missing
+  sides; those sides do not count as edge support, and at least two real sides are needed. Each candidate
+  is scored on edge support, area, real sides, and how much brighter its inside is than the rest of the
+  photo. If nothing is reliable, the whole frame is used. Corners stay editable as for a page.
+- **Processing:** perspective only. No unwarp nets, line stage, orientation guess, shadow net or finger
+  erase. A board is flat, and those stages are tuned for paper.
+- **Filters:** **Whiteboard** whitens the board: a tile-wise background estimate that skips tiles with
+  strokes or coloured areas (sticky notes, magnets), then normalisation, white-point blend, and a
+  saturation boost on strokes only. **Dark slide** is chosen automatically when the screen's median
+  brightness is below 70 (light text on a dark slide); it keeps the dark background and lifts the content.
+  Original and Auto colour are also offered.
+
+### Measured (`tools/board/sheet.py`, `docs/results/whiteboard/`)
+
+Test photos: 17 whiteboards and 14 projector screens from Wikimedia Commons (`testdata/whiteboard`,
+`testdata/projector`; licences in `testdata/MANIFEST_extra.json`). I labelled the board / screen corners by
+hand (`testdata/board_corners.json`, about ±2 % of the photo). Two photos have no single board to find and
+are not scored: a wall-sized board, and a slide projected on a wall.
+
+Corner IoU with the labels:
+
+| | whiteboards (16) | projector screens (13) |
+|---|---|---|
+| whole frame (what Document mode's page finder falls back to on these photos) | 0.71 mean; IoU ≥ 0.8 on 6; < 0.5 on 3 | 0.27 mean; ≥ 0.8 on 0; < 0.5 on 12 |
+| `find_board`, first version (edge support × area only) | 0.83; ≥ 0.8 on 12; < 0.5 on 1 | 0.44; ≥ 0.8 on 1; < 0.5 on 8 |
+| `find_board`, final (+ brightness against the surroundings; small quads allowed when they stand out by ≥ 40 levels) | **0.86; ≥ 0.8 on 12; < 0.5 on 0** | **0.67; ≥ 0.8 on 5; < 0.5 on 2** |
+
+The final weights came from a small sweep (11 settings) on the same photos, so the numbers are optimistic.
+There is no held-out set. A texture ("calm inside") term did not help and was dropped.
+
+Most projector photos are wide room shots of a presentation, taken by event photographers, not a phone
+user framing a slide. The two misses below 0.5 are projector_01 (a screen at a steep angle under a tent
+roof) and projector_08 (a small screen behind people). The before / after sheets
+(`docs/results/whiteboard/sheet_*.jpg`) show every photo: the corners used, and the result with the
+Whiteboard or Dark slide filter at strength 0.7.
+
+**Document path unchanged:** `tools/board/doc_identity.py` runs every photo through the build before this
+feature and the build after. It uses the app settings (nets, rule net, shadow net) with the finger erase
+off, because feature 5 changes that on purpose. It then compares the flattened page (lossless PNG), the
+rendered page and the JSON byte for byte. Result: **79 of 79 photos identical** (46 control, 33 finger).
+The repo has no runnable document benchmark (`docs/AUDIT.md` §3), so this identity check stands in for it.
+
+Tests: `tools/desktop_check/board_test.cpp` (13 checks on synthetic photos: a board on a wall and a lit
+screen in a dark room found with corners within 2 % of the diagonal; no quad found in a noisy scene; the board
+white on its dim and lit sides; red and blue markers keep their colour and gain saturation; a sticky note keeps
+its colour; a dark slide stays dark and even with bright text) and `PageMetaTest` (a page's mode and finger
+edits survive save/load; files from before load with defaults; the mode is part of the page geometry, so
+switching it re-processes; the filters offered in each mode).
+
+**Not verified on a phone:** the mode switch, corner detection speed on a phone CPU (desktop, one core: median 21 ms,
+max 71 ms over the 31 photos, at 640 px), and how the filter looks on a phone screen.
+
 ## Better output (Phase 1, feature 3)
 
 Export sheet (Save / Share): **format** PDF, JPEG per page, PNG per page, or PDF + JPEG; **colour**,

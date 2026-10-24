@@ -101,6 +101,11 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("ocr_after_scan", true)
         set(v) = p.edit().putBoolean("ocr_after_scan", v).apply()
 
+    /** Document or whiteboard mode for new scans (the camera screen's switch; imports follow it). */
+    var captureMode: CaptureMode
+        get() = CaptureMode.entries.firstOrNull { it.name == p.getString("capture_mode", null) } ?: CaptureMode.Document
+        set(v) = p.edit().putString("capture_mode", v.name).apply()
+
     /** The document open when the app was last used (reopened at start), or null. */
     var lastDocument: String?
         get() = p.getString("last_document", null)

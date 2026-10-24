@@ -110,6 +110,23 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** The page with the live session (result screen). */
     var currentId by mutableStateOf<String?>(null)
         private set
+    /** Document or whiteboard mode for new scans and imports (the camera screen's switch, remembered). */
+    var captureMode by mutableStateOf(settings.captureMode)
+        private set
+
+    fun chooseCaptureMode(m: CaptureMode) {
+        captureMode = m
+        settings.captureMode = m
+    }
+
+    /** The mode of the page on the result screen. */
+    val pageMode: CaptureMode get() = sessionGeomState?.mode ?: CaptureMode.Document
+
+    /** The mode of the photo on the crop screen: its page's, or [captureMode] for a new page. */
+    private var cropMode = CaptureMode.Document
+    /** Whiteboard mode: the board detection saw a dark slide (the Dark slide filter for the new page). */
+    private var boardDark = false
+
     /** Imported images still to go through crop -> processing. */
     val pending = mutableStateListOf<Uri>()
     var pendingTotal by mutableIntStateOf(0)
@@ -480,7 +497,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val detectMs = msSince(td)
             val c = FloatArray(8) { i -> if (i % 2 == 0) pg.corners[i / 2].x else pg.corners[i / 2].y }
             val h = NativeLib.process(
-                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, null,
+                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, false, null,
             )
             val pageMs = msSince(t0)
             val info = if (h != 0L) JSONObject(NativeLib.info(h)).also { NativeLib.release(h) } else null
@@ -847,6 +864,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 discardStaging()
                 photoPageId = id
                 cropMeta = null
+                cropMode = captureMode
                 usePhoto(p.bitmap)
                 focalPx = p.focalPx
                 userRotated = false
@@ -902,6 +920,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun detect(auto: Boolean = false) {
         val p = photo ?: return
+        if (cropMode == CaptureMode.Whiteboard) {
+            detectBoard(p, auto)
+            return
+        }
         if (flatImport) {
             // a PDF page: the whole image is the page, already flat
             detected = listOf(Offset(0f, 0f), Offset(p.width - 1f, 0f), Offset(p.width - 1f, p.height - 1f), Offset(0f, p.height - 1f))
@@ -939,6 +961,37 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val doubtful = first == null || cropReasons.isNotEmpty()
         if (first == null && !(batch && !settings.reviewCrops)) message = "Page not found - drag the corners to the page"
         if (auto && !settings.reviewCrops && (!doubtful || batch)) process()
+    }
+
+    /**
+     * Whiteboard mode: the board's or screen's corners (core/src/board.cpp). Found: processed straight away
+     * (unless Settings > Check every crop). Not found: the whole photo, on the crop screen to set the
+     * corners by hand. Corners always lie inside the photo, so nothing from outside it is ever shown.
+     */
+    private suspend fun detectBoard(p: Bitmap, auto: Boolean) {
+        val b = withContext(Dispatchers.Default) { runCatching { NativeLib.detectBoard(p) }.onFailure { Log.e(TAG, "board detection failed", it) }.getOrNull() }
+        if (photo !== p) return
+        val frame = listOf(Offset(1f, 1f), Offset(p.width - 2f, 1f), Offset(p.width - 2f, p.height - 2f), Offset(1f, p.height - 2f))
+        val found = b?.let { List(4) { i -> Offset(it[2 * i], it[2 * i + 1]) } }
+        detected = found ?: frame
+        corners = detected!!
+        boardDark = b != null && b[10] > 0.5f
+        cropPageIndex = 0
+        cropReasons = if (found == null) listOf("No board edges found: drag the corners to the board or screen") else emptyList()
+        forceHomography = true
+        spreadNext = null
+        detecting = false
+        if (found == null && !(batch && !settings.reviewCrops)) message = "Board not found - drag the corners"
+        if (auto && !settings.reviewCrops && (found != null || batch)) process()
+    }
+
+    /** Switches the page on the result screen between document and whiteboard processing (processed again). */
+    fun setPageMode(m: CaptureMode) {
+        val g = sessionGeomState ?: return
+        if (g.mode == m || !sourceAvailable(g.id)) return
+        sessionGeomState = g.copy(mode = m)
+        params = params.copy(filter = if (m == CaptureMode.Whiteboard) FilterKind.Whiteboard else settings.defaultFilter)
+        reflatten()
     }
 
     /** The second page of a book spread: same photo, its own corners and gate, a new document page. */
@@ -1099,6 +1152,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private fun setCrop(m: PageMeta, bmp: Bitmap) {
         photoPageId = m.id
         cropMeta = m
+        cropMode = m.mode
         usePhoto(bmp)
         corners = List(4) { Offset(m.corners[2 * it], m.corners[2 * it + 1]) }
         detected = m.detected?.let { d -> List(4) { Offset(d[2 * it], d[2 * it + 1]) } }
@@ -1657,20 +1711,25 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val ig = ignoreAreas
             ?: prev?.takeIf { it.corners.contentEquals(c) && it.cropRotation == cropRotation }?.ignore?.toList()
             ?: emptyList()
-        val po = perspective ?: prev?.perspectiveOnly ?: false
+        // the page's mode: a page keeps its own (setPageMode changes it); a new page takes the crop's
+        val mode = prev?.mode ?: cropMode
+        val board = mode == CaptureMode.Whiteboard
+        // a board is flat: perspective correction only, whatever the unwarp switch says
+        val po = board || (perspective ?: prev?.perspectiveOnly ?: false)
         val geom = PageMeta(
             id = id, corners = c, detected = detected?.let { d -> FloatArray(8) { i -> if (i % 2 == 0) d[i / 2].x else d[i / 2].y } },
             cropRotation = cropRotation, userRotated = userRotated, focalPx = focalPx,
             params = RenderParams(), protect = FloatArray(0), rotation = 0,
             pageIndex = pageIndex, forceHomography = force,
             spreadWith = spread?.firstId ?: stored?.spreadWith ?: (if (same) sessionGeom?.spreadWith else null),
-            ignore = ig.toFloatArray(), perspectiveOnly = po,
+            ignore = ig.toFloatArray(), perspectiveOnly = po, mode = mode,
         )
         val key = geometryKey(geom)
         val defaults = settings.defaultParams()
         val startParams = when {
             same -> params
             stored != null -> stored.params
+            board -> defaults.copy(filter = if (boardDark) FilterKind.ProjectorDark else FilterKind.Whiteboard, solid = false, screen = ScreenMode.Off)
             else -> defaults
         }
         val startProtect = when {
@@ -1686,15 +1745,19 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val startLook = when {
             same -> look
             stored != null -> stored.look
+            // a board keeps its own proportions (measured from its corners), not A4's
+            board -> PageLook(shape = PageShape.Measured)
             else -> LookPrefs.newPageLook(getApplication())
         }
         val quadHw = measuredPageHw(corners, p.width, p.height, focalPx)
-        val autoOrient = settings.autoRotate && !userRotated
+        // whiteboard mode: no orientation decision (its cue is tuned on printed text), no shadow net (trained
+        // on paper), no rule net, no finger erase (core: PipelineOptions::erase_fingers)
+        val autoOrient = settings.autoRotate && !userRotated && !board
         val width = settings.outputWidth
-        val useUv = settings.uvDoc
+        val useUv = settings.uvDoc && !board
         val nets = settings.flatNets
-        val shadows = settings.neuralShadows
-        val rules = settings.ruleNet
+        val shadows = settings.neuralShadows && !board
+        val rules = settings.ruleNet && !board
         val focal = focalPx
         recropBackup = null
         screen = Screen.Processing
@@ -1714,12 +1777,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 val hh = try {
                     val plan = if ((useUv && !po) || shadows) ensureNets { s -> viewModelScope.launch(Dispatchers.Main) { stage = s } } else netPlan
                     val reused = synchronized(logitsLock) { logitsCache?.first === p }
-                    val logits = logitsFor(p)
+                    val logits = if (board) null else logitsFor(p)
                     val finder = if (logits != null) finderTiming(p) else null
                     accel = { j -> j.put("accel", accelJson(j.optJSONObject("accel"), finder, reused, plan)) }
                     CrashGuard.guard(getApplication(), "processing a page", gpu = !plan.cpuOnly) {
                         NativeLib.process(
-                            p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules,
+                            p, c, edited || board, focal, autoOrient, width, true, if (board) null else logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules, board,
                         ) { pct, s ->
                             viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                         }
@@ -1798,9 +1861,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         lines = ln
         ignore = geom.ignore.toList()
         erase = geom.erase.toList()
-        if (erase.isNotEmpty()) {
+        fingersAuto = geom.fingersAuto
+        fingerStrokes = geom.fingerStrokes.toList()
+        fingerOverlay = null
+        fingersOverText = runCatching { JSONObject(withContext(nativeCtx) { NativeLib.info(h) }).optBoolean("fingers_over_text") }.getOrDefault(false)
+        if (geom.hasEdits) {
             val rects = erase.toFloatArray()
-            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setErase(h, rects) }
+            val fa = fingersAuto
+            val st = fingerStrokes.toFloatArray()
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, rects, fa, st) }
         }
         outVersion++
         details = text
@@ -1999,7 +2068,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun currentMeta(): PageMeta? =
-        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray(), look = look)
+        sessionGeom?.copy(
+            params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray(), look = look,
+            fingersAuto = fingersAuto, fingerStrokes = fingerStrokes.toFloatArray(),
+        )
 
     /**
      * Writes the current page's settings and (if it changed) its rendered output to disk.
@@ -2036,7 +2108,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun selectFilter(f: FilterKind) {
         if (f == params.filter) return
         params = params.copy(filter = f)
-        settings.defaultFilter = f
+        // the default for new pages is a document filter; whiteboard pages start from the board filters
+        if (pageMode == CaptureMode.Document) settings.defaultFilter = f
         requestRender(false)
     }
 
@@ -2136,13 +2209,83 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun setEraseRects(rects: List<Float>) {
+        erase = rects
+        applyPageEdits()
+    }
+
+    // ---- finger brush (feature 5)
+    /** The automatic finger removal applies to the page on the result screen. */
+    var fingersAuto by mutableStateOf(true)
+        private set
+    /** Brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ...] repeated. */
+    var fingerStrokes by mutableStateOf(listOf<Float>())
+        private set
+    /** The finger mask shown while brushing (translucent orange, page size), and its share of the page. */
+    var fingerOverlay by mutableStateOf<Bitmap?>(null)
+        private set
+    var fingerShare by mutableFloatStateOf(0f)
+        private set
+
+    /** A brush stroke over the page ([points]: page fractions x0, y0, ...): [add] fills it as a finger, else brings the photo back there. */
+    fun addFingerStroke(add: Boolean, radius: Float, points: List<Float>) {
+        if (points.size < 2) return
+        fingerStrokes = fingerStrokes + listOf(if (add) 1f else 0f, radius, (points.size / 2).toFloat()) + points
+        applyPageEdits()
+    }
+
+    fun undoFingerStroke() {
+        var i = 0
+        var last = -1
+        val s = fingerStrokes
+        while (i + 3 <= s.size) { last = i; i += 3 + 2 * s[i + 2].toInt() }
+        if (last >= 0) { fingerStrokes = s.take(last); applyPageEdits() }
+    }
+
+    fun clearFingerStrokes() {
+        if (fingerStrokes.isNotEmpty()) { fingerStrokes = emptyList(); applyPageEdits() }
+    }
+
+    fun setFingersAutoOn(on: Boolean) {
+        if (on != fingersAuto) { fingersAuto = on; applyPageEdits() }
+    }
+
+    /** The finger tool is closed: its overlay goes. */
+    fun closeFingerTool() {
+        fingerOverlay = null
+    }
+
+    /** Text ran under a removed finger on this page (its area is outlined in the page). */
+    var fingersOverText by mutableStateOf(false)
+        private set
+
+    /** Refreshes the brush overlay (the finger tool is open). */
+    fun refreshFingerOverlay() {
+        val h = handle
+        if (h == 0L || pageWidth == 0) return
+        val fa = fingersAuto
+        val st = fingerStrokes.toFloatArray()
+        viewModelScope.launch {
+            val r = withContext(nativeCtx) {
+                if (h != nativeHandle) return@withContext null
+                val b = Bitmap.createBitmap(pageWidth, pageHeight, Bitmap.Config.ARGB_8888)
+                b to NativeLib.fingerOverlay(h, fa, st, b)
+            }
+            if (r != null && handle == h) { fingerOverlay = r.first; fingerShare = r.second }
+        }
+    }
+
+    /** The Erase rectangles and the finger mask applied to the live page (from its unedited state). */
+    private fun applyPageEdits() {
         val h = handle
         if (h == 0L) return
-        erase = rects
-        val arr = rects.toFloatArray()
+        val arr = erase.toFloatArray()
+        val fa = fingersAuto
+        val st = fingerStrokes.toFloatArray()
+        val overlayShown = fingerOverlay != null
         viewModelScope.launch {
             rendering = true
-            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setErase(h, arr) }
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, arr, fa, st) }
+            if (overlayShown) refreshFingerOverlay()
             if (handle != h) return@launch
             thumbKey = null
             histKey = null
@@ -2178,7 +2321,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The edits [history] tracks, as they are now. */
-    fun editState() = EditState(params, look, rotation, protect, erase)
+    fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes)
 
     fun undo() {
         // a change still inside the debounce is the one to undo
@@ -2200,7 +2343,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             rotation = s.rotation
             outVersion++
         }
-        if (s.erase != erase) setEraseRects(s.erase)
+        if (s.erase != erase || s.fingersAuto != fingersAuto || s.fingerStrokes != fingerStrokes) {
+            erase = s.erase
+            fingersAuto = s.fingersAuto
+            fingerStrokes = s.fingerStrokes
+            applyPageEdits()
+        }
     }
 
     /**
@@ -2244,7 +2392,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val h = NativeLib.restoreSession(dir.absolutePath, true)
             if (h == 0L) return@withContext null
             try {
-                if (m.erase.isNotEmpty()) NativeLib.setErase(h, m.erase)
+                if (m.hasEdits) NativeLib.setEdits(h, m.erase, m.fingersAuto, m.fingerStrokes)
                 val size = NativeLib.pageSize(h)
                 val b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
                 val ok = JSONObject(NativeLib.render(h, p.toArray(), m.protect, true, b)).optBoolean("ok")
@@ -2346,7 +2494,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 val tw = THUMB_W
                 val th = (THUMB_W.toFloat() * pageHeight / pageWidth.coerceAtLeast(1)).roundToInt().coerceIn(32, 4 * THUMB_W)
                 var complete = true
-                for (f in FilterKind.entries) {
+                for (f in FilterKind.forMode(pageMode)) {
                     if (handle != h || wantedKey() != key) { complete = false; break }
                     val b = withContext(nativeCtx) {
                         if (h != nativeHandle) return@withContext null

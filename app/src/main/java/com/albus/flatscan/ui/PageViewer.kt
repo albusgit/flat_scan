@@ -56,7 +56,7 @@ class ViewerState {
 private const val MAX_ZOOM = 6f
 private const val DOUBLE_TAP_ZOOM = 2.5f
 
-private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Split, Idle }
+private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Brush, Split, Idle }
 
 /**
  * Maps page pixels to the screen: the page (turned [rotation] clockwise quarter turns) is fitted
@@ -106,7 +106,7 @@ private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int, colorF
 }
 
 /** What the page viewer edits besides zooming: nothing, protected pictures or the unwarp's lines. */
-enum class AreaMode { None, Protect, Lines, Erase }
+enum class AreaMode { None, Protect, Lines, Erase, Fingers }
 
 private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF))   // ruled, text row, grid
 private val IgnoreColor = Color(0xFFFF6B5E)
@@ -143,6 +143,11 @@ fun PageViewer(
     colorFilter: ColorFilter? = null,
     compare: Float? = null,
     onCompare: (Float) -> Unit = {},
+    // AreaMode.Fingers: the finger mask over the page, the brush radius (page-width fraction), and each
+    // finished one-finger stroke as page fractions x0, y0, x1, y1, ...
+    brushOverlay: Bitmap? = null,
+    brushRadius: Float = 0.02f,
+    onStroke: (List<Float>) -> Unit = {},
 ) {
     val protectMode = areaMode != AreaMode.None
     val pageImg = remember(page) { page?.asImageBitmap() }
@@ -153,6 +158,11 @@ fun PageViewer(
     // the rectangle being drawn, page pixels
     var drawFrom by remember { mutableStateOf<Offset?>(null) }
     var drawTo by remember { mutableStateOf(Offset.Zero) }
+    // the brush stroke being drawn, page pixels
+    var stroke by remember { mutableStateOf(listOf<Offset>()) }
+    val brushImg = remember(brushOverlay) { brushOverlay?.asImageBitmap() }
+    val strokeDone by rememberUpdatedState(onStroke)
+    val brushing by rememberUpdatedState(areaMode == AreaMode.Fingers)
 
     val geomNow = { PageGeometry(pageWidth, pageHeight, rotation, box, state.scale, state.pan) }
     val geometry by rememberUpdatedState(geomNow)
@@ -233,6 +243,10 @@ fun PageViewer(
                                         splitTo(splitAt(ch.position.x))
                                         Mode.Split
                                     }
+                                    brushing -> {
+                                        stroke = listOf(geometry().toPage(start), geometry().toPage(ch.position))
+                                        Mode.Brush
+                                    }
                                     protecting -> {
                                         drawFrom = geometry().toPage(start)
                                         drawTo = geometry().toPage(ch.position)
@@ -252,6 +266,10 @@ fun PageViewer(
                                 drawTo = geometry().toPage(ch.position)
                                 ch.consume()
                             }
+                            Mode.Brush -> {
+                                stroke = stroke + geometry().toPage(ch.position)
+                                ch.consume()
+                            }
                             Mode.Split -> {
                                 splitTo(splitAt(ch.position.x))
                                 ch.consume()
@@ -263,6 +281,11 @@ fun PageViewer(
                         Mode.Hold -> {
                             holding = false
                             hold(false)
+                        }
+                        Mode.Brush -> {
+                            val g = geometry()
+                            if (g.pw > 0 && g.ph > 0 && stroke.size >= 2) strokeDone(stroke.flatMap { listOf(it.x / g.pw, it.y / g.ph) })
+                            stroke = emptyList()
                         }
                         Mode.Draw -> {
                             val a = drawFrom
@@ -322,6 +345,18 @@ fun PageViewer(
             inPage {
                 drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null)
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
+                if (areaMode == AreaMode.Fingers) {
+                    brushImg?.let { drawPageImage(it, pageWidth, pageHeight) }
+                    if (stroke.size >= 2) {
+                        val path = androidx.compose.ui.graphics.Path().apply {
+                            moveTo(stroke[0].x, stroke[0].y)
+                            for (q in stroke.drop(1)) lineTo(q.x, q.y)
+                        }
+                        drawPath(path, EraseColor.copy(alpha = 0.55f), style = androidx.compose.ui.graphics.drawscope.Stroke(
+                            width = 2 * brushRadius * pageWidth, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round,
+                        ))
+                    }
+                }
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
                     val areaColor = when (areaMode) {

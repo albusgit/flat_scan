@@ -82,6 +82,9 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.material.icons.outlined.TouchApp
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -124,6 +127,9 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     var sheet by remember { mutableStateOf(Sheet.None) }
     var showDetails by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    // the finger brush: Remove (add to the mask) or Keep, and its radius (page-width fraction)
+    var brushAdd by remember { mutableStateOf(true) }
+    var brushRadius by remember { mutableFloatStateOf(0.02f) }
     var tool by remember {
         // back from flattening again in the line editor: show the new lines
         mutableStateOf(if (vm.reopenLines) AreaMode.Lines else AreaMode.None).also { vm.reopenLines = false }
@@ -230,6 +236,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 areas = when (mode) {
                     AreaMode.Lines -> if (vm.perspectiveOnly) emptyList() else vm.ignore
                     AreaMode.Erase -> vm.erase
+                    AreaMode.Fingers -> emptyList()
                     else -> vm.protect
                 },
                 areaMode = mode, lines = vm.lines, state = viewer,
@@ -243,6 +250,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 },
                 onTap = { x, y, line ->
                     when {
+                        mode == AreaMode.Fingers -> {}
                         mode == AreaMode.Protect -> vm.removeProtectAt(x, y)
                         mode == AreaMode.Erase -> vm.removeEraseAt(x, y)
                         line >= 0 -> vm.toggleLine(line)
@@ -253,6 +261,9 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 colorFilter = colorFilter,
                 compare = if (mode == AreaMode.None) compare else null,
                 onCompare = { compare = it },
+                brushOverlay = if (mode == AreaMode.Fingers) vm.fingerOverlay else null,
+                brushRadius = brushRadius,
+                onStroke = { pts -> vm.addFingerStroke(brushAdd, brushRadius, pts) },
             )
             if (mode == AreaMode.None && vm.showHoldHint && vm.page != null && compare == null) {
                 Text(
@@ -302,11 +313,13 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             LinesPanel(vm, onClose = closeTool)
         } else if (mode == AreaMode.Erase) {
             ErasePanel(vm, onDone = { tool = AreaMode.None })
+        } else if (mode == AreaMode.Fingers) {
+            FingerPanel(vm, brushAdd, { brushAdd = it }, brushRadius, { brushRadius = it }, onDone = { tool = AreaMode.None })
         } else if (vm.adjustOpen) {
             AdjustPanel(vm)
         } else {
             FilterPanel(
-                vm, onProtect = { tool = AreaMode.Protect }, onErase = { tool = AreaMode.Erase },
+                vm, onProtect = { tool = AreaMode.Protect }, onErase = { tool = AreaMode.Erase }, onFingers = { tool = AreaMode.Fingers },
                 onAddPage = {
                     if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                     else vm.startCamera()
@@ -430,7 +443,7 @@ private fun EditorChip(
 }
 
 @Composable
-private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () -> Unit, onAddPage: () -> Unit) {
+private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () -> Unit, onFingers: () -> Unit, onAddPage: () -> Unit) {
     val p = vm.params
     val thumbFilter = remember(vm.look) { vm.look.composeFilter() }
     Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -453,7 +466,7 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
     ) {
-        items(FilterKind.entries) { f ->
+        items(FilterKind.forMode(vm.pageMode)) { f ->
             val selected = f == p.filter
             Column(
                 // wide enough for "High contrast" (66 dp cut it to "High")
@@ -495,8 +508,17 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
         }
         val ne = vm.erase.size / 4
         EditorChip(if (ne > 0) "Erased ($ne)" else "Erase", onClick = onErase, icon = Icons.Outlined.AutoFixHigh)
+        if (vm.pageMode == com.albus.flatscan.CaptureMode.Document) {
+            EditorChip("Fingers", onClick = onFingers, icon = Icons.Outlined.TouchApp, selected = !vm.fingersAuto || vm.fingerStrokes.isNotEmpty())
+        }
         // photo of a monitor / laptop / phone: descreen (moire, pixel grid) before the filter. Auto finds only clear
         // cases (docs/results/r11/filters.md), so a tap cycles Auto -> On -> Off
+        // document or whiteboard processing for this page (processed again from its photo)
+        EditorChip(
+            "Mode: ${vm.pageMode.label}",
+            onClick = { vm.setPageMode(if (vm.pageMode == com.albus.flatscan.CaptureMode.Document) com.albus.flatscan.CaptureMode.Whiteboard else com.albus.flatscan.CaptureMode.Document) },
+            icon = Icons.Outlined.Monitor, selected = vm.pageMode == com.albus.flatscan.CaptureMode.Whiteboard,
+        )
         EditorChip(
             "Screen photo: ${p.screen.label}",
             onClick = { vm.setScreen(when (p.screen) { ScreenMode.Auto -> ScreenMode.On; ScreenMode.On -> ScreenMode.Off; ScreenMode.Off -> ScreenMode.Auto }) },
@@ -513,6 +535,50 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
             EditorChip("Next page (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
         } else {
             EditorChip("Add page", onClick = onAddPage, icon = Icons.Outlined.Add)
+        }
+    }
+}
+
+/**
+ * Fingers: the automatic finger removal (on / off) and a brush that adds areas to it (filled with the paper
+ * around them) or takes areas out (the photo comes back there). The mask is shown in orange; strokes are
+ * saved with the page.
+ */
+@Composable
+private fun FingerPanel(
+    vm: ScanViewModel, add: Boolean, onAdd: (Boolean) -> Unit, radius: Float, onRadius: (Float) -> Unit, onDone: () -> Unit,
+) {
+    LaunchedEffect(Unit) { vm.refreshFingerOverlay() }
+    DisposableEffect(Unit) { onDispose { vm.closeFingerTool() } }
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.TouchApp, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("Fingers", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
+            Text(if (vm.fingerShare <= 0f) "none removed" else "%.1f%% of the page".format(100 * vm.fingerShare), style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+        }
+        Text(
+            "Orange is filled with the paper around it. Paint over a finger the app missed, or switch to Keep and paint where it took too much." +
+                if (vm.fingersOverText) " Text ran under a finger: that area is outlined, not guessed." else "",
+            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
+        )
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            EditorChip("Remove", onClick = { onAdd(true) }, selected = add)
+            EditorChip("Keep", onClick = { onAdd(false) }, selected = !add)
+            EditorChip(if (vm.fingersAuto) "Automatic: on" else "Automatic: off", onClick = { vm.setFingersAutoOn(!vm.fingersAuto) }, selected = vm.fingersAuto)
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Brush", style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+            Slider(value = radius, onValueChange = onRadius, valueRange = 0.005f..0.06f, modifier = Modifier.weight(1f).padding(horizontal = 10.dp))
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            EditorChip("Undo", onClick = { vm.undoFingerStroke() }, enabled = vm.fingerStrokes.isNotEmpty())
+            EditorChip("Clear", onClick = { vm.clearFingerStrokes() }, enabled = vm.fingerStrokes.isNotEmpty())
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = onDone, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
+            ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
         }
     }
 }
