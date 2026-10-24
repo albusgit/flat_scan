@@ -245,7 +245,18 @@ fun SettingsScreen(vm: ScanViewModel) {
             )
             RuledDivider(Modifier.padding(vertical = 8.dp))
             SwitchRow("Solid colors", "Flatten shaded table cells to one colour", solid) { solid = it; s.solidColors = it }
-            SwitchRow("Recognise text after scanning", "Hebrew and English, on the phone: search finds documents by their text", ocrAfter) { ocrAfter = it; s.ocrAfterScan = it }
+            val ocrState = com.albus.flatscan.output.OcrPack.state
+            SwitchRow(
+                "Recognise text after scanning",
+                "Hebrew and English, on the phone: search finds documents by their text" +
+                    if (ocrState is com.albus.flatscan.output.OcrPack.State.Ready) "" else " (needs the text recognition download)",
+                ocrAfter,
+            ) {
+                ocrAfter = it
+                s.ocrAfterScan = it
+                if (it && ocrState !is com.albus.flatscan.output.OcrPack.State.Ready) vm.downloadOcr()
+            }
+            OcrPackRow(vm)
             SwitchRow("Auto-rotate pages", "Turn sideways pages upright (use Turn 180° for an upside-down page)", autoRotate) { autoRotate = it; s.autoRotate = it }
             RuledDivider(Modifier.padding(vertical = 8.dp))
             Section("Finding the page")
@@ -307,17 +318,21 @@ fun SettingsScreen(vm: ScanViewModel) {
             Spacer(Modifier.height(4.dp))
             Text(vm.gpuInfo, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             RuledDivider(Modifier.padding(vertical = 8.dp))
-            Section("Self-test and benchmark")
-            Text(
-                "Processes a bundled test page 6 times and checks the result against the reference implementation, then times the neural nets on it 6 times. Takes a few minutes.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(8.dp))
+            // the self-test is in debug builds only (its files: src/debug/assets); the report area also shows the
+            // acceleration benchmark's report
+            if (vm.hasSelfTest || vm.selfTestReport.isNotEmpty() || vm.selfTestRunning) Section(if (vm.hasSelfTest) "Self-test and benchmark" else "Benchmark report")
+            if (vm.hasSelfTest) {
+                Text(
+                    "Processes a bundled test page 6 times and checks the result against the reference implementation, then times the neural nets on it 6 times. Takes a few minutes.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+            }
             val ctx = androidx.compose.ui.platform.LocalContext.current
             Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = { vm.runSelfTest() }, enabled = !vm.selfTestRunning) { Text("Run self-test") }
+                if (vm.hasSelfTest) OutlinedButton(onClick = { vm.runSelfTest() }, enabled = !vm.selfTestRunning) { Text("Run self-test") }
                 if (vm.selfTestReport.isNotEmpty()) {
-                    Spacer(Modifier.size(8.dp))
+                    if (vm.hasSelfTest) Spacer(Modifier.size(8.dp))
                     androidx.compose.material3.TextButton(onClick = {
                         val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
                             type = "text/plain"
@@ -424,6 +439,51 @@ private fun PaperPlaneLanding(key: Any) {
         },
         tint = MaterialTheme.colorScheme.inversePrimary,
     )
+}
+
+/**
+ * The text recognition pack (output/OcrPack.kt): not in the app, downloaded when text recognition is first wanted
+ * (here, the switch above or the export sheet's searchable text); its progress, its size on the phone, removing it.
+ */
+@Composable
+internal fun OcrPackRow(vm: ScanViewModel) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    LaunchedEffect(Unit) { com.albus.flatscan.output.OcrPack.refresh(ctx) }
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val mono = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono)
+    val size = vm.ocrPackBytes?.let { com.albus.flatscan.formatBytes(it) }
+    Column(Modifier.fillMaxWidth().padding(start = 4.dp, top = 2.dp, bottom = 6.dp)) {
+        when (val st = com.albus.flatscan.output.OcrPack.state) {
+            is com.albus.flatscan.output.OcrPack.State.Ready -> Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Text recognition installed: ${com.albus.flatscan.formatBytes(com.albus.flatscan.output.OcrPack.installedBytes(ctx))} on the phone",
+                    style = mono, color = muted, modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { vm.removeOcr() }) { Text("Remove") }
+            }
+            is com.albus.flatscan.output.OcrPack.State.Downloading -> {
+                LinearProgressIndicator(
+                    progress = { if (st.total > 0) st.done.toFloat() / st.total else 0f },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                )
+                Text("Downloading text recognition: ${com.albus.flatscan.formatBytes(st.done)} of ${com.albus.flatscan.formatBytes(st.total)}", style = mono, color = muted)
+            }
+            else -> {
+                if (st is com.albus.flatscan.output.OcrPack.State.Failed) {
+                    Text("The download failed: ${st.message}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+                if (size == null) {
+                    Text("Text recognition is not available for this phone's processor.", style = MaterialTheme.typography.bodySmall, color = muted)
+                } else {
+                    Text("Text recognition is not part of the app: a $size download, once.", style = MaterialTheme.typography.bodySmall, color = muted)
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = { vm.downloadOcr() }) {
+                        Text(if (st is com.albus.flatscan.output.OcrPack.State.Failed) "Try again" else "Download text recognition ($size)")
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** Settings > Storage: what the scans take, and removing the original photos of old documents. */

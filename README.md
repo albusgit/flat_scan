@@ -180,7 +180,7 @@ Framework, remembered). Code: `Exporter.kt`, `output/` (`PdfWriter`, `Bilevel`, 
   `tools/pdf_check/make_glyphless_font.py`) with a ToUnicode map, and metadata: Title (Unicode), Creator,
   Producer, CreationDate, ModDate, /Lang. Android's `PdfDocument` (used before) can do none of these.
 - **OCR:** Tesseract 5 (Tesseract4Android 4.8.0, JitPack, Apache-2.0) with the `heb` + `eng` tessdata_fast
-  models in `assets/tessdata` (ML Kit has no Hebrew). It runs on the finished page (`out.jpg`: rotation and
+  models (ML Kit has no Hebrew), downloaded on first use since the size work: see *App size* below. It runs on the finished page (`out.jpg`: rotation and
   page shape applied), which is exactly the image the PDF places, so the text layer lines up with it by
   construction. Results are cached per page (`ocr.json`, keyed by the page image) and the text goes to the
   database (`pages.ocr_text`, schema v3) for the **history search**. Settings › *Recognise text after
@@ -823,6 +823,28 @@ redo, a compare split view, apply to all pages, export options (paper size, marg
 reorder, the camera torch and a gallery button, processing progress, a landscape layout. Defaults give
 byte-identical pages; every feature was driven on the emulator without a crash.
 
+## App size: one file per net, text recognition as a download, the self-test in debug builds
+
+- **One file per net.** The rule net shipped three times (any size for the CPU, 1152 x 800 and 800 x 1152 for the
+  GPU) and ShadeNet twice (any size, 512 x 352). Now each ships once at a fixed size (`rulenet.tflite` 1152 x 800,
+  `shadenet.tflite` 512 x 352) and the loader rewrites it in memory for each page (`core/src/tflite_shape.cpp`: the
+  input's size and the resizes' constant output sizes; the interpreter derives every other shape), on the CPU and
+  for the GPU delegate (allocated before delegating). `tools/litert/check_resize.py` compares the rewrite with the
+  converter's own files: bit for bit at the 9 rule-net and 6 ShadeNet sizes checked, with and without XNNPACK, and
+  with the former 800 x 1152 GPU copy. Not run on a phone GPU.
+- **Text recognition is a download** (`output/OcrPack.kt`, Gradle task `ocrPacks`): Tesseract4Android's native
+  libraries and the heb + eng models are a 5.6 MB zip per ABI (12.6 MB unpacked), fetched from the GitHub release
+  `ocr-pack-1` when text recognition is first wanted (Settings, the export sheet's searchable text), checked against
+  the SHA-256 the APK carries (`assets/ocr_pack.json`), unpacked to `no_backup/ocr_pack/` and loaded by a class
+  loader whose library path is the pack (Tesseract4Android's Java classes stay in the APK). The zip is
+  reproducible (two builds, the same SHA-256). Emulator (x86_64, the pack from a local server): downloaded,
+  checked, unpacked, 391 words of the English test page in 3.7 s.
+- **The self-test's photo and reference** (4.1 MB) are in `src/debug/assets` only; release builds have no self-test.
+  Auto's GPU benchmark runs on a lossy copy of the photo (`assets/bench/photo1.webp`, 0.5 MB): it compares each
+  backend with the CPU on the same input.
+- Sizes (clean builds, arm64-v8a): debug APK 99.6 -> 86.9 MB; release APK 64.5 MB (Round 11: 67.1 MB).
+  Emulator batch (3 real photos, CPU, shadow net on): 3 / 3 processed, rule net and ShadeNet from their one file.
+
 ## Paper redesign: a new logo, Recursive, paper colours, the iron
 
 The layouts and flows are unchanged; the look moves from rounded and modern to printer paper on a graph-paper desk.
@@ -1067,7 +1089,7 @@ the full texts (`assets/licenses/`; the list is `ui/Licenses.kt`).
 | AndroidX (Compose, Material3, Activity, Lifecycle, Core, CameraX, ExifInterface), Kotlin stdlib | `app/build.gradle.kts`; Kotlin 2.1.21 | Apache-2.0 |
 | Tesseract OCR (Tesseract4Android, JitPack) | 4.8.0 (Tesseract 5) | Apache-2.0 |
 | in Tesseract4Android: Leptonica / libjpeg / libpng (its own .so files) | from its build | BSD-2-Clause style / IJG / libpng: **texts not yet in `assets/licenses/`** |
-| Tesseract models `eng`, `heb` (`assets/tessdata`) | tessdata_fast | Apache-2.0 |
+| Tesseract models `eng`, `heb` (in the downloaded text recognition pack; source `app/ocr/tessdata`) | tessdata_fast | Apache-2.0 |
 | OkHttp, Okio | 4.12.0 | Apache-2.0 |
 | AndroidX Room, WorkManager, Security-crypto (with Google Tink) | 2.7.2, 2.10.5, 1.1.0 | Apache-2.0 |
 | LLVM libc++ (NDK r27c) | LLVM 18 | Apache-2.0 with LLVM Exceptions |

@@ -234,10 +234,32 @@ fun ExportSheet(
                 modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 8.dp),
             )
             if (o.format != OutputFormat.Jpeg && o.format != OutputFormat.Png) {
+                // text recognition is a download (output/OcrPack.kt): switching this on fetches it
+                val ocr = com.albus.flatscan.output.OcrPack.state
+                val size = vm.ocrPackBytes?.let { com.albus.flatscan.formatBytes(it) }
                 ListItem(
                     headlineContent = { Text("Searchable text") },
-                    supportingContent = { Text("Recognise the text (Hebrew and English) and put it invisibly over the page") },
-                    trailingContent = { Switch(checked = o.searchable, onCheckedChange = { o = o.copy(searchable = it) }) },
+                    supportingContent = {
+                        Text(
+                            when {
+                                ocr is com.albus.flatscan.output.OcrPack.State.Ready -> "Recognise the text (Hebrew and English) and put it invisibly over the page"
+                                ocr is com.albus.flatscan.output.OcrPack.State.Downloading ->
+                                    "Downloading text recognition: ${com.albus.flatscan.formatBytes(ocr.done)} of ${com.albus.flatscan.formatBytes(ocr.total)}"
+                                ocr is com.albus.flatscan.output.OcrPack.State.Failed -> "The text recognition download failed: ${ocr.message}"
+                                size == null -> "Text recognition is not available for this phone's processor"
+                                else -> "Recognise the text (Hebrew and English): needs text recognition, a $size download"
+                            },
+                        )
+                    },
+                    trailingContent = {
+                        Switch(
+                            checked = o.searchable && ocr is com.albus.flatscan.output.OcrPack.State.Ready, enabled = size != null,
+                            onCheckedChange = {
+                                if (it && ocr !is com.albus.flatscan.output.OcrPack.State.Ready) vm.downloadOcr()
+                                o = o.copy(searchable = it)
+                            },
+                        )
+                    },
                     colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 )
             }

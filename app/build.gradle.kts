@@ -1,4 +1,6 @@
+import java.security.MessageDigest
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins {
     id("com.android.application")
@@ -18,7 +20,8 @@ val localProps = Properties().apply { rootProject.file("local.properties").takeI
 // .onnx models are no longer in the app (Round 11, docs/results/r11/runtime.md); the desktop builds
 // (tools/desktop_check) keep them, and the .onnx files stay in app/src/main/assets/models/ for those builds only.
 // -PlitertModels=DIR: the .tflite files from DIR instead of app/src/main/litert/models (same file names: pagefinder,
-// uvdoc_static, syntheticdoc_hr_static, shadenet (dynamic H x W, the CPU's), shadenet_512x352 (the GPU's)).
+// uvdoc_static, syntheticdoc_hr_static, shadenet (512 x 352) and rulenet (1152 x 800): one file per net; the core rewrites
+// the last two for each input size, core/src/tflite_shape.h).
 val litertVersion = "1.4.0"
 val litertAars: Configuration by configurations.creating { isTransitive = false }
 val litertLibs = listOf("libtensorflowlite_jni.so", "libtensorflowlite_gpu_jni.so")
@@ -48,9 +51,68 @@ val syncLitert by tasks.registering(Sync::class) {
         require(models.isNotEmpty()) { "no .tflite models in $litertModels" }
     }
 }
+
+// Text recognition (output/Ocr.kt, OcrPack.kt) is a download, not part of the APK: Tesseract4Android's native
+// libraries and the heb + eng tessdata_fast models (ocr/tessdata/) go into one zip per ABI,
+// build/ocrpack/packs/flatscan-ocr-<ocrPackVersion>-<ABI>.zip (lib/*.so, tessdata/*.traineddata; reproducible: no
+// timestamps, fixed order), to be published as assets of the GitHub release tagged ocr-pack-<ocrPackVersion>
+// (ocrPackBase). The APK carries each zip's SHA-256 and size (assets/ocr_pack.json) and leaves the libraries out
+// (packaging.jniLibs.excludes); Tesseract4Android's Java classes stay in it. A new pack (other libraries or
+// models): raise ocrPackVersion and publish its zips under the new tag.
+val ocrPackVersion = 1
+val ocrPackBase = "https://github.com/albusgit/flat_scan/releases/download/ocr-pack-$ocrPackVersion/"
+val ocrLibs = listOf("libjpeg.so", "libpngx.so", "libleptonica.so", "libtesseract.so")
+val tessAar: Configuration by configurations.creating { isTransitive = false }
+val ocrPackDir = layout.buildDirectory.dir("ocrpack")
+val ocrPacks = abis.map { abi ->
+    tasks.register<Zip>("ocrPack_" + abi.replace("-", "_")) {
+        archiveFileName.set("flatscan-ocr-$ocrPackVersion-$abi.zip")
+        destinationDirectory.set(ocrPackDir.map { it.dir("packs") })
+        isPreserveFileTimestamps = false
+        isReproducibleFileOrder = true
+        from({ tessAar.files.map { zipTree(it) } }) {
+            include(ocrLibs.map { "jni/$abi/$it" })
+            eachFile { path = "lib/$name" }
+        }
+        from("ocr/tessdata") {
+            include("*.traineddata")
+            into("tessdata")
+        }
+        includeEmptyDirs = false
+    }
+}
+val ocrPackInfo by tasks.registering {
+    val packs = ocrPacks.map { t -> t.flatMap { it.archiveFile } }
+    inputs.files(packs)
+    val out = ocrPackDir.map { it.file("assets/ocr_pack.json") }
+    outputs.file(out)
+    val version = ocrPackVersion
+    val base = ocrPackBase
+    val names = abis
+    doLast {
+        val entries = names.zip(packs).joinToString(",\n") { (abi, p) ->
+            val f = p.get().asFile
+            ZipFile(f).use { z ->
+                val got = z.entries().toList().map { it.name }.toSet()
+                for (lib in ocrLibs) require("lib/$lib" in got) { "${f.name}: no lib/$lib (Tesseract4Android AAR, $abi)" }
+                require(got.any { it.startsWith("tessdata/") }) { "${f.name}: no tessdata" }
+            }
+            val sha = MessageDigest.getInstance("SHA-256").digest(f.readBytes()).joinToString("") { "%02x".format(it) }
+            "    \"$abi\": {\"file\": \"${f.name}\", \"sha256\": \"$sha\", \"size\": ${f.length()}}"
+        }
+        out.get().asFile.apply { parentFile.mkdirs() }.writeText("{\"version\": $version, \"base\": \"$base\", \"packs\": {\n$entries\n}}\n")
+    }
+}
+tasks.register("ocrPacks") {
+    group = "build"
+    description = "The text recognition packs to publish (build/ocrpack/packs) and their pins (assets/ocr_pack.json)"
+    dependsOn(ocrPackInfo)
+}
 tasks.configureEach {
     if (name.startsWith("merge") && (name.endsWith("JniLibFolders") || name.endsWith("Assets") || name.endsWith("NativeLibs")) ||
         name.contains("lint", ignoreCase = true) || name.startsWith("generate") && name.endsWith("Assets")) dependsOn(syncLitert)
+    if (name.startsWith("merge") && name.endsWith("Assets") || name.contains("lint", ignoreCase = true) ||
+        name.startsWith("generate") && name.endsWith("Assets")) dependsOn(ocrPackInfo)
 }
 
 // OpenCV 4.11.0 for the core. opencv.min.dir in local.properties (or -PopencvMin=DIR): the slim static build of
@@ -124,6 +186,7 @@ android {
     }
     sourceSets["main"].jniLibs.srcDir(litertDir.map { it.dir("jni") })
     sourceSets["main"].assets.srcDir(litertDir.map { it.dir("assets") })
+    sourceSets["main"].assets.srcDir(ocrPackDir.map { it.dir("assets") })
     buildFeatures {
         compose = true
         prefab = opencvMin == null
@@ -148,6 +211,8 @@ android {
             // OpenCV's AAR bundles an older, 4 KB-aligned libc++_shared; the NDK's own copy
             // (built by externalNativeBuild) is 16 KB-aligned and ABI-compatible
             pickFirsts += "**/libc++_shared.so"
+            // Tesseract4Android's native libraries: in the text recognition pack, not the APK (ocrPacks)
+            excludes += ocrLibs.map { "**/$it" }
         }
     }
 }
@@ -183,8 +248,10 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0")
     testImplementation("androidx.work:work-testing:2.10.5")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
-    // OCR (feature 3): Tesseract 5 for Android, Apache-2.0; the heb + eng tessdata_fast models are in assets/tessdata
+    // OCR (feature 3): Tesseract 5 for Android, Apache-2.0: its Java classes in the APK, its native libraries and the
+    // heb + eng tessdata_fast models (ocr/tessdata) in the downloaded text recognition pack (ocrPacks)
     implementation("com.github.adaptech-cz.Tesseract4Android:tesseract4android:4.8.0")
+    tessAar("com.github.adaptech-cz.Tesseract4Android:tesseract4android:4.8.0@aar")
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")

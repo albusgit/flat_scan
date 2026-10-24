@@ -8,8 +8,9 @@
 //   * without it (the Android app since Round 11): LiteRT's CPU kernels (with the default XNNPACK delegate
 //     taking the ops it supports) on the .tflite models (tools/litert/convert.py, float32 NHWC input and
 //     outputs, converted here from / to run()'s NCHW tensors): `pagefinder.tflite`, `uvdoc_static.tflite`,
-//     `syntheticdoc_hr_static.tflite` and `shadenet.tflite` (dynamic H x W: the interpreter's input is
-//     resized to each page's shape; without that file `shadenet_<H>x<W>.tflite`). One interpreter per net,
+//     `syntheticdoc_hr_static.tflite`, `shadenet.tflite` and `rulenet.tflite` (one fixed-shape file each, made at
+//     512 x 352 and 1152 x 800, rewritten in memory for each page's shape: tflite_shape.h; the interpreter is made
+//     again when the shape changes). One interpreter per net,
 //     on the caller's thread, InferConfig::threads threads (0: min(cores, 4)). libtensorflowlite_jni.so is
 //     dlopen'ed from litert_dir (empty: by name, the APK's lib/).
 // An accelerator whose model exists only per input shape (ShadeNet's static models on QNN, NNAPI and the
@@ -38,7 +39,7 @@
 //   LiteRtGpu (not ORT)     Android / Linux builds with core/third_party/litert/include on the include
 //                           path (else compiled out: the net moves on to the next backend). The .tflite
 //                           models (`uvdoc_static.tflite`, `syntheticdoc_hr_static.tflite`,
-//                           `shadenet_<H>x<W>.tflite`: float32 NHWC input and outputs, converted here
+//                           `shadenet.tflite` at 512 x 352: float32 NHWC input and outputs, converted here
 //                           from / to the NCHW tensors of run()) on LiteRT's GPU delegate in fp32 (no
 //                           precision loss, MAX_PRECISION first), the whole graph or no session (as QNN);
 //                           libtensorflowlite_jni.so and libtensorflowlite_gpu_jni.so (LiteRT 1.4.0) are
@@ -48,9 +49,9 @@
 //                           the SoC, the build and the LiteRT version; no OpenCL library on the device:
 //                           no delegate (opencl_found)
 // The page finder never runs on QNN, NNAPI or the LiteRT GPU (PLAN: 34 NNAPI partitions; kept on the CPU). The rule
-// net (rulenet.onnx / rulenet.tflite, any page size) runs on the LiteRT GPU from its fixed-shape copies
-// (`rulenet_1152x800.tflite`, `rulenet_800x1152.tflite`: the A4 stage-1 page at half size, portrait and landscape;
-// other shapes on the CPU for that call, as ShadeNet's), never on QNN / NNAPI.
+// net (rulenet.onnx, any page size; rulenet.tflite, made at 1152 x 800 and rewritten for each shape) runs on the
+// LiteRT GPU at kRuleGpuHw only (the A4 stage-1 page at half size, portrait and landscape; other shapes on the CPU
+// for that call, as ShadeNet's at other than kShadeGpuHw), never on QNN / NNAPI.
 #include "infer.h"
 
 #include <algorithm>
@@ -64,6 +65,7 @@
 #include <thread>
 
 #include "log.h"
+#include "tflite_shape.h"
 
 #ifdef FS_WITH_ORT
 #include <onnxruntime_cxx_api.h>
@@ -180,6 +182,17 @@ Ort::Env& ort_env() {
 // no ONNX Runtime: the CPU backend is LiteRT's CPU kernels
 constexpr bool kCpuOnLiteRt = true;
 #endif
+
+// the NCHW input [H, W] ShadeNet and the rule net take on the LiteRT GPU (other shapes: the CPU for that call):
+// ShadeNet's input as nets.cpp makes it; the rule net's the A4 stage-1 page at half size, portrait and landscape
+const std::vector<std::array<int64_t, 2>> kShadeGpuHw = {{512, 352}};
+const std::vector<std::array<int64_t, 2>> kRuleGpuHw = {{1152, 800}, {800, 1152}};
+
+std::string dims_nchw(const std::vector<int64_t>& d) {
+    std::string r = "[";
+    for (size_t i = 0; i < d.size(); ++i) r += (i ? "," : "") + std::to_string(d[i]);
+    return r + "]";
+}
 
 #if defined(FS_ORT_QNN) || defined(FS_LITERT)
 // SHA-256 (FIPS 180-4), for the compiled-model cache key
@@ -455,6 +468,7 @@ struct LrtSession {
     const LrtApi* api = nullptr;
     std::vector<uint8_t> bytes;           // the model buffer (TfLiteModelCreate does not copy it)
     std::vector<int64_t> in_shape;        // NCHW, as run() gets it
+    bool reshaped = false;                // bytes rewritten for in_shape (tflite_shape): allocate before delegating
     std::string cache_dir, token;         // serialisation folder and key (kept alive for the delegate)
 #ifdef FS_LITERT_TEST_XNNPACK
     std::string lib_dir;
@@ -661,6 +675,13 @@ bool litert_open(LrtSession& s, bool serialize, std::string& why) {
         s.close();
         return false;
     }
+    // a rewritten file still holds its activations' shapes at the size it was made: AllocateTensors derives them
+    // from the input first, so that the delegate builds its graph at this size (tflite_shape.h)
+    if (s.reshaped && api.TfLiteInterpreterAllocateTensors(s.interp) != kTfLiteOk) {
+        why = "AllocateTensors before the delegate failed: " + s.log;
+        s.close();
+        return false;
+    }
     const TfLiteStatus st = api.TfLiteInterpreterModifyGraphWithDelegate(s.interp, &p.d);
     if (st != kTfLiteOk) {
         if (p.kernels > 1 || (p.kernels == 1 && !p.all_delegated))
@@ -791,6 +812,7 @@ struct LrtCpu {
     TfLiteDelegate* xnn = nullptr;        // outlives the interpreter
     bool use_xnn = true;
     int threads = 1;
+    std::vector<uint8_t> source;          // a fixed-shape file rewritten per shape (tflite_shape); empty: resized
     std::vector<int64_t> in_shape;        // NCHW of the allocated input tensor
     std::string log;                     // the interpreter's error reports since the last call
     void close() {
@@ -859,13 +881,35 @@ bool lrt_cpu_open(LrtCpu& s, std::string& why) {
     return true;
 }
 
-// run() on the CPU interpreter: an input of another shape resizes the interpreter's input first (models with
-// a dynamic H x W, ShadeNet's; a fixed-shape model then fails in AllocateTensors, and this input fails)
+// run() on the CPU interpreter: an input of another shape makes the interpreter again from the source file rewritten
+// for that shape (s.source: the rule net, ShadeNet), or resizes the interpreter's input (a fixed-shape model then
+// fails in AllocateTensors, and this input fails)
 bool lrt_cpu_run(LrtCpu& s, const Tensor& in, std::vector<Tensor>& out, double& ms, std::string& why) {
     const LrtApi& api = *s.api;
     if (in.shape.size() != 4) {
         why = "LiteRT models take a 4-D input";
         return false;
+    }
+    if (in.shape != s.in_shape && !s.source.empty()) {
+        s.close();
+        if (s.model) api.TfLiteModelDelete(s.model);
+        s.model = nullptr;
+        s.bytes = s.source;
+        std::string w;
+        if (!tflite_set_input_hw(s.bytes, (int)in.shape[2], (int)in.shape[3], &w)) {
+            why = "the model does not take " + std::to_string(in.shape[2]) + " x " + std::to_string(in.shape[3]) + ": " + w;
+            return false;
+        }
+        if (!lrt_cpu_open(s, why) && s.use_xnn) {
+            LOGI("infer: LiteRT CPU: %s with XNNPACK failed (%s); without XNNPACK", dims_nchw(in.shape).c_str(), why.c_str());
+            s.use_xnn = false;
+            if (!lrt_cpu_open(s, why)) return false;
+        }
+        if (s.in_shape != in.shape) {
+            why = "input shape after the rewrite differs";
+            s.in_shape.clear();
+            return false;
+        }
     }
     if (in.shape != s.in_shape) {
         const int dims[4] = {(int)in.shape[0], (int)in.shape[2], (int)in.shape[3], (int)in.shape[1]};
@@ -943,6 +987,14 @@ struct Inference::Impl {
         return n == 0 ? 4 : (int)std::min(4u, n);
     }
 
+    // a fixed-shape file rewritten for the NCHW `shape` (tflite_shape.h); a size it does not take leaves no bytes
+    static void reshape(std::vector<uint8_t>& bytes, const std::vector<int64_t>& shape, std::string& file) {
+        std::string why;
+        if (shape.size() == 4 && tflite_set_input_hw(bytes, (int)shape[2], (int)shape[3], &why)) return;
+        LOGI("infer: %s: %s", file.c_str(), why.c_str());
+        bytes.clear();
+    }
+
     // model bytes for net on backend b and an input of shape `shape`; file: the name used; per_shape: the
     // file named is the model of this input shape only (a missing one leaves the other shapes on b)
     std::vector<uint8_t> model_bytes(NetId net, Backend b, const std::vector<int64_t>& shape, std::string& file, bool* per_shape = nullptr) const {
@@ -957,25 +1009,27 @@ struct Inference::Impl {
         const std::string hw = shape.size() == 4 ? std::to_string(shape[2]) + "x" + std::to_string(shape[3]) : std::string();
         const std::string shade_static = hw.empty() ? hw : "shadenet_" + hw;
         if (b == Backend::LiteRtGpu) {
-            // LiteRT GPU: only the converted fixed-shape models (C2), the page finder has none
+            // LiteRT GPU: only the converted fixed-shape models (C2), the page finder has none; ShadeNet and the
+            // rule net only at their GPU shapes, their one file rewritten for that shape (tflite_shape.h)
             if (net == NetId::UVDoc) load("uvdoc_static.tflite");
             else if (net == NetId::SynthDocHR) load("syntheticdoc_hr_static.tflite");
-            else if (net == NetId::ShadeNet && !shade_static.empty()) {
+            else if (net == NetId::ShadeNet || net == NetId::RuleNet) {
                 if (per_shape) *per_shape = true;
-                load(shade_static + ".tflite");
-            } else if (net == NetId::RuleNet && !hw.empty()) {
-                // rulenet_1152x800 / rulenet_800x1152: the A4 stage-1 page at half size (other pages: the CPU)
-                if (per_shape) *per_shape = true;
-                load("rulenet_" + hw + ".tflite");
+                const auto& ok_hw = net == NetId::ShadeNet ? kShadeGpuHw : kRuleGpuHw;
+                const bool at = shape.size() == 4 && std::find(ok_hw.begin(), ok_hw.end(), std::array<int64_t, 2>{shape[2], shape[3]}) != ok_hw.end();
+                if (!at) file = std::string(net == NetId::ShadeNet ? "shadenet" : "rulenet") + " at " + (hw.empty() ? std::string("this shape") : hw);
+                else if (load(net == NetId::ShadeNet ? "shadenet.tflite" : "rulenet.tflite")) reshape(bytes, shape, file);
+                if (!at) bytes.clear();
             } else file.clear();
             return bytes;
         }
         if (b == Backend::CPU && kCpuOnLiteRt) {
-            // LiteRT CPU: every net; ShadeNet's dynamic-shape model, else its model of this shape
+            // LiteRT CPU: every net; ShadeNet's and the rule net's fixed-shape files are rewritten per input shape
+            // (make_litert_cpu keeps their bytes, lrt_cpu_run)
             if (net == NetId::PageFinder) load("pagefinder.tflite");
             else if (net == NetId::UVDoc) load("uvdoc_static.tflite");
             else if (net == NetId::SynthDocHR) load("syntheticdoc_hr_static.tflite");
-            else if (net == NetId::ShadeNet && !load("shadenet.tflite") && !shade_static.empty()) load(shade_static + ".tflite");
+            else if (net == NetId::ShadeNet) load("shadenet.tflite");
             else if (net == NetId::RuleNet) load("rulenet.tflite");
             return bytes;
         }
@@ -1156,6 +1210,9 @@ struct Inference::Impl {
         }
         per_shape = false;
         s->in_shape = shape;
+        int h0 = 0, w0 = 0;
+        s->reshaped = (net == NetId::ShadeNet || net == NetId::RuleNet) && tflite_input_hw(s->bytes, h0, w0) && shape.size() == 4 &&
+                      (shape[2] != h0 || shape[3] != w0);
         s->cache_dir = cfg.cache_dir;
         s->token = litert_token(*api, s->bytes);
 #ifdef FS_LITERT_TEST_XNNPACK
@@ -1219,6 +1276,7 @@ struct Inference::Impl {
             why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
             return false;
         }
+        if (net == NetId::ShadeNet || net == NetId::RuleNet) s->source = s->bytes;
         auto t0 = Clock::now();
         s->threads = cpu_threads();
         if (!lrt_cpu_open(*s, why)) {

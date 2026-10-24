@@ -2,24 +2,25 @@
 
   python tools/litert/convert.py [OUT_DIR] [--work DIR] [NAME ...]
       OUT_DIR default app/src/main/litert/models; --work default a temp folder (deleted afterwards)
-      NAME: uvdoc, sdhr, shade, finder, rule, rulegpu (default all; rule and rulegpu only when its source exists)
+      NAME: uvdoc, sdhr, shade, finder, rule (default all; rule only when its source exists)
       --rulenet PATH: the rule net's ONNX file (default app/src/main/assets/models/rulenet.onnx)
-      -> uvdoc_static.tflite, syntheticdoc_hr_static.tflite, shadenet_512x352.tflite (GPU and CPU: fixed input),
-         shadenet.tflite (with shade: the CPU's ShadeNet for any input size, any_hw()), pagefinder.tflite (finder:
-         CPU only, fp32 weights, keep_fp32()), rulenet.tflite (rule: the rule net, CPU only, any input size:
-         rulenet.onnx made static at 512 x 352 (tools/accel/prepare_models.py make_static), converted as ShadeNet,
-         then any_hw(); the static intermediate stays in the work folder), rulenet_1152x800.tflite and
-         rulenet_800x1152.tflite (rulegpu: the rule net's GPU copies, fixed to the A4 stage-1 page at half size,
-         portrait and landscape, with the GPU op check), and NAME.analyzer.txt (tf.lite.experimental.Analyzer,
-         gpu_compatibility=True) in the work folder
+      -> uvdoc_static.tflite, syntheticdoc_hr_static.tflite (GPU and CPU: fixed input), shadenet.tflite (shade:
+         fixed at 512 x 352), pagefinder.tflite (finder: CPU only, fp32 weights, keep_fp32()), rulenet.tflite (rule:
+         rulenet.onnx made static at 1152 x 800, the A4 stage-1 page at half size (tools/accel/prepare_models.py
+         make_static), converted as ShadeNet, with the GPU op check), and NAME.analyzer.txt
+         (tf.lite.experimental.Analyzer, gpu_compatibility=True) in the work folder
+      One file per net: the app's loader rewrites shadenet.tflite and rulenet.tflite in memory for each input size
+      (core/src/tflite_shape.cpp: the input and the resizes' sizes), on the CPU and on the GPU. For the check, the
+      work folder also gets each one's any-size form (any_hw(): shadenet_any.tflite, rulenet_any.tflite), run at the
+      pipeline's sizes; tools/litert/check_resize.py compares the app's rewrite with them bit for bit.
       The files are byte-identical when re-made by the full run (no NAME): onnx2tf's tensor names carry a counter
       of the models made in the process, so a run of fewer nets gives the same graphs and numbers under other names.
 Run it with C:/Users/User/Android/litert_venv (tensorflow 2.19.1, onnx2tf 1.28.8: docs/results/litert/models.txt).
 Sources: the static ONNX files of app/src/main/assets/models (tools/accel/prepare_models.py), and pagefinder.onnx.
-The app's loader (core/src/infer.cpp) runs shadenet.tflite after TfLiteInterpreterResizeInputTensor to the page's
-[1, 512, W, 3], rulenet.tflite likewise to [1, H, W, 3] (the half-size page padded to multiples of 32: core/src
-warpmap.cpp rule_probs); every other file at its fixed input. Swapping a model (e.g. a quantised one): a file of the same name,
-float32 NHWC input and output of the same shapes.
+The app's loader (core/src/infer.cpp) runs shadenet.tflite rewritten for the page's [1, 512, W, 3], rulenet.tflite
+for [1, H, W, 3] (the half-size page padded to multiples of 32: core/src/warpmap.cpp rule_probs); every other file at
+its fixed input. Swapping a model (e.g. a quantised one): a file of the same name, float32 NHWC input and output of
+the same shapes.
 
 Steps per net:
   1. fp32 copy of the ONNX graph: each fp16 weight's Cast -> fp32 node becomes an fp32 initializer. Exact (fp16
@@ -61,20 +62,18 @@ OUT = os.path.join(REPO, 'app', 'src', 'main', 'litert', 'models')
 # (name, ONNX source, .tflite, NHWC input shape, NHWC output shape)
 NETS = [('uvdoc', 'uvdoc_static.onnx', 'uvdoc_static.tflite', [1, 712, 488, 3], [1, 45, 31, 2]),
         ('sdhr', 'syntheticdoc_hr_static.onnx', 'syntheticdoc_hr_static.tflite', [1, 1440, 1024, 3], [1, 121, 177, 2]),
-        ('shade', 'shadenet_512x352.onnx', 'shadenet_512x352.tflite', [1, 512, 352, 3], [1, 512, 352, 3]),
+        ('shade', 'shadenet_512x352.onnx', 'shadenet.tflite', [1, 512, 352, 3], [1, 512, 352, 3]),
         # the page finder: LiteRT CPU only (it never runs on the GPU), fp32 weights as in the ONNX file
         ('finder', 'pagefinder.onnx', 'pagefinder.tflite', [1, 256, 256, 3], [1, 256, 256, 2])]
-# ShadeNet at any input size (LiteRT CPU): made from shadenet_512x352.tflite by any_hw() after 'shade'
-SHADE_ANY = 'shadenet.tflite'
+# ShadeNet at any input size, the check's reference (work folder): made from shadenet.tflite by any_hw() after 'shade'
+SHADE_ANY = 'shadenet_any.tflite'
 # the sizes the pipeline feeds it (core/src/pipeline.cpp apply_shade_net: portrait, long side 512, W a multiple of 32)
 SHADE_WIDTHS = list(range(32, 513, 32))
-# the rule net (Round 10, tools/rule_net): dynamic h, w in its ONNX file; converted at RULE_HW, then any size
+# the rule net (Round 10, tools/rule_net): dynamic h, w in its ONNX file; converted at RULE_HW, the A4 stage-1 page
+# (1600 x 2263) at half size padded to multiples of 32 (core/src/warpmap.cpp rule_probs; the GPU's portrait shape)
 RULE_SRC = os.path.join(SRC, 'rulenet.onnx')
-RULE_HW = [512, 352]
+RULE_HW = [1152, 800]
 RULE_OUT = 'rulenet.tflite'
-# the GPU's fixed-shape copies (rulegpu): the A4 stage-1 page (1600 x 2263) at half size padded to multiples of 32,
-# portrait and landscape (core/src/warpmap.cpp rule_probs)
-RULE_GPU_HW = [[1152, 800], [800, 1152]]
 # sizes check_any runs it at (H, W): the half-size pages of rule_probs are multiples of 32 in both
 RULE_SIZES = [(32, 32), (64, 96), (512, 352), (352, 512), (1152, 800), (800, 1152), (1024, 1024), (1440, 1024), (96, 1440)]
 # onnx2tf runs a sample inference on this file when it is in the working folder (else it downloads one)
@@ -393,7 +392,7 @@ def keep_fp32(path, dst, m):
 
 
 def any_hw(path, dst):
-    """ShadeNet at any input size on LiteRT's CPU kernels: shadenet_512x352.tflite (the same fp16 weights and ops)
+    """A net at any input size on LiteRT's CPU kernels (the check's reference): the fixed-shape file (the same fp16 weights and ops)
     with each resize's constant output size replaced by the size of the tensor it is concatenated with (the skip
     connection, or the input for the last two): SHAPE -> STRIDED_SLICE [1:3] of that tensor. The input / output
     shape signature becomes [1, -1, -1, C]; after TfLiteInterpreterResizeInputTensor to [1, H, W, 3] (H, W multiples
@@ -481,12 +480,11 @@ def any_hw(path, dst):
     return f'{n} resize sizes from {len(sizes)} SHAPE -> STRIDED_SLICE pairs, input / output signature [1, -1, -1, C]'
 
 
-def check_any(path, ref_path=None, sizes=None, gpu_note='the GPU runs shadenet_512x352.tflite'):
-    """An any-size file (shadenet.tflite, rulenet.tflite): runs at every size the pipeline feeds (sizes: (H, W) list,
-    default 512 x SHADE_WIDTHS), and at the static file's size gives its output bit for bit (the same graph
-    otherwise). ref_path default shadenet_512x352.tflite next to path. Returns summary lines."""
+def check_any(path, ref_path, sizes=None, gpu_note='the app runs the fixed-shape file, rewritten per size'):
+    """An any-size file (shadenet_any.tflite, rulenet_any.tflite): runs at every size the pipeline feeds (sizes: (H, W)
+    list, default 512 x SHADE_WIDTHS), and at the size of the fixed-shape file ref_path gives its output bit for bit
+    (the same graph otherwise). Returns summary lines."""
     from ai_edge_litert.interpreter import Interpreter
-    ref_path = ref_path or os.path.join(os.path.dirname(path), 'shadenet_512x352.tflite')
     sizes = sizes or [(512, w) for w in SHADE_WIDTHS]
     it = Interpreter(model_path=path)
     ref = Interpreter(model_path=ref_path)
@@ -552,24 +550,17 @@ def rule_static(src, work, hw, gpu):
 
 
 def convert_rule(src, work, out):
-    """rulenet.tflite: rule_static() at RULE_HW, then any_hw(): the CPU's model for any page size."""
-    static = rule_static(src, work, RULE_HW, gpu=False)
+    """rulenet.tflite: rule_static() at RULE_HW with the GPU op check, the app's one rule net file (rewritten per page
+    size by the loader); its any_hw() form in the work folder (rulenet_any.tflite) is run at RULE_SIZES."""
+    static = rule_static(src, work, RULE_HW, gpu=True)
     path = os.path.join(out, RULE_OUT)
-    summary = any_hw(static, path)
-    print(f'{RULE_OUT}: {os.path.getsize(path)} bytes; {summary}')
-    for s in check_any(path, static, RULE_SIZES, 'CPU only'):
+    shutil.copyfile(static, path)
+    print(f'{RULE_OUT}: {os.path.getsize(path)} bytes (CPU and GPU, fixed at {RULE_HW[0]} x {RULE_HW[1]})', flush=True)
+    any_path = os.path.join(work, 'rulenet_any.tflite')
+    summary = any_hw(static, any_path)
+    print(f'rulenet_any.tflite (work folder, the check's reference): {summary}')
+    for s in check_any(any_path, static, RULE_SIZES):
         print('  ' + s, flush=True)
-
-
-def convert_rule_gpu(src, work, out):
-    """rulenet_<H>x<W>.tflite for the GPU delegate at RULE_GPU_HW (the A4 stage-1 page at half size, portrait and
-    landscape: rule_probs' padded input), with the GPU op check; the loader picks the file of the input's shape
-    (as shadenet_<H>x<W>), other shapes run on the CPU."""
-    for hw in RULE_GPU_HW:
-        static = rule_static(src, work, hw, gpu=True)
-        dst = os.path.join(out, os.path.basename(static))
-        shutil.copyfile(static, dst)
-        print(f'{os.path.basename(dst)}: {os.path.getsize(dst)} bytes (GPU)', flush=True)
 
 
 def check(path, want_in, want_out, gpu=True):
@@ -618,9 +609,9 @@ def main():
         k = args.index('--rulenet')
         rule_src = os.path.abspath(args[k + 1])
         del args[k:k + 2]
-    known = [n[0] for n in NETS] + ['rule', 'rulegpu']
+    known = [n[0] for n in NETS] + ['rule']
     out = os.path.abspath(args[0]) if args and args[0] not in known else OUT
-    names = [a for a in args if a in known] or [n[0] for n in NETS] + (['rule', 'rulegpu'] if os.path.exists(rule_src) else [])
+    names = [a for a in args if a in known] or [n[0] for n in NETS] + (['rule'] if os.path.exists(rule_src) else [])
     keep_work = work is not None
     work = work or tempfile.mkdtemp(prefix='litert_convert_')
     os.makedirs(work, exist_ok=True)
@@ -656,15 +647,13 @@ def main():
             for s in lines:
                 print('  ' + s, flush=True)
             if name == 'shade':
-                any_path = os.path.join(out, SHADE_ANY)
+                any_path = os.path.join(work, SHADE_ANY)
                 summary = any_hw(path, any_path)
-                print(f'{SHADE_ANY}: {os.path.getsize(any_path)} bytes; {summary}')
-                for s in check_any(any_path):
+                print(f'{SHADE_ANY} (work folder, the check's reference): {summary}')
+                for s in check_any(any_path, path):
                     print('  ' + s, flush=True)
         if 'rule' in names:
             convert_rule(rule_src, work, out)
-        if 'rulegpu' in names:
-            convert_rule_gpu(rule_src, work, out)
     finally:
         os.chdir(cwd)
         if not keep_work:

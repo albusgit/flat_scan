@@ -61,9 +61,17 @@ class MainActivity : ComponentActivity() {
      * candidates even where the GPU is unavailable (the emulator: the CPU fallback), its report in
      * files/batch_out/bench_report.txt. `--es open_test SET`: the photos of files/batch/SET imported as pages,
      * then each stored page opened in turn, the times in files/batch_out/open_report.txt (ScanViewModel.runOpenTest).
+     * `--es ocrPackBase URL`: the text recognition pack from URL instead of the GitHub release (a local server
+     * through `adb reverse`; empty: the release again), with any other extra. `--es ocr_test PHOTO`: the pack
+     * downloaded if needed and files/batch/PHOTO recognised, report in files/batch_out/ocr_test.txt.
      */
     private fun startBatch(i: Intent?) {
         if (i == null || applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        i.getStringExtra("ocrPackBase")?.let { com.albus.flatscan.output.OcrPack.setDebugBase(this, it) }
+        i.getStringExtra("ocr_test")?.let { photo ->
+            vm.runOcrTest(photo, java.io.File(getExternalFilesDir(null), "batch_out/ocr_test.txt"))
+            return
+        }
         if (i.getBooleanExtra("selftest", false)) {
             vm.runSelfTest(1, java.io.File(getExternalFilesDir(null), "batch_out/selftest_report.txt"))
             vm.open(Screen.Settings)

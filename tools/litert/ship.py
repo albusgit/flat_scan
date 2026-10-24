@@ -4,7 +4,7 @@
                               [--inputs DIR --names A,B,...] [--work DIR]
       NET: uvdoc | sdhr | shade | pagefinder
       SRC.onnx: the net as the CPU path runs it (dynamic or static shapes, fp16 + Cast or fp32 weights)
-      OUT_DIR gets: FILE.tflite (the shipped file: uvdoc_static / syntheticdoc_hr_static / shadenet_512x352 /
+      OUT_DIR gets: FILE.tflite (the shipped file: uvdoc_static / syntheticdoc_hr_static / shadenet /
         pagefinder .tflite), FILE.fp16.tflite (the fp16-weight file before int8), FILE.sim.onnx (the fp32 ONNX of the
         int8 weights: what the .tflite computes with, for pipeline_cli FS_MODELS), FILE.report.txt (sizes, ops,
         checks, parity), FILE.qmap.npz (with --gptq).
@@ -43,7 +43,7 @@ import quantize  # noqa: E402
 # NET: (file stem, NCHW input, NHWC input, NHWC output, parity tags, GPU net)
 NETS = {'uvdoc': ('uvdoc_static', [1, 3, 712, 488], [1, 712, 488, 3], [1, 45, 31, 2], ['uv_p1', 'uv_rc0'], True),
         'sdhr': ('syntheticdoc_hr_static', [1, 3, 1440, 1024], [1, 1440, 1024, 3], [1, 121, 177, 2], ['sdhr_rc2'], True),
-        'shade': ('shadenet_512x352', [1, 3, 512, 352], [1, 512, 352, 3], [1, 512, 352, 3], ['shade'], True),
+        'shade': ('shadenet', [1, 3, 512, 352], [1, 512, 352, 3], [1, 512, 352, 3], ['shade'], True),
         'pagefinder': ('pagefinder', [1, 3, 256, 256], [1, 256, 256, 3], [1, 256, 256, 2], ['pf'], False)}
 DEFAULT_KEEP = {'uvdoc': ['out_point_positions2D', 'bridge_concat'], 'sdhr': ['bm_head.0', 'bridge_concat'],
                 'shade': [], 'pagefinder': []}

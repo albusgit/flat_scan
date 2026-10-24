@@ -1377,7 +1377,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             in.push_back({"shadenet", NetId::ShadeNet, BENCH_SHADE, std::move(t)});
         }
         {
-            // the rule net's GPU shape (rulenet_1152x800): the page through the found corners, else the photo
+            // the rule net's GPU shape (1152 x 800, infer.cpp kRuleGpuHw): the page through the found corners, else the photo
             const int rw = 800, rh = 1152;
             cv::Mat pg;
             if (pc.ok) {

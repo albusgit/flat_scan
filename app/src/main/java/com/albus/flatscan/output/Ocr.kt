@@ -10,71 +10,105 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import android.graphics.Rect
 import com.albus.flatscan.data.Library
-import com.googlecode.tesseract.android.TessBaseAPI
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
 /**
- * On-device OCR: Tesseract 5 (Tesseract4Android) with the Hebrew and English LSTM models (tessdata_fast,
- * bundled in assets/tessdata, copied to filesDir/ocr/tessdata on first use). ML Kit has no Hebrew.
+ * On-device OCR: Tesseract 5 (Tesseract4Android) with the Hebrew and English LSTM models (tessdata_fast). Both
+ * come in the text recognition pack the app downloads ([OcrPack]); without it there is no OCR ([available]).
+ * ML Kit has no Hebrew.
  * A page is recognised on its finished image (out.jpg: rotation and page shape applied), the very image the
  * PDF places, so the text layer's boxes line up with it. Results are kept beside the page (ocr.json, keyed by
  * out.jpg's size and time) and its plain text in the database (search).
  */
 class Ocr(private val ctx: Context) {
-    private val dir = File(ctx.filesDir, "ocr")
-
-    /** The traineddata files in place (copied from the assets once per app version). */
-    private fun ensureData(): File {
-        val td = File(dir, "tessdata").apply { mkdirs() }
-        for (lang in LANGS) {
-            val f = File(td, "$lang.traineddata")
-            val size = runCatching { ctx.assets.openFd("tessdata/$lang.traineddata").use { it.length } }.getOrDefault(-1L)
-            if (f.exists() && (size < 0 || f.length() == size)) continue
-            val tmp = File(td, "$lang.traineddata.tmp")
-            ctx.assets.open("tessdata/$lang.traineddata").use { i -> tmp.outputStream().use { i.copyTo(it) } }
-            if (!tmp.renameTo(f)) error("cannot install $lang.traineddata")
-        }
-        return dir
-    }
+    /** True when the text recognition pack is installed (else [recognise] fails and [pageWords] gives null). */
+    val available: Boolean get() = OcrPack.isReady(ctx)
 
     /** Lines of words found on [page] (any size), in its pixel coordinates. Slow (about a second per page): call off the main thread. */
     @Synchronized
     fun recognise(page: Bitmap): List<OcrLine> {
-        val api = TessBaseAPI()
+        val data = OcrPack.dataDir(ctx) ?: error("the text recognition pack is not installed")
+        val t = Tess(OcrPack.loader(ctx) ?: error("the text recognition pack is not installed"))
+        val api = t.create()
         try {
-            if (!api.init(ensureData().absolutePath, LANGS.joinToString("+"), TessBaseAPI.OEM_LSTM_ONLY)) error("Tesseract did not start")
-            api.pageSegMode = TessBaseAPI.PageSegMode.PSM_AUTO
-            api.setImage(page)
-            api.getUTF8Text()   // runs the recognition
-            val it = api.resultIterator ?: return emptyList()
+            if (!t.init(api, data.absolutePath, LANGS.joinToString("+"))) error("Tesseract did not start")
+            t.setPageSegMode(api, t.psmAuto)
+            t.setImage(api, page)
+            t.utf8Text(api)   // runs the recognition
+            val it = t.resultIterator(api) ?: return emptyList()
             val lines = mutableListOf<OcrLine>()
             var words = mutableListOf<OcrWord>()
             fun flush() {
                 if (words.isNotEmpty()) lines += OcrLine(words, rtlShare(words) > 0.5)
                 words = mutableListOf()
             }
-            it.begin()
+            t.begin(it)
             do {
-                if (it.isAtBeginningOf(TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)) flush()
-                val text = it.getUTF8Text(TessBaseAPI.PageIteratorLevel.RIL_WORD)?.trim().orEmpty()
-                val conf = it.confidence(TessBaseAPI.PageIteratorLevel.RIL_WORD)
-                val r = it.getBoundingRect(TessBaseAPI.PageIteratorLevel.RIL_WORD)
+                if (t.isAtBeginningOf(it, t.rilTextline)) flush()
+                val text = t.wordText(it, t.rilWord)?.trim().orEmpty()
+                val conf = t.confidence(it, t.rilWord)
+                val r = t.boundingRect(it, t.rilWord)
                 if (text.isNotEmpty() && conf >= MIN_CONF) words += OcrWord(text, r.left, r.top, r.right, r.bottom)
-            } while (it.next(TessBaseAPI.PageIteratorLevel.RIL_WORD))
+            } while (t.next(it, t.rilWord))
             flush()
-            it.delete()
+            t.delete(it)
             return lines
         } finally {
-            api.recycle()
+            t.recycle(api)
         }
     }
 
     /**
+     * Tesseract4Android's API (TessBaseAPI, ResultIterator) through the pack's class loader ([OcrPack.loader]):
+     * the app's own loader must never load these classes (their static initialiser loads the native libraries
+     * from the APK, where they are not).
+     */
+    private class Tess(private val loader: ClassLoader) {
+        private val api = loader.loadClass("com.googlecode.tesseract.android.TessBaseAPI")
+        private val iter = loader.loadClass("com.googlecode.tesseract.android.ResultIterator")
+        private fun const(cls: String, name: String) = loader.loadClass(cls).getField(name).getInt(null)
+        private val oemLstmOnly = api.getField("OEM_LSTM_ONLY").getInt(null)
+        val psmAuto = const("com.googlecode.tesseract.android.TessBaseAPI\$PageSegMode", "PSM_AUTO")
+        val rilTextline = const("com.googlecode.tesseract.android.TessBaseAPI\$PageIteratorLevel", "RIL_TEXTLINE")
+        val rilWord = const("com.googlecode.tesseract.android.TessBaseAPI\$PageIteratorLevel", "RIL_WORD")
+        private val mInit = api.getMethod("init", String::class.java, String::class.java, Int::class.javaPrimitiveType)
+        private val mPsm = api.getMethod("setPageSegMode", Int::class.javaPrimitiveType)
+        private val mImage = api.getMethod("setImage", Bitmap::class.java)
+        private val mText = api.getMethod("getUTF8Text")
+        private val mIter = api.getMethod("getResultIterator")
+        private val mRecycle = api.getMethod("recycle")
+        private val mBegin = iter.getMethod("begin")
+        private val mAtBegin = iter.getMethod("isAtBeginningOf", Int::class.javaPrimitiveType)
+        private val mWord = iter.getMethod("getUTF8Text", Int::class.javaPrimitiveType)
+        private val mConf = iter.getMethod("confidence", Int::class.javaPrimitiveType)
+        private val mRect = iter.getMethod("getBoundingRect", Int::class.javaPrimitiveType)
+        private val mNext = iter.getMethod("next", Int::class.javaPrimitiveType)
+        private val mDelete = iter.getMethod("delete")
+
+        fun create(): Any = api.getConstructor().newInstance()
+        fun init(a: Any, data: String, langs: String) = mInit.invoke(a, data, langs, oemLstmOnly) as Boolean
+        fun setPageSegMode(a: Any, m: Int) { mPsm.invoke(a, m) }
+        fun setImage(a: Any, b: Bitmap) { mImage.invoke(a, b) }
+        fun utf8Text(a: Any) = mText.invoke(a) as String?
+        fun resultIterator(a: Any): Any? = mIter.invoke(a)
+        fun recycle(a: Any) { mRecycle.invoke(a) }
+        fun begin(i: Any) { mBegin.invoke(i) }
+        fun isAtBeginningOf(i: Any, level: Int) = mAtBegin.invoke(i, level) as Boolean
+        fun wordText(i: Any, level: Int) = mWord.invoke(i, level) as String?
+        fun confidence(i: Any, level: Int) = mConf.invoke(i, level) as Float
+        fun boundingRect(i: Any, level: Int) = mRect.invoke(i, level) as Rect
+        fun next(i: Any, level: Int) = mNext.invoke(i, level) as Boolean
+        fun delete(i: Any) { mDelete.invoke(i) }
+    }
+
+    /**
      * The words of page [id] of [lib]: from its cache when out.jpg has not changed, else recognised now
-     * (and cached, and its text stored for search). Null when the page has no rendered image.
+     * (and cached, and its text stored for search). Null when the page has no rendered image, or when it has
+     * no cached text and the text recognition pack is not installed.
      */
     fun pageWords(lib: Library, id: String): PageText? {
         val out = lib.store.outputFile(id)
@@ -85,6 +119,7 @@ class Ocr(private val ctx: Context) {
             val j = JSONObject(cache.readText())
             if (j.optString("key") == key) return PageText(fromJson(j.getJSONArray("lines")), j.getInt("w"), j.getInt("h"))
         }
+        if (!available) return null
         val bmp = BitmapFactory.decodeFile(out.absolutePath) ?: return null
         val lines = try { recognise(bmp) } finally { bmp.recycle() }
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }.also { BitmapFactory.decodeFile(out.absolutePath, it) }
@@ -123,8 +158,9 @@ class Ocr(private val ctx: Context) {
             OcrLine(List(ws.length()) { k -> ws.getJSONArray(k).let { OcrWord(it.getString(0), it.getInt(1), it.getInt(2), it.getInt(3), it.getInt(4)) } }, l.getBoolean("rtl"))
         }
 
-        /** Recognises the pages of [doc] in the background (search), once per change of a page. */
+        /** Recognises the pages of [doc] in the background (search), once per change of a page; nothing without the pack. */
         fun enqueue(ctx: Context, doc: String) {
+            if (!OcrPack.isReady(ctx)) return
             val req = OneTimeWorkRequestBuilder<OcrWorker>().setInputData(workDataOf("doc" to doc)).addTag("ocr").build()
             WorkManager.getInstance(ctx).enqueueUniqueWork("ocr-$doc", ExistingWorkPolicy.REPLACE, req)
         }

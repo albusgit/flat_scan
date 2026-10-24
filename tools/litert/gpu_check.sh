@@ -24,8 +24,8 @@ LITERT=${LITERT:-C:/Users/User/Android/litert}
 INPUTS=${INPUTS:-C:/Users/User/AppData/Local/Temp/claude/C--Users-User-Desktop-flat-scan/922e3e9d-4193-49a6-b4b4-d3421c7157d5/scratchpad/accel_a/in}
 LOCK=/c/Users/User/Desktop/docunet_bench/.heavy_lock
 D=/data/local/tmp/litert_check
-MODELS="uvdoc_static syntheticdoc_hr_static shadenet_512x352"
-model_of() { case $1 in *_uv_p1|*_uv_rc0) echo uvdoc_static;; *_sdhr_rc2) echo syntheticdoc_hr_static;; *_shade) echo shadenet_512x352;; esac; }
+MODELS="uvdoc_static syntheticdoc_hr_static shadenet"
+model_of() { case $1 in *_uv_p1|*_uv_rc0) echo uvdoc_static;; *_sdhr_rc2) echo syntheticdoc_hr_static;; *_shade) echo shadenet;; esac; }
 mkdir -p "$OUT/raw" "$OUT/bin"
 if [ -n "${SERIAL:-}" ]; then ABI=arm64-v8a; CL=aarch64; GF=${GPU_FLAG:-}; else ABI=x86_64; CL=x86_64; SERIAL=emulator-5582; GF=${GPU_FLAG:---gl}; fi
 "$NDK/clang.exe" --target=$CL-linux-android26 -O2 -Wall -o "$OUT/bin/gpu_check" "$REPO/tools/litert/gpu_check.c" -ldl || exit 1

@@ -135,11 +135,11 @@ val OssComponents = listOf(
         "Apache-2.0", "https://developer.android.com/jetpack/androidx", listOf(APACHE),
     ),
     OssComponent(
-        "Tesseract OCR (Tesseract4Android)", "4.8.0 (Tesseract 5)", "Copyright the Tesseract and Tesseract4Android authors",
+        "Tesseract OCR (Tesseract4Android)", "4.8.0 (Tesseract 5); its native code in the text recognition download", "Copyright the Tesseract and Tesseract4Android authors",
         "Apache-2.0", "https://github.com/adaptech-cz/Tesseract4Android", listOf(APACHE),
     ),
     OssComponent(
-        "Tesseract models: English and Hebrew", "tessdata_fast", "Copyright Google LLC and the Tesseract authors", "Apache-2.0",
+        "Tesseract models: English and Hebrew", "tessdata_fast, in the text recognition download", "Copyright Google LLC and the Tesseract authors", "Apache-2.0",
         "https://github.com/tesseract-ocr/tessdata_fast", listOf(APACHE),
     ),
     OssComponent(

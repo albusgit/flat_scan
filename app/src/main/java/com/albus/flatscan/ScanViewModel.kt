@@ -286,7 +286,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }.onFailure { Log.e(TAG, "library clean-up failed", it) }
         }
         viewModelScope.launch { renderLoop() }
-        viewModelScope.launch { trackEdits(this@ScanViewModel, history) }
+        // dispatched (not Main.immediate): trackEdits reads editState() at once, whose fields (fingersAuto...) are
+        // declared further down and not yet initialised while this init block runs
+        viewModelScope.launch(Dispatchers.Main) { trackEdits(this@ScanViewModel, history) }
     }
 
     // ---- self-test / benchmark
@@ -299,7 +301,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** [report] (debug batch mode `--ez selftest true`): the report is also written there. */
     fun runSelfTest(runs: Int = 5, report: java.io.File? = null) {
-        if (selfTestRunning) return
+        if (selfTestRunning || !hasSelfTest) return
         selfTestRunning = true
         selfTestReport = ""
         viewModelScope.launch {
@@ -324,13 +326,29 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** The bundled self-test photo (assets/selftest/photo1.webp, 1659 x 2212: lossless WebP, the pixels of the earlier photo1.png). */
-    private fun selfTestPhoto(): Bitmap {
+    /**
+     * The self-test's photo (assets/selftest/photo1.webp, 1659 x 2212: lossless WebP, the pixels of the earlier
+     * photo1.png) and its reference warp map: debug builds only (src/debug/assets), release builds have no self-test.
+     */
+    val hasSelfTest: Boolean by lazy {
+        runCatching { getApplication<Application>().assets.list("selftest").orEmpty().contains("photo1.webp") }.getOrDefault(false)
+    }
+
+    private fun selfTestPhoto(): Bitmap = assetPhoto("selftest/photo1.webp")
+
+    /**
+     * Auto's benchmark photo (assets/bench/photo1.webp): the self-test photo as lossy WebP (quality 85, 0.5 MB
+     * instead of 2.3), in every build. The benchmark compares each backend's nets with the CPU's on the same
+     * input, so it needs no exact pixels.
+     */
+    private fun benchPhoto(): Bitmap = assetPhoto("bench/photo1.webp")
+
+    private fun assetPhoto(path: String): Bitmap {
         val opts = android.graphics.BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
             inScaled = false
         }
-        return getApplication<Application>().assets.open("selftest/photo1.webp").use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
+        return getApplication<Application>().assets.open(path).use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
     }
 
     /**
@@ -411,7 +429,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice].
+     * Auto's benchmark on [benchPhoto] ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice].
      * No candidate (no GPU on this phone): the CPU at once, without running anything.
      */
     private fun runAutoBenchmark(stage: (String) -> Unit, cand: String = Accel.candidates()): JSONObject {
@@ -419,7 +437,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val bench = if (cand.isEmpty()) JSONObject().put("ok", true).put("runs", 0)
             .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu").put("rule", "cpu"))
         else CrashGuard.guard(getApplication(), "the acceleration benchmark (GPU)", gpu = true) {
-            JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
+            JSONObject(NativeLib.benchBackends(benchPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
         }
         val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
         if (cand.isEmpty()) stored.put("note", "no GPU on this phone: ${NetEnv.gpuWhy}")
@@ -1586,6 +1604,52 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private fun backgroundOcr(doc: String) {
         if (!settings.ocrAfterScan) return
         runCatching { com.albus.flatscan.output.Ocr.enqueue(getApplication(), doc) }.onFailure { Log.e(TAG, "OCR queue failed", it) }
+    }
+
+    /** The text recognition pack (output/OcrPack.kt): download size of this phone's pack, null when there is none. */
+    val ocrPackBytes: Long? by lazy { com.albus.flatscan.output.OcrPack.pack(getApplication())?.size }
+
+    /**
+     * Downloads the text recognition pack (Settings, the export sheet's searchable text); then, with Recognise text
+     * after scanning on, every document's pages are recognised in the background (search).
+     */
+    fun downloadOcr() {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            if (!com.albus.flatscan.output.OcrPack.download(app)) return@launch
+            if (settings.ocrAfterScan) {
+                val docs = runCatching { library.documents.first() }.getOrDefault(emptyList())
+                for (d in docs) backgroundOcr(d.id)
+            }
+        }
+    }
+
+    /** Removes the text recognition pack (text already recognised stays searchable). */
+    fun removeOcr() = com.albus.flatscan.output.OcrPack.remove(getApplication())
+
+    /**
+     * Debug batch mode (`--es ocr_test PHOTO`): the pack downloaded if needed, then [photo] (a file under
+     * files/batch, internal or external files) recognised; the lines, the time and the pack state in files/batch_out/ocr_test.txt.
+     */
+    fun runOcrTest(photo: String, report: java.io.File) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.IO) {
+                val ok = com.albus.flatscan.output.OcrPack.download(app)
+                val sb = StringBuilder("pack: ${com.albus.flatscan.output.OcrPack.state} (download ok $ok)\n")
+                if (ok) runCatching {
+                    val f = java.io.File(app.filesDir, "batch/$photo").takeIf { it.isFile } ?: java.io.File(app.getExternalFilesDir(null), "batch/$photo")
+                    val bmp = android.graphics.BitmapFactory.decodeFile(f.absolutePath) ?: error("cannot read $f")
+                    val t0 = System.nanoTime()
+                    val lines = com.albus.flatscan.output.Ocr(app).recognise(bmp)
+                    sb.append("photo ${f.name} ${bmp.width} x ${bmp.height}: ${lines.size} lines, ${lines.sumOf { it.words.size }} words in ${(System.nanoTime() - t0) / 1_000_000} ms\n")
+                    for (l in lines) sb.append(if (l.rtl) "R " else "L ").append(l.words.joinToString(" ") { it.text }).append('\n')
+                }.onFailure { sb.append("FAILED: ").append(Log.getStackTraceString(it)) }
+                sb.toString()
+            }
+            runCatching { report.parentFile?.mkdirs(); report.writeText(text) }
+            Log.i(TAG, "OCR test: ${text.lineSequence().take(2).joinToString(" | ")}")
+        }
     }
 
     private suspend fun autoUpload(doc: String) {
