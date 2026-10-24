@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <future>
 
 #include "log.h"
 #include "pagefind.h"
@@ -95,13 +96,12 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
             LOGI("flattening nets: page finder failed: %s", e.what());
         }
     }
-    // one net on one crop; false: no grid (input, net or output size failed)
-    auto run = [&](const char* name, const UvCrop& c, std::vector<float>& grid) {
+    // one net on one crop into nr; false: no grid (input, net or output size failed)
+    auto run_into = [&](const char* name, const UvCrop& c, std::vector<float>& grid, NetRun& nr) {
         auto t0 = Clock::now();
         const NetId id = c.model == 2 ? NetId::SynthDocHR : NetId::UVDoc;
         Inference& inf = c.model == 2 && hr ? *hr : uv_inf;
         const UvSpec& sp = uv_spec(c.model);
-        NetRun nr;
         nr.name = name;
         grid.clear();
         if (rq.cancel && *rq.cancel) return false;
@@ -124,8 +124,13 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
         nr.backend = inf.backend(id);
         nr.ms = inf.last_ms(id);
         nr.total_ms = ms_since(t0);
-        r.runs.push_back(nr);
         return nr.ok;
+    };
+    auto run = [&](const char* name, const UvCrop& c, std::vector<float>& grid) {
+        NetRun nr;
+        const bool ok = run_into(name, c, grid, nr);
+        if (!nr.name.empty()) r.runs.push_back(nr);
+        return ok;
     };
     // automatic corners: a first UVDoc pass on the whole photo finds the page; the nets then run on its
     // outline (a page finder that split a folded page or cut a curled one does not decide what they see)
@@ -148,8 +153,21 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
     };
     std::vector<float> uv, sd;
     UvCrop cu, cs;
-    if (rq.nets != FlatNets::SynthDocOnly && crop_for(0, cu)) run("uvdoc", cu, uv);
-    if (rq.nets != FlatNets::UVDocOnly && crop_for(2, cs)) run("synthdoc_hr", cs, sd);
+    const bool want_uv = rq.nets != FlatNets::SynthDocOnly && crop_for(0, cu);
+    const bool want_sd = rq.nets != FlatNets::UVDocOnly && crop_for(2, cs);
+    // the two depend only on their crops (and run on their own Inference): side by side
+    if (want_uv && want_sd) {
+        NetRun nu, ns;
+        auto f = std::async(std::launch::async, [&] { run_into("synthdoc_hr", cs, sd, ns); });
+        run_into("uvdoc", cu, uv, nu);
+        f.get();
+        for (NetRun* n : {&nu, &ns})
+            if (!n->name.empty()) r.runs.push_back(*n);
+    } else if (want_uv) {
+        run("uvdoc", cu, uv);
+    } else if (want_sd) {
+        run("synthdoc_hr", cs, sd);
+    }
     // SyntheticDoc high-res fills the first slot (run_photo keeps it unless UVDoc's rows are far
     // straighter), UVDoc the second; UVDoc alone the first
     if (!sd.empty()) {
