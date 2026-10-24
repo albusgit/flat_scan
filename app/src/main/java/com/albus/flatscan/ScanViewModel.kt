@@ -971,6 +971,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val id = photoPageId ?: return
         if (id in pages || id == currentId) return
         photoPageId = null
+        runCatching { NativeLib.cancelPrecompute() }
         val job = sourceJob
         viewModelScope.launch(Dispatchers.IO) {
             job?.join()
@@ -1024,6 +1025,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         detecting = true
         val focal = focalPx
+        // with automatic corners the flattening nets need only the photo and the page finder's output: they
+        // start before the detection, beside it and the crop screen
+        netsAhead(p)
         val res = withContext(Dispatchers.Default) {
             runCatching { JSONObject(NativeLib.detect(p, logitsFor(p), focal)) }
                 .onFailure { Log.e(TAG, "detect failed", it) }.getOrElse { JSONObject() }
@@ -1042,10 +1046,36 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             firstId = photoPageId ?: "", photo = p, page = second, firstCentroid = first.centroid,
             focalPx = focalPx, cropRotation = cropRotation, userRotated = userRotated,
         ) else null
+        // no page found: the corners will be set by hand, the nets ahead are of no use
+        if (first == null) runCatching { NativeLib.cancelPrecompute() }
         detecting = false
         val doubtful = first == null || cropReasons.isNotEmpty()
         if (first == null && !(batch && !settings.reviewCrops)) message = "Page not found - drag the corners to the page"
         if (auto && !settings.reviewCrops && (!doubtful || batch)) process()
+    }
+
+    /**
+     * The flattening nets for the photo [detect] is about to find the page of, started at once
+     * ([NativeLib.precomputeNets]): processing it with the detected corners then takes their grids. Not where
+     * processing would run no flattening nets, nor before Auto's benchmark has chosen the backends
+     * (processing runs it first). Registers them before it returns, so that processing cannot miss them.
+     */
+    private suspend fun netsAhead(p: Bitmap) {
+        if (!settings.uvDoc || cropMode == CaptureMode.Whiteboard) return
+        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) return
+        val nets = settings.flatNets
+        val plan = withContext(Dispatchers.Default) {
+            runCatching {
+                val pl = synchronized(netsLock) { currentPlan().also { if (it != netPlan) configureNets(it) } }
+                NativeLib.precomputeNets(p, logitsFor(p), 0, nets)
+                pl
+            }.onFailure { Log.e(TAG, "nets ahead failed", it) }.getOrNull()
+        } ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                CrashGuard.guard(getApplication(), "the flattening nets on the crop screen", gpu = !plan.cpuOnly) { NativeLib.runPrecompute() }
+            }.onFailure { Log.e(TAG, "nets ahead failed", it) }
+        }
     }
 
     /**

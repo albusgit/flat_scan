@@ -132,6 +132,21 @@ object NativeLib {
     ): Long
 
     /**
+     * The flattening nets for [photo] with automatic corners, ahead of [process] (the crop screen: they depend
+     * only on the photo, [logits], [pageIndex] and [flatNets] there). Registers them and returns; [runPrecompute]
+     * runs them. From here on a [process] of the same photo with those inputs and unedited corners takes their
+     * grids instead of running the nets, also while they still run (the same page, sooner); anything else
+     * cancels them. Replaces an earlier call's.
+     */
+    @JvmStatic external fun precomputeNets(photo: Bitmap, logits: FloatArray?, pageIndex: Int, flatNets: Int)
+
+    /** Runs [precomputeNets]' nets on the calling thread (off the main thread); returns when they are done or cancelled. */
+    @JvmStatic external fun runPrecompute()
+
+    /** Cancels [precomputeNets]' nets (those not yet started do not run). */
+    @JvmStatic external fun cancelPrecompute()
+
+    /**
      * The finger tool's smart select: the outline of the area around page point ([x], [y], fractions) that
      * belongs with it (a finger, a thumb), page fractions [x0, y0, x1, y1, ...]; empty if none was found.
      */

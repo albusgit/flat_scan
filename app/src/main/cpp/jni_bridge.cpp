@@ -8,6 +8,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -584,9 +585,132 @@ std::vector<double> grid_px(const std::vector<float>& a, const std::vector<float
     return d;
 }
 
+// ---- the flattening nets ahead of processing (precomputeNets): while the crop screen is open. With
+// automatic corners they depend only on the photo, the page finder's output, the page of a spread and
+// the nets setting (a first UVDoc pass on the whole photo finds the page; the detection's corners only
+// where that pass fails, and the detection is the same function of the photo). process() takes them
+// when it runs with the same inputs on the same net groups (configureNets makes new ones), so the page
+// is the same; otherwise they are cancelled and process runs its own.
+uint64_t fnv(uint64_t h, const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, b + i, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+uint64_t nets_key(const cv::Mat& bgr, const std::vector<float>& logits, int page_index, int flat_nets) {
+    uint64_t h = 1469598103934665603ull;
+    const int head[4] = {bgr.cols, bgr.rows, page_index, flat_nets};
+    h = fnv(h, head, sizeof head);
+    for (int y = 0; y < bgr.rows; ++y) h = fnv(h, bgr.ptr(y), bgr.cols * bgr.elemSize());
+    return fnv(h, logits.data(), logits.size() * sizeof(float));
+}
+
+// their grids, and whether every net that was to run ran (false: cancelled, process then runs its own)
+struct AheadResult {
+    NetsResult nets;
+    bool complete = false;
+};
+
+struct AheadNets {
+    uint64_t key = 0;
+    std::shared_ptr<NetGroup> flat, hr;   // the groups they run on
+    cv::Mat bgr;                          // the inputs, until run_ahead takes them
+    std::vector<float> logits;
+    int page_index = 0, nets = 0;
+    bool started = false;
+    std::shared_ptr<std::promise<AheadResult>> done;
+    std::shared_future<AheadResult> result;
+    std::shared_ptr<std::atomic<bool>> cancel;
+};
+std::mutex g_ahead_mu;
+AheadNets g_ahead;
+
+// caller holds g_ahead_mu. A set that never started is answered at once (incomplete); one that runs stops
+// before its next net and answers then.
+void drop_ahead() {
+    if (g_ahead.cancel) *g_ahead.cancel = true;
+    if (g_ahead.done && !g_ahead.started) g_ahead.done->set_value(AheadResult());
+    g_ahead = AheadNets();
+}
+
+// Runs the registered set on the calling thread; returns when its nets are done or cancelled (at once if
+// there is none, or it runs or ran elsewhere).
+void run_ahead() {
+    AheadNets a;
+    {
+        std::lock_guard<std::mutex> lk(g_ahead_mu);
+        if (!g_ahead.done || g_ahead.started) return;
+        g_ahead.started = true;
+        a = g_ahead;
+        g_ahead.bgr.release();
+        g_ahead.logits.clear();
+    }
+    AheadResult res;
+    try {
+        NetsRequest rq;
+        rq.nets = (FlatNets)a.nets;
+        rq.seg_logits = a.logits.empty() ? nullptr : a.logits.data();
+        rq.page_index = a.page_index;
+        rq.cancel = a.cancel.get();
+        // as run_photo's: the detection's corners, asked for only without a first-pass grid
+        PageCorners pc;
+        bool detected = false;
+        rq.corners_fn = [&]() -> const std::array<cv::Point2d, 4>* {
+            if (!detected) {
+                pc = detect_corners(a.bgr, PipelineOptions().max_analysis_side, rq.seg_logits, a.page_index);
+                detected = true;
+            }
+            return pc.ok ? &pc.pts : nullptr;
+        };
+        res.nets = run_flat_nets(a.bgr, rq, *a.flat->inf, a.hr->inf.get());
+        res.complete = !*a.cancel;
+    } catch (const std::exception& e) {
+        LOGI("flattening nets ahead failed: %s", e.what());
+        res = AheadResult();
+    }
+    a.done->set_value(std::move(res));
+}
+
 }  // namespace
 
 extern "C" {
+
+// The flattening nets for this photo with automatic corners (see AheadNets), in two steps: this call
+// registers them (from here on a process() of the same inputs waits for them instead of running its own),
+// runPrecompute runs them. Replaces (and cancels) an earlier set.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_precomputeNets(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,
+                                                                        jint page_index, jint flat_nets) {
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    std::vector<float> lg = read_logits(env, logits);
+    std::lock_guard<std::mutex> lk(g_ahead_mu);
+    drop_ahead();
+    if (bgr.empty()) return;
+    AheadNets& a = g_ahead;
+    a.nets = std::min(2, std::max(0, (int)flat_nets));
+    a.key = nets_key(bgr, lg, page_index, a.nets);
+    a.flat = group(g_flat);
+    a.hr = group(g_hr);
+    a.bgr = bgr;
+    a.logits = std::move(lg);
+    a.page_index = page_index;
+    a.cancel = std::make_shared<std::atomic<bool>>(false);
+    a.done = std::make_shared<std::promise<AheadResult>>();
+    a.result = a.done->get_future().share();
+}
+
+// Runs the registered set on the calling thread (run_ahead).
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_runPrecompute(JNIEnv*, jclass) { run_ahead(); }
+
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_cancelPrecompute(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lk(g_ahead_mu);
+    drop_ahead();
+}
 
 // Whiteboard mode: the board or projector screen in the photo (board.cpp find_board). Returns
 // [x0, y0, ... x3, y3 (TL, TR, BR, BL, photo px), confidence, area share, dark (1: a dark slide)] or null
@@ -803,6 +927,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     // They run on a worker thread, which must not touch JNI: their entries are made after run_photo.
     std::ostringstream acc;   // the "accel" nets entries (info)
     NetsResult nets;
+    bool nets_ahead = false;   // the grids came from precomputeNets
     std::shared_ptr<NetGroup> flat_g, hr_g;
     if (flatten && !perspective_only) {
         flat_g = group(g_flat);
@@ -812,7 +937,40 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         rq.nets = (FlatNets)std::min(2, std::max(0, (int)flat_nets));
         rq.seg_logits = o.seg_logits;
         rq.page_index = page_index;
-        o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
+        // the nets started on the crop screen, if they ran on this photo with these inputs (precomputeNets)
+        std::shared_future<AheadResult> ahead;
+        {
+            std::lock_guard<std::mutex> lk(g_ahead_mu);
+            if (g_ahead.result.valid()) {
+                if (!o.corners_edited && g_ahead.flat == flat_g && g_ahead.hr == hr_g && g_ahead.key == nets_key(bgr, lg, page_index, (int)rq.nets))
+                    ahead = g_ahead.result;
+                else
+                    drop_ahead();
+            }
+        }
+        if (ahead.valid()) {
+            nets_ahead = true;
+            FlatNetsFn own = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
+            o.flat_nets = [ahead, own, &nets, &nets_ahead](const NetCornersFn& corners) {
+                run_ahead();   // not started yet: here (this set, or a replaced one, already answered)
+                const AheadResult& a = ahead.get();
+                if (!a.complete) {   // cancelled before it ran every net: this run's own
+                    nets_ahead = false;
+                    return own(corners);
+                }
+                nets = a.nets;
+                FlatNetGrids g;
+                g.grid1 = nets.grid1;
+                g.grid2 = nets.grid2;
+                g.grid_pass1 = nets.grid_pass1;
+                g.crop1 = nets.crop1;
+                g.crop2 = nets.crop2;
+                g.crop_pass1 = nets.crop_pass1;
+                return g;
+            };
+        } else {
+            o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
+        }
     }
     // the shadow net, after SyntheticDoc's grid (as with the Kotlin ShadeNet)
     NetCall shade;
@@ -867,7 +1025,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     if (rule.calls > 0) acc << (acc.tellp() > 0 ? ", " : "") << "\"rulenet\": " << rule.entry();
     std::ostringstream a;
     a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(std::max(0.0, r.nets_ms)) << ", \"nets_overlap\": " << r.nets_overlap
-      << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"process_ms\": " << std::lround(ms_since(t1));
+      << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"nets_ahead\": " << (nets_ahead ? "true" : "false")
+      << ", \"process_ms\": " << std::lround(ms_since(t1));
     s->accel = a.str();
     if (!r.ok) LOGI("pipeline failed: %s", r.error.c_str());
     progress(100, "Done");

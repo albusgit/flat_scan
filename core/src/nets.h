@@ -12,6 +12,7 @@
 #pragma once
 #include <opencv2/core.hpp>
 #include <array>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,9 @@ struct NetsRequest {
     // set: the corners come from here instead of `corners`, asked for only when a net needs them (no
     // first-pass grid); null result: no page found, those nets do not run (flat_nets_fn)
     NetCornersFn corners_fn;
+    // set and true: the nets not yet started do not run (the result is then incomplete, for a caller that
+    // no longer wants it)
+    const std::atomic<bool>* cancel = nullptr;
 };
 
 struct NetRun {

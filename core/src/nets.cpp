@@ -104,6 +104,7 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
         NetRun nr;
         nr.name = name;
         grid.clear();
+        if (rq.cancel && *rq.cancel) return false;
         try {
             if (c.model == 0 || c.model == 2) {
                 Tensor x{{1, 3, sp.in_h, sp.in_w}, uv_input(photo, c, blank)};
