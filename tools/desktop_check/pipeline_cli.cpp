@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
     o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
-    o.second_line_pass = std::getenv("FS_NO_SECOND") == nullptr;
+    o.second_line_pass = std::getenv("FS_SECOND") != nullptr;
     o.robust_solve = std::getenv("FS_NO_ROBUST") == nullptr;
     o.colour_edges = std::getenv("FS_NO_EDGES") == nullptr;
     if (const char* md = std::getenv("FS_MAX_DIST")) o.max_line_distortion = std::atof(md), o.max_line_distortion_frac = 1;

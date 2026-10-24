@@ -586,6 +586,16 @@ Lines merge_gap(Lines L, double tol = 8, double maxgap = 60) {
 }
 
 // ------------------------------------------------------------------ tracing (numba kernels)
+// the rule net's highest rule probability within +-r px across the line at (along k, across c)
+inline float prob_at(const cv::Mat& P, bool hz, long k, double c, int r) {
+    const int n_a = hz ? P.cols : P.rows, n_c = hz ? P.rows : P.cols;
+    if (k < 0 || k >= n_a) return 0.f;
+    long c0 = std::max(0L, (long)std::lround(c) - r), c1 = std::min((long)n_c - 1, (long)std::lround(c) + r);
+    float m = 0.f;
+    for (long q = c0; q <= c1; ++q) m = std::max(m, hz ? P.at<float>((int)q, (int)k) : P.at<float>((int)k, (int)q));
+    return m;
+}
+
 struct DView {
     const float* p;
     int rows, cols;
@@ -621,8 +631,12 @@ inline void measure(const DView& D, bool hz, long col, double guess, double w, d
 }
 
 // warpmap.trace_w2 -> t (integers), c, wd
+// P (app, the rule net's map of the line's direction): a hit must lie on a rule the net marks (probability >= 0.3
+// within +-2 px, as extend_trace). A dark area against a rule (a coloured table cell) merges with the rule's run
+// and moves its centre a little at each step, inside the step test; the trace slid 7 px off a table's column rule
+// across a green cell and lost it below (the map then bent the rest of the rule by that much).
 void trace_w2(const DView& D, double pos, double a, double b, bool hz, std::vector<long>& t, Vec& c, Vec& wd,
-              long maxrun, const Vec* prior, double win = 16, double thr = 60, long max_gap = 90) {
+              long maxrun, const Vec* prior, double win = 16, double thr = 60, long max_gap = 90, const cv::Mat* P = nullptr) {
     long t0 = pyint(a), t1 = pyint(b);
     t.clear();
     for (long k = t0; k <= t1; ++k) t.push_back(k);
@@ -658,6 +672,7 @@ void trace_w2(const DView& D, double pos, double a, double b, bool hz, std::vect
                 measure(D, hz, t[k], g2, 8.0, thr, maxrun, n_c, v2, ww2);
                 if (!std::isnan(v2) && std::fabs(v2 - g2) < 3) { v = v2; ww = ww2; ok = true; }
             }
+            if (ok && P && prob_at(*P, hz, t[k], v, 2) < 0.3f) ok = false;
             if (ok) {
                 c[k] = v; wd[k] = ww;
                 ht[nh] = (double)t[k]; hc[nh] = v; ++nh;
@@ -739,16 +754,6 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
 }
 
 // ------------------------------------------------------------------ rule net (app)
-// the net's highest rule probability within +-r px across the line at (along k, across c)
-inline float prob_at(const cv::Mat& P, bool hz, long k, double c, int r) {
-    const int n_a = hz ? P.cols : P.rows, n_c = hz ? P.rows : P.cols;
-    if (k < 0 || k >= n_a) return 0.f;
-    long c0 = std::max(0L, (long)std::lround(c) - r), c1 = std::min((long)n_c - 1, (long)std::lround(c) + r);
-    float m = 0.f;
-    for (long q = c0; q <= c1; ++q) m = std::max(m, hz ? P.at<float>((int)q, (int)k) : P.at<float>((int)k, (int)q));
-    return m;
-}
-
 // share of the stretch [a, b] along a line at pos (every 2 px) the net marks as a rule of the
 // line's direction (probability >= 0.5 within +-r px)
 double net_cover(const cv::Mat& P, bool hz, double pos, double a, double b, int r) {
@@ -1166,7 +1171,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 }
                 if (!pk.empty()) thr = std::min(60.0, std::max(25.0, 0.75 * median(pk)));
             }
-            trace_w2(D, p, a2, b2, hz, t, c, wd, maxrun, prior, 16, thr);
+            trace_w2(D, p, a2, b2, hz, t, c, wd, maxrun, prior, 16, thr, 90, P);
             std::vector<char> ok = chain_trace(t, c, wd, prior);
             size_t n = t.size();
             auto count = [&] { size_t s = 0; for (char q : ok) s += q; return s; };

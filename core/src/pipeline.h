@@ -116,7 +116,9 @@ struct PipelineOptions {
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
     bool colour_edges = true;         // neural pages: long straight boundaries between colour areas are lines too (warpmap colour_edges)
-    bool second_line_pass = true;     // neural pages: the line stage again on its own output, kept if the rules come out straighter
+    bool second_line_pass = false;    // neural pages: the line stage again on its own output, kept if the rules come out straighter
+                                      // (off since the text-line net: real35 kept it on 2 of 24 pages, straightness the same without it,
+                                      // the warp map 24 % faster; 1.6 s of a 5.4 s page on the S24 FE)
     bool faint_lines = true;          // also find and trace printed rules too pale for the darkness-45 threshold (warpmap faint_rules)
     bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
     int finger_rules = kFingerSkinRegion | kFingerHandColour;   // finger tests (kFinger* bits; tools/fingers/eval.py measures each)

@@ -691,7 +691,11 @@ Page 3 is unchanged to the eye.
 - **Second pass** (`second_line_pass`): the line stage runs again on its own output and its map is
   composed with the first. It is kept only if it passes the guard, straightens the rules it traced
   by more than 0.1 px, and leaves the first pass's rules no less straight. The idea comes from
-  Marior and ArbDR (run again on your own output, stop on a score).
+  Marior and ArbDR (run again on your own output, stop on a score). Off by default since the
+  text-line net (`FS_SECOND=1` on the desktop turns it on): on the 34 real photos it ran on 24 and was
+  kept on 2, and without it straightness is the same (row deviation p90 6.4997 → 6.4952 px, angle
+  spread 1.4977 → 1.5000°) and the warp map takes 24 % less time. On the S24 FE it was 1.6 s of a
+  5.4 s page.
 - **Wavy rules found as pieces:**
   - an extension stops where it meets another found piece of the same rule;
   - `share_ideals` gives one height to pieces whose traces run on the same ink (median gap ≤ 2 px

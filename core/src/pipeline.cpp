@@ -1048,9 +1048,13 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     // the rule net's output is kept for the further unwarp_map runs on the same page (the retry)
     std::vector<float> net_out;
     int net_w = 0, net_h = 0;
+    // progress through the stage (30 - 85): it is one call to the nets' 1 - 3 and can take seconds on a phone
     RuleNetFn net = [&](std::vector<float>& io, int w, int h) {
         if (!net_out.empty() && w == net_w && h == net_h) { io = net_out; return true; }
-        if (!opt.rule_net(io, w, h)) return false;
+        report(opt, 32, "Finding rules and text lines");
+        const bool ok = opt.rule_net(io, w, h);
+        report(opt, 42, "Tracing lines and solving the warp map");
+        if (!ok) return false;
         net_out = io; net_w = w; net_h = h;
         return true;
     };
@@ -1088,9 +1092,14 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         if (r.warp.H.empty() && r.warp.V.empty()) return;
         auto t2 = Clock::now();
         struct Done { PipelineResult& r; Clock::time_point t; ~Done() { r.second_pass_ms = ms_since(t); } } done{r, t2};
+        report(opt, 62, "Second line pass");
         cv::Mat page2 = resample_cpu(page, m);
         if (page2.channels() == 4) cv::cvtColor(page2, page2, cv::COLOR_BGRA2BGR);
-        RuleNetFn net2 = opt.rule_net;   // the page moved: the net runs again
+        RuleNetFn net2 = [&](std::vector<float>& io, int w, int h) {   // the page moved: the net runs again
+            const bool ok = opt.rule_net(io, w, h);
+            report(opt, 70, "Second line pass: tracing");
+            return ok;
+        };
         WarpDebug w;
         GridMap m2 = unwarp_map(page2, &w, nullptr, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges,
                                 opt.rule_net ? &net2 : nullptr);
@@ -1118,12 +1127,14 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         // the same lines without those that pass through the overstretched spots (left out whole:
         // dropping only their samples there straightened a rule on one side of a spot and not on
         // the other); the nets' page stays as it is there
+        report(opt, 50, "Tracing lines again, without the overstretched spots");
         cv::Mat spots = distortion_spots(w0, page.cols, page.rows);
         WarpDebug w1;
         GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots);
         if (take(w1, m1)) { r.lines_spots_dropped = true; second_pass(m1); return m1; }
         // the reference lines alone: the faint rules may be what overstretches it (picture edges, a
         // rule traced into text)
+        report(opt, 56, "Tracing the main lines only");
         WarpDebug w2;
         GridMap m2 = unwarp_map(page, &w2, ig, opt.share_rows, false, opt.robust_solve);
         if (take(w2, m2)) { second_pass(m2); return m2; }
