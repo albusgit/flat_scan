@@ -1918,38 +1918,41 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         // (remapped with the page below) the CPU path runs
     } else {
         d.A_img.create(h, w, src.type());
+        if (!P0h.empty()) { d.PH.create(h, w, CV_32F); d.PV.create(h, w, CV_32F); }
+        if (!P0th.empty()) { d.TH.create(h, w, CV_32F); d.TV.create(h, w, CV_32F); }
+        // the 64-row bands are independent: on all cores, each with its own map rows
         const int band = 64;
-        cv::Mat mx(band, w, CV_32F), my(band, w, CV_32F);
-        for (int y0 = 0; y0 < h; y0 += band) {
-            int y1 = std::min(h, y0 + band);
-            for (int y = y0; y < y1; ++y) {
-                int iy = y >> 5;
-                float ay = (y & 31) * (1.f / 32), vy0 = 1.f - ay;
-                for (int x = 0; x < w; ++x) {
-                    int ix = x >> 5;
-                    float ax = (x & 31) * (1.f / 32), vx0 = 1.f - ax;
-                    size_t i00 = (size_t)iy * gw + ix;
-                    float ddx = gx[i00] * (vy0 * vx0) + gx[i00 + 1] * (vy0 * ax) + gx[i00 + gw] * (ay * vx0) + gx[i00 + gw + 1] * (ay * ax);
-                    float ddy = gy[i00] * (vy0 * vx0) + gy[i00 + 1] * (vy0 * ax) + gy[i00 + gw] * (ay * vx0) + gy[i00 + gw + 1] * (ay * ax);
-                    mx.at<float>(y - y0, x) = (float)x + ddx;
-                    my.at<float>(y - y0, x) = (float)y + ddy;
+        cv::parallel_for_(cv::Range(0, (h + band - 1) / band), [&](const cv::Range& R) {
+            cv::Mat mx(band, w, CV_32F), my(band, w, CV_32F);
+            for (int b = R.start; b < R.end; ++b) {
+                int y0 = b * band, y1 = std::min(h, y0 + band);
+                for (int y = y0; y < y1; ++y) {
+                    int iy = y >> 5;
+                    float ay = (y & 31) * (1.f / 32), vy0 = 1.f - ay;
+                    for (int x = 0; x < w; ++x) {
+                        int ix = x >> 5;
+                        float ax = (x & 31) * (1.f / 32), vx0 = 1.f - ax;
+                        size_t i00 = (size_t)iy * gw + ix;
+                        float ddx = gx[i00] * (vy0 * vx0) + gx[i00 + 1] * (vy0 * ax) + gx[i00 + gw] * (ay * vx0) + gx[i00 + gw + 1] * (ay * ax);
+                        float ddy = gy[i00] * (vy0 * vx0) + gy[i00 + 1] * (vy0 * ax) + gy[i00 + gw] * (ay * vx0) + gy[i00 + gw + 1] * (ay * ax);
+                        mx.at<float>(y - y0, x) = (float)x + ddx;
+                        my.at<float>(y - y0, x) = (float)y + ddy;
+                    }
+                }
+                cv::Mat dst = d.A_img.rowRange(y0, y1);
+                cv::remap(src, dst, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar::all(255));
+                if (!P0h.empty()) {
+                    cv::Mat ph = d.PH.rowRange(y0, y1), pv = d.PV.rowRange(y0, y1);
+                    cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                    cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                }
+                if (!P0th.empty()) {
+                    cv::Mat th = d.TH.rowRange(y0, y1), tv = d.TV.rowRange(y0, y1);
+                    cv::remap(P0th, th, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                    cv::remap(P0tv, tv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
                 }
             }
-            cv::Mat dst = d.A_img.rowRange(y0, y1);
-            cv::remap(src, dst, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar::all(255));
-            if (!P0h.empty()) {
-                if (d.PH.empty()) { d.PH.create(h, w, CV_32F); d.PV.create(h, w, CV_32F); }
-                cv::Mat ph = d.PH.rowRange(y0, y1), pv = d.PV.rowRange(y0, y1);
-                cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-                cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-            }
-            if (!P0th.empty()) {
-                if (d.TH.empty()) { d.TH.create(h, w, CV_32F); d.TV.create(h, w, CV_32F); }
-                cv::Mat th = d.TH.rowRange(y0, y1), tv = d.TV.rowRange(y0, y1);
-                cv::remap(P0th, th, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-                cv::remap(P0tv, tv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-            }
-        }
+        });
     }
     d.D = darkness_fast(d.A_img);
     d.ms.emplace_back("global_remap+darkness", ms_since(t0));
