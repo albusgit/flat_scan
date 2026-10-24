@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
 #include <numeric>
 #include <atomic>
@@ -1035,9 +1036,10 @@ cv::Mat darkness_fast(const cv::Mat& img) {
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* PH, const cv::Mat* PV, NetLineStats* stats) {
     cv::Mat ink = D > 45.f;   // 0 / 255
     cv::Mat ink_h = ink, ink_v = ink;
-    if (faint) {   // app: faint printed rules too (faint_rules)
+    if (faint) {   // app: faint printed rules too (faint_rules; the two directions side by side)
+        auto fv = std::async(std::launch::async, [&] { return faint_rules(D, false, 100); });
         ink_h = ink | faint_rules(D, true, 100);
-        ink_v = ink | faint_rules(D, false, 100);
+        ink_v = ink | fv.get();
         // ... and leaning vertical ones: a 3-px rule leaning 5 deg leaves a 1-px column after
         // ~30 px, so the short box sides where a page curls (the receipt's totals boxes) were never
         // seen. Widened by 2 px across the line, rules up to ~7 deg give long runs; the tracer then
@@ -1045,8 +1047,9 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* 
         // for horizontal rules: there it joins the letters of a text row into false rules.
         cv::dilate(ink_v, ink_v, rect(5, 1));
     }
+    auto sv = std::async(std::launch::async, [&] { return segments(ink_v, false); });
     H = segments(ink_h, true);
-    V = segments(ink_v, false);
+    V = sv.get();
     Lines Vs = short_segments(ink_v, false, V, H, faint, &D);
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
@@ -1526,30 +1529,52 @@ std::vector<std::array<double, 3>> text_margins(const cv::Mat& Dm, const Lines& 
 // leaning bottle - is no residual warp) and straight like a rule (3 px + 1 % of its length), except
 // that one over 500 px may bow by 4 % of its length: that long a step is a cell or column boundary,
 // and its wave is what the net left.
-void colour_edges(const cv::Mat& img, const Lines& H, const Lines& V, std::vector<std::array<double, 3>>& eh,
-                  std::vector<std::array<double, 3>>& ev, Lines& EH, Lines& EV, int& nbowed) {
+// colour_edges in two parts: the step maps and their segments from the page alone (made beside the
+// line search, unwarp_map), then the lines. S[0], segs[0]: horizontal edges (steps along y).
+struct ColourEdgeMaps {
+    cv::Mat S[2];
+    Lines segs[2];
+};
+
+// cancel: set when the maps are no longer wanted (they are then left unfinished)
+ColourEdgeMaps colour_edge_maps(const cv::Mat& img, const std::atomic<bool>& cancel) {
     const int h = img.rows, w = img.cols, border = 25;
+    ColourEdgeMaps E;
     cv::Mat cl, lab;
     cv::morphologyEx(img, cl, cv::MORPH_CLOSE, cv::Mat::ones(9, 9, CV_8U));
     cv::cvtColor(cl, lab, cv::COLOR_BGR2Lab);
     lab.convertTo(lab, CV_32FC3);
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < 2 && !cancel; ++pass) {
         const bool hz = pass == 0;   // horizontal edges: steps along y
         cv::Mat B;
         cv::blur(lab, B, hz ? cv::Size(5, 8) : cv::Size(8, 5));
         cv::Mat S(h, w, CV_32F, cv::Scalar(0));
-        for (int y = border; y < h - border; ++y)
-            for (int x = border; x < w - border; ++x) {
-                const cv::Vec3f &q1 = hz ? B.at<cv::Vec3f>(y + 5, x) : B.at<cv::Vec3f>(y, x + 5),
-                                &q0 = hz ? B.at<cv::Vec3f>(y - 5, x) : B.at<cv::Vec3f>(y, x - 5);
-                cv::Vec3f d = q1 - q0;
-                S.at<float>(y, x) = std::min(255.f, 2.5f * std::sqrt(d.dot(d)));
-            }
+        cv::parallel_for_(cv::Range(border, std::max(border, h - border)), [&](const cv::Range& R) {
+            for (int y = R.start; y < R.end; ++y)
+                for (int x = border; x < w - border; ++x) {
+                    const cv::Vec3f &q1 = hz ? B.at<cv::Vec3f>(y + 5, x) : B.at<cv::Vec3f>(y, x + 5),
+                                    &q0 = hz ? B.at<cv::Vec3f>(y - 5, x) : B.at<cv::Vec3f>(y, x - 5);
+                    cv::Vec3f d = q1 - q0;
+                    S.at<float>(y, x) = std::min(255.f, 2.5f * std::sqrt(d.dot(d)));
+                }
+        });
         cv::Mat mask = S > 30.f;
         cv::dilate(mask, mask, hz ? rect(1, 5) : rect(5, 1));
         // pieces unjoined: a column boundary is a step only where the cells on either side differ,
         // and one trace from the middle of the whole column stops at the first such gap
-        Lines segs = segments(mask, hz, 100, 150, false, 7);
+        E.segs[pass] = segments(mask, hz, 100, 150, false, 7);
+        E.S[pass] = S;
+    }
+    return E;
+}
+
+void colour_edges(const ColourEdgeMaps& E, const Lines& H, const Lines& V, std::vector<std::array<double, 3>>& eh,
+                  std::vector<std::array<double, 3>>& ev, Lines& EH, Lines& EV, int& nbowed) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool hz = pass == 0;   // horizontal edges: steps along y
+        const cv::Mat& S = E.S[pass];
+        const Lines& segs = E.segs[pass];
+        const int h = S.rows, w = S.cols;
         const Lines& ink = hz ? H : V;
         Lines keep;
         for (const auto& s : segs) {
@@ -2125,6 +2150,11 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     d.D = darkness_fast(d.A_img);
     d.ms.emplace_back("global_remap+darkness", ms_since(t0));
     t0 = Clock::now();
+    // colour_edges' maps need only the page: made beside the line search below (abandoned if no
+    // line is found)
+    std::atomic<bool> no_edges{false};
+    std::future<ColourEdgeMaps> edge_maps;
+    if (edges && share_rows) edge_maps = std::async(std::launch::async, [&] { return colour_edge_maps(d.A_img, no_edges); });
     // ---- local stage (local_field)
     const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
     const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
@@ -2132,8 +2162,9 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     // app: the text lines from the text-line net (any script; ink blobs otherwise, text_rows below)
     if (!d.TH.empty()) {
         d.text_net = true;
+        auto tv = std::async(std::launch::async, [&] { return text_rows_net(d.TV, false, d.n_text_v); });
         d.T = text_rows_net(d.TH, true, d.n_text);
-        d.TVs = text_rows_net(d.TV, false, d.n_text_v);
+        d.TVs = tv.get();
     }
     const int GC = 16, GF = 8;
     // (app: lines of one direction alone are straightened too - a ruled sheet, a receipt with only
@@ -2144,6 +2175,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
         // pages then get the surface model only (without the text-line net).
         d.n_text = 0;
+        no_edges = true;
         d.Fx = d.Fy = d.Fx1 = d.Fy1 = zero_field(w / GF + 2, h / GF + 2, GF);
         d.ms.emplace_back("lines (none: zero field)", ms_since(t0));
         return compose_maps(d, w, h);
@@ -2158,7 +2190,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     }
     if (edges && share_rows) {
         Lines eh, ev;
-        colour_edges(d.A_img, d.H, d.V, d.EH, d.EV, eh, ev, d.n_edge_bowed);
+        colour_edges(edge_maps.get(), d.H, d.V, d.EH, d.EV, eh, ev, d.n_edge_bowed);
         d.n_edges_h = (int)eh.size();
         d.E_lines = eh;
         d.E_lines.insert(d.E_lines.end(), ev.begin(), ev.end());
