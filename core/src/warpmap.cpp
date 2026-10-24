@@ -9,6 +9,8 @@
 #include <map>
 #include <numeric>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <cstdlib>
 #include <thread>
 
@@ -305,18 +307,21 @@ struct Stencil {
         int n = gw * gh;
         M.n = n;
         M.ptr.assign(n + 1, 0);
-        M.idx.reserve((size_t)n * NOFF);
-        M.val.reserve((size_t)n * NOFF);
+        M.idx.resize((size_t)n * NOFF);
+        M.val.resize((size_t)n * NOFF);
+        size_t k = 0;
         for (int iy = 0; iy < gh; ++iy)
             for (int ix = 0; ix < gw; ++ix) {
                 for (int o = 0; o < NOFF; ++o) {
                     int y = iy + OFF_DY[o], x = ix + OFF_DX[o];
                     if (y < 0 || y >= gh || x < 0 || x >= gw) continue;
-                    M.idx.push_back(y * gw + x);
-                    M.val.push_back(a[((size_t)iy * gw + ix) * NOFF + o]);
+                    M.idx[k] = y * gw + x;
+                    M.val[k++] = a[((size_t)iy * gw + ix) * NOFF + o];
                 }
-                M.ptr[iy * gw + ix + 1] = (int)M.idx.size();
+                M.ptr[iy * gw + ix + 1] = (int)k;
             }
+        M.idx.resize(k);
+        M.val.resize(k);
         return M;
     }
 };
@@ -359,6 +364,26 @@ void add_regularizer(Stencil& S) {
     for (size_t i = 0; i < (size_t)gw * gh; ++i) S.a[i * NOFF + 6] += 1e-9;
 }
 
+// The regulariser's stencil of a grid size, kept for the next fields of that size (a page's fields
+// use three sizes: the global, coarse and fine grids)
+std::shared_ptr<const Stencil> regularizer(int gw, int gh) {
+    static std::mutex mu;
+    static std::vector<std::shared_ptr<const Stencil>> cache;   // most recent last
+    std::lock_guard<std::mutex> lock(mu);
+    for (size_t i = 0; i < cache.size(); ++i)
+        if (cache[i]->gw == gw && cache[i]->gh == gh) {
+            auto r = cache[i];
+            cache.erase(cache.begin() + (long)i);
+            cache.push_back(r);
+            return r;
+        }
+    auto S = std::make_shared<Stencil>(gw, gh);
+    add_regularizer(*S);
+    cache.push_back(S);
+    if (cache.size() > 3) cache.erase(cache.begin());
+    return S;
+}
+
 // The fields' CG tolerance (warpmap.h: set_warp_cg_rtol). 1e-6 (the reference: 1e-8).
 constexpr double kCgRtol = 1e-6;
 static std::atomic<double>& cg_rtol_store() {
@@ -370,13 +395,11 @@ static std::atomic<double>& cg_rtol_store() {
     return v;
 }
 
-// warpmap.solve: regularised least squares on a G-px grid
-Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh,
-                  int G, const Field* warm, int* iters) {
-    int64_t n = (int64_t)gw * gh;
-    Stencil S(gw, gh);
-    add_regularizer(S);
-    std::vector<double> rhs(n, 0.0);
+// warpmap.solve's normal equations: the samples' bilinear data terms added to S (the regulariser), and
+// for each of the nv value sets its right-hand side
+void add_samples(const std::vector<std::array<double, 2>>& xy, const Vec* const* values, std::vector<double>* const* rhs, int nv,
+                 const Vec* weights, int G, Stencil& S) {
+    const int gw = S.gw, gh = S.gh;
     for (size_t s = 0; s < xy.size(); ++s) {
         double gx = xy[s][0] / G, gy = xy[s][1] / G;
         long x0 = std::min(std::max((long)std::floor(gx), 0L), (long)gw - 2);
@@ -387,10 +410,21 @@ Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& value
         double ws = weights ? (*weights)[s] : 1.0;
         for (int a = 0; a < 4; ++a) {
             int ia = yy[a] * gw + xx[a];
-            rhs[ia] += w[a] * (ws * values[s]);
+            for (int k = 0; k < nv; ++k) (*rhs[k])[ia] += w[a] * (ws * (*values[k])[s]);
             for (int b = 0; b < 4; ++b) S.a[(size_t)ia * NOFF + off_index(yy[b] - yy[a], xx[b] - xx[a])] += w[a] * ws * w[b];
         }
     }
+}
+
+// warpmap.solve: regularised least squares on a G-px grid
+Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh,
+                  int G, const Field* warm, int* iters) {
+    int64_t n = (int64_t)gw * gh;
+    Stencil S = *regularizer(gw, gh);
+    std::vector<double> rhs(n, 0.0);
+    const Vec* v[1] = {&values};
+    std::vector<double>* r[1] = {&rhs};
+    add_samples(xy, v, r, 1, weights, G, S);
     Csr M = S.to_csr();
     std::vector<double> x0;
     if (warm) x0 = warm->v;
@@ -400,6 +434,28 @@ Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& value
     F.v = solve_spd_grid(M, rhs, gw, gh, warm ? &x0 : nullptr, warp_cg_rtol(), 1000, &st);
     if (iters) *iters = st.iterations;
     return F;
+}
+
+// Two fields from the same samples without weights (the global stage's x and y): one operator and
+// one hierarchy, the two solves side by side. The same fields as two solve_field calls.
+void solve_field_pair(const std::vector<std::array<double, 2>>& xy, const Vec& vx, const Vec& vy, int gw, int gh, int G,
+                      Field& Fx, Field& Fy, int* iters_x, int* iters_y) {
+    const size_t n = (size_t)gw * gh;
+    Stencil S = *regularizer(gw, gh);
+    std::vector<double> rx(n, 0.0), ry(n, 0.0);
+    const Vec* v[2] = {&vx, &vy};
+    std::vector<double>* r[2] = {&rx, &ry};
+    add_samples(xy, v, r, 2, nullptr, G, S);
+    const Csr M = S.to_csr();
+    const SpdGridSolver solver(M, gw, gh);
+    SolveStats sx, sy;
+    Fx = Field{gw, gh, G, {}};
+    Fy = Field{gw, gh, G, {}};
+    std::thread tx([&] { Fx.v = solver.solve(rx, nullptr, warp_cg_rtol(), 1000, &sx); });
+    Fy.v = solver.solve(ry, nullptr, warp_cg_rtol(), 1000, &sy);
+    tx.join();
+    *iters_x = sx.iterations;
+    *iters_y = sy.iterations;
 }
 
 // warpmap._grid_to_grid: cv2.remap(F.astype(f32), gx*g_to/g_from, ..., LINEAR, REPLICATE)
@@ -2014,10 +2070,8 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.n_ctrl = 0;
         d.GX = zero_field(gw, gh, GG);
         d.GY = zero_field(gw, gh, GG);
-    } else {   // the x and y fields are independent solves
-        std::thread tx([&] { d.GX = solve_field(cxy, vx, nullptr, gw, gh, GG, nullptr, &d.cg_iters[0]); });
-        d.GY = solve_field(cxy, vy, nullptr, gw, gh, GG, nullptr, &d.cg_iters[1]);
-        tx.join();
+    } else {   // the x and y fields: one operator, two right-hand sides
+        solve_field_pair(cxy, vx, vy, gw, gh, GG, d.GX, d.GY, &d.cg_iters[0], &d.cg_iters[1]);
     }
     d.ms.emplace_back("global", ms_since(t0));
     t0 = Clock::now();
