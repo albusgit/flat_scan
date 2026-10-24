@@ -1793,7 +1793,7 @@ std::vector<std::array<double, 3>> text_rows_net(const cv::Mat& P_in, bool hz, i
 }
 
 GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges,
-                   const RuleNetFn* rule_net, const cv::Mat* drop_lines) {
+                   const RuleNetFn* rule_net, const cv::Mat* drop_lines, const WarpDebug* resume) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1830,6 +1830,120 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     };
     const int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     int h = src.rows, w = src.cols;
+    // the lines drop_lines leaves out whole
+    auto drop_lines_whole = [&] {
+        drop_whole(d.M, false);
+        drop_whole(d.EH, true);
+        drop_whole(d.EV, false);
+        drop_whole(d.S1.h, true);
+        drop_whole(d.S1.v, false);
+        drop_whole(d.T, true);
+        drop_whole(d.TVs, false);
+    };
+    // ---- the solve passes on the traced lines (local_field, after the tracing below)
+    auto solve_fields = [&](Clock::time_point t0) -> GridMap {
+        const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
+        const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
+        DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
+        const int GC = 16, GF = 8;
+        Field Fx_prev, Fy_prev;
+        for (int it = 0; it < 2; ++it) {
+            int G = it == 1 ? GF : GC;
+            int gw2 = w / G + 2, gh2 = h / G + 2;
+            const Samples& S = it == 0 ? d.S1 : d.S2;
+            if (it == 1) {
+                auto tc = Clock::now();
+                d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
+                if (share_rows && faint) corner_junctions(d.S2, d.H, d.V);
+                drop(d.S2.h, true);
+                drop(d.S2.v, false);
+                drop_whole(d.S2.h, true);
+                drop_whole(d.S2.v, false);
+                d.ms.emplace_back("trace pass2", ms_since(tc));
+            }
+            const Samples& SS = it == 0 ? d.S1 : d.S2;
+            (void)S;
+            std::vector<std::array<double, 2>> xy;
+            Vec val, wts;
+            for (const auto& r : SS.h) {
+                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
+            }
+            for (const auto& r : d.T) {
+                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);   // TEXT_W = 1
+            }
+            for (const auto& r : d.EH) {
+                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
+            }
+            Field warm_y, warm_x;
+            if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
+            std::vector<std::array<double, 2>> xyv;
+            Vec valv;
+            for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
+                                                                  (const std::vector<std::array<double, 3>>*)&d.EV,
+                                                                  (const std::vector<std::array<double, 3>>*)&d.TVs})
+                for (const auto& r : *src) {
+                    double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
+                    xyv.push_back({r[1], ys}); valv.push_back(r[2]);
+                }
+            Field Fy, Fx;
+            // every sample of one direction ignored: nothing to straighten that way
+            std::thread ty([&] {
+                Fy = xy.empty() ? zero_field(gw2, gh2, G) : solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]);
+            });
+            Fx = xyv.empty() ? zero_field(gw2, gh2, G) : solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
+            ty.join();
+            // robust (app): a line the solved field does not follow - one that is not straight on the
+            // paper (a curve, a mis-trace, two pieces forced to one height) - is down-weighted as a
+            // whole, w = 1 / (1 + (median |residual| / 3 px)^2), and the fields solved again (IRLS:
+            // 2 reweights on the coarse pass, 1 on the fine one). Whole lines, not samples: a correct
+            // line with one sharp bend keeps its weight. A line's samples share its ideal position
+            // (the y of a horizontal sample, the x of a vertical one), which groups them.
+            if (robust) {
+                const double c = 3.0;
+                auto line_weights = [&](const std::vector<std::array<double, 2>>& pos, const Vec& v, const Field& F, int key) {
+                    std::map<double, std::vector<size_t>> groups;
+                    for (size_t i = 0; i < pos.size(); ++i) groups[pos[i][key]].push_back(i);
+                    Vec w(pos.size(), 1.0);
+                    for (const auto& kv : groups) {
+                        Vec r;
+                        for (size_t i : kv.second) r.push_back(std::fabs(v[i] - F.sample(pos[i][0], pos[i][1])));
+                        double m = median(r) / c, q = 1 / (1 + m * m);
+                        for (size_t i : kv.second) w[i] = q;
+                    }
+                    return w;
+                };
+                for (int rw = 0; rw < (it == 0 ? 2 : 1); ++rw) {
+                    Vec wy = line_weights(xy, val, Fy, 1), wx = line_weights(xyv, valv, Fx, 0);
+                    for (size_t i = 0; i < wy.size(); ++i) wy[i] *= wts[i];
+                    Field Fy0 = Fy, Fx0 = Fx;
+                    std::thread t2([&] { if (!xy.empty()) Fy = solve_field(xy, val, &wy, gw2, gh2, G, &Fy0, nullptr); });
+                    if (!xyv.empty()) Fx = solve_field(xyv, valv, &wx, gw2, gh2, G, &Fx0, nullptr);
+                    t2.join();
+                    double down = 0;
+                    for (double q : wx) down += q < 0.5;
+                    for (size_t i = 0; i < wy.size(); ++i) down += wy[i] < 0.5 * wts[i];
+                    d.n_downweighted = (int)down;
+                }
+            }
+            if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
+            Fy_prev = Fy; Fx_prev = Fx;
+        }
+        d.Fx = Fx_prev; d.Fy = Fy_prev;
+        d.ms.emplace_back("solves", ms_since(t0));
+        return compose_maps(d, w, h);
+    };
+    if (resume && resume->traced) {   // the first attempt's global stage and traces, then this call's drop_lines
+        auto t0 = Clock::now();
+        d = *resume->traced;
+        d.traced.reset();
+        d.ms.clear();
+        drop_lines_whole();
+        d.ms.emplace_back("lines: the first attempt's", ms_since(t0));
+        return solve_fields(Clock::now());
+    }
     auto t0 = Clock::now();
     // ---- global stage (global_grid)
     std::vector<DLine> Hs, Vs;
@@ -1987,7 +2101,6 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
         drop(d.M, false);
-        drop_whole(d.M, false);
     }
     if (edges && share_rows) {
         Lines eh, ev;
@@ -1997,107 +2110,17 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.E_lines.insert(d.E_lines.end(), ev.begin(), ev.end());
         drop(d.EH, true);
         drop(d.EV, false);
-        drop_whole(d.EH, true);
-        drop_whole(d.EV, false);
     }
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
     drop(d.TVs, false);
-    drop_whole(d.S1.h, true);
-    drop_whole(d.S1.v, false);
-    drop_whole(d.T, true);
-    drop_whole(d.TVs, false);
+    // nothing above depends on drop_lines: a retry with other drop_lines starts here (resume)
+    if (dbg && dbg->keep_traced) d.traced = std::make_shared<const WarpDebug>(d);
+    drop_lines_whole();
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
-    Field Fx_prev, Fy_prev;
-    for (int it = 0; it < 2; ++it) {
-        int G = it == 1 ? GF : GC;
-        int gw2 = w / G + 2, gh2 = h / G + 2;
-        const Samples& S = it == 0 ? d.S1 : d.S2;
-        if (it == 1) {
-            auto tc = Clock::now();
-            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
-            if (share_rows && faint) corner_junctions(d.S2, d.H, d.V);
-            drop(d.S2.h, true);
-            drop(d.S2.v, false);
-            drop_whole(d.S2.h, true);
-            drop_whole(d.S2.v, false);
-            d.ms.emplace_back("trace pass2", ms_since(tc));
-        }
-        const Samples& SS = it == 0 ? d.S1 : d.S2;
-        (void)S;
-        std::vector<std::array<double, 2>> xy;
-        Vec val, wts;
-        for (const auto& r : SS.h) {
-            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
-        }
-        for (const auto& r : d.T) {
-            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);   // TEXT_W = 1
-        }
-        for (const auto& r : d.EH) {
-            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
-        }
-        Field warm_y, warm_x;
-        if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
-        std::vector<std::array<double, 2>> xyv;
-        Vec valv;
-        for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
-                                                              (const std::vector<std::array<double, 3>>*)&d.EV,
-                                                              (const std::vector<std::array<double, 3>>*)&d.TVs})
-            for (const auto& r : *src) {
-                double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
-                xyv.push_back({r[1], ys}); valv.push_back(r[2]);
-            }
-        Field Fy, Fx;
-        // every sample of one direction ignored: nothing to straighten that way
-        std::thread ty([&] {
-            Fy = xy.empty() ? zero_field(gw2, gh2, G) : solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]);
-        });
-        Fx = xyv.empty() ? zero_field(gw2, gh2, G) : solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
-        ty.join();
-        // robust (app): a line the solved field does not follow - one that is not straight on the
-        // paper (a curve, a mis-trace, two pieces forced to one height) - is down-weighted as a
-        // whole, w = 1 / (1 + (median |residual| / 3 px)^2), and the fields solved again (IRLS:
-        // 2 reweights on the coarse pass, 1 on the fine one). Whole lines, not samples: a correct
-        // line with one sharp bend keeps its weight. A line's samples share its ideal position
-        // (the y of a horizontal sample, the x of a vertical one), which groups them.
-        if (robust) {
-            const double c = 3.0;
-            auto line_weights = [&](const std::vector<std::array<double, 2>>& pos, const Vec& v, const Field& F, int key) {
-                std::map<double, std::vector<size_t>> groups;
-                for (size_t i = 0; i < pos.size(); ++i) groups[pos[i][key]].push_back(i);
-                Vec w(pos.size(), 1.0);
-                for (const auto& kv : groups) {
-                    Vec r;
-                    for (size_t i : kv.second) r.push_back(std::fabs(v[i] - F.sample(pos[i][0], pos[i][1])));
-                    double m = median(r) / c, q = 1 / (1 + m * m);
-                    for (size_t i : kv.second) w[i] = q;
-                }
-                return w;
-            };
-            for (int rw = 0; rw < (it == 0 ? 2 : 1); ++rw) {
-                Vec wy = line_weights(xy, val, Fy, 1), wx = line_weights(xyv, valv, Fx, 0);
-                for (size_t i = 0; i < wy.size(); ++i) wy[i] *= wts[i];
-                Field Fy0 = Fy, Fx0 = Fx;
-                std::thread t2([&] { if (!xy.empty()) Fy = solve_field(xy, val, &wy, gw2, gh2, G, &Fy0, nullptr); });
-                if (!xyv.empty()) Fx = solve_field(xyv, valv, &wx, gw2, gh2, G, &Fx0, nullptr);
-                t2.join();
-                double down = 0;
-                for (double q : wx) down += q < 0.5;
-                for (size_t i = 0; i < wy.size(); ++i) down += wy[i] < 0.5 * wts[i];
-                d.n_downweighted = (int)down;
-            }
-        }
-        if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
-        Fy_prev = Fy; Fx_prev = Fx;
-    }
-    d.Fx = Fx_prev; d.Fy = Fy_prev;
-    d.ms.emplace_back("solves", ms_since(t0));
-    return compose_maps(d, w, h);
+    return solve_fields(t0);
 }
 
 Field solve_field_at(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh, int G) {

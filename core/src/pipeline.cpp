@@ -1218,6 +1218,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     const RuleNetFn* netp = opt.rule_net ? &net : nullptr;
     const cv::Mat* ig = ignore.empty() ? nullptr : &ignore;
     WarpDebug w0;
+    w0.keep_traced = opt.faint_lines;   // for the local retry below
     GridMap m0 = unwarp_map(page, &w0, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp);
     // the yardstick for every candidate: the rules the first attempt traced, all of them
     const PageTraces T = page_traces(w0);
@@ -1235,6 +1236,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         r.line_straightness[1] = st;
         r.line_distortion = q;
         r.warp = std::move(w);
+        r.warp.traced.reset();
         return true;
     };
     // a second trace-and-solve pass on the page the first one straightened (Marior, ArbDR: run again
@@ -1287,7 +1289,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         report(opt, 50, "Tracing lines again, without the overstretched spots");
         cv::Mat spots = distortion_spots(w0, page.cols, page.rows);
         WarpDebug w1;
-        GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots);
+        GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots, &w0);
         if (take(w1, m1)) { r.lines_spots_dropped = true; second_pass(m1); return m1; }
         // the reference lines alone: the faint rules may be what overstretches it (picture edges, a
         // rule traced into text)
@@ -1297,6 +1299,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         if (take(w2, m2)) { second_pass(m2); return m2; }
     }
     r.warp = std::move(w0);
+    r.warp.traced.reset();
     r.lines_rejected = true;
     r.bumps_faded = 0;
     return identity_grid(page.cols, page.rows);
