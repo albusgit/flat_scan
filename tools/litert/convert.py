@@ -558,7 +558,7 @@ def convert_rule(src, work, out):
     print(f'{RULE_OUT}: {os.path.getsize(path)} bytes (CPU and GPU, fixed at {RULE_HW[0]} x {RULE_HW[1]})', flush=True)
     any_path = os.path.join(work, 'rulenet_any.tflite')
     summary = any_hw(static, any_path)
-    print(f'rulenet_any.tflite (work folder, the check's reference): {summary}')
+    print(f"rulenet_any.tflite (work folder, the check's reference): {summary}")
     for s in check_any(any_path, static, RULE_SIZES):
         print('  ' + s, flush=True)
 
@@ -649,7 +649,7 @@ def main():
             if name == 'shade':
                 any_path = os.path.join(work, SHADE_ANY)
                 summary = any_hw(path, any_path)
-                print(f'{SHADE_ANY} (work folder, the check's reference): {summary}')
+                print(f"{SHADE_ANY} (work folder, the check's reference): {summary}")
                 for s in check_any(any_path, path):
                     print('  ' + s, flush=True)
         if 'rule' in names:
