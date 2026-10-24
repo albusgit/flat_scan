@@ -1206,24 +1206,40 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Rotate the photo 90 degrees clockwise (corners follow). Disables auto orientation. */
+    private var rotating = false
+
     fun rotatePhoto() {
         val p = photo ?: return
-        val h = p.height.toFloat()
-        val rot = { o: Offset -> Offset(h - 1 - o.y, o.x) }
-        // after a clockwise turn the old bottom-left corner is the new top-left
-        val reorder = { l: List<Offset> -> listOf(rot(l[3]), rot(l[0]), rot(l[1]), rot(l[2])) }
-        corners = reorder(corners)
-        detected = detected?.let(reorder)
-        usePhoto(p.rotatedQuarterTurns(1))
-        userRotated = true
-        cropRotation = (cropRotation + 1) % 4
-        // a waiting second page of a book spread turns with the photo
-        spreadNext = spreadNext?.let { sp ->
-            val q = sp.page
-            SpreadPage(
-                firstId = sp.firstId, photo = photo!!, page = DetectedPage(q.ok, reorder(q.corners), q.reasons, rot(q.centroid)),
-                firstCentroid = rot(sp.firstCentroid), focalPx = sp.focalPx, cropRotation = cropRotation, userRotated = true,
-            )
+        if (rotating) return
+        rotating = true
+        viewModelScope.launch {
+            try {
+                // the turn of a full-size photo and its display copy: off the main thread
+                val (turned, display) = withContext(Dispatchers.Default) { p.rotatedQuarterTurns(1).let { it to it.forDisplay() } }
+                if (photo !== p) return@launch
+                val h = p.height.toFloat()
+                val rot = { o: Offset -> Offset(h - 1 - o.y, o.x) }
+                // after a clockwise turn the old bottom-left corner is the new top-left
+                val reorder = { l: List<Offset> -> listOf(rot(l[3]), rot(l[0]), rot(l[1]), rot(l[2])) }
+                corners = reorder(corners)
+                detected = detected?.let(reorder)
+                photo = turned
+                photoDisplay = display
+                userRotated = true
+                cropRotation = (cropRotation + 1) % 4
+                // a waiting second page of a book spread turns with the photo
+                spreadNext = spreadNext?.let { sp ->
+                    val q = sp.page
+                    SpreadPage(
+                        firstId = sp.firstId, photo = turned, page = DetectedPage(q.ok, reorder(q.corners), q.reasons, rot(q.centroid)),
+                        firstCentroid = rot(sp.firstCentroid), focalPx = sp.focalPx, cropRotation = cropRotation, userRotated = true,
+                    )
+                }
+                // the nets ahead were for the photo as it was
+                if (detected != null && cropMode != CaptureMode.Whiteboard) netsAhead(turned) else runCatching { NativeLib.cancelPrecompute() }
+            } finally {
+                rotating = false
+            }
         }
     }
 
@@ -1849,7 +1865,19 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    suspend fun thumbnail(id: String): Bitmap? = withContext(Dispatchers.IO) { runCatching { store.loadThumbnail(id, 480) }.getOrNull() }
+    suspend fun thumbnail(id: String): Bitmap? = withContext(Dispatchers.IO) {
+        runCatching {
+            // the lists ask again whenever they are composed: decoded once per file version (its time and size)
+            val f = store.thumbFile(id).takeIf { it.exists() } ?: store.outputFile(id)
+            val key = "$id ${f.lastModified()} ${f.length()}"
+            thumbCache.get(key) ?: store.loadThumbnail(id, 480)?.also { thumbCache.put(key, it) }
+        }.getOrNull()
+    }
+
+    /** Decoded thumbnails ([thumbnail]), up to 24 MB. */
+    private val thumbCache = object : android.util.LruCache<String, Bitmap>(24 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount
+    }
 
     /** The rendered pages in order, for export (writes the current page first). */
     suspend fun exportPages(): List<File> {
