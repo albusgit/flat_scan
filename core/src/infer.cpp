@@ -1266,8 +1266,9 @@ struct Inference::Impl {
 #endif
     }
 
-    // The CPU session on LiteRT's CPU kernels (builds without ONNX Runtime), or false with why.
-    bool make_litert_cpu(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why) const {
+    // The CPU session on LiteRT's CPU kernels (builds without ONNX Runtime), or false with why. first: the input
+    // shape of the run it is made for (ShadeNet and the rule net are made at that shape, not at their file's).
+    bool make_litert_cpu(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why, const std::vector<int64_t>& first) const {
 #ifdef FS_LITERT
         const LrtApi* api = litert_api(cfg.litert_dir, why);
         if (!api) return false;
@@ -1279,7 +1280,12 @@ struct Inference::Impl {
             why = "model not available (" + (file.empty() ? std::string(net_str(net)) : file) + ")";
             return false;
         }
-        if (net == NetId::ShadeNet || net == NetId::RuleNet) s->source = s->bytes;
+        if (net == NetId::ShadeNet || net == NetId::RuleNet) {
+            s->source = s->bytes;
+            // at the first input's shape (lrt_cpu_run would otherwise make the interpreter again for it); a shape the
+            // file does not take: its own, and lrt_cpu_run reports it
+            if (first.size() == 4 && !tflite_set_input_hw(s->bytes, (int)first[2], (int)first[3])) s->bytes = s->source;
+        }
         auto t0 = Clock::now();
         s->threads = cpu_threads();
         if (!lrt_cpu_open(*s, why)) {
@@ -1297,16 +1303,19 @@ struct Inference::Impl {
         (void)net;
         (void)shape;
         (void)out;
+        (void)first;
         why = "LiteRT is not compiled into this build";
         return false;
 #endif
     }
 
-    // A session for net on backend b, or false with why (per_shape: no model for this input shape only).
-    bool make_session(NetId net, Backend b, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape) const {
+    // A session for net on backend b, or false with why (per_shape: no model for this input shape only). first:
+    // the input shape of the run it is made for.
+    bool make_session(NetId net, Backend b, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape,
+                      const std::vector<int64_t>& first) const {
         per_shape = false;
         if (b == Backend::LiteRtGpu) return make_litert(net, shape, out, why, per_shape);
-        if (b == Backend::CPU && kCpuOnLiteRt) return make_litert_cpu(net, shape, out, why);
+        if (b == Backend::CPU && kCpuOnLiteRt) return make_litert_cpu(net, shape, out, why, first);
 #ifdef FS_WITH_ORT
         std::string file;
         std::vector<uint8_t> bytes = model_bytes(net, b, shape, file, &per_shape);
@@ -1427,7 +1436,7 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
         if (it == S.sess.end()) {
             Sess s;
             bool per_shape = false;
-            if (!I.make_session(net, b, key, s, why, per_shape)) {
+            if (!I.make_session(net, b, key, s, why, per_shape, in.shape)) {
                 LOGI("infer: %s: %s unavailable%s: %s", net_str(net), backend_str(b), per_shape ? " for this input shape" : "", why.c_str());
                 if (cpu) { S.cpu_failed = true; break; }
                 if (per_shape) { ++at; continue; }
