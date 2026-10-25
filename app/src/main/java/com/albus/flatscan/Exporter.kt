@@ -23,6 +23,8 @@ import com.albus.flatscan.output.PdfWriter
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -50,18 +52,25 @@ class Exporter(private val ctx: Context, private val lib: Library) {
     /** Encodes the pages of [doc] for [o] ([progress]: stage, 0..1). OCR runs only for a searchable PDF and reuses cached text. */
     fun prepare(doc: ExportDoc, o: OutputOptions, progress: (String, Float) -> Unit = { _, _ -> }): Prepared {
         val ocr = if (o.searchable && o.format != OutputFormat.Jpeg && o.format != OutputFormat.Png) Ocr(ctx) else null
-        val out = doc.pages.mapIndexedNotNull { i, id ->
-            val f = lib.store.outputFile(id)
-            if (!f.exists()) return@mapIndexedNotNull null
-            val text = ocr?.let {
-                progress("Recognising text, page ${i + 1} of ${doc.pages.size}", i.toFloat() / doc.pages.size)
-                runCatching { it.pageWords(lib, id) }.getOrNull()
+        val files = doc.pages.mapIndexedNotNull { i, id -> lib.store.outputFile(id).takeIf { it.exists() }?.let { Triple(i, id, it) } }
+        // the pages are encoded two at a time, beside the text recognition (one engine: a page at a time)
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val encoded = files.map { (_, _, f) -> pool.submit<Triple<PdfImage, ByteArray, String>> { encodePage(f, o) } }
+            val out = files.mapIndexed { k, (i, id, _) ->
+                val text = ocr?.let {
+                    progress("Recognising text, page ${i + 1} of ${doc.pages.size}", i.toFloat() / doc.pages.size)
+                    runCatching { it.pageWords(lib, id) }.getOrNull()
+                }
+                progress("Preparing page ${i + 1} of ${doc.pages.size}", (i + 0.5f) / doc.pages.size)
+                val (img, pic, ext) = try { encoded[k].get() } catch (e: ExecutionException) { throw e.cause ?: e }
+                PreparedPage(img, pic, ext, text)
             }
-            progress("Preparing page ${i + 1} of ${doc.pages.size}", (i + 0.5f) / doc.pages.size)
-            encodePage(f, o).let { (img, pic, ext) -> PreparedPage(img, pic, ext, text) }
+            progress("Done", 1f)
+            return Prepared(doc, o, out)
+        } finally {
+            pool.shutdownNow()
         }
-        progress("Done", 1f)
-        return Prepared(doc, o, out)
     }
 
     /** The document's file name (without extension) from the options' template; [page] for one picture per page. */
@@ -147,7 +156,11 @@ class Exporter(private val ctx: Context, private val lib: Library) {
             }
             var bmp = BitmapFactory.decodeFile(src.absolutePath, BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 })
                 ?: error("cannot read $src")
-            if (tw != bmp.width) bmp = Bitmap.createScaledBitmap(bmp, tw, th, true)
+            if (tw != bmp.width) {
+                val full = bmp
+                bmp = Bitmap.createScaledBitmap(full, tw, th, true)
+                if (bmp !== full) full.recycle()
+            }
             return when (o.color) {
                 ColorMode.BlackWhite -> {
                     val px = IntArray(bmp.width * bmp.height).also { bmp.getPixels(it, 0, bmp.width, 0, 0, bmp.width, bmp.height) }
@@ -159,7 +172,12 @@ class Exporter(private val ctx: Context, private val lib: Library) {
                     // grayscale: a one-channel JPEG from the native library (Android writes only three-channel ones; where
                     // the library is missing, as in JVM tests, an R = G = B JPEG)
                     val grayJpeg = if (o.color == ColorMode.Grayscale) runCatching { NativeLib.encodeGrayJpeg(bmp, o.size.jpegQuality) }.getOrNull() else null
-                    if (o.color == ColorMode.Grayscale) bmp = gray(bmp)
+                    // the gray copy only where it is encoded (no native gray JPEG, or a PNG picture)
+                    if (o.color == ColorMode.Grayscale && (grayJpeg == null || o.format == OutputFormat.Png)) {
+                        val colour = bmp
+                        bmp = gray(colour)
+                        colour.recycle()
+                    }
                     val jpg = grayJpeg ?: ByteArrayOutputStream().also { bmp.compress(Bitmap.CompressFormat.JPEG, o.size.jpegQuality, it) }.toByteArray()
                     val picture = if (o.format == OutputFormat.Png) ByteArrayOutputStream().also { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray() else jpg
                     Triple(PdfImage.Jpeg(jpg, bmp.width, bmp.height, if (grayJpeg != null) 1 else 3), picture, if (o.format == OutputFormat.Png) "png" else "jpg")
