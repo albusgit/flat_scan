@@ -148,6 +148,8 @@ import com.albus.flatscan.ScreenMode
 import com.albus.flatscan.Screen
 import com.albus.flatscan.countDrawnLines
 import androidx.compose.material.icons.outlined.Draw
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material.icons.outlined.Restore
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.ui.layout.SubcomposeLayout
@@ -744,17 +746,32 @@ private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> 
     }
 }
 
-/** One of the Page panel's four page actions. */
+/**
+ * A tool tile of the editor panels (the Page panel's page actions, the Flatten panel's line tools): an icon over its
+ * name; [selected] (a tool that stays on) fills it with a tint of the accent, a disabled one dims.
+ */
 @Composable
-private fun PageAction(label: String, icon: ImageVector, modifier: Modifier, onClick: () -> Unit) {
+private fun PanelTile(
+    label: String,
+    icon: ImageVector,
+    modifier: Modifier,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    role: Role = Role.Button,
+    onClick: () -> Unit,
+) {
     Column(
-        modifier.heightIn(min = 64.dp).clip(ChipShape).border(1.dp, Editor.Outline, ChipShape).clickable(role = Role.Button, onClick = onClick)
+        modifier.heightIn(min = 64.dp).clip(ChipShape)
+            .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
+            .border(1.dp, if (selected) Editor.Accent else Editor.Outline, ChipShape)
+            .selectable(selected, enabled = enabled, role = role, onClick = onClick)
+            .alpha(if (enabled) 1f else 0.4f)
             .padding(horizontal = 4.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
-        Icon(icon, null, Modifier.size(20.dp))
+        Icon(icon, null, Modifier.size(20.dp), tint = if (selected) Editor.Accent else LocalContentColor.current)
         Spacer(Modifier.height(5.dp))
-        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center)
+        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center, color = if (selected) Editor.Accent else Color.Unspecified)
     }
 }
 
@@ -767,11 +784,11 @@ private fun PagePanel(vm: ScanViewModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PageAction("Crop", Icons.Outlined.Crop, Modifier.weight(1f).fillMaxHeight()) { vm.recrop() }
-            PageAction("Rotate left", Icons.AutoMirrored.Outlined.RotateLeft, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResultLeft() }
-            PageAction("Rotate right", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult() }
+            PanelTile("Crop", Icons.Outlined.Crop, Modifier.weight(1f).fillMaxHeight()) { vm.recrop() }
+            PanelTile("Rotate left", Icons.AutoMirrored.Outlined.RotateLeft, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResultLeft() }
+            PanelTile("Rotate right", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult() }
             // there is no automatic 180-degree turn: one tap for an upside-down page
-            PageAction("Turn 180°", Icons.Outlined.Cached, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult180() }
+            PanelTile("Turn 180°", Icons.Outlined.Cached, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult180() }
         }
         Column {
             Text("PAGE SIZE", style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono), color = Editor.Muted, modifier = Modifier.padding(bottom = 6.dp))
@@ -935,61 +952,101 @@ private fun ProtectPanel(vm: ScanViewModel, onDone: () -> Unit) {
 private fun LinesPanel(
     vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?) -> Unit, ironing: Boolean, drawing: Boolean, onDrawing: (Boolean) -> Unit,
 ) {
-    val n = vm.ignore.size / 4
+    val ignoredBoxes = vm.ignore.size / 4
     val drawn = countDrawnLines(vm.userLines)
-    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 14.dp)) {
+    val ironOn = !vm.perspectiveOnly
+    // the page's lines by kind (ruled, text row, table) and those ignored (their middle in a box), for the key
+    val ignore = vm.ignore.toList()
+    val counts = remember(vm.lines, ignore) {
+        val c = IntArray(4)
+        val l = vm.lines
+        var i = 0
+        while (5 * i + 4 < l.size) {
+            val mx = (l[5 * i + 1] + l[5 * i + 3]) / 2
+            val my = (l[5 * i + 2] + l[5 * i + 4]) / 2
+            if (inAreas(ignore, mx, my)) c[3]++ else c[l[5 * i].toInt().coerceIn(0, 2)]++
+            i++
+        }
+        c
+    }
+    val used = counts[0] + counts[1] + counts[2]
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 16.dp)) {
+        // what the tab does and how it stands, the iron as a switch (as Remove shadows)
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(PaperIcons.Iron, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
-            Spacer(Modifier.width(10.dp))
-            Text("Flatten", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
-            EditorChip(
-                if (vm.perspectiveOnly) "Iron off" else "Iron on", role = Role.Switch, selected = !vm.perspectiveOnly,
-                icon = if (vm.perspectiveOnly) PaperIcons.IronLifted else PaperIcons.Iron, enabled = !ironing,
-                onClick = { if (vm.perspectiveOnly) onIron(false) else vm.reflatten(perspective = true) },
+            Icon(if (ironOn) PaperIcons.Iron else PaperIcons.IronLifted, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Flatten", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold))
+                Text(
+                    when {
+                        !ironOn -> "Iron lifted: perspective only"
+                        used == 0 -> "No lines found on this page"
+                        used == 1 -> "1 line guides the iron"
+                        else -> "$used lines guide the iron"
+                    },
+                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                )
+            }
+            Row(
+                Modifier.clip(ChipShape).toggleable(ironOn, enabled = !ironing, role = Role.Switch) { on ->
+                    if (on) onIron(false) else vm.reflatten(perspective = true)
+                }.padding(start = 10.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Iron", style = MaterialTheme.typography.labelLarge, color = Editor.Inactive, modifier = Modifier.padding(end = 10.dp))
+                Switch(checked = ironOn, onCheckedChange = null, enabled = !ironing)
+            }
+        }
+        if (ironOn) {
+            // the key to the colours on the page, with how many of each
+            if (used + counts[3] + drawn > 0) {
+                FlowRow(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (counts[0] > 0) LegendDot(LineColors[0], "Ruled", counts[0])
+                    if (counts[1] > 0) LegendDot(LineColors[1], "Text rows", counts[1])
+                    if (counts[2] > 0) LegendDot(LineColors[2], "Table", counts[2])
+                    if (drawn > 0) LegendDot(DrawnLineColor, "Drawn", drawn)
+                    if (counts[3] > 0) LegendDot(IgnoreColor, "Ignored", counts[3])
+                }
+            }
+            // one line for the tool in use
+            Text(
+                when {
+                    drawing -> "Draw along a printed line the iron missed, end to end. Tap a yellow line to remove it."
+                    used == 0 -> "Add a line along a printed rule, or the page's outline alone flattens it."
+                    else -> "Tap a line to leave it out (a logo, a second sheet), or drag a box over an area."
+                },
+                style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 10.dp),
+            )
+            // the line tools, always in place (dimmed when there is nothing for them to do)
+            Row(Modifier.padding(top = 12.dp).height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PanelTile(
+                    "Add line", Icons.Outlined.Draw, Modifier.weight(1f).fillMaxHeight(), selected = drawing, enabled = !ironing, role = Role.Switch,
+                ) { onDrawing(!drawing) }
+                PanelTile("Undo line", Icons.AutoMirrored.Outlined.Undo, Modifier.weight(1f).fillMaxHeight(), enabled = drawn > 0 && !ironing) { vm.undoUserLine() }
+                PanelTile("Use all lines", Icons.Outlined.Restore, Modifier.weight(1f).fillMaxHeight(), enabled = ignoredBoxes > 0 && !ironing) { vm.clearIgnore() }
+            }
+        } else {
+            Text(
+                "Only the perspective is corrected. Turn the iron on to straighten curved lines.",
+                style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 10.dp),
             )
         }
-        Text(
-            when {
-                vm.perspectiveOnly -> "The iron is lifted: only the perspective is corrected. Turn it on to straighten curved lines."
-                drawing -> "Draw along a printed line the iron missed, end to end. It is straightened when you flatten again; tap a yellow line to remove it."
-                vm.lines.isEmpty() -> "No lines were found on this page. Add a line along a printed rule, or only its outline flattens it."
-                else -> "Tap a line that should stay as it is (a logo, a drawing, a second sheet), or drag a box over an area. Missed a rule? Add line. Then iron again."
-            },
-            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
-        )
-        if (!vm.perspectiveOnly && vm.lines.isNotEmpty()) {
-            Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                LegendDot(Color(0xFF8FB0FF), "Ruled lines")
-                LegendDot(Color(0xFF5BD18B), "Text rows")
-                LegendDot(Color(0xFFFF6B5E), "Ignored")
-                if (drawn > 0) LegendDot(DrawnLineColor, "Drawn")
-            }
-        }
-        if (!vm.perspectiveOnly) {
-            FlowRow(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                EditorChip("Add line", onClick = { onDrawing(!drawing) }, icon = Icons.Outlined.Draw, selected = drawing, role = Role.Switch)
-                if (drawn > 0) EditorChip("Undo line", onClick = { vm.undoUserLine() }, enabled = !ironing)
-                if (n > 0) EditorChip("Use all lines", onClick = { vm.clearIgnore() }, enabled = !ironing)
-            }
-        }
-        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Spacer(Modifier.weight(1f))
-            if (vm.lineEditsChanged) {
-                TextButton(onClick = onClose, enabled = !ironing) { Text("Cancel") }
-                Button(
-                    onClick = { onIron(null) }, enabled = !ironing, shape = ChipShape,
-                    colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
-                    contentPadding = PaddingValues(start = 14.dp, end = 18.dp), modifier = Modifier.height(40.dp),
+        // leave, or flatten with the edits (as the crop screen's Cancel and Flatten page): "Flatten again" comes in with
+        // the first edit, and until then there is only Done (a dimmed accent button read as half-enabled)
+        Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            SecondaryPill(
+                onClick = onClose, enabled = !ironing, container = Editor.Raised, border = Editor.Outline,
+                modifier = Modifier.weight(1f).height(48.dp),
+            ) { PillText(if (vm.lineEditsChanged) "Cancel" else "Done") }
+            if (ironOn && (vm.lineEditsChanged || ironing)) {
+                PrimaryPill(
+                    onClick = { onIron(null) }, enabled = !ironing, container = Editor.Accent, content = Editor.Ground,
+                    modifier = Modifier.weight(1.6f).height(48.dp),
                 ) {
                     Icon(PaperIcons.Iron, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Flatten again", style = MaterialTheme.typography.titleSmall)
+                    PillText("Flatten again")
                 }
-            } else {
-                Button(
-                    onClick = onClose, shape = ChipShape, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
-                    contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
-                ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
             }
         }
     }
@@ -1009,11 +1066,13 @@ private fun IronSweep(t: Float, modifier: Modifier) {
 }
 
 @Composable
-private fun LegendDot(color: Color, label: String) {
+private fun LegendDot(color: Color, label: String, count: Int) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(width = 14.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(color))
         Spacer(Modifier.width(6.dp))
         Text(label, style = MaterialTheme.typography.labelMedium, color = Editor.Inactive)
+        Spacer(Modifier.width(4.dp))
+        Text("$count", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono), color = Editor.Muted)
     }
 }
 

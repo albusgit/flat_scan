@@ -116,8 +116,8 @@ enum class AreaMode { None, Protect, Lines, Erase, Fingers }
 
 /** Lines the user drew in the line editor (Add line). */
 val DrawnLineColor = Color(0xFFFFE15A)
-private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF), DrawnLineColor)   // ruled, text row, grid, drawn
-private val IgnoreColor = Color(0xFFFF6B5E)
+internal val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF), DrawnLineColor)   // ruled, text row, grid, drawn
+internal val IgnoreColor = Color(0xFFFF6B5E)
 private val EraseColor = Color(0xFFF2B84B)
 
 /**
