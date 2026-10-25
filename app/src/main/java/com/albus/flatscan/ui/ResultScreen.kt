@@ -79,6 +79,16 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.animateColorAsState
@@ -438,7 +448,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
                 // the editor panel: the tool of the selected tab over the tool dock
                 Column(Modifier.fillMaxWidth().clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding()) {
-                    SteadyPanel(shownPanel, cap = panelCap, panel = panelOf)
+                    ToolPanel(shownPanel, cap = panelCap, panel = panelOf)
                     dock()
                 }
             }
@@ -459,41 +469,32 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
 }
 
 /**
- * The editor panel at one height whichever tab or tool is open, so the page above it keeps its size: the
- * tallest of every panel (measured, not shown) and of what was shown so far, at most [cap]; a shorter panel
- * leaves space below it, a taller one scrolls.
+ * The editor panel at the height of what it shows, as photo editors do: the page above re-fits as the panel
+ * grows or shrinks (the dock stays put), so a short panel (Look, Clean up) leaves no empty space. A change of tab
+ * or tool fades through (the old controls out in 90 ms, the new ones in, rising 8 dp) while the height follows on a
+ * critically damped spring, which also takes a quick second tap in its stride; a change inside a panel (Levels,
+ * a row that appears) animates its height too. At most [cap], then the panel scrolls. Reduced motion: no animation.
  */
 @Composable
-private fun SteadyPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScope.(PanelKind) -> Unit) {
-    // not state: the height found while measuring is only read by the next measure (measured again from
-    // scratch when the text size or the display size changes)
-    val density = LocalDensity.current
-    val tallest = remember(density.density, density.fontScale) { intArrayOf(0) }
-    val scroll = rememberScrollState()
+private fun ToolPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScope.(PanelKind) -> Unit) {
     val reduced = rememberReducedMotion()
-    val rise = with(density) { 12.dp.roundToPx() }
-    SubcomposeLayout(Modifier.fillMaxWidth()) { cs ->
-        val w = cs.maxWidth
-        val capPx = cap.roundToPx()
-        val free = Constraints(minWidth = w, maxWidth = w)
-        for (k in PanelKind.entries) {
-            for (m in subcompose(k) { Column(Modifier.fillMaxWidth()) { panel(k) } }) tallest[0] = max(tallest[0], m.measure(free).height)
-        }
-        val minH = min(tallest[0], capPx)
-        // a new tab's panel fades in rising 12 dp (160 ms); the height stays (steady), so nothing above moves
-        val placeables = subcompose(Unit) {
-            Column(Modifier.fillMaxWidth().verticalScroll(scroll)) {
-                if (reduced) panel(shown)
-                else AnimatedContent(
-                    shown, label = "panel",
-                    transitionSpec = { (fadeIn(tween(160)) + slideInVertically(tween(160)) { rise }) togetherWith fadeOut(tween(100)) },
-                ) { k -> Column(Modifier.fillMaxWidth()) { panel(k) } }
-            }
-        }
-            .map { it.measure(Constraints(minWidth = w, maxWidth = w, minHeight = minH, maxHeight = max(minH, capPx))) }
-        val h = placeables.maxOfOrNull { it.height } ?: minH
-        tallest[0] = max(tallest[0], h)
-        layout(w, h) { placeables.forEach { it.place(0, 0) } }
+    val rise = with(LocalDensity.current) { 8.dp.roundToPx() }
+    val size = spring<IntSize>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
+    AnimatedContent(
+        shown, label = "tool panel", contentAlignment = Alignment.TopCenter,
+        modifier = Modifier.fillMaxWidth().heightIn(max = cap),
+        transitionSpec = {
+            if (reduced) (EnterTransition.None togetherWith ExitTransition.None).using(SizeTransform(clip = true) { _, _ -> snap() })
+            else (fadeIn(tween(200, delayMillis = 70, easing = LinearOutSlowInEasing)) +
+                slideInVertically(tween(260, delayMillis = 70, easing = LinearOutSlowInEasing)) { rise })
+                .togetherWith(fadeOut(tween(90, easing = FastOutLinearInEasing)))
+                .using(SizeTransform(clip = true) { _, _ -> size })
+        },
+    ) { k ->
+        Column(
+            Modifier.fillMaxWidth().then(if (reduced) Modifier else Modifier.animateContentSize(size))
+                .verticalScroll(rememberScrollState()),
+        ) { panel(k) }
     }
 }
 
@@ -620,7 +621,7 @@ private fun FilterPanel(vm: ScanViewModel) {
     }
     if (vm.pages.size > 1 || vm.pending.isNotEmpty()) {
         Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 10.dp),
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 14.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -637,7 +638,7 @@ private fun FilterPanel(vm: ScanViewModel) {
             }
         }
     } else {
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(14.dp))
     }
 }
 
@@ -692,7 +693,7 @@ private fun <T> EditorSegments(label: String, options: List<Pair<T, String>>, se
 @Composable
 private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> Unit, onProtect: () -> Unit) {
     val p = vm.params
-    Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 6.dp)) {
+    Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 10.dp)) {
         val ne = vm.erase.size / 4
         CleanRow(
             Icons.Outlined.AutoFixHigh, "Erase marks", "Stains, stamps, punch holes: drag a box over them.",
@@ -762,7 +763,7 @@ private fun PageAction(label: String, icon: ImageVector, modifier: Modifier, onC
 private fun PagePanel(vm: ScanViewModel) {
     val l = vm.look
     Column(
-        Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 8.dp),
+        Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -936,7 +937,7 @@ private fun LinesPanel(
 ) {
     val n = vm.ignore.size / 4
     val drawn = countDrawnLines(vm.userLines)
-    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 14.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(PaperIcons.Iron, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
             Spacer(Modifier.width(10.dp))
