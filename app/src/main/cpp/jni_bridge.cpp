@@ -628,13 +628,31 @@ uint64_t fnv(uint64_t h, const void* p, size_t n) {
     return h;
 }
 
-uint64_t nets_key(const cv::Mat& bgr, const std::vector<float>& logits, int page_index, int flat_nets) {
+// the photo and the page finder's output
+uint64_t photo_key(const cv::Mat& bgr, const std::vector<float>& logits) {
     uint64_t h = 1469598103934665603ull;
-    const int head[4] = {bgr.cols, bgr.rows, page_index, flat_nets};
+    const int head[2] = {bgr.cols, bgr.rows};
     h = fnv(h, head, sizeof head);
     for (int y = 0; y < bgr.rows; ++y) h = fnv(h, bgr.ptr(y), bgr.cols * bgr.elemSize());
     return fnv(h, logits.data(), logits.size() * sizeof(float));
 }
+
+uint64_t nets_key(uint64_t photo, int page_index, int flat_nets) {
+    const int v[2] = {page_index, flat_nets};
+    return fnv(photo, v, sizeof v);
+}
+
+// ---- the crop screen's detection for process(): NativeLib.detect's pages of the last photo (assess_pages),
+// keyed by the photo, the page finder's output and the focal length. process() with automatic corners takes the
+// page's corners and surface fit (PipelineOptions::assessed: the same values, not made again).
+struct Assessed {
+    uint64_t key = 0;
+    std::vector<PageAssessment> pages;
+};
+std::mutex g_assessed_mu;
+Assessed g_assessed;
+
+uint64_t assessed_key(uint64_t photo, float focal_px) { return fnv(photo, &focal_px, sizeof focal_px); }
 
 // their grids, and whether every net that was to run ran (false: cancelled, process then runs its own)
 struct AheadResult {
@@ -718,7 +736,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_precomputeNets(JNIEnv* 
     if (bgr.empty()) return;
     AheadNets& a = g_ahead;
     a.nets = std::min(2, std::max(0, (int)flat_nets));
-    a.key = nets_key(bgr, lg, page_index, a.nets);
+    a.key = nets_key(photo_key(bgr, lg), page_index, a.nets);
     a.flat = group(g_flat);
     a.hr = group(g_hr);
     a.bgr = bgr;
@@ -867,6 +885,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, 
     std::vector<PageAssessment> pages;
     try {
         pages = assess_pages(bgr, lg.empty() ? nullptr : lg.data(), focal_px);
+        std::lock_guard<std::mutex> lk(g_assessed_mu);
+        g_assessed.key = assessed_key(photo_key(bgr, lg), focal_px);
+        g_assessed.pages = pages;
     } catch (const std::exception& e) {
         LOGI("detect failed: %s", e.what());
         return env->NewStringUTF((std::string("{\"ok\": false, \"error\": \"") + escape(e.what()) + "\", \"pages\": []}").c_str());
@@ -917,6 +938,18 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     std::vector<float> lg = read_logits(env, logits);
     o.seg_logits = lg.empty() ? nullptr : lg.data();
     o.page_index = page_index;
+    // automatic corners: what the crop screen found for this photo (NativeLib.detect), and the nets ahead, are
+    // taken when they were made from the same inputs
+    const uint64_t pkey = o.corners_edited ? 0 : photo_key(bgr, lg);
+    PageAssessment assessed;
+    if (!o.corners_edited) {
+        std::lock_guard<std::mutex> lk(g_assessed_mu);
+        if (g_assessed.key == assessed_key(pkey, focal_px) && page_index >= 0 && page_index < (int)g_assessed.pages.size() &&
+            g_assessed.pages[page_index].pc.ok) {
+            assessed = g_assessed.pages[page_index];
+            o.assessed = &assessed;
+        }
+    }
     o.force_homography = force_homography;
     o.perspective_only = perspective_only;
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
@@ -967,7 +1000,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         {
             std::lock_guard<std::mutex> lk(g_ahead_mu);
             if (g_ahead.result.valid()) {
-                if (!o.corners_edited && g_ahead.flat == flat_g && g_ahead.hr == hr_g && g_ahead.key == nets_key(bgr, lg, page_index, (int)rq.nets))
+                if (!o.corners_edited && g_ahead.flat == flat_g && g_ahead.hr == hr_g && g_ahead.key == nets_key(pkey, page_index, (int)rq.nets))
                     ahead = g_ahead.result;
                 else
                     drop_ahead();
@@ -1051,6 +1084,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     std::ostringstream a;
     a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(std::max(0.0, r.nets_ms)) << ", \"nets_overlap\": " << r.nets_overlap
       << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"nets_ahead\": " << (nets_ahead ? "true" : "false")
+      << ", \"detection_reused\": " << (o.assessed ? "true" : "false")
       << ", \"process_ms\": " << std::lround(ms_since(t1));
     s->accel = a.str();
     if (!r.ok) LOGI("pipeline failed: %s", r.error.c_str());

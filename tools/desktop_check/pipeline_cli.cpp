@@ -148,8 +148,9 @@ int main(int argc, char** argv) {
     const float* logits = lg.empty() ? nullptr : lg.data();
     std::ostringstream f;
     f << "{\"photo\": \"" << argv[1] << "\", \"assess\": [";
+    std::vector<PageAssessment> pages;
     try {
-        auto pages = assess_pages(img, logits, 0);
+        pages = assess_pages(img, logits, 0);
         for (size_t i = 0; i < pages.size(); ++i) {
             const auto& a = pages[i];
             f << (i ? ", " : "") << "{\"ok\": " << (a.pc.ok ? "true" : "false") << ", \"fit_median_px\": " << num(a.fit_median_px)
@@ -164,6 +165,9 @@ int main(int argc, char** argv) {
     }
     PipelineOptions o;
     o.use_gpu = false;
+    // page 0's detection and surface fit from the assessment above, as the app hands the crop screen's to
+    // processing (FS_NO_ASSESSED=1: made again inside run_photo)
+    if (!pages.empty() && pages[0].pc.ok && !std::getenv("FS_NO_ASSESSED")) o.assessed = &pages[0];
 #ifdef FS_DESKTOP_GPU
     const bool gpu_on = std::getenv("FS_GPU") != nullptr;
     if (gpu_on) {

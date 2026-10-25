@@ -55,6 +55,7 @@ struct PageAssessment {
     PageCorners pc;
     double fit_median_px = -1;        // full-resolution px; -1: no fit
     std::vector<std::string> reasons; // quality_gate
+    SurfaceModel model;               // the surface fit (when pc.ok), as run_photo makes it (PipelineOptions::assessed)
 };
 
 // The flattening nets' grids (PipelineOptions::flat_nets) for the uv_out / uv_crop, uv_out2 / uv_crop2
@@ -130,6 +131,10 @@ struct PipelineOptions {
     const float* seg_logits = nullptr;   // page-finder net output for this photo (2 x 256 x 256);
                                          // null: colour-threshold paper_mask (the feature flag is off)
     int page_index = 0;               // book spread: which page of the photo (0 = the larger one)
+    // automatic corners: this photo's page page_index as assess_pages found it with the same seg_logits, focal_px
+    // and max_analysis_side (the crop screen's detection): its corners and surface fit are taken instead of made
+    // again (the same values). Null: made here.
+    const PageAssessment* assessed = nullptr;
     std::array<cv::Point2d, 4> corners;   // used when corners_edited (full-res px)
     double focal_px = 0;              // full-res focal length from EXIF / camera; 0 = 0.72*max side
     bool auto_orient = true;          // decide 0/90/180/270 on the homography page

@@ -952,7 +952,8 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
         if (!a.pc.ok) {
             a.reasons.push_back("no page found");
         } else {
-            SurfaceModel m = fit_detected(photo, a.pc, focal_px);
+            a.model = fit_detected(photo, a.pc, focal_px);
+            const SurfaceModel& m = a.model;
             a.fit_median_px = m.ok ? m.median_px / a.pc.scale : -1;
             a.reasons = quality_gate(a.pc, a.fit_median_px, photo.size());
             if (!m.ok) a.reasons.push_back("surface fit failed");
@@ -1364,7 +1365,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     std::array<cv::Point2d, 4> corners;
     PageCorners pc;
     if (!opt.corners_edited) {
-        pc = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
+        pc = opt.assessed ? opt.assessed->pc : detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
         r.detection = pc;
         if (!pc.ok) {
             give_corners(nullptr);   // the nets that need corners do not run; the future's destructor waits for the rest
@@ -1413,7 +1414,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     if (!opt.corners_edited) {
         t0 = Clock::now();
         report(opt, 8, "Fitting the page surface");
-        r.model = fit_detected(photo, pc, opt.focal_px);
+        r.model = opt.assessed ? opt.assessed->model : fit_detected(photo, pc, opt.focal_px);
         r.ms.emplace_back("surface fit", ms_since(t0));
         r.fit_median_px = r.model.median_px;
         r.fit_p90_px = r.model.p90_px;
