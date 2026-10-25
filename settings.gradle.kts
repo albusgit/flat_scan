@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "FlatScan"
 include(":app")
+include(":baselineprofile")

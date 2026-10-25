@@ -7,6 +7,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
+    id("androidx.baselineprofile")
 }
 
 val localProps = Properties().apply { rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) } }
@@ -229,6 +230,15 @@ ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
 }
 
+// The baselineprofile plugin copies the release source set's directories into its nonMinifiedRelease and
+// benchmarkRelease variants, one of them as a provider whose path is "provider(?)" (KSP 2.1.21-2.0.2 on Windows: an
+// illegal path, the build fails). It is not a directory of this project; dropped.
+gradle.projectsEvaluated {
+    kotlin.sourceSets.matching { it.name == "nonMinifiedRelease" || it.name == "benchmarkRelease" }.configureEach {
+        kotlin.setSrcDirs(kotlin.srcDirTrees.map { it.dir }.filter { !it.name.startsWith("provider(") })
+    }
+}
+
 // Robolectric's Android runtime jar, fetched by Gradle (which retries; Robolectric's own download does not)
 // and handed to the tests offline
 val robolectricRuntime: Configuration by configurations.creating { isTransitive = false }
@@ -249,6 +259,10 @@ tasks.withType<Test>().configureEach {
 
 val roomVersion = "2.7.2"
 dependencies {
+    // the baseline and startup profiles (src/main/generated/baselineProfiles, from :baselineprofile's journey),
+    // installed on phones without Play by profileinstaller
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+    baselineProfile(project(":baselineprofile"))
     // sync (feature 6): HTTP for WebDAV / paperless-ngx, queued uploads, encrypted credentials
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.work:work-runtime-ktx:2.10.5")

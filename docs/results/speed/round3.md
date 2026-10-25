@@ -84,3 +84,34 @@ That is -117 ms on the median and a tighter spread (max 3539 -> 2964). It's less
 because the library load now competes with the first frame for the emulator's cores. Batch t4: 20 files
 identical. Unit tests: 64 run (the new one included), 10 skipped, 0 failures. Camera after a cold start: the
 page finder warmed (ready in 467 ms), no errors.
+
+### b. Baseline and startup profiles
+
+A `:baselineprofile` module (`com.android.test`, `androidx.baselineprofile` 1.5.0: the current stable, works
+with AGP 8.11.1; the plan named 1.4.1). It has one journey, `firstScan`: Home -> camera -> photo -> crop ->
+flattening -> result (its tabs, the save sheet) -> Home -> Settings. It also has `StartupBenchmark`, a cold start
+with no compilation and with the profile. The app gets `profileinstaller` and the generated
+`app/src/release/generated/baselineProfiles/{baseline,startup}-prof.txt` (26,006 rules each); the release APK
+carries `assets/dexopt/baseline.prof`. Regenerate with
+`./gradlew :app:generateBaselineProfile -Pandroid.testInstrumentationRunnerArguments.androidx.benchmark.suppressErrors=EMULATOR`
+(on a phone, without the flag).
+
+- Windows: the plugin copies the release source set's directories into `nonMinifiedRelease` and
+  `benchmarkRelease`, one of them as a provider whose path comes out as `provider(?)`. KSP 2.1.21-2.0.2 rejects
+  that as an illegal path (KSP1 too), so the build fails. `app/build.gradle.kts` drops that entry; it is not a
+  directory of this project.
+- Writing the journey turned up two things on the emulator. "Flatten page" is disabled while the detection runs,
+  so the journey waits for the enabled pill. And **a shutter tap in the first seconds after the camera opens is
+  lost**: CameraX is still retrying its camera check (about 6 s here, because there is no front camera), the
+  capture never completes, and the camera screen stays open with nothing happening. The journey waits 10 s. On
+  a phone, CameraX starts much faster, but the app has no timeout or retry for this. Not changed here.
+
+Macrobenchmark, release build, emulator, 10 cold starts each (`timeToInitialDisplayMs`):
+
+| | runs | median |
+|---|---|---|
+| no compilation (a new install) | 1291 1172 1090 1151 1126 1076 1616 1240 1083 1048 | 1139 ms |
+| baseline profile | 1048 964 1020 1031 1021 1074 1029 1060 1030 1064 | 1031 ms |
+
+That is -108 ms (-9.5 %) on the median and -542 ms on the slowest start. The release build starts in about
+1.1 s, against the debug build's 2.8 s (4a).
