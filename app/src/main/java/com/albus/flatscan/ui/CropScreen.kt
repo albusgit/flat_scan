@@ -55,6 +55,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
@@ -168,7 +169,7 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
         val tools = !vm.detecting && photo != null
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             CropTool(Icons.AutoMirrored.Outlined.RotateRight, "Rotate", enabled = tools && !circling) { vm.rotatePhoto() }
-            CropTool(Icons.Outlined.Gesture, "Circle the page", enabled = tools, on = circling) { circling = !circling }
+            CropTool(Icons.Outlined.Gesture, "Circle page", enabled = tools, on = circling) { circling = !circling }
             CropTool(Icons.Outlined.Fullscreen, "Whole photo", enabled = tools && !circling) { vm.cropWholePhoto(); noteClosed = true }
         }
         Row(
@@ -210,7 +211,10 @@ private fun RowScope.CropTool(icon: ImageVector, label: String, enabled: Boolean
     ) {
         Icon(icon, null, Modifier.size(21.dp), tint = fg)
         Spacer(Modifier.height(4.dp))
-        Text(label, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = fg, maxLines = 1)
+        Text(
+            label, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = fg,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 6.dp),
+        )
     }
 }
 

@@ -198,6 +198,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** The processing animation has landed (PaperUnfold's onFinished) for this run: the result screen waits for it. */
     var unfoldLanded by mutableStateOf(false)
 
+    /** A page's finger and erase edits (PageMeta's), carried over when it is processed again. */
+    private class PageEdits(val erase: FloatArray, val fingersAuto: Boolean, val strokes: FloatArray, val fill: Int)
+
     private class CropBackup(
         val photo: Bitmap, val display: Bitmap?, val corners: List<Offset>, val detected: List<Offset>?,
         val userRotated: Boolean, val cropRotation: Int, val reasons: List<String>, val forceHomography: Boolean, val pageIndex: Int,
@@ -275,6 +278,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val ignoreChanged: Boolean get() = ignore != (sessionGeomState?.ignore?.toList() ?: emptyList<Float>())
     /** Lines drawn along rules the unwarp missed (PageMeta.userLines layout, being edited). */
     var userLines by mutableStateOf(listOf<Float>())
+        private set
+    /** The line editor's own undo: (ignore, userLines) before each of its edits, since it opened. */
+    private val lineHistory = ArrayList<Pair<List<Float>, List<Float>>>()
+    /** How many line edits Undo can take back. */
+    var lineUndoSteps by mutableIntStateOf(0)
         private set
     /** The line editor has changes to flatten with: ignore areas or drawn lines. */
     val lineEditsChanged: Boolean get() = ignoreChanged || userLines != (sessionGeomState?.userLines?.toList() ?: emptyList<Float>())
@@ -2124,6 +2132,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             board -> PageLook(shape = PageShape.Measured)
             else -> LookPrefs.newPageLook(getApplication())
         }
+        // the page's finger and erase edits stay when it is processed again (the iron switched off or on, lines
+        // added) on the same crop: page fractions, so they sit on the same parts of the page; a new crop drops them
+        val startEdits = when {
+            samePlace == null -> null
+            same -> PageEdits(erase.toFloatArray(), fingersAuto, fingerStrokes.toFloatArray(), fingerFill)
+            stored != null -> PageEdits(stored.erase, stored.fingersAuto, stored.fingerStrokes, stored.fingerFill)
+            else -> null
+        }
         val quadHw = measuredPageHw(corners, p.width, p.height, focalPx)
         // whiteboard mode: no orientation decision (its cue is tuned on printed text), no shadow net (trained
         // on paper), no rule net, no finger erase (core: PipelineOptions::erase_fingers)
@@ -2198,7 +2214,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             saveOrderNow()
             // the measured shape in the page's frame: a sideways page was turned a quarter (rot 0 / 2)
             val hw = if (quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 }) 1f / quadHw else quadHw
-            val geomL = geom.copy(look = startLook.copy(measuredHw = hw))
+            val geomL = geom.copy(look = startLook.copy(measuredHw = hw)).let { g ->
+                if (startEdits == null) g
+                else g.copy(erase = startEdits.erase, fingersAuto = startEdits.fingersAuto, fingerStrokes = startEdits.strokes, fingerFill = startEdits.fill)
+            }
             val meta = geomL.copy(params = startParams, protect = startProtect.toFloatArray(), rotation = startRotation)
             withContext(Dispatchers.IO) {
                 runCatching {
@@ -2244,6 +2263,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         lines = ln
         ignore = geom.ignore.toList()
         userLines = geom.userLines.toList()
+        forgetLineEdits()
         erase = geom.erase.toList()
         fingersAuto = geom.fingersAuto
         fingerStrokes = geom.fingerStrokes.toList()
@@ -2325,14 +2345,34 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Remembers the line edits as they are, before a change (Undo goes back to them). */
+    private fun noteLineEdit() {
+        lineHistory += ignore to userLines
+        lineUndoSteps = lineHistory.size
+    }
+
+    /** Line editor: takes back the last line edit (a line left out or used again, a box, a line added or removed). */
+    fun undoLineEdit() {
+        val last = lineHistory.removeLastOrNull() ?: return
+        ignore = last.first
+        userLines = last.second
+        lineUndoSteps = lineHistory.size
+    }
+
+    private fun forgetLineEdits() {
+        lineHistory.clear()
+        lineUndoSteps = 0
+    }
+
     /** Line editor: ignores line [i] of [lines] (or uses it again when it is ignored). */
     fun toggleLine(i: Int) {
         val l = lines
         if (5 * i + 4 >= l.size) return
+        noteLineEdit()
         val cx = (l[5 * i + 1] + l[5 * i + 3]) / 2
         val cy = (l[5 * i + 2] + l[5 * i + 4]) / 2
         if (ignoreAt(cx, cy) >= 0) {
-            removeIgnoreAt(cx, cy)
+            ignore = ignoreWithout(cx, cy)
             return
         }
         val pad = 0.008f
@@ -2355,8 +2395,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Removes every ignore area containing the page point. */
     fun removeIgnoreAt(x: Float, y: Float) {
-        ignore = ignore.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
+        val kept = ignoreWithout(x, y)
+        if (kept.size == ignore.size) return
+        noteLineEdit()
+        ignore = kept
     }
+
+    private fun ignoreWithout(x: Float, y: Float) = ignore.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
 
     /** Line editor: ignores every line inside the rectangle (page fractions, any corner order). */
     fun addIgnore(x0: Float, y0: Float, x1: Float, y1: Float) {
@@ -2365,10 +2410,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val c = maxOf(x0, x1).coerceIn(0f, 1f)
         val d = maxOf(y0, y1).coerceIn(0f, 1f)
         if (c - a < 0.01f || d - b < 0.01f) return
+        noteLineEdit()
         ignore = ignore + listOf(a, b, c, d)
     }
 
     fun clearIgnore() {
+        if (ignore.isEmpty()) return
+        noteLineEdit()
         ignore = emptyList()
     }
 
@@ -2376,6 +2424,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun revertIgnore() {
         ignore = sessionGeomState?.ignore?.toList() ?: emptyList()
         userLines = sessionGeomState?.userLines?.toList() ?: emptyList()
+        forgetLineEdits()
     }
 
     /**
@@ -2392,6 +2441,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val n = points.size / 2
         val step = maxOf(1, (n + 63) / 64)
         val kept = (0 until n step step).toMutableList().also { if (it.last() != n - 1) it += n - 1 }
+        noteLineEdit()
         userLines = userLines + listOf(group.toFloat(), kept.size.toFloat()) + kept.flatMap { listOf(points[2 * it], points[2 * it + 1]) }
     }
 
@@ -2414,14 +2464,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Line editor: removes the last drawn line. */
-    fun undoUserLine() {
-        val starts = drawnLineStarts(userLines)
-        if (starts.isNotEmpty()) userLines = userLines.take(starts.last())
-    }
-
     /** Line editor: removes every drawn line. */
     fun clearUserLines() {
+        if (userLines.isEmpty()) return
+        noteLineEdit()
         userLines = emptyList()
     }
 
@@ -2443,6 +2489,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (best < 0) return
         val a = starts[best]
         val b = starts.getOrNull(best + 1) ?: l.size
+        noteLineEdit()
         userLines = l.take(a) + l.drop(b)
     }
 

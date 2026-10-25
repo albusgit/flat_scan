@@ -20,7 +20,9 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -40,6 +42,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.List
@@ -210,13 +213,13 @@ fun HomeScreen(vm: ScanViewModel) {
                 searching -> SearchTopBar(query, hasText = vm.hasOcrText, onQuery = { query = it }, onClose = stopSearch)
                 else -> AppTopBar(onSettings = { vm.open(Screen.Settings) })
             }
-            LazyColumn(
+            if (empty && !searching && !selecting) FirstRun(Modifier.weight(1f), onScan = { vm.scanNew() }, onImport = importPhotos)
+            else LazyColumn(
                 Modifier.weight(1f).fillMaxWidth().testTag("history"),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = if (searching && !selecting) 24.dp else 112.dp),
             ) {
                 when {
-                    docs == null -> {}
-                    empty -> firstRun()
+                    docs == null || empty -> {}
                     searching -> searchResults(vm, query, shown, selected, tap, toggle)
                     else -> {
                         if (open != null && !selecting) item("carry_on") {
@@ -244,10 +247,7 @@ fun HomeScreen(vm: ScanViewModel) {
                 onUpload = { vm.uploadDocuments(selected); selected = emptySet() },
                 onTrash = { confirmDelete = true },
             )
-            !searching && docs != null -> {
-                if (empty) StartHere(Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 52.dp, bottom = 96.dp))
-                HomeDock(Modifier.align(Alignment.BottomCenter), onImport = importPhotos, onScan = { vm.scanNew() })
-            }
+            !searching && docs != null && !empty -> HomeDock(Modifier.align(Alignment.BottomCenter), onImport = importPhotos, onScan = { vm.scanNew() })
         }
     }
     renaming?.let { d ->
@@ -655,72 +655,69 @@ private fun SearchResultRow(vm: ScanViewModel, d: DocumentSummary, query: String
 
 // ---------------------------------------------------------------- nothing scanned yet
 
+/**
+ * Nothing scanned yet: what the app does, in one picture (the iron crossing a page, the lines behind it straight,
+ * the ones ahead still wavy), one line and what it is good at; a large Scan card and Import under it.
+ */
 @OptIn(ExperimentalLayoutApi::class)
-private fun LazyListScope.firstRun() {
-    item("headline") {
-        Column(Modifier.padding(start = 4.dp, end = 4.dp, top = 14.dp)) {
-            HighlightedHeadline("Flat, clean pages\nfrom ", "any photo.")
-            Spacer(Modifier.height(12.dp))
-            Text(
-                "Bent, curled or in shadow: FlatScan finds the page, irons it flat and whitens the paper, all on your phone.",
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp), color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-    item("how") {
-        PaperSurface(Modifier.fillMaxWidth().padding(top = 26.dp), tape = true) {
-            Column(Modifier.padding(start = 12.dp, end = 12.dp, top = 18.dp, bottom = 12.dp)) {
-                HowItWorks(
-                    Modifier.fillMaxWidth().height(112.dp),
-                    ink = MaterialTheme.colorScheme.onSurface, paper = MaterialTheme.colorScheme.surfaceContainerLowest,
-                    accent = MaterialTheme.colorScheme.primary, marker = if (isPaperLight()) Palette.Highlighter else Graphite.Highlighter,
-                )
-                Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                    for (t in listOf("1 · Snap it", "2 · Iron it", "3 · Flat, clean")) {
-                        Text(
-                            t, style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            textAlign = TextAlign.Center, modifier = Modifier.weight(1f),
-                        )
-                    }
-                }
-            }
-        }
-    }
-    item("good_at") {
-        Column(Modifier.padding(top = 22.dp)) {
-            Text(
-                "GOOD AT", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, letterSpacing = 0.1.em),
-                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 8.dp),
-            )
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                for (t in listOf("Curled book pages", "Crumpled receipts", "Forms and tables", "Whiteboards", "Pages in shadow")) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Outlined.Check, null, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(5.dp))
-                        Text(t, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold))
-                    }
-                }
-            }
-        }
-    }
-}
-
-/** First run: a handwritten note and an arrow down to the Scan button. */
 @Composable
-private fun StartHere(modifier: Modifier) {
-    val pen = MaterialTheme.colorScheme.primary
-    Row(modifier.rotate(-4f), verticalAlignment = Alignment.Bottom) {
+private fun FirstRun(modifier: Modifier, onScan: () -> Unit, onImport: () -> Unit) {
+    val light = isPaperLight()
+    val accent = MaterialTheme.colorScheme.primary
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Text(
-            "Start here", style = MaterialTheme.typography.titleMedium.copy(fontFamily = RecursiveDisplay), color = pen,
-            modifier = Modifier.padding(bottom = 18.dp, end = 4.dp),
+            "Iron out\nany page.",
+            style = MaterialTheme.typography.headlineLarge.copy(fontSize = 48.sp, lineHeight = 50.sp, fontWeight = FontWeight.Black),
+            modifier = Modifier.padding(top = 18.dp),
         )
-        androidx.compose.foundation.Canvas(Modifier.size(40.dp, 46.dp)) {
-            val u = size.width / 44f
-            val stroke = androidx.compose.ui.graphics.drawscope.Stroke(2.4f * u, cap = androidx.compose.ui.graphics.StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
-            val p = androidx.compose.ui.graphics.Path().apply { moveTo(4 * u, 6 * u); cubicTo(24 * u, 4 * u, 38 * u, 16 * u, 34 * u, 42 * u) }
-            drawPath(p, pen, style = stroke)
-            val head = androidx.compose.ui.graphics.Path().apply { moveTo(26 * u, 36 * u); lineTo(34 * u, 44 * u); lineTo(40 * u, 34 * u) }
-            drawPath(head, pen, style = stroke)
+        // a pen stroke under it
+        androidx.compose.foundation.Canvas(Modifier.padding(top = 2.dp).size(210.dp, 14.dp)) {
+            val u = size.width / 210f
+            drawPath(
+                androidx.compose.ui.graphics.Path().apply { moveTo(3 * u, 9 * u); cubicTo(40 * u, 3 * u, 70 * u, 12 * u, 105 * u, 7 * u); cubicTo(140 * u, 2 * u, 170 * u, 3 * u, 207 * u, 8 * u) },
+                accent, style = androidx.compose.ui.graphics.drawscope.Stroke(4 * u, cap = androidx.compose.ui.graphics.StrokeCap.Round),
+            )
+        }
+        // the picture takes the room there is (a short screen draws it smaller)
+        Box(Modifier.weight(1f).fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+            IronHero(
+                Modifier.fillMaxWidth().aspectRatio(350f / 312f, matchHeightConstraintsFirst = true),
+                accent = accent, pencil = muted, shadow = if (light) Palette.Ink.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.55f),
+            )
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("BOOK PAGES", "RECEIPTS", "FORMS", "WHITEBOARDS").forEachIndexed { i, t ->
+                if (i > 0) Text("/", style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono), color = muted.copy(alpha = 0.5f))
+                Text(t, style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontWeight = FontWeight.SemiBold, letterSpacing = 0.12.em), color = muted)
+            }
+        }
+        InkPressable(
+            onClick = onScan, shape = RoundedCornerShape(14.dp), depth = 5.dp,
+            container = accent, contentColor = MaterialTheme.colorScheme.onPrimary,
+            modifier = Modifier.padding(top = 22.dp).fillMaxWidth().height(76.dp).testTag("scan"),
+        ) {
+            Row(Modifier.fillMaxSize().padding(horizontal = 22.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.PhotoCamera, null, Modifier.size(30.dp))
+                Spacer(Modifier.width(16.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Scan a page", style = MaterialTheme.typography.titleLarge.copy(fontSize = 21.sp))
+                    Text(
+                        "bent, curled or in shadow", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono),
+                        color = LocalContentColor.current.copy(alpha = 0.75f),
+                    )
+                }
+                Icon(Icons.AutoMirrored.Filled.ArrowForward, null, Modifier.size(22.dp))
+            }
+        }
+        Row(
+            Modifier.padding(top = 8.dp, bottom = 10.dp).fillMaxWidth().height(48.dp).clip(RoundedCornerShape(10.dp))
+                .clickable(role = Role.Button, onClick = onImport).navigationBarsPadding().testTag("import"),
+            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(19.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Import photos", style = MaterialTheme.typography.titleSmall)
         }
     }
 }

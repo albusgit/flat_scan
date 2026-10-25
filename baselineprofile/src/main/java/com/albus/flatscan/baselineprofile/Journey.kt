@@ -4,6 +4,7 @@ import androidx.benchmark.macro.MacrobenchmarkScope
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.BySelector
 import androidx.test.uiautomator.Until
+import java.util.regex.Pattern
 
 const val PACKAGE = "com.albus.flatscan"
 
@@ -20,7 +21,8 @@ fun MacrobenchmarkScope.firstScan() {
     device.executeShellCommand("pm grant $PACKAGE android.permission.CAMERA")
     pressHome()
     startActivityAndWait()
-    tap(By.text("Scan"))
+    // a new install opens on the first-run page ("Scan a page"); with documents the dock says "Scan"
+    tap(By.text(Pattern.compile("Scan( a page)?")))
     // a tap before CameraX is ready never completes (the emulator retries its camera check for about 6 s: the
     // capture stays pending and the camera screen open)
     tap(By.desc("Take photo").also { device.wait(Until.hasObject(it), 20_000); Thread.sleep(10_000) })

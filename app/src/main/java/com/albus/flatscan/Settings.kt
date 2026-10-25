@@ -116,11 +116,6 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("hold_hint_shown", false)
         set(v) = p.edit().putBoolean("hold_hint_shown", v).apply()
 
-    /** The home headline's highlighter has swiped once (it is drawn in place from then on). */
-    var headlineSwiped: Boolean
-        get() = p.getBoolean("headline_swiped", false)
-        set(v) = p.edit().putBoolean("headline_swiped", v).apply()
-
     /** Render parameters of a new page. */
     /** Screen mode of a new scan (Auto: descreen when the page is detected as a photo of a screen). */
     var screenMode: ScreenMode

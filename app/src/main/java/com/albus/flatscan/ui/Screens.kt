@@ -86,8 +86,6 @@ import com.albus.flatscan.FilterKind
 import com.albus.flatscan.NetEnv
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
-import androidx.compose.ui.platform.LocalContext
-import com.albus.flatscan.Settings
 import kotlinx.coroutines.delay
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -95,13 +93,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextLayoutResult
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.withStyle
 import kotlin.math.min
 
 /** The app mark: a page with a folded corner; its first accent line starts wavy and ends straight. */
@@ -124,54 +117,6 @@ internal fun LogoMark(modifier: Modifier = Modifier) {
         drawPath(wave, accent, style = Stroke(width = 2 * u, cap = StrokeCap.Round, join = StrokeJoin.Round))
         drawLine(accent, Offset(8.5f * u, 17 * u), Offset(15 * u, 17 * u), strokeWidth = 2 * u, cap = StrokeCap.Round)
     }
-}
-
-/** The home headline: [lead] then [marked], which a highlighter swipes across (once ever: drawn in place after). */
-@Composable
-internal fun HighlightedHeadline(lead: String, marked: String) {
-    val light = isPaperLight()
-    val marker = if (light) Palette.Highlighter else Graphite.Highlighter
-    val reduced = rememberReducedMotion()
-    val settings = Settings(LocalContext.current)
-    val sweep = remember { Animatable(if (settings.headlineSwiped || reduced) 1f else 0f) }
-    LaunchedEffect(Unit) {
-        if (sweep.value < 1f) {
-            delay(250)
-            sweep.animateTo(1f, tween(650, easing = FastOutSlowInEasing))
-        }
-        settings.headlineSwiped = true
-    }
-    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-    val ink = MaterialTheme.colorScheme.onBackground
-    // on graphite the marked words turn dark as the yellow arrives under them
-    val markedInk = if (light) ink else lerp(ink, Graphite.Ground, sweep.value)
-    val text = buildAnnotatedString {
-        append(lead)
-        withStyle(SpanStyle(color = markedInk)) { append(marked) }
-    }
-    val pad = with(LocalDensity.current) { 4.dp.toPx() }
-    Text(
-        text, style = MaterialTheme.typography.headlineLarge, onTextLayout = { layout = it },
-        modifier = Modifier.drawBehind {
-            val l = layout ?: return@drawBehind
-            val end = lead.length + marked.length
-            var i = lead.length
-            while (i < end) {
-                val line = l.getLineForOffset(i)
-                val lineEnd = min(end, l.getLineEnd(line, visibleEnd = true))
-                if (lineEnd <= i) break
-                val left = l.getBoundingBox(i).left - pad
-                val right = l.getBoundingBox(lineEnd - 1).right + pad
-                val top = l.getLineTop(line)
-                val bottom = l.getLineBottom(line)
-                drawRect(
-                    marker, topLeft = Offset(left, top + (bottom - top) * 0.06f),
-                    size = Size((right - left) * sweep.value, (bottom - top) * 0.94f),
-                )
-                i = l.getLineEnd(line)
-            }
-        },
-    )
 }
 
 @Composable

@@ -9,8 +9,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.EnterTransition
-import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
@@ -151,14 +149,16 @@ private fun App(vm: ScanViewModel) {
     }
     val reduced = rememberReducedMotion()
     Box(Modifier.fillMaxSize()) {
+        // with animations off the screen changes outright: AnimatedContent, even with no transition, draws the old
+        // and the new screen over each other for a frame
+        if (reduced) ScreenContent(vm, vm.screen)
         // screens slide like sheets: deeper screens come in from the right, going back slides them out; the
         // flattened page grows into the result
-        AnimatedContent(
+        else AnimatedContent(
             vm.screen,
             transitionSpec = {
                 val fwd = depth(targetState) >= depth(initialState)
                 when {
-                    reduced -> EnterTransition.None togetherWith ExitTransition.None
                     initialState == Screen.Processing && targetState == Screen.Result ->
                         (fadeIn(tween(280, 60)) + scaleIn(tween(360, easing = FastOutSlowInEasing), initialScale = 0.94f)) togetherWith fadeOut(tween(200))
                     else -> (slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) { w -> if (fwd) w / 3 else -w / 3 } + fadeIn(tween(240))) togetherWith
@@ -166,22 +166,25 @@ private fun App(vm: ScanViewModel) {
                 }.using(SizeTransform(clip = false))
             },
             label = "screen",
-        ) { screen ->
-        when (screen) {
-            Screen.Home -> HomeScreen(vm)
-            Screen.Camera -> CameraScreen(vm)
-            Screen.Crop -> CropScreen(vm)
-            Screen.Processing -> ProcessingScreen(vm)
-            Screen.Result -> ResultScreen(vm)
-            Screen.Pages -> PagesScreen(vm)
-            Screen.Settings -> SettingsScreen(vm)
-            Screen.Licenses -> LicensesScreen(vm)
-            Screen.Trash -> TrashScreen(vm)
-            Screen.Sync -> SyncScreen(vm)
-            Screen.Advanced -> AdvancedSettingsScreen(vm)
-            Screen.Storage -> StorageScreen(vm)
-        }
-        }
+        ) { screen -> ScreenContent(vm, screen) }
         MessageHost(vm)
+    }
+}
+
+@Composable
+private fun ScreenContent(vm: ScanViewModel, screen: Screen) {
+    when (screen) {
+        Screen.Home -> HomeScreen(vm)
+        Screen.Camera -> CameraScreen(vm)
+        Screen.Crop -> CropScreen(vm)
+        Screen.Processing -> ProcessingScreen(vm)
+        Screen.Result -> ResultScreen(vm)
+        Screen.Pages -> PagesScreen(vm)
+        Screen.Settings -> SettingsScreen(vm)
+        Screen.Licenses -> LicensesScreen(vm)
+        Screen.Trash -> TrashScreen(vm)
+        Screen.Sync -> SyncScreen(vm)
+        Screen.Advanced -> AdvancedSettingsScreen(vm)
+        Screen.Storage -> StorageScreen(vm)
     }
 }

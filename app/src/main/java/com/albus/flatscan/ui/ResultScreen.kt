@@ -80,12 +80,9 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.SizeTransform
-import androidx.compose.animation.EnterTransition
-import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.ui.unit.IntSize
@@ -108,6 +105,7 @@ import kotlin.math.sin
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -482,20 +480,25 @@ private fun ToolPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScope.
     val reduced = rememberReducedMotion()
     val rise = with(LocalDensity.current) { 8.dp.roundToPx() }
     val size = spring<IntSize>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
+    // with animations off the panel changes outright (AnimatedContent would draw both panels for a frame)
+    if (reduced) {
+        key(shown) {
+            Column(Modifier.fillMaxWidth().heightIn(max = cap).verticalScroll(rememberScrollState())) { panel(shown) }
+        }
+        return
+    }
     AnimatedContent(
         shown, label = "tool panel", contentAlignment = Alignment.TopCenter,
         modifier = Modifier.fillMaxWidth().heightIn(max = cap),
         transitionSpec = {
-            if (reduced) (EnterTransition.None togetherWith ExitTransition.None).using(SizeTransform(clip = true) { _, _ -> snap() })
-            else (fadeIn(tween(200, delayMillis = 70, easing = LinearOutSlowInEasing)) +
+            (fadeIn(tween(200, delayMillis = 70, easing = LinearOutSlowInEasing)) +
                 slideInVertically(tween(260, delayMillis = 70, easing = LinearOutSlowInEasing)) { rise })
                 .togetherWith(fadeOut(tween(90, easing = FastOutLinearInEasing)))
                 .using(SizeTransform(clip = true) { _, _ -> size })
         },
     ) { k ->
         Column(
-            Modifier.fillMaxWidth().then(if (reduced) Modifier else Modifier.animateContentSize(size))
-                .verticalScroll(rememberScrollState()),
+            Modifier.fillMaxWidth().animateContentSize(size).verticalScroll(rememberScrollState()),
         ) { panel(k) }
     }
 }
@@ -550,20 +553,22 @@ private fun EditorChip(
     role: Role = Role.Button,
 ) {
     val shape = ChipShape
+    // dimmed through its colours (as PanelTile)
+    val fg = LocalContentColor.current.let { if (enabled) it else it.copy(alpha = 0.4f) }
+    val edge = (if (selected) Editor.Accent else Editor.Outline).let { if (enabled) it else it.copy(alpha = 0.5f) }
     Row(
         Modifier.minimumInteractiveComponentSize().height(36.dp).clip(shape)
             .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
-            .border(1.dp, if (selected) Editor.Accent else Editor.Outline, shape)
+            .border(1.dp, edge, shape)
             .selectable(selected, enabled = enabled, role = role, onClick = onClick)
-            .alpha(if (enabled) 1f else 0.4f)
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (icon != null) {
-            Icon(icon, null, Modifier.size(16.dp))
+            Icon(icon, null, Modifier.size(16.dp), tint = fg)
             Spacer(Modifier.width(8.dp))
         }
-        Text(text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), maxLines = 1)
+        Text(text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), color = fg, maxLines = 1)
     }
 }
 
@@ -652,11 +657,14 @@ private fun CleanRow(icon: ImageVector, title: String, caption: String, value: S
         verticalAlignment = Alignment.CenterVertically,
     ) {
         CleanIcon(icon)
+        // the state beside the title, so the caption keeps the row's width
         Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.titleSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f, fill = false))
+                if (value.isNotEmpty()) Text(value, style = MaterialTheme.typography.labelMedium, color = Editor.Accent, maxLines = 1, modifier = Modifier.padding(start = 8.dp))
+            }
             Text(caption, style = MaterialTheme.typography.bodySmall, color = Editor.Muted)
         }
-        if (value.isNotEmpty()) Text(value, style = MaterialTheme.typography.labelLarge, color = Editor.Accent, modifier = Modifier.padding(start = 10.dp))
         Icon(Icons.Outlined.ChevronRight, null, tint = Editor.Muted)
     }
 }
@@ -668,28 +676,37 @@ private fun CleanIcon(icon: ImageVector) {
     }
 }
 
-/** A small segmented choice of the editor panel ([options]: value to label). */
+/**
+ * A segmented choice of the editor panel ([options]: value to label): a track with the chosen option as a solid pill
+ * filling its cell. [wide]: the track takes the width it is given, the options sharing it equally.
+ */
 @Composable
-private fun <T> EditorSegments(label: String, options: List<Pair<T, String>>, selected: T, onPick: (T) -> Unit) {
+private fun <T> EditorSegments(
+    label: String, options: List<Pair<T, String>>, selected: T, modifier: Modifier = Modifier, wide: Boolean = false, onPick: (T) -> Unit,
+) {
     Row(
-        Modifier.clip(ChipShape).border(1.dp, Editor.Outline, ChipShape).selectableGroup().semantics { contentDescription = label },
+        modifier.height(40.dp).clip(ChipShape).background(Editor.Raised).border(1.dp, Editor.Outline, ChipShape).padding(3.dp)
+            .selectableGroup().semantics { contentDescription = label },
     ) {
         for ((v, text) in options) {
             val on = v == selected
+            val fill by animateColorAsState(if (on) Editor.Accent else Color.Transparent, label = "segment")
             Box(
-                Modifier.minimumInteractiveComponentSize().height(36.dp)
-                    .background(if (on) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
-                    .selectable(on, role = Role.RadioButton) { onPick(v) }.padding(horizontal = 12.dp),
+                (if (wide) Modifier.weight(1f) else Modifier).fillMaxHeight().clip(SegmentShape).background(fill)
+                    .selectable(on, role = Role.RadioButton) { onPick(v) }.padding(horizontal = 14.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
                     text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = if (on) FontWeight.ExtraBold else FontWeight.Medium),
-                    color = if (on) Editor.Accent else Editor.Text, maxLines = 1,
+                    color = if (on) Editor.Ground else Editor.Text, maxLines = 1,
                 )
             }
         }
     }
 }
+
+/** A segment inside the [ChipShape] track (3 dp in): its corners follow the track's. */
+private val SegmentShape = RoundedCornerShape(5.dp)
 
 /** Clean up: marks erased, fingers at the edges, shaded cells made one colour, a screen photo's pixel grid. */
 @Composable
@@ -733,14 +750,18 @@ private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> 
         }
         // a photo of a monitor, laptop or phone: descreen (moire, pixel grid) before the filter; Auto finds only clear
         // cases (docs/results/r11/filters.md)
-        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            CleanIcon(Icons.Outlined.Monitor)
-            Column(Modifier.weight(1f).padding(end = 10.dp)) {
-                Text("Photo of a screen", style = MaterialTheme.typography.titleSmall)
-                Text("Removes the pixel grid and moiré.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted)
+        Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CleanIcon(Icons.Outlined.Monitor)
+                Column(Modifier.weight(1f)) {
+                    Text("Photo of a screen", style = MaterialTheme.typography.titleSmall)
+                    Text("Removes the pixel grid and moiré.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted)
+                }
             }
+            // under the text, at the text's width: the label keeps the row and the choice gets its own line
             EditorSegments(
                 "Photo of a screen", listOf(ScreenMode.Auto to "Auto", ScreenMode.On to "On", ScreenMode.Off to "Off"), p.screen,
+                Modifier.padding(start = 46.dp, top = 8.dp).fillMaxWidth(), wide = true,
             ) { vm.setScreen(it) }
         }
     }
@@ -760,18 +781,20 @@ private fun PanelTile(
     role: Role = Role.Button,
     onClick: () -> Unit,
 ) {
+    // dimmed through its colours, not a layer's alpha: the outline under a layer whose alpha changed was not drawn again
+    val fg = (if (selected) Editor.Accent else LocalContentColor.current).let { if (enabled) it else it.copy(alpha = 0.4f) }
+    val edge = (if (selected) Editor.Accent else Editor.Outline).let { if (enabled) it else it.copy(alpha = 0.5f) }
     Column(
         modifier.heightIn(min = 64.dp).clip(ChipShape)
             .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
-            .border(1.dp, if (selected) Editor.Accent else Editor.Outline, ChipShape)
+            .border(1.dp, edge, ChipShape)
             .selectable(selected, enabled = enabled, role = role, onClick = onClick)
-            .alpha(if (enabled) 1f else 0.4f)
             .padding(horizontal = 4.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
-        Icon(icon, null, Modifier.size(20.dp), tint = if (selected) Editor.Accent else LocalContentColor.current)
+        Icon(icon, null, Modifier.size(20.dp), tint = fg)
         Spacer(Modifier.height(5.dp))
-        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center, color = if (selected) Editor.Accent else Color.Unspecified)
+        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center, color = fg)
     }
 }
 
@@ -811,14 +834,12 @@ private fun PagePanel(vm: ScanViewModel) {
             }
         }
         Column {
-            // with large text the choice goes under its label
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("This page is a", style = MaterialTheme.typography.titleSmall, modifier = Modifier.align(Alignment.CenterVertically))
-                // document or whiteboard processing for this page (processed again from its photo)
-                EditorSegments("Kind of page", listOf(CaptureMode.Document to "Document", CaptureMode.Whiteboard to "Whiteboard"), vm.pageMode) {
-                    if (it != vm.pageMode) vm.setPageMode(it)
-                }
-            }
+            Text("This page is a", style = MaterialTheme.typography.titleSmall)
+            // document or whiteboard processing for this page (processed again from its photo)
+            EditorSegments(
+                "Kind of page", listOf(CaptureMode.Document to "Document", CaptureMode.Whiteboard to "Whiteboard"), vm.pageMode,
+                Modifier.padding(top = 8.dp).fillMaxWidth(), wide = true,
+            ) { if (it != vm.pageMode) vm.setPageMode(it) }
             Text("Changing these processes the page again.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 4.dp))
         }
         if (vm.spreadPartner != null) {
@@ -854,8 +875,8 @@ private fun FingerPanel(
         FlowRow(
             Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            EditorSegments("Tool", listOf(true to "Smart select", false to "Brush"), smart, onSmart)
-            EditorSegments("Remove or keep", listOf(true to "Remove", false to "Keep"), add, onAdd)
+            EditorSegments("Tool", listOf(true to "Smart select", false to "Brush"), smart, onPick = onSmart)
+            EditorSegments("Remove or keep", listOf(true to "Remove", false to "Keep"), add, onPick = onAdd)
             EditorChip(if (vm.fingersAuto) "Automatic: on" else "Automatic: off", onClick = { vm.setFingersAutoOn(!vm.fingersAuto) }, selected = vm.fingersAuto)
         }
         // how a removed finger is filled: the paper around it, or the inpainting net (content-aware, on the phone)
@@ -1022,7 +1043,7 @@ private fun LinesPanel(
                 PanelTile(
                     "Add line", Icons.Outlined.Draw, Modifier.weight(1f).fillMaxHeight(), selected = drawing, enabled = !ironing, role = Role.Switch,
                 ) { onDrawing(!drawing) }
-                PanelTile("Undo line", Icons.AutoMirrored.Outlined.Undo, Modifier.weight(1f).fillMaxHeight(), enabled = drawn > 0 && !ironing) { vm.undoUserLine() }
+                PanelTile("Undo", Icons.AutoMirrored.Outlined.Undo, Modifier.weight(1f).fillMaxHeight(), enabled = vm.lineUndoSteps > 0 && !ironing) { vm.undoLineEdit() }
                 PanelTile("Use all lines", Icons.Outlined.Restore, Modifier.weight(1f).fillMaxHeight(), enabled = ignoredBoxes > 0 && !ironing) { vm.clearIgnore() }
             }
         } else {

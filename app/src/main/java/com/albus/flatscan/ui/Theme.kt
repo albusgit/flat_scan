@@ -2,6 +2,7 @@ package com.albus.flatscan.ui
 
 import android.app.Activity
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -216,6 +217,9 @@ fun EditorTheme(content: @Composable () -> Unit) {
         }
     }
     MaterialTheme(colorScheme = EditorScheme, typography = Type, shapes = Shape) {
-        Surface(Modifier.fillMaxSize(), color = Editor.Ground, contentColor = Editor.Text, content = content)
+        // the desk's graph paper on the editor's ground too (graphite lines), under the photo and the page
+        Surface(Modifier.fillMaxSize(), color = Editor.Ground, contentColor = Editor.Text) {
+            Box(Modifier.fillMaxSize().graphPaper(), propagateMinConstraints = true) { content() }
+        }
     }
 }
