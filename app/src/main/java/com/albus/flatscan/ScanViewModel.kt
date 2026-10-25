@@ -192,6 +192,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** The spread page being processed now (the second one). */
     private var spreadCurrent: SpreadPage? = null
 
+    /** The page being processed is one page of a book spread (the processing animation curls it at the gutter). */
+    val processingBookPage: Boolean get() = spreadCurrent != null
+
+    /** The processing animation has landed (PaperUnfold's onFinished) for this run: the result screen waits for it. */
+    var unfoldLanded by mutableStateOf(false)
+
     private class CropBackup(
         val photo: Bitmap, val display: Bitmap?, val corners: List<Offset>, val detected: List<Offset>?,
         val userRotated: Boolean, val cropRotation: Int, val reasons: List<String>, val forceHomography: Boolean, val pageIndex: Int,
@@ -2132,6 +2138,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         screen = Screen.Processing
         progress = 0f
         stage = "Starting"
+        unfoldLanded = false
         viewModelScope.launch {
             if (!same) commitCurrent()
             sourceJob?.join()
@@ -2175,6 +2182,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.Crop
                 return@launch
             }
+            // the core's last report is 95 % (Finishing): done, so the animation plays its last beats
+            progress = 1f
             if (id !in pages) {
                 val i = spread?.let { pages.indexOf(it.firstId) } ?: -1
                 val at = insertAt
@@ -2256,6 +2265,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         awaitRender()
         // a stored session renders what out.jpg already holds
         if (restored) committedVersion = outVersion
+        // the processing animation ends 0.4-0.9 s after the core (the page thumps flat, the light band, the landing)
+        if (!restored && screen == Screen.Processing) withTimeoutOrNull(1500) { snapshotFlow { unfoldLanded }.first { it } }
         if (screen == Screen.Processing && !batch) screen = Screen.Result
         fetchBefore(h)
         if (showWrinkles) fetchOverlay(h)

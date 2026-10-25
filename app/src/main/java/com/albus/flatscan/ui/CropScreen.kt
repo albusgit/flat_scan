@@ -34,6 +34,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -85,6 +86,13 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
     var circling by remember { mutableStateOf(false) }
     // the quality-gate note stays until it is closed or a corner is moved
     var noteClosed by remember(vm.cropReasons) { mutableStateOf(false) }
+    // Flatten page tapped while the page is still being found: it starts once the crop is there
+    var queued by remember(photo) { mutableStateOf(false) }
+    LaunchedEffect(queued, vm.detecting) {
+        if (!queued || vm.detecting) return@LaunchedEffect
+        queued = false
+        if (vm.corners.size == 4) vm.process()
+    }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(
             Modifier.fillMaxWidth().height(64.dp).padding(start = 4.dp, end = 12.dp, top = 8.dp),
@@ -171,14 +179,15 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
                 PillText("Cancel")
             }
             PrimaryPill(
-                onClick = { vm.process() },
-                enabled = !vm.detecting && !circling && photo != null && vm.corners.size == 4,
+                onClick = { if (vm.detecting) queued = true else vm.process() },
+                enabled = !circling && photo != null && (vm.detecting || vm.corners.size == 4),
                 container = Editor.Accent, content = Editor.Ground,
                 modifier = Modifier.weight(1.6f),
             ) {
                 PillText("Flatten page")
                 Spacer(Modifier.width(8.dp))
-                Icon(Icons.AutoMirrored.Filled.ArrowForward, null, Modifier.size(18.dp))
+                if (queued) CircularProgressIndicator(Modifier.size(18.dp), color = Editor.Ground, strokeWidth = 2.dp)
+                else Icon(Icons.AutoMirrored.Filled.ArrowForward, null, Modifier.size(18.dp))
             }
         }
     }

@@ -194,10 +194,11 @@ fun ProcessingScreen(vm: ScanViewModel) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        // the photo arrives crumpled, unfolds with the core's steps and is ironed flat
+        // the page peels off the photo, springs out of its curl and is ironed flat, in step with the core
         PaperUnfold(
             photo, vm.corners, vm.photo?.width ?: 0, vm.progress,
             Modifier.widthIn(max = 340.dp).fillMaxWidth().aspectRatio(0.85f),
+            book = vm.processingBookPage, onFinished = { vm.unfoldLanded = true },
         )
         Spacer(Modifier.height(20.dp))
         Text(if (photo == null) "Opening the page" else "Flattening the page", style = MaterialTheme.typography.headlineSmall)
