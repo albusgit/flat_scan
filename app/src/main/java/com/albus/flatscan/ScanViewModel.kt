@@ -98,6 +98,17 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private var pagesReturnTo = Screen.Home
     var message by mutableStateOf<String?>(null)
 
+    /** An action offered with one message ([showMessage]); shown only while that message is. */
+    class MessageAction(val message: String, val label: String, val run: () -> Unit)
+    var messageAction by mutableStateOf<MessageAction?>(null)
+        private set
+
+    /** [text] with an action button ([label], e.g. Undo) for 5 s. */
+    fun showMessage(text: String, label: String, run: () -> Unit) {
+        messageAction = MessageAction(text, label, run)
+        message = text
+    }
+
     private val nativeExec = Executors.newSingleThreadExecutor { r -> Thread(r, "flatscan-native") }
     private val nativeCtx = nativeExec.asCoroutineDispatcher()
     /** The live session as the native thread sees it; read and written only on [nativeCtx]. */

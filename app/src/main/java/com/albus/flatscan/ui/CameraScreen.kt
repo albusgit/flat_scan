@@ -57,11 +57,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.FlashOff
 import androidx.compose.material.icons.outlined.FlashOn
 import androidx.compose.material.icons.outlined.PhotoLibrary
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.alpha
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.ui.draw.rotate
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -149,8 +153,16 @@ private fun CameraPreview(vm: ScanViewModel) {
         }, ContextCompat.getMainExecutor(ctx))
         onDispose { runCatching { future.get().unbindAll() } }
     }
+    // the shutter's white flash (85 %, fading over 320 ms)
+    val flash = remember { Animatable(0f) }
+    val reduced = rememberReducedMotion()
+    val scope = rememberCoroutineScope()
     val shoot = {
         busy = true
+        if (!reduced) scope.launch {
+            flash.snapTo(0.85f)
+            flash.animateTo(0f, tween(320, easing = LinearOutSlowInEasing))
+        }
         ctx.cacheDir.listFiles { f -> f.name.startsWith("capture_") }?.forEach { it.delete() }
         val file = File(ctx.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
         capture.takePicture(
@@ -170,6 +182,7 @@ private fun CameraPreview(vm: ScanViewModel) {
     }
     Box(Modifier.fillMaxSize().background(Editor.Ground)) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        if (flash.value > 0f) Box(Modifier.fillMaxSize().graphicsLayer { alpha = flash.value }.background(Color.White))
         // top: close, a hint, the torch
         Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             RoundButton(onClick = { vm.back() }) { Icon(Icons.Outlined.Close, "Close the camera", tint = Editor.Text) }
@@ -208,18 +221,18 @@ private fun CameraPreview(vm: ScanViewModel) {
                         }
                     }
                 }
+                // a capture asked for before CameraX has bound the camera never completes (the screen would wait
+                // for ever): the shutter waits for the camera, dimmed
+                val ready = camera != null
+                // pressed in while the photo is taken
+                val sink by animateFloatAsState(if (busy) 0.78f else 1f, if (reduced) snap() else tween(140), label = "shutter")
                 Box(
-                    Modifier.size(80.dp).border(4.dp, Color.White, CircleShape).padding(8.dp).background(Color.White, CircleShape)
+                    Modifier.size(80.dp).alpha(if (ready) 1f else 0.45f).clip(CircleShape).border(4.dp, Color.White, CircleShape)
                         .semantics { contentDescription = "Take photo" }.testTag("shutter")
-                        .clickable(enabled = !busy) { shoot() },
+                        .clickable(enabled = ready && !busy) { shoot() },
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (busy) {
-                        // a tiny crumpled ball tumbling while the photo is taken
-                        val spin = rememberInfiniteTransition(label = "capture")
-                        val turn by spin.animateFloat(0f, 360f, infiniteRepeatable(tween(1400, easing = LinearEasing)), label = "turn")
-                        CrumpledBall(Modifier.size(40.dp).rotate(turn), seed = 5)
-                    }
+                    Box(Modifier.size(64.dp).graphicsLayer { scaleX = sink; scaleY = sink }.background(Color.White, CircleShape))
                 }
                 Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
                     val n = vm.pages.size

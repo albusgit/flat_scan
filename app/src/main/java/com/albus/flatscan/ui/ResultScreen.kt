@@ -78,6 +78,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
@@ -229,25 +234,32 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = { if (mode != AreaMode.None) closeTool() else vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            // the page count opens the document's pages (reorder, select, delete, add)
-            Row(
+            // the page count opens the document's pages (reorder, select, delete, add); two lines, so that undo and
+            // redo fit beside it
+            Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(8.dp))
                     .clickable(role = Role.Button, onClickLabel = "Show all pages") { vm.open(Screen.Pages) }
-                    .padding(horizontal = 8.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
             ) {
                 Text(
-                    buildAnnotatedString {
-                        if (vm.pages.size > 1 && index >= 0) {
-                            append("Page ${index + 1} ")
-                            withStyle(SpanStyle(color = Editor.Muted, fontWeight = FontWeight.SemiBold)) { append("of ${vm.pages.size}") }
-                        } else {
-                            append("Page")
-                        }
-                    },
-                    style = MaterialTheme.typography.titleMedium, maxLines = 1,
+                    if (vm.pages.size > 1 && index >= 0) "Page ${index + 1}" else "Page",
+                    style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                Icon(Icons.Outlined.ExpandMore, null, tint = Editor.Muted, modifier = Modifier.padding(start = 2.dp).size(20.dp))
+                if (vm.pages.size > 1 && index >= 0) {
+                    Text(
+                        "of ${vm.pages.size}", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 12.sp),
+                        color = Editor.Muted, maxLines = 1,
+                    )
+                }
+            }
+            // undo / redo of every edit that does not re-run the geometry (filters, adjust, rotate, areas): always
+            // here, dimmed when there is nothing to undo; the area tools have their own undo in their panels
+            val editing = mode == AreaMode.None
+            IconButton(onClick = { vm.undo() }, enabled = editing && vm.history.canUndo, modifier = Modifier.width(40.dp)) {
+                Icon(Icons.AutoMirrored.Outlined.Undo, "Undo")
+            }
+            IconButton(onClick = { vm.redo() }, enabled = editing && vm.history.canRedo, modifier = Modifier.width(40.dp)) {
+                Icon(Icons.AutoMirrored.Outlined.Redo, "Redo")
             }
             if (vm.pending.isEmpty()) IconButton(onClick = addPage) { Icon(Icons.Outlined.PostAdd, "Add a page") }
             Box {
@@ -267,17 +279,17 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     )
                 }
             }
-            Button(
+            Spacer(Modifier.width(4.dp))
+            // pressed into its ink shadow, as the app's other primary buttons
+            InkPressable(
                 onClick = { sheet = Sheet.Save }, enabled = ready, shape = ChipShape,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Editor.Text, contentColor = Editor.Ground,
-                    disabledContainerColor = Editor.Text.copy(alpha = 0.3f), disabledContentColor = Editor.Ground.copy(alpha = 0.7f),
-                ),
-                contentPadding = PaddingValues(horizontal = 18.dp),
+                container = Editor.Text, contentColor = Editor.Ground, shadow = Color.Black,
                 modifier = Modifier.height(40.dp),
             ) {
-                if (exporter.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Editor.Ground)
-                else Text("Save", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp))
+                Box(Modifier.padding(horizontal = 18.dp), contentAlignment = Alignment.Center) {
+                    if (exporter.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Editor.Ground)
+                    else Text("Save", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp))
+                }
             }
         }
     }
@@ -320,6 +332,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 onStroke = { pts -> if (mode == AreaMode.Lines) vm.addUserLine(pts) else vm.addFingerStroke(brushAdd, brushRadius, pts) },
                 drawStrokes = (mode == AreaMode.Fingers && !smartSelect) || (mode == AreaMode.Lines && drawingLine),
                 pendingLines = if (mode == AreaMode.Lines) vm.pendingUserLines else emptyList(),
+                fadeKey = p.filter,
             )
             if (mode == AreaMode.None && vm.showHoldHint && vm.page != null && compare == null) {
                 Text(
@@ -327,19 +340,10 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
-                        .background(Editor.Text.copy(alpha = 0.12f), ChipShape)
+                        // dark, as the compare button: a light pill vanished on a white page
+                        .background(Editor.Panel.copy(alpha = 0.88f), ChipShape)
                         .padding(horizontal = 14.dp, vertical = 7.dp),
                 )
-            }
-            // undo / redo of every edit that does not re-run the geometry (filters, adjust, rotate, areas)
-            AnimatedVisibility(
-                visible = mode == AreaMode.None && (vm.history.canUndo || vm.history.canRedo),
-                enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopStart),
-            ) {
-                Row(Modifier.padding(4.dp).background(Editor.Panel.copy(alpha = 0.88f), RoundedCornerShape(10.dp))) {
-                    IconButton(onClick = { vm.undo() }, enabled = vm.history.canUndo) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
-                    IconButton(onClick = { vm.redo() }, enabled = vm.history.canRedo) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
-                }
             }
             Row(Modifier.align(Alignment.TopEnd).padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (vm.rendering) {
@@ -466,6 +470,8 @@ private fun SteadyPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScop
     val density = LocalDensity.current
     val tallest = remember(density.density, density.fontScale) { intArrayOf(0) }
     val scroll = rememberScrollState()
+    val reduced = rememberReducedMotion()
+    val rise = with(density) { 12.dp.roundToPx() }
     SubcomposeLayout(Modifier.fillMaxWidth()) { cs ->
         val w = cs.maxWidth
         val capPx = cap.roundToPx()
@@ -474,7 +480,16 @@ private fun SteadyPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScop
             for (m in subcompose(k) { Column(Modifier.fillMaxWidth()) { panel(k) } }) tallest[0] = max(tallest[0], m.measure(free).height)
         }
         val minH = min(tallest[0], capPx)
-        val placeables = subcompose(Unit) { Column(Modifier.fillMaxWidth().verticalScroll(scroll)) { panel(shown) } }
+        // a new tab's panel fades in rising 12 dp (160 ms); the height stays (steady), so nothing above moves
+        val placeables = subcompose(Unit) {
+            Column(Modifier.fillMaxWidth().verticalScroll(scroll)) {
+                if (reduced) panel(shown)
+                else AnimatedContent(
+                    shown, label = "panel",
+                    transitionSpec = { (fadeIn(tween(160)) + slideInVertically(tween(160)) { rise }) togetherWith fadeOut(tween(100)) },
+                ) { k -> Column(Modifier.fillMaxWidth()) { panel(k) } }
+            }
+        }
             .map { it.measure(Constraints(minWidth = w, maxWidth = w, minHeight = minH, maxHeight = max(minH, capPx))) }
         val h = placeables.maxOfOrNull { it.height } ?: minH
         tallest[0] = max(tallest[0], h)
@@ -583,9 +598,12 @@ private fun FilterPanel(vm: ScanViewModel) {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 val ring = RoundedCornerShape(6.dp)
+                // the selection ring moves to the picked filter (160 ms)
+                val ringWidth by animateDpAsState(if (selected) 2.5.dp else 1.dp, tween(160), label = "ring")
+                val ringColor by animateColorAsState(if (selected) Editor.Accent else Editor.Divider, tween(160), label = "ring")
                 Box(
                     Modifier.size(58.dp, 76.dp)
-                        .border(if (selected) 2.5.dp else 1.dp, if (selected) Editor.Accent else Editor.Divider, ring)
+                        .border(ringWidth, ringColor, ring)
                         .padding(3.dp).clip(RoundedCornerShape(3.dp)).background(Editor.Ground),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -606,15 +624,16 @@ private fun FilterPanel(vm: ScanViewModel) {
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // the next imported photo first: the step most often taken from here
+            if (vm.pending.isNotEmpty()) {
+                EditorChip("Next photo (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
+            }
             if (vm.pages.size > 1) {
                 // the filter, strength and adjustments of this page on every page of the document
                 EditorChip(
                     if (vm.applyingAll) "Applying..." else "Use this look on all ${vm.pages.size} pages", onClick = { vm.applyToAllPages() },
                     icon = Icons.Outlined.DoneAll, enabled = !vm.applyingAll && vm.page != null,
                 )
-            }
-            if (vm.pending.isNotEmpty()) {
-                EditorChip("Next photo (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
             }
         }
     } else {

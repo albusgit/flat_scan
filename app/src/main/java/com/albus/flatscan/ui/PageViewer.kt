@@ -159,6 +159,8 @@ fun PageViewer(
     onStroke: (List<Float>) -> Unit = {},
     drawStrokes: Boolean = areaMode == AreaMode.Fingers,
     pendingLines: List<FloatArray> = emptyList(),
+    // a change of fadeKey (the filter) crossfades the rendering before it into the next one (200 ms)
+    fadeKey: Any? = null,
 ) {
     val protectMode = areaMode != AreaMode.None
     val pageImg = remember(page) { page?.asImageBitmap() }
@@ -175,6 +177,26 @@ fun PageViewer(
         } else {
             crinkle.snapTo(0f)
         }
+    }
+    // the crossfade: the rendering shown before (the other of the page's two render targets, not written while
+    // this one is new) over the new one, fading out
+    var fadeFrom by remember { mutableStateOf<ImageBitmap?>(null) }
+    val fadeOut = remember { Animatable(0f) }
+    val key by rememberUpdatedState(fadeKey)
+    val last = remember { arrayOf<Any?>(null, null) }   // the image last drawn, and its fadeKey
+    LaunchedEffect(pageImg) {
+        val prev = last[0] as ImageBitmap?
+        val changed = last[1] != key
+        last[0] = pageImg
+        last[1] = key
+        if (reduced || prev == null || pageImg == null || prev === pageImg || !changed || prev.width != pageImg.width || prev.height != pageImg.height) {
+            fadeFrom = null
+            return@LaunchedEffect
+        }
+        fadeFrom = prev
+        fadeOut.snapTo(1f)
+        fadeOut.animateTo(0f, tween(200))
+        fadeFrom = null
     }
     var box by remember { mutableStateOf(Size.Zero) }
     // the rectangle being drawn, page pixels
@@ -366,6 +388,13 @@ fun PageViewer(
         with(g) {
             inPage {
                 drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null)
+                val f = fadeFrom
+                if (f != null && shown === pageImg && fadeOut.value > 0f) {
+                    drawImage(
+                        f, srcOffset = IntOffset.Zero, srcSize = IntSize(f.width, f.height), dstOffset = IntOffset.Zero, dstSize = IntSize(pageWidth, pageHeight),
+                        alpha = fadeOut.value, filterQuality = FilterQuality.Medium, colorFilter = colorFilter,
+                    )
+                }
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
                 val c = crinkle.value
                 if (holding && c > 0.01f) drawCreases(pageWidth, pageHeight, c, 2.dp.toPx() / g.k)

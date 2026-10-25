@@ -86,6 +86,7 @@ import com.albus.flatscan.FilterKind
 import com.albus.flatscan.NetEnv
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
+import androidx.compose.ui.platform.LocalContext
 import com.albus.flatscan.Settings
 import kotlinx.coroutines.delay
 import androidx.compose.animation.core.Animatable
@@ -125,22 +126,20 @@ internal fun LogoMark(modifier: Modifier = Modifier) {
     }
 }
 
-/** Shown once per launch: the highlighter swipes across the headline's last words. */
-private var highlighterSwiped = false
-
-/** The home headline: [lead] then [marked], which a highlighter swipes across (once per launch). */
+/** The home headline: [lead] then [marked], which a highlighter swipes across (once ever: drawn in place after). */
 @Composable
 internal fun HighlightedHeadline(lead: String, marked: String) {
     val light = isPaperLight()
     val marker = if (light) Palette.Highlighter else Graphite.Highlighter
     val reduced = rememberReducedMotion()
-    val sweep = remember { Animatable(if (highlighterSwiped || reduced) 1f else 0f) }
+    val settings = Settings(LocalContext.current)
+    val sweep = remember { Animatable(if (settings.headlineSwiped || reduced) 1f else 0f) }
     LaunchedEffect(Unit) {
         if (sweep.value < 1f) {
             delay(250)
             sweep.animateTo(1f, tween(650, easing = FastOutSlowInEasing))
         }
-        highlighterSwiped = true
+        settings.headlineSwiped = true
     }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val ink = MaterialTheme.colorScheme.onBackground
@@ -239,12 +238,22 @@ internal fun SettingsSheet(title: String, content: @Composable ColumnScope.() ->
 @Composable
 fun MessageHost(vm: ScanViewModel) {
     val m = vm.message ?: return
-    LaunchedEffect(m) {
-        delay(3500)
+    val action = vm.messageAction?.takeIf { it.message == m }
+    LaunchedEffect(m, action) {
+        delay(if (action != null) 5000 else 3500)
         vm.message = null
     }
     Box(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), contentAlignment = Alignment.BottomCenter) {
-        Snackbar(shape = MaterialTheme.shapes.small) {
+        Snackbar(
+            shape = MaterialTheme.shapes.small,
+            action = action?.let { a ->
+                {
+                    TextButton(onClick = { vm.message = null; a.run() }) {
+                        Text(a.label, color = MaterialTheme.colorScheme.inversePrimary, fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (m.startsWith("Saved")) {
                     PaperPlaneLanding(m)

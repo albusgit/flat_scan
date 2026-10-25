@@ -129,9 +129,9 @@ private data class AddTarget(val before: String?)
 fun PagesScreen(vm: ScanViewModel) {
     val exporter = rememberExportActions(vm)
     var sheet by remember { mutableStateOf(PagesSheet.None) }
-    var confirmDelete by remember { mutableStateOf<Set<String>?>(null) }
-    // the pages being crumpled away after their delete was confirmed
+    // the pages being crumpled away (no confirmation: the message after it offers Undo)
     var crumpling by remember { mutableStateOf(setOf<String>()) }
+    val delete = { ids: Set<String> -> crumpling = ids.filter { it in vm.pages }.toSet() }
     var menu by remember { mutableStateOf(false) }
     var selecting by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<String>()) }
@@ -228,13 +228,15 @@ fun PagesScreen(vm: ScanViewModel) {
                     if (selecting) selected = if (id in selected) selected - id else selected + id
                     else vm.openPage(id)
                 },
-                onDelete = { confirmDelete = setOf(id) },
+                onDelete = { delete(setOf(id)) },
                 crumpling = id in crumpling,
                 onCrumpled = {
                     // the last of the set to finish deletes them all (one undo step)
                     if (crumpling.isNotEmpty()) {
+                        val k = crumpling.size
                         vm.deletePages(crumpling)
                         crumpling = emptySet()
+                        vm.showMessage(if (k == 1) "Page deleted" else "$k pages deleted", "Undo") { if (vm.canUndoPages) vm.undoPages() }
                     }
                 },
                 onRotate = { vm.rotatePages(setOf(id), 1) },
@@ -251,7 +253,7 @@ fun PagesScreen(vm: ScanViewModel) {
                 BarAction(Icons.AutoMirrored.Outlined.RotateRight, "Rotate", any) { vm.rotatePages(selected, 1) }
                 BarAction(Icons.Outlined.ContentCopy, "Duplicate", any) { vm.duplicatePages(selected) }
                 BarAction(Icons.AutoMirrored.Outlined.DriveFileMove, "Move", any) { moving = selected }
-                BarAction(Icons.Outlined.Delete, "Delete", any) { confirmDelete = selected }
+                BarAction(Icons.Outlined.Delete, "Delete", any) { delete(selected) }
             }
         } else Row(
             Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 16.dp),
@@ -293,16 +295,6 @@ fun PagesScreen(vm: ScanViewModel) {
             },
             confirmButton = { TextButton(onClick = { vm.renameDocument(text); renaming = false }) { Text("Rename") } },
             dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } },
-        )
-    }
-    confirmDelete?.let { ids ->
-        val title = if (ids.size == 1) "Delete page ${vm.pages.indexOf(ids.first()) + 1}?" else "Delete ${ids.size} pages?"
-        AlertDialog(
-            onDismissRequest = { confirmDelete = null },
-            title = { Text(title) },
-            text = { Text("Undo brings them back while you are on this screen.") },
-            confirmButton = { TextButton(onClick = { crumpling = ids.filter { it in vm.pages }.toSet(); confirmDelete = null }) { Text("Delete") } },
-            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel") } },
         )
     }
     moving?.let { ids ->
