@@ -858,6 +858,16 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         lastSource = ImportSource.Camera
         persist()
         screen = Screen.Camera
+        prewarmFinder()
+    }
+
+    private var finderWarm = false
+
+    /** The page finder's session, made while the camera is open (its first photo would otherwise wait for it). */
+    private fun prewarmFinder() {
+        if (finderWarm || !settings.pageFinderNet) return
+        finderWarm = true
+        viewModelScope.launch(Dispatchers.IO) { runCatching { NativeLib.prewarmFinder() }.onFailure { Log.e(TAG, "page finder warm-up failed", it) } }
     }
 
     /** Home > Scan: the camera, into a new document. */

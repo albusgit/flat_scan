@@ -875,6 +875,17 @@ JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_pageFinder(JNIEn
     return a;
 }
 
+// The page finder's session made ahead of its first photo (the camera screen): one run on a blank input. The
+// first photo's entry then says first_use false, as its run no longer makes the session.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_prewarmFinder(JNIEnv*, jclass) {
+    auto g = group(g_finder);
+    if (!g->first_use(NetId::PageFinder)) return;
+    Tensor x{{1, 3, SEG_SIZE, SEG_SIZE}, std::vector<float>((size_t)SEG_INPUT_LEN, 0.f)};
+    std::vector<Tensor> y;
+    std::string err;
+    if (!g->inf->run(NetId::PageFinder, x, y, &err)) LOGI("page finder warm-up: %s", err.c_str());
+}
+
 // -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
 //    "ok", "fit_median_px", "needs_manual_crop": [reasons], finder fields}, ...]} (2 pages: book spread)
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,

@@ -98,6 +98,9 @@ object NativeLib {
      */
     @JvmStatic external fun pageFinder(photo: Bitmap, timing: Array<String?>?): FloatArray?
 
+    /** Makes the page finder's session ahead of [pageFinder]'s first photo (one run on a blank input; off the main thread). */
+    @JvmStatic external fun prewarmFinder()
+
     /**
      * Page detection for the crop screen. logits: the page-finder net's output for this photo
      * (float[2 * 256 * 256]) or null for the colour-threshold detector. JSON: ok, error, pages
