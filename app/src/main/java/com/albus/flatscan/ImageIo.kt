@@ -6,6 +6,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import androidx.exifinterface.media.ExifInterface
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.InputStream
 import kotlin.math.hypot
@@ -99,27 +104,53 @@ fun formatBytes(n: Long): String {
 /**
  * The pages of a PDF ([uri]) as PNG files in cacheDir/pdf_import/ (the folder is emptied first), white
  * background, at 200 dpi with the long side capped at 3508 px (A4 at 300 dpi). For importing PDF pages.
+ * [onCount] gets the files (page order) before the first page is rendered, [onPage] a page's index once its
+ * file is written. The pages render one after the other (PdfRenderer), and up to [encoders] are PNG-encoded at
+ * a time beside that (Android's encoder is single-threaded; the same bytes as one at a time).
  */
-fun renderPdfPages(ctx: Context, uri: Uri): List<File> {
+suspend fun renderPdfPages(
+    ctx: Context,
+    uri: Uri,
+    encoders: Int = Runtime.getRuntime().availableProcessors().coerceIn(1, 3),
+    onCount: (List<File>) -> Unit = {},
+    onPage: (Int) -> Unit = {},
+): List<File> = withContext(Dispatchers.IO) {
     val dir = File(ctx.cacheDir, "pdf_import").apply { deleteRecursively(); mkdirs() }
-    val out = mutableListOf<File>()
-    ctx.contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+    (ctx.contentResolver.openFileDescriptor(uri, "r") ?: error("cannot open $uri")).use { fd ->
         android.graphics.pdf.PdfRenderer(fd).use { r ->
-            for (i in 0 until r.pageCount) {
-                r.openPage(i).use { page ->
-                    val k = minOf(200f / 72f, 3508f / max(page.width, page.height))
-                    val w = (page.width * k).toInt().coerceAtLeast(1)
-                    val h = (page.height * k).toInt().coerceAtLeast(1)
-                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    b.eraseColor(android.graphics.Color.WHITE)
-                    page.render(b, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
-                    val f = File(dir, "page_%04d.png".format(java.util.Locale.US, i + 1))
-                    f.outputStream().buffered().use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                    b.recycle()
-                    out += f
+            val files = List(r.pageCount) { File(dir, "page_%04d.png".format(java.util.Locale.US, it + 1)) }
+            onCount(files)
+            // a permit per page in memory, from its render to the end of its encode
+            val permits = Semaphore(encoders)
+            coroutineScope {
+                for (i in files.indices) {
+                    permits.acquire()
+                    val b = try {
+                        r.openPage(i).use { page ->
+                            val k = minOf(200f / 72f, 3508f / max(page.width, page.height))
+                            val w = (page.width * k).toInt().coerceAtLeast(1)
+                            val h = (page.height * k).toInt().coerceAtLeast(1)
+                            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+                                it.eraseColor(android.graphics.Color.WHITE)
+                                page.render(it, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        permits.release()
+                        throw e
+                    }
+                    launch(Dispatchers.Default) {
+                        try {
+                            files[i].outputStream().buffered().use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                        } finally {
+                            b.recycle()
+                            permits.release()
+                        }
+                        onPage(i)
+                    }
                 }
             }
+            files
         }
-    } ?: error("cannot open $uri")
-    return out
+    }
 }

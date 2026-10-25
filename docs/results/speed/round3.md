@@ -115,3 +115,35 @@ Macrobenchmark, release build, emulator, 10 cold starts each (`timeToInitialDisp
 
 That is -108 ms (-9.5 %) on the median and -542 ms on the slowest start. The release build starts in about
 1.1 s, against the debug build's 2.8 s (4a).
+
+## 3. B2 int8 nets: no code (as planned)
+
+The plan's checks need a phone: `gpu_check.sh` with the int8 files and the GPU delegate's verdict on the
+DEQUANTIZE graph. Nothing was written for it.
+
+## 6. security-crypto / Tink: measured, deferred
+
+Release APK (R8), `apkanalyzer dex packages --defined-only --proguard-mappings`: `com.google.crypto.tink`
+(its shaded protobuf included) is 174,422 bytes of dex, 1,246 methods; `androidx.security.crypto` is 4,290 bytes.
+That is 4.8 % of the 3.73 MB of dex, and less on the wire after compression. Under the 0.5 MB bar, so it stays.
+Dropping it would mean the two-release migration of the sync credentials, for under 0.2 MB.
+
+## 5. PDF import: the first page right away, the pages encoded side by side (same bytes)
+
+`renderPdfPages` still renders the pages one after another (PdfRenderer), but PNG-encodes up to
+`min(cores, 3)` at a time beside that (a semaphore keeps at most that many page bitmaps in memory). `importPdf`
+starts the import when page 1's file is written. `pending` still holds every page's file, so the batch logic
+(`flatImport`, the counts, "Next photo") is unchanged; `loadUri` waits for a page whose file isn't written yet
+(`pdfPages`). The PNG stays: it is the page's stored original.
+
+Emulator, an 8-page PDF of the t4 photos, imported through Pages > Add page > PDF pages:
+
+| | page 1 written | page 8 written | page 1's import starts |
+|---|---|---|---|
+| before | +2.16 s | +11.95 s | +11.97 s (after every page) |
+| after | +2.17 s | +13.32 s | by +4.31 s (the screen showed "Photo 1 of 8") |
+
+The 8 PNG files are byte-identical (md5) before and after. Rendering all 8 takes about as long as before
+(13.3 s against 12.0 s), because it now shares the 4 cores with page 1's processing; the gain is the wait before
+the first page, about 8 s here. The whole import's duration wasn't measured precisely (the emulator stopped
+before the second run's page files were read).

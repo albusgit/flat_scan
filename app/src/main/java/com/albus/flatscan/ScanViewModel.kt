@@ -16,6 +16,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -973,6 +974,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             spreadCurrent = null
             screen = if (batch && !settings.reviewCrops) Screen.Processing else Screen.Crop
             try {
+                // a PDF page still being rendered: its file first (a failed render fails the read below)
+                pdfPages[uri]?.let { runCatching { it.await() } }
                 val id = store.newId()
                 // the photo is kept byte for byte and processed from that copy (re-edits later start from the same pixels)
                 val p = withContext(Dispatchers.IO) {
@@ -1639,18 +1642,48 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Pages of a PDF ([uri]) imported as pages (rendered at up to 200 dpi, perspective only, no page finding). */
     fun importPdf(uri: Uri) {
-        viewModelScope.launch {
-            val files = withContext(Dispatchers.IO) {
-                runCatching { renderPdfPages(getApplication(), uri) }.onFailure { Log.e(TAG, "PDF import failed", it) }.getOrNull()
+        // the import starts with the first page written; the others render (and encode) meanwhile, and loadUri
+        // waits for a page whose file is not written yet (pdfPages)
+        pdfJob?.cancel()
+        pdfPages.values.forEach { it.cancel() }
+        pdfPages.clear()
+        val first = CompletableDeferred<List<Uri>>()
+        var uris = emptyList<Uri>()
+        pdfJob = viewModelScope.launch {
+            try {
+                renderPdfPages(
+                    getApplication(), uri,
+                    onCount = { files ->
+                        uris = files.map { Uri.fromFile(it) }
+                        uris.forEach { pdfPages[it] = CompletableDeferred() }
+                        if (uris.isEmpty()) first.complete(uris)
+                    },
+                    onPage = { i ->
+                        pdfPages[uris[i]]?.complete(Unit)
+                        if (i == 0) first.complete(uris)
+                    },
+                )
+            } catch (e: Throwable) {
+                if (e !is CancellationException) Log.e(TAG, "PDF import failed", e)
+                first.completeExceptionally(e)
+                pdfPages.values.forEach { it.completeExceptionally(e) }
             }
+        }
+        viewModelScope.launch {
+            val files = runCatching { first.await() }.getOrNull()
             if (files.isNullOrEmpty()) {
                 message = "Could not read the PDF"
                 return@launch
             }
             flatImport = true
-            importUris(files.map { Uri.fromFile(it) })
+            importUris(files)
         }
     }
+
+    /** The PDF pages being rendered ([importPdf]); null job: none. */
+    private var pdfJob: Job? = null
+    /** A PDF page's file is written (or failed): loadUri waits for it. */
+    private val pdfPages = java.util.concurrent.ConcurrentHashMap<Uri, CompletableDeferred<Unit>>()
 
     /** The photos being imported are already flat pages (PDF pages): no detection, perspective only. */
     private var flatImport = false
