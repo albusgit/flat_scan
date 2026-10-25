@@ -465,6 +465,7 @@ AAssetManager* g_mgr = nullptr;
 std::condition_variable g_mgr_cv;  // configureNets set g_mgr
 std::string g_cache_dir;          // compiled-model cache (the LiteRT GPU's serialised kernels)
 int g_threads = 0;
+bool g_gpu_exhaustive = false;    // the LiteRT GPU's exhaustive work-group tuning (debug, setGpuTuning)
 bool g_static_models = false;     // the CPU loads the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1)
 
 // The asset manager; a net asked for before the first configureNets (the app makes that call on its native
@@ -535,6 +536,7 @@ std::shared_ptr<NetGroup> make_group(const std::string& pref) {
     }
     c.cache_dir = g_cache_dir;
     c.threads = g_threads;
+    c.gpu_exhaustive_tuning = g_gpu_exhaustive;
     g->inf = Inference::create(c);
     return g;
 }
@@ -894,6 +896,52 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_prewarmFinder(JNIEnv*, 
     std::vector<Tensor> y;
     std::string err;
     if (!g->inf->run(NetId::PageFinder, x, y, &err)) LOGI("page finder warm-up: %s", err.c_str());
+}
+
+// Debug: the LiteRT GPU's exhaustive work-group tuning instead of the fast one (infer.h), from the next
+// sessions: the groups are made again.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_setGpuTuning(JNIEnv*, jclass, jboolean exhaustive) {
+    std::lock_guard<std::mutex> lk(g_nets_mu);
+    if ((bool)exhaustive == g_gpu_exhaustive) return;
+    g_gpu_exhaustive = exhaustive;
+    for (std::shared_ptr<NetGroup>* s : {&g_finder, &g_flat, &g_hr, &g_shade, &g_rule})
+        if (*s) *s = make_group((*s)->pref);
+}
+
+// The app's GPU sessions made ahead of the first page (after Auto's benchmark, which leaves the app's groups
+// empty): one run on a blank input of every net and shape the groups run on the GPU (UVDoc, SyntheticDoc high-res,
+// the shadow net at its GPU shape, the rule net portrait and landscape); the GPU compiles and tunes its kernels
+// there, not mid-page. Groups on the CPU are left alone. -> text, one line per net: its setup ms and backend.
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_prewarmGpu(JNIEnv* env, jclass, jobject listener) {
+    Progress progress(env, listener);
+    struct Warm { std::shared_ptr<NetGroup>* slot; NetId net; int h, w; const char* name; };
+    const UvSpec& uv = uv_spec(0);
+    const UvSpec& hr = uv_spec(2);
+    const std::vector<Warm> all = {
+        {&g_flat, NetId::UVDoc, uv.in_h, uv.in_w, "UVDoc"},
+        {&g_hr, NetId::SynthDocHR, hr.in_h, hr.in_w, "SyntheticDoc high-res"},
+        {&g_shade, NetId::ShadeNet, 512, 352, "the shadow net"},
+        {&g_rule, NetId::RuleNet, 1152, 800, "the rule net (portrait)"},
+        {&g_rule, NetId::RuleNet, 800, 1152, "the rule net (landscape)"},
+    };
+    std::ostringstream o;
+    for (size_t i = 0; i < all.size(); ++i) {
+        const Warm& w = all[i];
+        auto g = group(*w.slot);
+        if (g->pref.find("gpu") == std::string::npos) continue;
+        progress((int)(100 * i / all.size()), w.name);
+        g->first_use(w.net);   // the session is made here: the page's own first run is not its first use
+        Tensor x{{1, 3, w.h, w.w}, std::vector<float>((size_t)3 * w.h * w.w, 0.f)};
+        std::vector<Tensor> y;
+        std::string err;
+        auto t0 = Clock::now();
+        const bool ok = g->inf->run(w.net, x, y, &err);
+        o << w.name << " " << w.h << "x" << w.w << ": " << std::lround(ms_since(t0)) << " ms on " << backend_name(g->inf->backend(w.net))
+          << (ok ? "" : " (failed: " + err + ")") << "\n";
+    }
+    progress(100, "Done");
+    LOGI("GPU warm-up:\n%s", o.str().c_str());
+    return env->NewStringUTF(o.str().c_str());
 }
 
 // -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
@@ -1685,6 +1733,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             std::lock_guard<std::mutex> lk(g_nets_mu);
             c.cache_dir = g_cache_dir;
             c.threads = g_threads;
+            c.gpu_exhaustive_tuning = g_gpu_exhaustive;
             return Inference::create(c);
         };
         // Memory: only one backend's sessions at a time. The app's own sessions go first (each group keeps

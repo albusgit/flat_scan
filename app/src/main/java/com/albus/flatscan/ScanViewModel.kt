@@ -394,7 +394,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     synchronized(netsLock) {
                         val stage = { s: String -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s }; Unit }
                         val stored = runAutoBenchmark(stage, candidates)
-                        if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
+                        if (settings.acceleration == Accel.AUTO) {
+                            configureNets(currentPlan())
+                            if (!currentPlan().cpuOnly) warmGpu(stage)
+                        }
                         formatBench(stored)
                     }
                 }.getOrElse { "Acceleration benchmark FAILED: ${it.message ?: it}" }
@@ -417,6 +420,28 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** [configureNets]' own lock (not [netsLock]: a benchmark under it may be waiting for the first configuration). Before
      *  init, which starts the first configuration on the native thread. */
     private val configLock = Any()
+    /**
+     * Debug (`--ez gpu_warm true`): every group on the GPU, the GPU sessions made as after Auto's benchmark
+     * ([warmGpu]), the setup ms of each net in [report]; then the setting's backends again.
+     */
+    fun debugWarmGpu(report: File) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val lines = mutableListOf<String>()
+            synchronized(netsLock) {
+                configureNets(Accel.fixed(Accel.GPU)!!)
+                val t0 = System.nanoTime()
+                warmGpu { lines += it }
+                lines += "total ${msSince(t0).roundToInt()} ms; " + NativeLib.prewarmGpu(null).lineSequence().filter { it.isNotBlank() }.joinToString("; ", "again: ")
+                configureNets(currentPlan())
+            }
+            runCatching { report.parentFile?.mkdirs(); report.writeText(lines.joinToString("\n") + "\n") }
+        }
+    }
+
+    /** The launch's GPU set-up ([setUpGpu]) while it runs: its stage text; null: none running. Before init, which starts it. */
+    @Volatile private var gpuSetup: String? = null
+    /** Processing waiting for that set-up ([ensureNets]): where its stage texts go. */
+    @Volatile private var gpuSetupSink: ((String) -> Unit)? = null
 
     init {
         // a crash in guarded native work last time (CrashGuard): report it, and keep the nets off a GPU that crashed
@@ -431,6 +456,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         // NativeLib call loads libflatscan.so (0.85 s on the emulator), which kept the first frame waiting on the
         // main thread; a net asked for before this ran waits for it (jni_bridge.cpp assets_locked)
         viewModelScope.launch(nativeCtx) { synchronized(configLock) { if (!netsConfigured) configureNets(netPlan) } }
+        setUpGpu()
     }
 
     /** Settings: the user asks for the GPU again after a crash turned it off. */
@@ -459,12 +485,63 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * version yet, the benchmark runs first ([stage]: its progress; it takes seconds to a minute, as the GPU
      * compiles its kernels on first use; none on a phone without a GPU candidate) and its choice is kept.
      */
-    private fun ensureNets(stage: (String) -> Unit): Accel.Plan = synchronized(netsLock) {
-        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
-            stage("Choosing the acceleration (once per phone and app version)")
-            runAutoBenchmark(stage)
+    private fun ensureNets(stage: (String) -> Unit): Accel.Plan {
+        // the launch's set-up (setUpGpu) may hold netsLock: its stage texts meanwhile
+        gpuSetup?.let { stage(it) }
+        gpuSetupSink = stage
+        try {
+            return synchronized(netsLock) { benchAndWarm(stage) }
+        } finally {
+            gpuSetupSink = null
         }
-        currentPlan().also { if (it != netPlan) configureNets(it) }
+    }
+
+    /**
+     * Auto's benchmark when this SoC and app version has none, the setting's backends, and after a benchmark the
+     * app's GPU sessions (NativeLib.prewarmGpu: the benchmark left the groups empty, and the GPU would compile and
+     * tune on the page). Caller holds [netsLock].
+     */
+    private fun benchAndWarm(stage: (String) -> Unit): Accel.Plan {
+        var benched = false
+        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
+            stage(GPU_SETUP)
+            runAutoBenchmark(stage)
+            benched = true
+        }
+        val plan = currentPlan().also { if (it != netPlan) configureNets(it) }
+        if (benched && !plan.cpuOnly) warmGpu(stage)
+        return plan
+    }
+
+    private fun warmGpu(stage: (String) -> Unit) {
+        val r = runCatching {
+            CrashGuard.guard(getApplication(), "setting up the GPU", gpu = true) { NativeLib.prewarmGpu { _, s -> stage("$GPU_SETUP: $s") } }
+        }.onFailure { Log.e(TAG, "GPU warm-up failed", it) }.getOrNull()
+        Log.i(TAG, "GPU warm-up: ${r?.trim()}")
+        r?.let { stage(it.trim()) }
+    }
+
+    /**
+     * After an install or a system update (Auto with no benchmark for this SoC and app version): Auto's benchmark
+     * and the app's GPU sessions at launch, in the background, instead of inside the first page's processing (where
+     * the user watched it for minutes). Processing that comes first waits for it, with its stage text. Nothing without
+     * Auto, with a stored choice, or without a GPU candidate (ensureNets then stores the CPU at once).
+     */
+    private fun setUpGpu() {
+        if (settings.acceleration != Accel.AUTO || Accel.autoPlan(settings.autoChoice) != null) return
+        viewModelScope.launch(Dispatchers.Default) {
+            runCatching {
+                if (Accel.candidates().isEmpty()) return@runCatching
+                gpuSetup = GPU_SETUP
+                synchronized(netsLock) {
+                    benchAndWarm { s ->
+                        gpuSetup = s
+                        gpuSetupSink?.invoke(s)
+                    }
+                }
+            }.onFailure { Log.e(TAG, "GPU set-up at launch failed", it) }
+            gpuSetup = null
+        }
     }
 
     /**
@@ -476,7 +553,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val bench = if (cand.isEmpty()) JSONObject().put("ok", true).put("runs", 0)
             .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu").put("rule", "cpu"))
         else CrashGuard.guard(getApplication(), "the acceleration benchmark (GPU)", gpu = true) {
-            JSONObject(NativeLib.benchBackends(benchPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
+            // one timed run per net: the backends differ by large factors; the stage says what it is (not the page's progress)
+            JSONObject(NativeLib.benchBackends(benchPhoto(), cand, 1) { pct, s -> stage("$GPU_SETUP: ${s.removePrefix("Auto: ")}, $pct %") })
         }
         val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
         if (cand.isEmpty()) stored.put("note", "no GPU on this phone: ${NetEnv.gpuWhy}")
@@ -2971,6 +3049,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val TAG = "FlatScan"
+        /** The stage text of the GPU's first set-up (Auto's benchmark, the GPU sessions). */
+        const val GPU_SETUP = "Setting up the GPU for this phone (once per install)"
         const val RENDER_DEBOUNCE_MS = 120L
         const val THUMB_W = 96
         /** [openingPreview]: out.jpg decoded at full size up to this side (a page is 1600 x 2263 by default) */

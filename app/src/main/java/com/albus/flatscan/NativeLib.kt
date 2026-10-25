@@ -102,6 +102,16 @@ object NativeLib {
     @JvmStatic external fun prewarmFinder()
 
     /**
+     * The app's GPU sessions made ahead of the first page: one run on a blank input of every net and shape its
+     * group runs on the GPU (the rule net portrait and landscape), so the GPU compiles and tunes there. -> one line
+     * per net: setup ms and backend.
+     */
+    @JvmStatic external fun prewarmGpu(listener: ProgressListener?): String
+
+    /** Debug: the LiteRT GPU's exhaustive work-group tuning instead of the fast one (the default), from the next sessions. */
+    @JvmStatic external fun setGpuTuning(exhaustive: Boolean)
+
+    /**
      * Page detection for the crop screen. logits: the page-finder net's output for this photo
      * (float[2 * 256 * 256]) or null for the colour-threshold detector. JSON: ok, error, pages
      * (1, or 2 for a book spread): [{ok, corners [x0, y0 ... x3, y3] (TL TR BR BL, bitmap px),

@@ -147,3 +147,33 @@ The 8 PNG files are byte-identical (md5) before and after. Rendering all 8 takes
 (13.3 s against 12.0 s), because it now shares the 4 cores with page 1's processing; the gain is the wait before
 the first page, about 8 s here. The whole import's duration wasn't measured precisely (the emulator stopped
 before the second run's page files were read).
+
+## The first page after an install: minutes at "Auto: rulenet on gpu (86%)" (bug report, S24 FE)
+
+Fixed as the report proposed, in its order:
+
+1. **Fast GPU tuning.** LiteRT GPU sessions open with `FAST_SINGLE_ANSWER` instead of `SUSTAINED_SPEED`.
+   With `SUSTAINED_SPEED`, LiteRT's OpenCL backend times every work-group size of every kernel (`kExhaustive`),
+   which takes minutes for the rule net and SyntheticDoc high-res in fp32. Precision is unchanged: it comes from
+   `is_precision_loss_allowed` and the priorities. The kernel cache key gets `|fast` / `|exhaustive`.
+   Debug: `--ez gpu_exhaustive true` brings back the exhaustive tuning, to time the trade-off.
+2. **Auto's benchmark at launch, in the background** (`setUpGpu`), when Auto has no benchmark for this SoC and app
+   version and the phone has a GPU candidate. Processing that comes first waits for it (`netsLock`) and shows its
+   stage: "Setting up the GPU for this phone (once per install): rulenet on gpu, 86 %". The processing screen
+   hides the page percentage while that text shows, since it isn't the page's progress.
+3. **One timed run per net** in the benchmark instead of 3.
+4. and 5. **The app's GPU sessions made right after the benchmark** (`NativeLib.prewarmGpu`): one blank run of
+   UVDoc, SyntheticDoc high-res, the shadow net (512 x 352, its only GPU shape; others run on the CPU) and the rule
+   net portrait and landscape, for each group whose backends include the GPU. The landscape rule net no longer
+   compiles mid-page. Settings > Run the benchmark does the same.
+6. **The setup ms per net**, logged (`infer: ... on LiteRT_GPU (..., fast tuning, 1x3x1152x800) ready in N ms`)
+   and from `--ez gpu_warm true` into `files/batch_out/gpu_warm.txt` (all groups on the GPU, a warm-up, then a
+   second warm-up showing the run time alone).
+
+Checked on the emulator (no OpenCL, so the GPU itself can't run there): the CPU path is unchanged (batch t4,
+20 files identical); `--es bench gpu` runs with one timed run; `--ez gpu_warm true` runs every warm-up (on the
+CPU fallback here: UVDoc 2504 ms, SyntheticDoc high-res 9300 ms, shadow net 221 ms, rule net 2074 / 1375 ms the
+first time); unit tests 64 run, 0 failures. **Not measured: anything on the GPU.** On the phone:
+`adb shell am start -S -n com.albus.flatscan/.MainActivity --ez gpu_warm true` (fast) and then with
+`--ez gpu_exhaustive true --ez gpu_warm true`, and compare the two `gpu_warm.txt` files and the benchmark's
+`first` column for `rulenet` and `synthdoc_hr`.

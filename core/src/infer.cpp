@@ -495,6 +495,7 @@ struct LrtSession {
     bool reshaped = false;                // bytes rewritten for in_shape (tflite_shape): allocate before delegating
     std::string cache_dir, token;         // serialisation folder and key (kept alive for the delegate)
     bool fp16 = false;                    // LiteRtGpu16: precision loss allowed
+    bool exhaustive = false;              // InferConfig::gpu_exhaustive_tuning
 #ifdef FS_LITERT_TEST_XNNPACK
     std::string lib_dir;
 #endif
@@ -615,8 +616,9 @@ std::string build_fingerprint() {
 
 // The serialisation key: the model, and the device (SoC, system build: GPU driver updates come with
 // it) with the LiteRT version and the precision options.
-std::string litert_token(const LrtApi& api, const uint8_t* model, size_t size, bool fp16) {
-    const std::string dev = soc_name() + "|" + build_fingerprint() + "|litert" + api.version + (fp16 ? "|fp16" : "|fp32");
+std::string litert_token(const LrtApi& api, const uint8_t* model, size_t size, bool fp16, bool exhaustive) {
+    const std::string dev = soc_name() + "|" + build_fingerprint() + "|litert" + api.version + (fp16 ? "|fp16" : "|fp32") +
+                            (exhaustive ? "|exhaustive" : "|fast");
     return "fs_" + sha256_hex(model, size).substr(0, 16) + "_" + sha256_hex(std::vector<uint8_t>(dev.begin(), dev.end())).substr(0, 8);
 }
 
@@ -651,7 +653,11 @@ bool litert_open(LrtSession& s, bool serialize, std::string& why) {
     // fp32: no precision loss, and precision ranked above the speed and memory priorities; fp16 (LiteRtGpu16):
     // precision loss allowed, speed first
     o.is_precision_loss_allowed = s.fp16 ? 1 : 0;
-    o.inference_preference = TFLITE_GPU_INFERENCE_PREFERENCE_SUSTAINED_SPEED;
+    // FAST_SINGLE_ANSWER: the OpenCL backend's fast work-group tuning (one size per kernel by formula). With
+    // SUSTAINED_SPEED it times every size of every kernel (kExhaustive): minutes for the rule net (1152 x 800) and
+    // SyntheticDoc high-res (1440 x 1024) in fp32 on a phone, paid on the first page after every install or system
+    // update. Precision is set by the two lines around it, not by this one.
+    o.inference_preference = s.exhaustive ? TFLITE_GPU_INFERENCE_PREFERENCE_SUSTAINED_SPEED : TFLITE_GPU_INFERENCE_PREFERENCE_FAST_SINGLE_ANSWER;
     o.inference_priority1 = s.fp16 ? TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY : TFLITE_GPU_INFERENCE_PRIORITY_MAX_PRECISION;
     o.inference_priority2 = s.fp16 ? TFLITE_GPU_INFERENCE_PRIORITY_MIN_MEMORY_USAGE : TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
     o.inference_priority3 = s.fp16 ? TFLITE_GPU_INFERENCE_PRIORITY_MAX_PRECISION : TFLITE_GPU_INFERENCE_PRIORITY_MIN_MEMORY_USAGE;
@@ -1261,7 +1267,8 @@ struct Inference::Impl {
                       (shape[2] != h0 || shape[3] != w0);
         s->cache_dir = cfg.cache_dir;
         s->fp16 = fp16;
-        s->token = litert_token(*api, s->model_data(), s->model_size(), fp16);
+        s->exhaustive = cfg.gpu_exhaustive_tuning;
+        s->token = litert_token(*api, s->model_data(), s->model_size(), fp16, s->exhaustive);
 #ifdef FS_LITERT_TEST_XNNPACK
         s->lib_dir = cfg.litert_dir;
 #endif
@@ -1284,7 +1291,8 @@ struct Inference::Impl {
                 if (!ok) s.reset();
             });
             if (!ok) return false;
-            LOGI("infer: %s on LiteRT_GPU%s (%s, LiteRT %s) ready in %.0f ms", net_str(net), fp16 ? "16" : "", file.c_str(), api->version.c_str(),
+            LOGI("infer: %s on LiteRT_GPU%s (%s, LiteRT %s, %s tuning, %s) ready in %.0f ms", net_str(net), fp16 ? "16" : "", file.c_str(),
+                 api->version.c_str(), cfg.gpu_exhaustive_tuning ? "exhaustive" : "fast", dims_nchw(shape).c_str(),
                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             out = Sess();
             out.lrt = std::make_unique<LrtNet>();

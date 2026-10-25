@@ -98,6 +98,13 @@ class MainActivity : ComponentActivity() {
         if (i.hasExtra("no_ahead")) vm.netsAheadOff = i.getBooleanExtra("no_ahead", false)
         // `--ei threads N` with any extra: the CPU nets on N threads (0: the default) from the next net configuration
         if (i.hasExtra("threads")) vm.netThreads = i.getIntExtra("threads", 0)
+        // `--ez gpu_exhaustive true` with any extra: the LiteRT GPU tunes its kernels exhaustively (to time the trade-off)
+        if (i.hasExtra("gpu_exhaustive")) NativeLib.setGpuTuning(i.getBooleanExtra("gpu_exhaustive", false))
+        // `--ez gpu_warm true`: the GPU sessions' setup ms per net into files/batch_out/gpu_warm.txt (ScanViewModel.debugWarmGpu)
+        if (i.getBooleanExtra("gpu_warm", false)) {
+            vm.debugWarmGpu(java.io.File(getExternalFilesDir(null), "batch_out/gpu_warm.txt"))
+            return
+        }
         i.getStringExtra("open_test")?.let { set ->
             vm.runOpenTest(set, java.io.File(getExternalFilesDir(null), "batch_out/open_report.txt"))
             return

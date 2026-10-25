@@ -36,6 +36,9 @@ struct InferConfig {
     int threads = 0;                   // 0: ORT default; LiteRT CPU: min(cores, 4)
     std::string qnn_dir;               // folder of libQnnHtp.so (Android: the qnn_htp asset pack); empty: the library path
     std::string litert_dir;            // folder of libtensorflowlite_jni.so + libtensorflowlite_gpu_jni.so; empty: by name (Android: the APK's lib/)
+    // LiteRT GPU: exhaustive work-group tuning (every size timed per kernel: minutes for the rule net and SyntheticDoc
+    // high-res at their shapes on a phone) instead of the fast one (one size by formula); a debug switch, to measure
+    bool gpu_exhaustive_tuning = false;
 };
 struct Tensor { std::vector<int64_t> shape; std::vector<float> data; };
 class Inference {

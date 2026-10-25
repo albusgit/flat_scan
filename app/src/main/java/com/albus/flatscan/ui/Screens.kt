@@ -208,7 +208,10 @@ fun ProcessingScreen(vm: ScanViewModel) {
         Spacer(Modifier.height(14.dp))
         Row(Modifier.widthIn(max = 340.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(vm.stage, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = RecursiveMono), color = muted, maxLines = 2, modifier = Modifier.weight(1f))
-            Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontFamily = RecursiveMono), color = muted)
+            // the GPU's first set-up is not the page's progress: no percentage beside it (its text says how far it is)
+            if (!vm.stage.startsWith(ScanViewModel.GPU_SETUP)) {
+                Text("${(vm.progress * 100).toInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontFamily = RecursiveMono), color = muted)
+            }
         }
     }
 }
