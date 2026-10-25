@@ -396,6 +396,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ---- the nets' backends (Settings > Acceleration)
     /** The groups' backends as last given to [NativeLib.configureNets]. */
     @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "", "", "")
+
+    /** Debug (`--ei threads N`): the CPU nets' threads; 0: the default, min(cores, 4). */
+    @Volatile var netThreads = 0
     private val netsLock = Any()
 
     init {
@@ -427,7 +430,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val app = getApplication<Application>()
         // the LiteRT GPU's serialised kernels (the folder kept its earlier name)
         val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
-        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, plan.rule, 0, staticModels)
+        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, plan.rule, netThreads, staticModels)
         netPlan = plan
     }
 
@@ -457,7 +460,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
         if (cand.isEmpty()) stored.put("note", "no GPU on this phone: ${NetEnv.gpuWhy}")
-        settings.autoChoice = stored.toString()
+        // the fp16 backends (gpu16, cpu16: debug `--es bench`) are measured, not kept as Auto's choice
+        if (cand.split(',').none { it.trim().endsWith("16") }) settings.autoChoice = stored.toString()
+        else stored.put("note", "fp16 candidates: measured only, Auto's choice unchanged")
         Log.i(TAG, "auto acceleration $stored")
         return stored
     }
@@ -672,7 +677,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val outDir = File(root, "batch_out/" + (out ?: "${set}_$setting")).apply { mkdirs() }
         File(outDir, "done.txt").delete()
         File(outDir, "run.json").writeText(NetEnv.toJson(plan).put("set", set).put("photos", photos.size).put("shade", doShade).put("rule_net", doRules)
-            .put("ext", pageExt).put("static_models", staticModels).put("app", BuildConfigInfo.VERSION)
+            .put("ext", pageExt).put("static_models", staticModels).put("threads", netThreads).put("app", BuildConfigInfo.VERSION)
             .put("started", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())).toString(1))
         val timesFile = File(outDir, "times_phone.txt")
         val times = runCatching { JSONObject(timesFile.readText()) }.getOrDefault(JSONObject())

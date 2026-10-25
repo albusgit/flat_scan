@@ -48,6 +48,11 @@
 //                           are serialised into cache_dir (OpenCL backend), keyed by the model's SHA-256,
 //                           the SoC, the build and the LiteRT version; no OpenCL library on the device:
 //                           no delegate (opencl_found)
+//   LiteRtGpu16             the same with precision loss allowed (fp16 arithmetic, MIN_LATENCY first); its own
+//                           kernel cache key (|fp16)
+//   LiteRtCpu16             LiteRT's CPU kernels with XNNPACK forced to fp16 (TFLITE_XNNPACK_DELEGATE_FLAG_FORCE_FP16;
+//                           XNNPACK runs fp32 kernels on CPUs without fp16 arithmetic); no fallback to the built-in
+//                           kernels (the net moves on to the next backend)
 // The page finder never runs on QNN, NNAPI or the LiteRT GPU (PLAN: 34 NNAPI partitions; kept on the CPU). The rule
 // net (rulenet.onnx, any page size; rulenet.tflite, made at 1152 x 800 and rewritten for each shape) runs on the
 // LiteRT GPU at kRuleGpuHw only (the A4 stage-1 page at half size, portrait and landscape; other shapes on the CPU
@@ -150,6 +155,8 @@ const char* backend_str(Backend b) {
         case Backend::OpenVINO: return "OpenVINO";
         case Backend::CoreML: return "CoreML";
         case Backend::LiteRtGpu: return "LiteRT_GPU";
+        case Backend::LiteRtGpu16: return "LiteRT_GPU16";
+        case Backend::LiteRtCpu16: return "LiteRT_CPU16";
     }
     return "?";
 }
@@ -487,6 +494,7 @@ struct LrtSession {
     std::vector<int64_t> in_shape;        // NCHW, as run() gets it
     bool reshaped = false;                // bytes rewritten for in_shape (tflite_shape): allocate before delegating
     std::string cache_dir, token;         // serialisation folder and key (kept alive for the delegate)
+    bool fp16 = false;                    // LiteRtGpu16: precision loss allowed
 #ifdef FS_LITERT_TEST_XNNPACK
     std::string lib_dir;
 #endif
@@ -606,9 +614,9 @@ std::string build_fingerprint() {
 }
 
 // The serialisation key: the model, and the device (SoC, system build: GPU driver updates come with
-// it) with the LiteRT version and the fp32 options.
-std::string litert_token(const LrtApi& api, const uint8_t* model, size_t size) {
-    const std::string dev = soc_name() + "|" + build_fingerprint() + "|litert" + api.version + "|fp32";
+// it) with the LiteRT version and the precision options.
+std::string litert_token(const LrtApi& api, const uint8_t* model, size_t size, bool fp16) {
+    const std::string dev = soc_name() + "|" + build_fingerprint() + "|litert" + api.version + (fp16 ? "|fp16" : "|fp32");
     return "fs_" + sha256_hex(model, size).substr(0, 16) + "_" + sha256_hex(std::vector<uint8_t>(dev.begin(), dev.end())).substr(0, 8);
 }
 
@@ -640,12 +648,13 @@ bool litert_open(LrtSession& s, bool serialize, std::string& why) {
     }
     LrtApi::GpuOptions go = api.GpuOptionsDefault();
     TfLiteGpuDelegateOptionsV2& o = go.o;
-    // fp32: no precision loss, and precision ranked above the speed and memory priorities
-    o.is_precision_loss_allowed = 0;
+    // fp32: no precision loss, and precision ranked above the speed and memory priorities; fp16 (LiteRtGpu16):
+    // precision loss allowed, speed first
+    o.is_precision_loss_allowed = s.fp16 ? 1 : 0;
     o.inference_preference = TFLITE_GPU_INFERENCE_PREFERENCE_SUSTAINED_SPEED;
-    o.inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MAX_PRECISION;
-    o.inference_priority2 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
-    o.inference_priority3 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_MEMORY_USAGE;
+    o.inference_priority1 = s.fp16 ? TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY : TFLITE_GPU_INFERENCE_PRIORITY_MAX_PRECISION;
+    o.inference_priority2 = s.fp16 ? TFLITE_GPU_INFERENCE_PRIORITY_MIN_MEMORY_USAGE : TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
+    o.inference_priority3 = s.fp16 ? TFLITE_GPU_INFERENCE_PRIORITY_MAX_PRECISION : TFLITE_GPU_INFERENCE_PRIORITY_MIN_MEMORY_USAGE;
     o.max_delegated_partitions = 1;
     if (serialize) {
         o.experimental_flags |= TFLITE_GPU_EXPERIMENTAL_FLAGS_ENABLE_SERIALIZATION;
@@ -831,6 +840,7 @@ struct LrtCpu {
     TfLiteInterpreter* interp = nullptr;
     TfLiteDelegate* xnn = nullptr;        // outlives the interpreter
     bool use_xnn = true;
+    bool fp16 = false;                    // LiteRtCpu16: XNNPACK forced to fp16, and XNNPACK or nothing
     int threads = 1;
     std::vector<uint8_t> source;          // a fixed-shape file rewritten per shape (tflite_shape); empty: resized
     std::vector<int64_t> in_shape;        // NCHW of the allocated input tensor
@@ -871,9 +881,14 @@ bool lrt_cpu_open(LrtCpu& s, std::string& why) {
     }
     api.TfLiteInterpreterOptionsSetNumThreads(s.opts, s.threads);
     api.TfLiteInterpreterOptionsSetErrorReporter(s.opts, litert_report, &s.log);
+    if (s.fp16 && (!s.use_xnn || !api.XnnCreate)) {
+        why = "fp16 needs XNNPACK";
+        return false;
+    }
     if (s.use_xnn && api.XnnCreate) {
         LrtApi::XnnOptions xo = api.XnnOptionsDefault();
         xo.o.num_threads = s.threads;
+        if (s.fp16) xo.o.flags |= TFLITE_XNNPACK_DELEGATE_FLAG_FORCE_FP16;
         if ((s.xnn = api.XnnCreate(&xo.o))) api.TfLiteInterpreterOptionsAddDelegate(s.opts, reinterpret_cast<TfLiteOpaqueDelegate*>(s.xnn));
     }
     if (!(s.interp = api.TfLiteInterpreterCreate(s.model, s.opts))) {
@@ -920,7 +935,7 @@ bool lrt_cpu_run(LrtCpu& s, const Tensor& in, std::vector<Tensor>& out, double& 
             why = "the model does not take " + std::to_string(in.shape[2]) + " x " + std::to_string(in.shape[3]) + ": " + w;
             return false;
         }
-        if (!lrt_cpu_open(s, why) && s.use_xnn) {
+        if (!lrt_cpu_open(s, why) && s.use_xnn && !s.fp16) {
             LOGI("infer: LiteRT CPU: %s with XNNPACK failed (%s); without XNNPACK", dims_nchw(in.shape).c_str(), why.c_str());
             s.use_xnn = false;
             if (!lrt_cpu_open(s, why)) return false;
@@ -936,7 +951,7 @@ bool lrt_cpu_run(LrtCpu& s, const Tensor& in, std::vector<Tensor>& out, double& 
         s.log.clear();
         s.in_shape.clear();
         bool ok = api.TfLiteInterpreterResizeInputTensor(s.interp, 0, dims, 4) == kTfLiteOk && api.TfLiteInterpreterAllocateTensors(s.interp) == kTfLiteOk;
-        if (!ok && s.use_xnn) {
+        if (!ok && s.use_xnn && !s.fp16) {
             // XNNPACK could not take the new shape: the interpreter without it, at that shape
             LOGI("infer: LiteRT CPU: resize with XNNPACK failed (%s); without XNNPACK", s.log.c_str());
             s.use_xnn = false;
@@ -998,7 +1013,8 @@ struct Inference::Impl {
     static bool accelerator_allowed(NetId net, Backend b) {
         if (net == NetId::Inpaint) return false;   // MI-GAN (finger fill): the CPU only, on demand
         if (net == NetId::RuleNet) return b != Backend::QNN_HTP && b != Backend::NNAPI;   // the LiteRT GPU: its fixed-shape copies
-        return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu));
+        return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu || b == Backend::LiteRtGpu16 ||
+                                              b == Backend::LiteRtCpu16));
     }
 
     // LiteRT CPU threads: InferConfig::threads, else min(cores, 4)
@@ -1035,7 +1051,7 @@ struct Inference::Impl {
         };
         const std::string hw = shape.size() == 4 ? std::to_string(shape[2]) + "x" + std::to_string(shape[3]) : std::string();
         const std::string shade_static = hw.empty() ? hw : "shadenet_" + hw;
-        if (b == Backend::LiteRtGpu) {
+        if (b == Backend::LiteRtGpu || b == Backend::LiteRtGpu16) {
             // LiteRT GPU: only the converted fixed-shape models (C2), the page finder has none; ShadeNet and the
             // rule net only at their GPU shapes, their one file rewritten for that shape (tflite_shape.h)
             if (net == NetId::UVDoc) load("uvdoc_static.tflite");
@@ -1050,7 +1066,7 @@ struct Inference::Impl {
             } else file.clear();
             return bytes;
         }
-        if (b == Backend::CPU && kCpuOnLiteRt) {
+        if ((b == Backend::CPU && kCpuOnLiteRt) || b == Backend::LiteRtCpu16) {
             // LiteRT CPU: every net; ShadeNet's and the rule net's fixed-shape files are rewritten per input shape
             // (make_litert_cpu keeps their bytes, lrt_cpu_run)
             if (net == NetId::PageFinder) load("pagefinder.tflite");
@@ -1200,7 +1216,9 @@ struct Inference::Impl {
 #else
                 break;
 #endif
-            case Backend::LiteRtGpu:   // not an ORT provider (make_litert)
+            case Backend::LiteRtGpu:   // not ORT providers (make_litert, make_litert_cpu)
+            case Backend::LiteRtGpu16:
+            case Backend::LiteRtCpu16:
                 break;
         }
         why = std::string(backend_str(b)) + " is not compiled into this build";
@@ -1209,8 +1227,8 @@ struct Inference::Impl {
 #endif  // FS_WITH_ORT
 
     // A LiteRT GPU session for net and the NCHW input shape `shape`, or false with why (per_shape: no model
-    // for this shape only).
-    bool make_litert(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape) const {
+    // for this shape only). fp16: precision loss allowed (LiteRtGpu16).
+    bool make_litert(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape, bool fp16) const {
 #ifdef FS_LITERT
         const LrtApi* api = litert_api(cfg.litert_dir, why);
         if (!api) return false;
@@ -1242,7 +1260,8 @@ struct Inference::Impl {
         s->reshaped = (net == NetId::ShadeNet || net == NetId::RuleNet) && tflite_input_hw(s->bytes, h0, w0) && shape.size() == 4 &&
                       (shape[2] != h0 || shape[3] != w0);
         s->cache_dir = cfg.cache_dir;
-        s->token = litert_token(*api, s->model_data(), s->model_size());
+        s->fp16 = fp16;
+        s->token = litert_token(*api, s->model_data(), s->model_size(), fp16);
 #ifdef FS_LITERT_TEST_XNNPACK
         s->lib_dir = cfg.litert_dir;
 #endif
@@ -1265,7 +1284,7 @@ struct Inference::Impl {
                 if (!ok) s.reset();
             });
             if (!ok) return false;
-            LOGI("infer: %s on LiteRT_GPU (%s, LiteRT %s) ready in %.0f ms", net_str(net), file.c_str(), api->version.c_str(),
+            LOGI("infer: %s on LiteRT_GPU%s (%s, LiteRT %s) ready in %.0f ms", net_str(net), fp16 ? "16" : "", file.c_str(), api->version.c_str(),
                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             out = Sess();
             out.lrt = std::make_unique<LrtNet>();
@@ -1286,6 +1305,7 @@ struct Inference::Impl {
         (void)shape;
         (void)out;
         (void)per_shape;
+        (void)fp16;
         why = "LiteRtGpu is not compiled into this build";
         return false;
 #endif
@@ -1293,7 +1313,9 @@ struct Inference::Impl {
 
     // The CPU session on LiteRT's CPU kernels (builds without ONNX Runtime), or false with why. first: the input
     // shape of the run it is made for (ShadeNet and the rule net are made at that shape, not at their file's).
-    bool make_litert_cpu(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why, const std::vector<int64_t>& first) const {
+    // fp16: XNNPACK forced to fp16 (LiteRtCpu16), without the built-in kernels' fallback.
+    bool make_litert_cpu(NetId net, const std::vector<int64_t>& shape, Sess& out, std::string& why, const std::vector<int64_t>& first,
+                         bool fp16 = false) const {
 #ifdef FS_LITERT
         const LrtApi* api = litert_api(cfg.litert_dir, why);
         if (!api) return false;
@@ -1313,14 +1335,16 @@ struct Inference::Impl {
         }
         auto t0 = Clock::now();
         s->threads = cpu_threads();
+        s->fp16 = fp16;
         if (!lrt_cpu_open(*s, why)) {
+            if (fp16) return false;
             // XNNPACK refused the model: the built-in kernels alone
             LOGI("infer: %s: LiteRT CPU with XNNPACK failed (%s); without XNNPACK", net_str(net), why.c_str());
             s->use_xnn = false;
             if (!lrt_cpu_open(*s, why)) return false;
         }
         LOGI("infer: %s on CPU (%s, LiteRT %s, %s, %d threads) ready in %.0f ms", net_str(net), file.c_str(), api->version.c_str(),
-             s->xnn ? "XNNPACK" : "built-in kernels", s->threads, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+             s->xnn ? (fp16 ? "XNNPACK fp16" : "XNNPACK") : "built-in kernels", s->threads, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         out = Sess();
         out.lcpu = std::move(s);
         return true;
@@ -1329,6 +1353,7 @@ struct Inference::Impl {
         (void)shape;
         (void)out;
         (void)first;
+        (void)fp16;
         why = "LiteRT is not compiled into this build";
         return false;
 #endif
@@ -1339,8 +1364,9 @@ struct Inference::Impl {
     bool make_session(NetId net, Backend b, const std::vector<int64_t>& shape, Sess& out, std::string& why, bool& per_shape,
                       const std::vector<int64_t>& first) const {
         per_shape = false;
-        if (b == Backend::LiteRtGpu) return make_litert(net, shape, out, why, per_shape);
+        if (b == Backend::LiteRtGpu || b == Backend::LiteRtGpu16) return make_litert(net, shape, out, why, per_shape, b == Backend::LiteRtGpu16);
         if (b == Backend::CPU && kCpuOnLiteRt) return make_litert_cpu(net, shape, out, why, first);
+        if (b == Backend::LiteRtCpu16) return make_litert_cpu(net, shape, out, why, first, true);
 #ifdef FS_WITH_ORT
         std::string file;
         std::vector<uint8_t> bytes = model_bytes(net, b, shape, file, &per_shape);
@@ -1456,7 +1482,9 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
         }
         if (cpu && S.cpu_failed) break;
         // ShadeNet's fixed-shape models on accelerators (every LiteRT GPU interpreter, the rule net's): one session per input shape
-        std::vector<int64_t> key = (!cpu && (net == NetId::ShadeNet || b == Backend::LiteRtGpu)) ? in.shape : std::vector<int64_t>();
+        // (LiteRtCpu16 as the CPU: one interpreter, made again per shape)
+        const bool gpu = b == Backend::LiteRtGpu || b == Backend::LiteRtGpu16;
+        std::vector<int64_t> key = (!cpu && b != Backend::LiteRtCpu16 && (net == NetId::ShadeNet || gpu)) ? in.shape : std::vector<int64_t>();
         auto it = S.sess.find(key);
         if (it == S.sess.end()) {
             Sess s;

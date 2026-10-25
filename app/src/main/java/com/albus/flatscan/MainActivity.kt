@@ -75,7 +75,8 @@ class MainActivity : ComponentActivity() {
      * (comma-separated names). `--ez selftest true` instead: the self-test (one run), its report written to
      * files/batch_out/selftest_report.txt (external files). `--es bench gpu`: Auto's benchmark with those
      * candidates even where the GPU is unavailable (the emulator: the CPU fallback), its report in
-     * files/batch_out/bench_report.txt. `--es open_test SET`: the photos of files/batch/SET imported as pages,
+     * files/batch_out/bench_report.txt (`--es bench gpu,gpu16,cpu16`: the fp16 backends too, measured only: Auto's stored
+     * choice is not replaced). `--ei threads N` with any of these: the CPU nets on N threads. `--es open_test SET`: the photos of files/batch/SET imported as pages,
      * then each stored page opened in turn, the times in files/batch_out/open_report.txt (ScanViewModel.runOpenTest).
      * `--es ocrPackBase URL`: the text recognition pack from URL instead of the GitHub release (a local server
      * through `adb reverse`; empty: the release again), with any other extra. `--es ocr_test PHOTO`: the pack
@@ -95,6 +96,8 @@ class MainActivity : ComponentActivity() {
         }
         // `--ez no_ahead true` with any extra: the flattening nets do not start ahead of processing (A/B checks)
         if (i.hasExtra("no_ahead")) vm.netsAheadOff = i.getBooleanExtra("no_ahead", false)
+        // `--ei threads N` with any extra: the CPU nets on N threads (0: the default) from the next net configuration
+        if (i.hasExtra("threads")) vm.netThreads = i.getIntExtra("threads", 0)
         i.getStringExtra("open_test")?.let { set ->
             vm.runOpenTest(set, java.io.File(getExternalFilesDir(null), "batch_out/open_report.txt"))
             return

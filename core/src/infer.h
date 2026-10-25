@@ -16,7 +16,9 @@
 
 namespace fs {
 enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet, Inpaint };
-enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu };
+// LiteRtGpu16 / LiteRtCpu16: the LiteRT GPU with precision loss allowed (fp16), LiteRT's CPU (XNNPACK) forced to
+// fp16 arithmetic; Auto's benchmark candidates when asked for (lossy: its tolerances decide), never the CPU fallback.
+enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu, LiteRtGpu16, LiteRtCpu16 };
 // A model file in place (Android: an uncompressed asset of the APK, AAsset_getBuffer), valid while keep lives.
 struct ModelView {
     const uint8_t* data = nullptr;

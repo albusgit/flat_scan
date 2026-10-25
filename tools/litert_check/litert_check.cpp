@@ -36,6 +36,7 @@ static const char* name(Backend b) {
     switch (b) {
         case Backend::CPU: return "cpu";
         case Backend::LiteRtGpu: return "gpu";
+        case Backend::LiteRtGpu16: return "gpu16";
         default: return "other";
     }
 }

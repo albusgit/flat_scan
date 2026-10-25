@@ -30,6 +30,8 @@ const char* backend_name(Backend b) {
         case Backend::OpenVINO: return "openvino";
         case Backend::CoreML: return "coreml";
         case Backend::LiteRtGpu: return "gpu";
+        case Backend::LiteRtGpu16: return "gpu16";
+        case Backend::LiteRtCpu16: return "cpu16";
     }
     return "?";
 }
@@ -45,7 +47,7 @@ bool parse_backends(const std::string& s, std::vector<Backend>& out) {
         if (!t.empty()) {
             bool found = false;
             for (Backend b : {Backend::CPU, Backend::XNNPACK, Backend::QNN_HTP, Backend::NNAPI, Backend::CUDA, Backend::TensorRT, Backend::DirectML,
-                              Backend::OpenVINO, Backend::CoreML, Backend::LiteRtGpu})
+                              Backend::OpenVINO, Backend::CoreML, Backend::LiteRtGpu, Backend::LiteRtGpu16, Backend::LiteRtCpu16})
                 if (t == backend_name(b) || (b == Backend::QNN_HTP && t == "qnn_htp") || (b == Backend::DirectML && t == "directml") ||
                     (b == Backend::LiteRtGpu && t == "litert")) {
                     out.push_back(b);
