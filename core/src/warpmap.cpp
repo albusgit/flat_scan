@@ -202,21 +202,23 @@ void dewarp_detect(const cv::Mat& img, std::vector<DLine>& Hs, std::vector<DLine
     cv::dilate(g, bg, cv::Mat::ones(9, 9, CV_8U));
     cv::medianBlur(bg, bg, 41);
     cv::Mat ink(g.size(), CV_8U);
-    for (int y = 0; y < g.rows; ++y)
-        for (int x = 0; x < g.cols; ++x) ink.at<uint8_t>(y, x) = ((int)bg.at<uint8_t>(y, x) - (int)g.at<uint8_t>(y, x)) > 45 ? 255 : 0;
-    cv::Mat hm, vm;
-    cv::morphologyEx(ink, hm, cv::MORPH_OPEN, rect(120, 1));
-    cv::morphologyEx(ink, vm, cv::MORPH_OPEN, rect(1, 120));
-    if (faint) {
-        cv::Mat Df;
-        cv::subtract(bg, g, Df, cv::noArray(), CV_32F);
-        hm |= faint_rules(Df, true, 120);
-        vm |= faint_rules(Df, false, 120);
-    }
-    cv::morphologyEx(hm, hm, cv::MORPH_CLOSE, rect(25, 3));
-    cv::morphologyEx(vm, vm, cv::MORPH_CLOSE, rect(3, 25));
-    Hs = merge_lines(comp_samples(hm, true, 250));
-    Vs = merge_lines(comp_samples(vm, false, 250));
+    cv::parallel_for_(cv::Range(0, g.rows), [&](const cv::Range& R) {
+        for (int y = R.start; y < R.end; ++y)
+            for (int x = 0; x < g.cols; ++x) ink.at<uint8_t>(y, x) = ((int)bg.at<uint8_t>(y, x) - (int)g.at<uint8_t>(y, x)) > 45 ? 255 : 0;
+    });
+    cv::Mat Df;
+    if (faint) cv::subtract(bg, g, Df, cv::noArray(), CV_32F);
+    // the two directions side by side
+    auto lines = [&](bool hz) {
+        cv::Mat m;
+        cv::morphologyEx(ink, m, cv::MORPH_OPEN, hz ? rect(120, 1) : rect(1, 120));
+        if (faint) m |= faint_rules(Df, hz, 120);
+        cv::morphologyEx(m, m, cv::MORPH_CLOSE, hz ? rect(25, 3) : rect(3, 25));
+        return merge_lines(comp_samples(m, hz, 250));
+    };
+    auto vs = std::async(std::launch::async, lines, false);
+    Hs = lines(true);
+    Vs = vs.get();
 }
 
 void dl_trace(const DLine& L, Vec& tc, Vec& vc, double step = 20) {
