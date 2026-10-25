@@ -58,3 +58,29 @@ Emulator (no OpenCL, so `gpu` and `gpu16` cannot run there; `bench_report.txt`):
 
 Phone checklist (yours): `--es bench gpu,gpu16,cpu16` -> `files/batch_out/bench_report.txt`; batch s35 with
 `--es accel cpu --ei threads 2`, then 4, then 6 -> per-stage ms.
+
+## 4. Cold start
+
+### a. The native library off the main thread; WorkManager on demand (same output)
+
+- The first `configureNets` (in the ViewModel's init) was the app's first native call. It loaded
+  `libflatscan.so` on the main thread: about 0.85 s on the emulator (logcat: nativeloader on the main thread's
+  tid). It now runs on the native thread (`nativeCtx`), under its own lock. A net asked for before it runs waits
+  for the asset manager (`jni_bridge.cpp` `assets_locked`, up to 10 s). It doesn't use `netsLock`, because a
+  benchmark holding that lock may be the one waiting. `prewarmFinder` stays on `Dispatchers.IO`: on the
+  native thread its 0.2-0.5 s session would hold up the renders queued behind it, and the wait covers the ordering.
+- WorkManager: `FlatScanApp : Configuration.Provider`, and the manifest removes `WorkManagerInitializer` from
+  androidx.startup. `WorkManager.getInstance` (OCR, sync) initialises it the first time it is called
+  (`FlatScanAppTest`).
+
+Emulator, `am start -W` TotalTime, 10 cold starts each (force-stop between):
+
+| | runs (ms) | median |
+|---|---|---|
+| before | 3539 2913 3262 2899 2755 2758 2736 3174 2916 2607 | 2906 ms |
+| after | 2638 2778 2884 2964 2688 2912 2751 2799 2659 2860 | 2789 ms |
+
+That is -117 ms on the median and a tighter spread (max 3539 -> 2964). It's less than the library's 0.85 s,
+because the library load now competes with the first frame for the emulator's cores. Batch t4: 20 files
+identical. Unit tests: 64 run (the new one included), 10 skipped, 0 failures. Camera after a cold start: the
+page finder warmed (ready in 467 ms), no errors.

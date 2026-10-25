@@ -19,6 +19,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -461,16 +462,24 @@ std::shared_ptr<NetGroup> g_finder, g_flat, g_hr, g_shade, g_rule;
 std::shared_ptr<NetGroup> g_inpaint;   // the finger AI fill (MI-GAN): CPU only, its own Inference
 jobject g_assets = nullptr;       // global reference: keeps the AAssetManager alive
 AAssetManager* g_mgr = nullptr;
+std::condition_variable g_mgr_cv;  // configureNets set g_mgr
 std::string g_cache_dir;          // compiled-model cache (the LiteRT GPU's serialised kernels)
 int g_threads = 0;
 bool g_static_models = false;     // the CPU loads the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1)
+
+// The asset manager; a net asked for before the first configureNets (the app makes that call on its native
+// thread at start, off the main thread) waits for it, up to 10 s. Caller holds lk (g_nets_mu).
+AAssetManager* assets_locked(std::unique_lock<std::mutex>& lk) {
+    g_mgr_cv.wait_for(lk, std::chrono::seconds(10), [] { return g_mgr != nullptr; });
+    return g_mgr;
+}
 
 // assets/models/<file>, or empty (missing: that net or backend is unavailable)
 std::vector<uint8_t> load_model(std::string file) {
     AAssetManager* mgr;
     {
-        std::lock_guard<std::mutex> lk(g_nets_mu);
-        mgr = g_mgr;
+        std::unique_lock<std::mutex> lk(g_nets_mu);
+        mgr = assets_locked(lk);
         if (g_static_models && file == "uvdoc.onnx") file = "uvdoc_static.onnx";
         if (g_static_models && file == "syntheticdoc_hr.onnx") file = "syntheticdoc_hr_static.onnx";
     }
@@ -494,8 +503,8 @@ std::vector<uint8_t> load_model(std::string file) {
 ModelView map_model(const std::string& file) {
     AAssetManager* mgr;
     {
-        std::lock_guard<std::mutex> lk(g_nets_mu);
-        mgr = g_mgr;
+        std::unique_lock<std::mutex> lk(g_nets_mu);
+        mgr = assets_locked(lk);
     }
     ModelView v;
     if (!mgr) return v;
@@ -816,6 +825,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     if (!g_assets && assets) {
         g_assets = env->NewGlobalRef(assets);
         g_mgr = AAssetManager_fromJava(env, g_assets);
+        g_mgr_cv.notify_all();
     }
     const bool same = cd == g_cache_dir && threads == g_threads && (bool)static_models == g_static_models;
     g_cache_dir = cd;

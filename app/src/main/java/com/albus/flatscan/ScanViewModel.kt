@@ -400,6 +400,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** Debug (`--ei threads N`): the CPU nets' threads; 0: the default, min(cores, 4). */
     @Volatile var netThreads = 0
     private val netsLock = Any()
+    /** [configureNets] ran at least once. */
+    @Volatile private var netsConfigured = false
+    /** [configureNets]' own lock (not [netsLock]: a benchmark under it may be waiting for the first configuration). Before
+     *  init, which starts the first configuration on the native thread. */
+    private val configLock = Any()
 
     init {
         // a crash in guarded native work last time (CrashGuard): report it, and keep the nets off a GPU that crashed
@@ -410,8 +415,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             message = r.lineSequence().first() + (if (CrashGuard.gpuDisabled(app)) " - the GPU is off now" else "") + " (details: Settings > Self-test)"
         }
         Accel.gpuOff = CrashGuard.gpuDisabled(app)
-        // the CPU until processing asks for the setting's backends (ensureNets)
-        configureNets(netPlan)
+        // the CPU until processing asks for the setting's backends (ensureNets). On the native thread: the first
+        // NativeLib call loads libflatscan.so (0.85 s on the emulator), which kept the first frame waiting on the
+        // main thread; a net asked for before this ran waits for it (jni_bridge.cpp assets_locked)
+        viewModelScope.launch(nativeCtx) { synchronized(configLock) { if (!netsConfigured) configureNets(netPlan) } }
     }
 
     /** Settings: the user asks for the GPU again after a crash turned it off. */
@@ -426,12 +433,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun currentPlan(): Accel.Plan = Accel.fixed(settings.acceleration) ?: Accel.autoPlan(settings.autoChoice)
         ?: Accel.Plan(Accel.AUTO, "", "", "", "", "", "not benchmarked yet")
 
-    private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) {
+    private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) = synchronized(configLock) {
         val app = getApplication<Application>()
         // the LiteRT GPU's serialised kernels (the folder kept its earlier name)
         val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
         NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, plan.rule, netThreads, staticModels)
         netPlan = plan
+        netsConfigured = true
     }
 
     /**
