@@ -86,6 +86,7 @@
 #ifdef FS_LITERT
 #include <condition_variable>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -96,6 +97,7 @@
 #include "tflite/c/c_api_opaque.h"
 #include "tflite/c/common.h"
 #include "tflite/delegates/gpu/delegate.h"
+#include "tflite/delegates/xnnpack/xnnpack_delegate.h"
 #endif
 
 namespace fs {
@@ -308,19 +310,25 @@ struct LrtApi {
     // past ours, and TfLiteGpuDelegateV2Create then reads its own defaults for them
     struct GpuOptions { TfLiteGpuDelegateOptionsV2 o; unsigned char spare[128]; };
     GpuOptions (*GpuOptionsDefault)() = nullptr;
-    // LiteRT's XNNPACK delegate (in libtensorflowlite_jni.so; no vendored header): the options struct is read
-    // the same way as the GPU's, with room to spare; num_threads is its first field in every version. The C
-    // API's TfLiteInterpreterCreate does not apply it by itself (measured on the emulator: built-in kernels
-    // only, 2.5-4x slower than ONNX Runtime), so the CPU interpreters get it explicitly.
-    struct XnnOptions { int32_t num_threads; uint32_t flags; unsigned char spare[256]; };
+    // LiteRT's XNNPACK delegate (in libtensorflowlite_jni.so): the options struct (the vendored header) is read
+    // the same way as the GPU's, with room to spare. The C API's TfLiteInterpreterCreate does not apply it by
+    // itself (measured on the emulator: built-in kernels only, 2.5-4x slower than ONNX Runtime), so the CPU
+    // interpreters get it explicitly.
+    struct XnnOptions { TfLiteXNNPackDelegateOptions o; unsigned char spare[256]; };
     XnnOptions (*XnnOptionsDefault)() = nullptr;
-    TfLiteDelegate* (*XnnCreate)(const XnnOptions*) = nullptr;
+    TfLiteDelegate* (*XnnCreate)(const TfLiteXNNPackDelegateOptions*) = nullptr;
     void (*XnnDelete)(TfLiteDelegate*) = nullptr;
     std::string version;
     std::string dir;
     bool gpu = false;                     // the GPU functions above are set
 };
 #undef FS_LRT_DECL
+#ifdef __LP64__
+// LiteRT 1.4.0's layout (the vendored header), which the CPU interpreters' options are written into
+static_assert(sizeof(TfLiteXNNPackDelegateOptions) == 56, "XNNPACK delegate options: not LiteRT 1.4.0's layout");
+static_assert(offsetof(TfLiteXNNPackDelegateOptions, flags) == 8, "XNNPACK delegate options: not LiteRT 1.4.0's layout");
+static_assert(offsetof(TfLiteXNNPackDelegateOptions, weight_cache_file_path) == 32, "XNNPACK delegate options: not LiteRT 1.4.0's layout");
+#endif
 
 std::mutex& litert_mu() {
     static std::mutex mu;
@@ -865,8 +873,8 @@ bool lrt_cpu_open(LrtCpu& s, std::string& why) {
     api.TfLiteInterpreterOptionsSetErrorReporter(s.opts, litert_report, &s.log);
     if (s.use_xnn && api.XnnCreate) {
         LrtApi::XnnOptions xo = api.XnnOptionsDefault();
-        xo.num_threads = s.threads;
-        if ((s.xnn = api.XnnCreate(&xo))) api.TfLiteInterpreterOptionsAddDelegate(s.opts, reinterpret_cast<TfLiteOpaqueDelegate*>(s.xnn));
+        xo.o.num_threads = s.threads;
+        if ((s.xnn = api.XnnCreate(&xo.o))) api.TfLiteInterpreterOptionsAddDelegate(s.opts, reinterpret_cast<TfLiteOpaqueDelegate*>(s.xnn));
     }
     if (!(s.interp = api.TfLiteInterpreterCreate(s.model, s.opts))) {
         why = "TfLiteInterpreterCreate failed: " + s.log;
