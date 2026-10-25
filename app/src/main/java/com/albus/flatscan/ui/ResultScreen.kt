@@ -341,7 +341,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 onCompare = { compare = it },
                 brushOverlay = if (mode == AreaMode.Fingers) vm.fingerOverlay else null,
                 brushRadius = brushRadius,
-                onStroke = { pts -> if (mode == AreaMode.Lines) vm.addUserLine(pts) else vm.addFingerStroke(brushAdd, brushRadius, pts) },
+                onStroke = { pts -> if (mode == AreaMode.Lines) vm.traceUserLine(pts) else vm.addFingerStroke(brushAdd, brushRadius, pts) },
                 drawStrokes = (mode == AreaMode.Fingers && !smartSelect) || (mode == AreaMode.Lines && drawingLine),
                 pendingLines = if (mode == AreaMode.Lines) vm.pendingUserLines else emptyList(),
                 fadeKey = p.filter,
@@ -955,21 +955,21 @@ private fun LinesPanel(
     val ignoredBoxes = vm.ignore.size / 4
     val drawn = countDrawnLines(vm.userLines)
     val ironOn = !vm.perspectiveOnly
-    // the page's lines by kind (ruled, text row, table) and those ignored (their middle in a box), for the key
+    // the page's lines by kind (ruled, text row, table, drawn and flattened) and those ignored (their middle in a box)
     val ignore = vm.ignore.toList()
     val counts = remember(vm.lines, ignore) {
-        val c = IntArray(4)
+        val c = IntArray(5)
         val l = vm.lines
         var i = 0
         while (5 * i + 4 < l.size) {
             val mx = (l[5 * i + 1] + l[5 * i + 3]) / 2
             val my = (l[5 * i + 2] + l[5 * i + 4]) / 2
-            if (inAreas(ignore, mx, my)) c[3]++ else c[l[5 * i].toInt().coerceIn(0, 2)]++
+            if (inAreas(ignore, mx, my)) c[4]++ else c[l[5 * i].toInt().coerceIn(0, 3)]++
             i++
         }
         c
     }
-    val used = counts[0] + counts[1] + counts[2]
+    val used = counts[0] + counts[1] + counts[2] + counts[3]
     Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 16.dp)) {
         // what the tab does and how it stands, the iron as a switch (as Remove shadows)
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -999,19 +999,19 @@ private fun LinesPanel(
         }
         if (ironOn) {
             // the key to the colours on the page, with how many of each
-            if (used + counts[3] + drawn > 0) {
+            if (used + counts[4] + drawn > 0) {
                 FlowRow(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (counts[0] > 0) LegendDot(LineColors[0], "Ruled", counts[0])
                     if (counts[1] > 0) LegendDot(LineColors[1], "Text rows", counts[1])
                     if (counts[2] > 0) LegendDot(LineColors[2], "Table", counts[2])
                     if (drawn > 0) LegendDot(DrawnLineColor, "Drawn", drawn)
-                    if (counts[3] > 0) LegendDot(IgnoreColor, "Ignored", counts[3])
+                    if (counts[4] > 0) LegendDot(IgnoreColor, "Ignored", counts[4])
                 }
             }
             // one line for the tool in use
             Text(
                 when {
-                    drawing -> "Draw along a printed line the iron missed, end to end. Tap a yellow line to remove it."
+                    drawing -> "Sweep roughly along a printed line the iron missed: the line is found and followed. Tap a yellow line to remove it."
                     used == 0 -> "Add a line along a printed rule, or the page's outline alone flattens it."
                     else -> "Tap a line to leave it out (a logo, a second sheet), or drag a box over an area."
                 },

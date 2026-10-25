@@ -166,6 +166,12 @@ object NativeLib {
     @JvmStatic external fun fingerSelect(handle: Long, x: Float, y: Float): FloatArray
 
     /**
+     * The line editor's Add line: the printed line a rough [stroke] (page fractions x0, y0, x1, y1, ...) was drawn
+     * along, followed along its length (page fractions, every 4 px); empty if there is no line under most of it.
+     */
+    @JvmStatic external fun findLine(handle: Long, stroke: FloatArray): FloatArray
+
+    /**
      * Whiteboard mode: the board or screen in [photo] (core/src/board.cpp): [x0, y0 .. x3, y3 (TL, TR, BR,
      * BL), confidence, area share, dark (1: a dark slide)], or null when no reliable quadrilateral is found.
      */

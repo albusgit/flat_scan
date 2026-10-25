@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -197,6 +198,19 @@ fun PageViewer(
         fadeOut.snapTo(1f)
         fadeOut.animateTo(0f, tween(200))
         fadeFrom = null
+    }
+    // a line just found from a sweep (the last of pendingLines) draws itself along its length, with a fading glow
+    val reveal = remember { Animatable(1f) }
+    val revealed = remember { intArrayOf(pendingLines.size) }
+    LaunchedEffect(pendingLines.size) {
+        val grew = pendingLines.size > revealed[0]
+        revealed[0] = pendingLines.size
+        if (grew && !reduced) {
+            reveal.snapTo(0f)
+            reveal.animateTo(1f, tween(420, easing = FastOutSlowInEasing))
+        } else {
+            reveal.snapTo(1f)
+        }
     }
     var box by remember { mutableStateOf(Size.Zero) }
     // the rectangle being drawn, page pixels
@@ -411,19 +425,40 @@ fun PageViewer(
                     }
                 }
                 if (areaMode == AreaMode.Lines) {
-                    // drawn lines not flattened yet, and the one being drawn
+                    // the lines found from sweeps, not flattened yet (the newest drawing itself in), and the sweep
+                    // being made: a soft wide guide, not a line (the line is found under it)
                     val lw = 3.dp.toPx() / g.k
-                    fun polyline(pts: List<Offset>) {
-                        if (pts.size < 2) return
-                        val path = androidx.compose.ui.graphics.Path().apply {
-                            moveTo(pts[0].x, pts[0].y)
-                            for (q in pts.drop(1)) lineTo(q.x, q.y)
+                    val round = Stroke(lw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+                    fun pathOf(pts: List<Offset>, upTo: Float = 1f): androidx.compose.ui.graphics.Path {
+                        val path = androidx.compose.ui.graphics.Path()
+                        if (pts.size < 2) return path
+                        var total = 0f
+                        for (i in 1 until pts.size) total += (pts[i] - pts[i - 1]).getDistance()
+                        var left = total * upTo
+                        path.moveTo(pts[0].x, pts[0].y)
+                        for (i in 1 until pts.size) {
+                            val seg = (pts[i] - pts[i - 1]).getDistance()
+                            if (seg >= left) {
+                                val q = if (seg > 0f) pts[i - 1] + (pts[i] - pts[i - 1]) * (left / seg) else pts[i]
+                                path.lineTo(q.x, q.y)
+                                break
+                            }
+                            path.lineTo(pts[i].x, pts[i].y)
+                            left -= seg
                         }
-                        drawPath(path, Color.Black.copy(alpha = 0.45f), style = Stroke(lw * 2.2f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
-                        drawPath(path, DrawnLineColor, style = Stroke(lw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                        return path
                     }
-                    for (f in pendingLines) polyline(List(f.size / 2) { Offset(f[2 * it] * pageWidth, f[2 * it + 1] * pageHeight) })
-                    polyline(stroke)
+                    for ((k, f) in pendingLines.withIndex()) {
+                        val pts = List(f.size / 2) { Offset(f[2 * it] * pageWidth, f[2 * it + 1] * pageHeight) }
+                        val t = if (k == pendingLines.lastIndex) reveal.value else 1f
+                        val path = pathOf(pts, t)
+                        if (t < 1f) drawPath(path, DrawnLineColor.copy(alpha = 0.35f * (1f - t)), style = Stroke(lw * 5f, cap = StrokeCap.Round))
+                        drawPath(path, Color.Black.copy(alpha = 0.45f), style = Stroke(lw * 2.2f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                        drawPath(path, DrawnLineColor, style = round)
+                    }
+                    if (stroke.size >= 2) {
+                        drawPath(pathOf(stroke), Color.White.copy(alpha = 0.35f), style = Stroke(14.dp.toPx() / g.k, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                    }
                 }
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k

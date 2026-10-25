@@ -28,6 +28,7 @@
 
 #include "cleanup.h"
 #include "screen.h"
+#include "linefind.h"
 #include "gpu.h"
 #include "infer.h"
 #include "log.h"
@@ -1424,6 +1425,34 @@ JNIEXPORT jfloat JNICALL Java_com_albus_flatscan_NativeLib_fingerOverlay(JNIEnv*
 // to the tap, holes filled, 2 px wider (the finger's soft edge). Returns its outline as page fractions
 // [x0, y0, x1, y1, ...]; empty when nothing was found or it would cover more than a quarter of the page
 // (a tap on blank paper).
+// The line editor's Add line: the printed line a rough stroke (page fractions x0, y0, x1, y1, ...) was drawn along
+// on this page (core/src/linefind.h), as page fractions along it; empty if there is none under most of the stroke.
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_findLine(JNIEnv* env, jclass, jlong h, jfloatArray stroke) {
+    std::vector<float> out;
+    Session* s = session(h);
+    if (s && s->result.ok && stroke) {
+        try {
+            const PipelineResult& r = s->result;
+            const cv::Mat& page = !r.page_unerased.empty() ? r.page_unerased : (!s->page_orig.empty() ? s->page_orig : r.page);
+            const int W = page.cols, H = page.rows;
+            std::vector<float> v((size_t)env->GetArrayLength(stroke));
+            if (!v.empty()) env->GetFloatArrayRegion(stroke, 0, (jsize)v.size(), v.data());
+            std::vector<cv::Point2f> pts;
+            for (size_t i = 0; i + 1 < v.size(); i += 2) pts.emplace_back(v[i] * W, v[i + 1] * H);
+            for (const auto& p : find_drawn_line(page, pts)) {
+                out.push_back(p.x / W);
+                out.push_back(p.y / H);
+            }
+        } catch (const std::exception& e) {
+            LOGI("findLine failed: %s", e.what());
+            out.clear();
+        }
+    }
+    jfloatArray a = env->NewFloatArray((jsize)out.size());
+    if (!out.empty()) env->SetFloatArrayRegion(a, 0, (jsize)out.size(), out.data());
+    return a;
+}
+
 JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_fingerSelect(JNIEnv* env, jclass, jlong h, jfloat fx, jfloat fy) {
     std::vector<float> out;
     Session* s = session(h);

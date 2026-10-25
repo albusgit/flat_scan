@@ -2384,6 +2384,25 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         userLines = userLines + listOf(group.toFloat(), kept.size.toFloat()) + kept.flatMap { listOf(points[2 * it], points[2 * it + 1]) }
     }
 
+    /**
+     * Line editor > Add line: the printed line a rough stroke was swept along ([points]: page fractions x0, y0, ...),
+     * found on the page (NativeLib.findLine: the stroke only has to come near it, and the line is followed past the
+     * stroke's ends) and added along its length. No line there: a message and no line (flattening could not use it).
+     */
+    fun traceUserLine(points: List<Float>) {
+        val h = handle
+        if (h == 0L || points.size < 4) return
+        viewModelScope.launch {
+            val found = withContext(nativeCtx) { if (h == nativeHandle) NativeLib.findLine(h, points.toFloatArray()) else FloatArray(0) }
+            if (handle != h) return@launch
+            if (found.size < 4) {
+                message = "No printed line along that stroke: sweep along the line itself"
+                return@launch
+            }
+            addUserLine(found.toList())
+        }
+    }
+
     /** Line editor: removes the last drawn line. */
     fun undoUserLine() {
         val starts = drawnLineStarts(userLines)
