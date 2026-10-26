@@ -15,7 +15,7 @@
 #include <vector>
 
 namespace fs {
-enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet, Inpaint };
+enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet, Inpaint, OrientNet };
 // LiteRtGpu16 / LiteRtCpu16: the LiteRT GPU with precision loss allowed (fp16), LiteRT's CPU (XNNPACK) forced to
 // fp16 arithmetic; Auto's benchmark candidates when asked for (lossy: its tolerances decide), never the CPU fallback.
 enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu, LiteRtGpu16, LiteRtCpu16 };
@@ -39,6 +39,11 @@ struct InferConfig {
     // LiteRT GPU: exhaustive work-group tuning (every size timed per kernel: minutes for the rule net and SyntheticDoc
     // high-res at their shapes on a phone) instead of the fast one (one size by formula); a debug switch, to measure
     bool gpu_exhaustive_tuning = false;
+    // Desktop tests: a folder where every run's outputs are stored under a hash of the net's CPU model
+    // (output_cache_tag(file): e.g. its path, size and time) and its exact input; a stored output is returned
+    // without loading the model. Empty (the app): off.
+    std::string output_cache_dir;
+    std::function<std::string(const std::string& file)> output_cache_tag;
 };
 struct Tensor { std::vector<int64_t> shape; std::vector<float> data; };
 class Inference {

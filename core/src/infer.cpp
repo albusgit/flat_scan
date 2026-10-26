@@ -64,6 +64,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -169,11 +171,12 @@ const char* net_str(NetId n) {
         case NetId::ShadeNet: return "shadenet";
         case NetId::RuleNet: return "rulenet";
         case NetId::Inpaint: return "inpaint";
+        case NetId::OrientNet: return "orientnet";
     }
     return "?";
 }
 
-constexpr int N_NETS = 6;
+constexpr int N_NETS = 7;
 
 }  // namespace
 
@@ -1018,6 +1021,7 @@ struct Inference::Impl {
 
     static bool accelerator_allowed(NetId net, Backend b) {
         if (net == NetId::Inpaint) return false;   // MI-GAN (finger fill): the CPU only, on demand
+        if (net == NetId::OrientNet) return false; // the orientation net: small, the CPU only
         if (net == NetId::RuleNet) return b != Backend::QNN_HTP && b != Backend::NNAPI;   // the LiteRT GPU: its fixed-shape copies
         return !(net == NetId::PageFinder && (b == Backend::QNN_HTP || b == Backend::NNAPI || b == Backend::LiteRtGpu || b == Backend::LiteRtGpu16 ||
                                               b == Backend::LiteRtCpu16));
@@ -1081,6 +1085,7 @@ struct Inference::Impl {
             else if (net == NetId::ShadeNet) load("shadenet.tflite");
             else if (net == NetId::RuleNet) load("rulenet.tflite");
             else if (net == NetId::Inpaint) load("migan_512.tflite");
+            else if (net == NetId::OrientNet) load("orientnet.tflite");
             return bytes;
         }
         if (b != Backend::CPU) {
@@ -1457,6 +1462,75 @@ std::unique_ptr<Inference> Inference::create(const InferConfig& cfg) {
     return std::unique_ptr<Inference>(new Inference(std::move(impl)));
 }
 
+namespace {
+
+// output cache (InferConfig::output_cache_dir): a 64-bit hash of the model's tag, the input's shape and
+// its values, taken 8 bytes at a time
+uint64_t mix(uint64_t h, uint64_t w) {
+    h ^= w + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h *= 0xBF58476D1CE4E5B9ull;
+    return h ^ (h >> 31);
+}
+
+uint64_t cache_key(const std::string& tag, const Tensor& in) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : tag) h = mix(h, c);
+    for (int64_t d : in.shape) h = mix(h, (uint64_t)d);
+    const size_t n = in.data.size() * sizeof(float);
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(in.data.data());
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = mix(h, w);
+    }
+    for (; i < n; ++i) h = mix(h, p[i]);
+    return h;
+}
+
+bool read_cached(const std::string& file, std::vector<Tensor>& out) {
+    FILE* f = std::fopen(file.c_str(), "rb");
+    if (!f) return false;
+    bool ok = true;
+    uint32_t count = 0;
+    ok &= std::fread(&count, 4, 1, f) == 1 && count < 64;
+    out.assign(ok ? count : 0, Tensor());
+    for (uint32_t k = 0; ok && k < count; ++k) {
+        uint32_t nd = 0;
+        ok &= std::fread(&nd, 4, 1, f) == 1 && nd < 16;
+        if (!ok) break;
+        out[k].shape.resize(nd);
+        ok &= nd == 0 || std::fread(out[k].shape.data(), 8, nd, f) == nd;
+        uint64_t n = 0;
+        ok &= std::fread(&n, 8, 1, f) == 1 && n < (1ull << 32);
+        if (!ok) break;
+        out[k].data.resize((size_t)n);
+        ok &= n == 0 || std::fread(out[k].data.data(), 4, (size_t)n, f) == n;
+    }
+    std::fclose(f);
+    if (!ok) out.clear();
+    return ok;
+}
+
+void write_cached(const std::string& file, const std::vector<Tensor>& out) {
+    // written beside and renamed: another process reading the same entry never sees half of it
+    const std::string tmp = file + ".tmp" + std::to_string((unsigned long long)std::hash<std::thread::id>()(std::this_thread::get_id()));
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const uint32_t count = (uint32_t)out.size();
+    bool ok = std::fwrite(&count, 4, 1, f) == 1;
+    for (const auto& t : out) {
+        const uint32_t nd = (uint32_t)t.shape.size();
+        const uint64_t n = t.data.size();
+        ok &= std::fwrite(&nd, 4, 1, f) == 1 && (nd == 0 || std::fwrite(t.shape.data(), 8, nd, f) == nd) && std::fwrite(&n, 8, 1, f) == 1 &&
+              (n == 0 || std::fwrite(t.data.data(), 4, (size_t)n, f) == n);
+    }
+    ok &= std::fclose(f) == 0;
+    if (!ok || std::rename(tmp.c_str(), file.c_str()) != 0) std::remove(tmp.c_str());
+}
+
+}  // namespace
+
 bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::string* err) {
     out.clear();
     Impl& I = *impl_;
@@ -1468,6 +1542,26 @@ bool Inference::run(NetId net, const Tensor& in, std::vector<Tensor>& out, std::
         if (err) *err = "input shape does not match its data";
         return false;
     }
+    // the output cache: a stored output for this model and input is returned as it is; a successful run's is
+    // stored on the way out (out is filled only on success)
+    std::string cached;
+    if (!I.cfg.output_cache_dir.empty()) {
+        const std::string file = std::string(net_str(net)) + ".onnx";
+        const std::string tag = file + "|" + (I.cfg.output_cache_tag ? I.cfg.output_cache_tag(file) : std::string());
+        char hex[17];
+        std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)cache_key(tag, in));
+        cached = I.cfg.output_cache_dir + "/" + net_str(net) + "_" + hex + ".bin";
+        if (read_cached(cached, out)) {
+            S.ms = 0;
+            S.ran = Backend::CPU;
+            return true;
+        }
+    }
+    struct Store {
+        const std::string& file;
+        const std::vector<Tensor>& out;
+        ~Store() { if (!file.empty() && !out.empty()) write_cached(file, out); }
+    } store{cached, out};
     std::string why;
     // at: the backend tried; S.pos moves on only when the net's backend fails for good (a missing model of one
     // input shape skips that backend for this call only)

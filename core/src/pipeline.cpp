@@ -103,7 +103,29 @@ OrientInput orient_input(const cv::Mat& op, const Unroll& U, const PipelineOptio
 
 Orientation orient_decide(cv::Mat op, const OrientInput& in, const PipelineOptions& opt) {
     if (in.rows > 0) cv::resize(op, op, cv::Size(op.cols, in.rows), 0, 0, in.area ? cv::INTER_AREA : cv::INTER_LINEAR);
-    return decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : in.min_ratio);
+    Orientation o = decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : in.min_ratio);
+    // the orientation net, on the same page at its own shape: any of the four turns, when it is sure
+    if (opt.orient_net && !opt.reference_orient) {
+        int k = -1, n = 0;
+        double m = -1;
+        if (orient_net_turn(op, opt.orient_net, &k, &m, &n)) {
+            o.net_turn = k;
+            o.net_margin = m;
+            o.net_patches = n;
+            // a half turn: the net alone (the text-axis rule never turns a page over); a quarter turn: only when the
+            // rule also finds the page's text running sideways (a portrait page with a table printed across it reads
+            // sideways to the net, and stays as printed), the net then choosing which way; upright: the net
+            if (m >= opt.orient_net_margin) {
+                static const int code[4] = {-1, cv::ROTATE_90_CLOCKWISE, cv::ROTATE_180, cv::ROTATE_90_COUNTERCLOCKWISE};
+                const bool rule_sideways = o.rot == cv::ROTATE_90_CLOCKWISE || o.rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+                if (k == 0 || k == 2 || rule_sideways) {
+                    o.rot = code[k];
+                    o.by_net = true;
+                }
+            }
+        }
+    }
+    return o;
 }
 
 // two homography unrolls with the same page and matrix (the same page image)
@@ -1249,28 +1271,65 @@ bool straight_edges_kept(const PageTraces& S, const GridMap& m) {
     return true;
 }
 
-// Height / width of the paper as it lies in the photo, measured along a flattening map: the median
-// length of its columns over that of its rows (photo px). Along the map, not between the corners: a
-// curled or crumpled sheet is longer than the chord between its corners (a curled magazine page
-// measured 1.25 from its corners, 1.44 along the map; it is A4, 1.41), and the core's page is A4
-// whatever the paper, so the app takes the paper's own shape from this.
-double map_page_hw(const GridMap& m) {
+// Height / width of the rectangle photographed as the quad c (TL, TR, BR, BL, photo px): Zhang and He's
+// rectangle-from-perspective method ("Whiteboard scanning and image enhancement", 2007), principal point
+// at the photo centre. The focal length: focal_px, else measured from the quad when both directions
+// converge enough to tell, else 0.72 x the long side (surface.cpp's default). The camera correction
+// always applies: a sheet tilted one way only is still foreshortened the other way (PageLook.kt
+// measuredPageHw, the same method). -1: degenerate quad.
+double quad_page_hw(const std::array<cv::Point2d, 4>& c, cv::Size photo, double focal_px) {
+    const double u0 = photo.width / 2.0, v0 = photo.height / 2.0, L = std::max(photo.width, photo.height);
+    auto hom = [](const cv::Point2d& p) { return cv::Vec3d(p.x, p.y, 1.0); };
+    const cv::Vec3d m1 = hom(c[0]), m2 = hom(c[1]), m3 = hom(c[3]), m4 = hom(c[2]);
+    const double d2 = m2.cross(m4).dot(m3), d3 = m3.cross(m4).dot(m2);
+    if (std::fabs(d2) < 1e-9 || std::fabs(d3) < 1e-9) return -1;
+    const double k2 = m1.cross(m4).dot(m3) / d2, k3 = m1.cross(m4).dot(m2) / d3;
+    const cv::Vec3d n2 = k2 * m2 - m1, n3 = k3 * m3 - m1;
+    auto converges = [&](const cv::Vec3d& n) { return std::fabs(n[2]) * L / std::max(1e-9, std::hypot(n[0], n[1])) > 0.02; };
+    double f2 = focal_px > 0 ? focal_px * focal_px : 0;
+    if (f2 <= 0 && converges(n2) && converges(n3))
+        f2 = -((n2[0] * n3[0] - (n2[0] * n3[2] + n2[2] * n3[0]) * u0 + n2[2] * n3[2] * u0 * u0) +
+               (n2[1] * n3[1] - (n2[1] * n3[2] + n2[2] * n3[1]) * v0 + n2[2] * n3[2] * v0 * v0)) / (n2[2] * n3[2]);
+    // a quad that barely converges measures the focal length badly (0.29 to 1.78 x the long side on real photos;
+    // phone cameras are about 0.7 - 1.0, 26 mm equivalent: 0.72): outside 0.5 - 2 x, the default
+    if (!(f2 >= 0.25 * L * L && f2 <= 4.0 * L * L) && focal_px <= 0) f2 = (0.72 * L) * (0.72 * L);
+    if (!(f2 > 0)) f2 = (0.72 * L) * (0.72 * L);
+    auto q = [&](const cv::Vec3d& n) {
+        const double x = n[0] - u0 * n[2], y = n[1] - v0 * n[2];
+        return (x * x + y * y) / f2 + n[2] * n[2];
+    };
+    const double a = q(n2), b = q(n3);
+    return a > 0 && b > 0 ? std::sqrt(b / a) : -1;
+}
+
+// Height / width of the paper itself, measured along a flattening map (output page -> photo px): the
+// map's points are first taken through the homography from its corners to a rectangle of the corners'
+// true shape (quad_page_hw: the perspective is removed), then the median length of its columns over
+// that of its rows. Along the map, not only between the corners: a curled sheet is longer than the
+// chord between its corners (a curled magazine page measured 1.25 from its corners, 1.44 along the
+// map; it is A4, 1.41), and the core's page is A4 whatever the paper, so the app takes the paper's own
+// shape from this. A homography map gives exactly the corners' shape. (Before round 17 the lengths were
+// summed in photo px, where a tilt foreshortens one direction.)
+double map_page_hw(const GridMap& m, cv::Size photo, double focal_px) {
     if (m.gw < 3 || m.gh < 3) return -1;
+    auto P = [&](int i, int j) { const size_t a = (size_t)i * m.gw + j; return cv::Point2d(m.x[a], m.y[a]); };
+    const std::array<cv::Point2d, 4> c = {P(0, 0), P(0, m.gw - 1), P(m.gh - 1, m.gw - 1), P(m.gh - 1, 0)};
+    const double hw0 = quad_page_hw(c, photo, focal_px);
+    if (!(hw0 > 0)) return -1;
+    std::vector<cv::Point2f> src, dst = {{0, 0}, {1, 0}, {1, (float)hw0}, {0, (float)hw0}}, pts, flat;
+    for (const auto& p : c) src.emplace_back((float)p.x, (float)p.y);
+    const cv::Mat Hc = cv::getPerspectiveTransform(src, dst);
+    for (size_t a = 0; a < m.x.size(); ++a) pts.emplace_back(m.x[a], m.y[a]);
+    cv::perspectiveTransform(pts, flat, Hc);
     Vec rows, cols;
     for (int i = 0; i < m.gh; ++i) {
         double s = 0;
-        for (int j = 0; j + 1 < m.gw; ++j) {
-            size_t a = (size_t)i * m.gw + j;
-            s += std::hypot(m.x[a + 1] - m.x[a], m.y[a + 1] - m.y[a]);
-        }
+        for (int j = 0; j + 1 < m.gw; ++j) s += cv::norm(flat[(size_t)i * m.gw + j + 1] - flat[(size_t)i * m.gw + j]);
         rows.push_back(s);
     }
     for (int j = 0; j < m.gw; ++j) {
         double s = 0;
-        for (int i = 0; i + 1 < m.gh; ++i) {
-            size_t a = (size_t)i * m.gw + j;
-            s += std::hypot(m.x[a + m.gw] - m.x[a], m.y[a + m.gw] - m.y[a]);
-        }
+        for (int i = 0; i + 1 < m.gh; ++i) s += cv::norm(flat[(size_t)(i + 1) * m.gw + j] - flat[(size_t)i * m.gw + j]);
         cols.push_back(s);
     }
     const double w = median(rows);
@@ -1465,9 +1524,16 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         for (int k = 0; k < 4; ++k) {
             const cv::Point2d a = pc.det.corners[k], b = pc.det.corners[(k + 1) % 4];
             const double L = cv::norm(b - a);
+            r.side_n[k] = (int)pc.det.side_pts[k].size();
             if (L < 1 || pc.det.side_pts[k].size() < 5) continue;
             Vec d;
-            for (const auto& p : pc.det.side_pts[k]) d.push_back(std::fabs((b - a).cross(p - a)) / L);
+            const double aw = photo.cols * std::min(1.0, pc.scale), ah = photo.rows * std::min(1.0, pc.scale);
+            int on_edge = 0;
+            for (const auto& p : pc.det.side_pts[k]) {
+                d.push_back(std::fabs((b - a).cross(p - a)) / L);
+                on_edge += std::min({p.x, p.y, aw - 1 - p.x, ah - 1 - p.y}) < 2.0;
+            }
+            r.side_edge[k] = (double)on_edge / pc.det.side_pts[k].size();
             std::sort(d.begin(), d.end());
             r.side_bow[k] = d[(size_t)(0.95 * (d.size() - 1))] / L;
         }
@@ -1592,7 +1658,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             const double tol = 0.02 * std::max(photo.cols, photo.rows);
             fills_photo &= std::min(c.x, photo.cols - 1 - c.x) < tol && std::min(c.y, photo.rows - 1 - c.y) < tol;
         }
-        struct Cand { UvGrid g; double agree = 0, consist = -1, paper = -1; int model = 0; bool own = false; };
+        struct Cand { UvGrid g; double agree = 0, agree_mask = -1, consist = -1, paper = -1; int model = 0; bool own = false; };
         std::vector<Cand> ok;
         double best_agree = 0;
         UvGrid pass1;
@@ -1605,8 +1671,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             c.g = uv_grid(out, crop);
             c.model = crop.model;
             // the page finder's mask can miss a coloured band or a dark page its corners still frame
-            c.agree = uv_agreement(c.g, corners, photo.size());
-            if (use_mask) c.agree = std::max(c.agree, uv_agreement(c.g, pc.det.paper, pc.scale));
+            c.agree = r.uv_agree_quad[k] = uv_agreement(c.g, corners, photo.size());
+            if (use_mask) c.agree = std::max(c.agree, c.agree_mask = r.uv_agree_mask[k] = uv_agreement(c.g, pc.det.paper, pc.scale));
+            {
+                const GridValidity gv = uv_grid_validity(c.g, photo.size());
+                r.uv_grid_check[k][0] = gv.folded;
+                r.uv_grid_check[k][1] = gv.collapsed;
+                r.uv_grid_check[k][2] = gv.outside;
+            }
             best_agree = std::max(best_agree, c.agree);
             if (!c.g.ok) continue;
             bool by_finder = c.g.turned == landscape && c.agree >= (c.model == 2 && use_mask ? opt.uv_min_agreement_hr : need);
@@ -1654,6 +1726,23 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             U = Uh;
             U.mode = GeomMode::Neural;
             U.uv = std::move(ok[pick].g);
+            // the other net where the chosen one's border misses the paper and the other's fits it (a corner the
+            // chosen net cut off and bent: the coupon's curled strip)
+            if (opt.fuse_miss > 0 && ok.size() == 2 && use_mask && !r.uv_defines_page &&
+                ok[1 - pick].agree_mask >= ok[pick].agree_mask + opt.fuse_min_gain) {
+                FuseStats fst;
+                UvGrid fused = uv_fuse_border(U.uv, ok[1 - pick].g, pc.det.paper, pc.scale, &fst, opt.fuse_miss);
+                r.fuse_runs = fst.runs;
+                r.fuse_worst[0] = fst.worst_a;
+                r.fuse_worst[1] = fst.worst_b;
+                r.fuse_moved_px = fst.moved_px;
+                r.fuse_area = fst.area;
+                if (fst.runs > 0) {
+                    const GridValidity gv = uv_grid_validity(fused, photo.size());
+                    if (gv.folded > 0.001) r.fuse_rejected = true;
+                    else U.uv = std::move(fused);
+                }
+            }
             r.uv_agreement = ok[pick].agree;
             r.uv_model = ok[pick].model;
             r.mode = GeomMode::Neural;
@@ -1758,6 +1847,21 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         }
         r.ms.emplace_back("flattening net check", ms_since(t_uv));
     }
+    // the surface model without paper edges to fit (PipelineOptions::surface_min_sides)
+    if (r.mode == GeomMode::Surface && opt.surface_min_sides > 0 && !opt.corners_edited) {
+        int known = 0;
+        bool straight = true;
+        for (int k = 0; k < 4; ++k) {
+            if (r.side_n[k] < 20 || r.side_edge[k] < 0 || r.side_edge[k] > opt.side_edge_max || r.side_bow[k] < 0) continue;
+            ++known;
+            straight &= r.side_bow[k] <= opt.flat_edge_bow;
+        }
+        if (known < opt.surface_min_sides || straight) {
+            U = Uh;
+            r.mode = GeomMode::Homography;
+            r.surface_unfounded = true;
+        }
+    }
     t0 = Clock::now();
     report(opt, 20, "Unrolling the page");
     cv::Mat stage1;
@@ -1789,6 +1893,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             o = orient_decide(op, in, opt);
         }
         r.rot = o.rot; r.orient_sh = o.sh; r.orient_sv = o.sv; r.orient_upright = o.upright;
+        r.orient_net_turn = o.net_turn; r.orient_net_margin = o.net_margin; r.orient_net_patches = o.net_patches; r.orient_by_net = o.by_net;
         r.ms.emplace_back("orientation", ms_since(t0));
     }
     t0 = Clock::now();
@@ -1818,7 +1923,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     report(opt, 85, "Composing the map");
     r.final_map = compose(U, warp4, r.rot, true);
     // a perspective-only page: the map is a homography, its lengths are the photo's foreshortened ones
-    if (!opt.perspective_only) r.page_hw = map_page_hw(r.final_map);
+    if (!opt.perspective_only) r.page_hw = map_page_hw(r.final_map, photo.size(), opt.focal_px);
     cv::Mat beyond = beyond_page(warp4, W, H, r.rot);
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");

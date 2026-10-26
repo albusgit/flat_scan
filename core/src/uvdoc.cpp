@@ -3,6 +3,8 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 
 namespace fs {
@@ -156,6 +158,38 @@ double uv_agreement(const UvGrid& g, const cv::Mat& mask, double scale) {
     m = m > 127;
     m /= 255;
     return iou_with(g.outline(), m, scale * k);
+}
+
+GridValidity uv_grid_validity(const UvGrid& g, cv::Size photo) {
+    GridValidity v;
+    if (!g.ok || g.gw < 2 || g.gh < 2) return v;
+    auto P = [&](int i, int j) { return g.pts[(size_t)i * g.gw + j]; };
+    std::vector<double> tri, cell;
+    for (int i = 0; i + 1 < g.gh; ++i)
+        for (int j = 0; j + 1 < g.gw; ++j) {
+            const cv::Point2d a = P(i, j), b = P(i, j + 1), c = P(i + 1, j + 1), d = P(i + 1, j);
+            const double t1 = (b - a).cross(c - a), t2 = (c - a).cross(d - a);
+            tri.push_back(t1);
+            tri.push_back(t2);
+            cell.push_back(std::fabs(t1 + t2));
+        }
+    // the grid's own orientation: the sign of most triangles (a turned crop does not mirror)
+    int pos = 0;
+    for (double t : tri) pos += t > 0;
+    const double sgn = 2 * pos >= (int)tri.size() ? 1 : -1;
+    int flip = 0;
+    for (double t : tri) flip += t * sgn <= 0;
+    v.folded = (double)flip / tri.size();
+    std::vector<double> s = cell;
+    std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+    const double med = s[s.size() / 2];
+    int small = 0;
+    for (double a : cell) small += a < 0.1 * med;
+    v.collapsed = (double)small / cell.size();
+    int out = 0;
+    for (const auto& p : g.pts) out += p.x < -1 || p.y < -1 || p.x > photo.width || p.y > photo.height;
+    v.outside = (double)out / g.pts.size();
+    return v;
 }
 
 double uv_paper_share(const UvGrid& g, const cv::Mat& mask, double scale, const cv::Mat& photo) {
@@ -484,6 +518,186 @@ UvGrid uv_zoom(const cv::Mat& photo, const UvGrid& g, int model, const UvNetFn& 
             f.pts[(size_t)i * f.gw + j] = ws > 0 ? sum / ws : grid_pt(g, u * (g.gw - 1), v * (g.gh - 1));
         }
     return f;
+}
+
+namespace {
+
+const int kFuseSamples = 64;
+
+// one side of a page grid at kFuseSamples points: (u, v) in [0, 1]^2 of the page as the net saw it
+struct SideSample { double u, v; };
+
+std::array<std::vector<SideSample>, 4> fuse_sides() {
+    std::array<std::vector<SideSample>, 4> s;
+    for (int i = 0; i < kFuseSamples; ++i) {
+        const double t = (double)i / (kFuseSamples - 1);
+        s[0].push_back({t, 0.0});        // top
+        s[1].push_back({1.0, t});        // right
+        s[2].push_back({1.0 - t, 1.0});  // bottom
+        s[3].push_back({0.0, 1.0 - t});  // left
+    }
+    return s;
+}
+
+cv::Point2d grid_uv(const UvGrid& g, double u, double v) { return grid_pt(g, u * (g.gw - 1), v * (g.gh - 1)); }
+
+// the signed distance (photo px) from the grid's border at (u, v) to the mask's edge along the outward normal:
+// + the paper goes on beyond the border; no edge within reach: +-reach by the mask at the border point (on paper:
+// the paper goes on, on the background: the border is out on it); NaN: the search leaves the mask image first
+double border_miss(const UvGrid& g, double u, double v, const cv::Mat& mask, double scale, double reach) {
+    const double e = 1.0 / 200;
+    const cv::Point2d p = grid_uv(g, u, v);
+    // the tangent along the side and the inward direction (towards the page's centre in (u, v))
+    const bool horiz = v <= 0.0 || v >= 1.0;
+    const cv::Point2d tg = horiz ? grid_uv(g, std::min(1.0, u + e), v) - grid_uv(g, std::max(0.0, u - e), v)
+                                 : grid_uv(g, u, std::min(1.0, v + e)) - grid_uv(g, u, std::max(0.0, v - e));
+    const cv::Point2d inw = grid_uv(g, u + (0.5 - u) * 0.02, v + (0.5 - v) * 0.02) - p;
+    cv::Point2d nrm(-tg.y, tg.x);
+    const double nl = cv::norm(nrm);
+    if (nl < 1e-9) return std::nan("");
+    nrm *= 1.0 / nl;
+    if (nrm.dot(inw) > 0) nrm = -nrm;   // outwards
+    const int steps = std::max(2, (int)std::ceil(reach * scale));
+    double best = 1e300;
+    int prev = -1;
+    for (int t = -steps; t <= steps; ++t) {
+        const cv::Point2d q = (p + nrm * (t / scale)) * scale;
+        const int x = (int)std::lround(q.x), y = (int)std::lround(q.y);
+        if (x < 1 || y < 1 || x >= mask.cols - 1 || y >= mask.rows - 1) {
+            if (std::fabs((double)t) < std::fabs(best)) return std::nan("");   // the photo's edge comes first
+            prev = -1;
+            continue;
+        }
+        const int val = mask.at<uint8_t>(y, x) > 127;
+        if (prev == 1 && val == 0 && std::fabs(t - 0.5) < std::fabs(best)) best = t - 0.5;
+        prev = val;
+    }
+    if (best > 1e299) {
+        const cv::Point2d q = p * scale;
+        const int x = (int)std::lround(q.x), y = (int)std::lround(q.y);
+        if (x < 0 || y < 0 || x >= mask.cols || y >= mask.rows) return std::nan("");
+        return mask.at<uint8_t>(y, x) > 127 ? reach : -reach;
+    }
+    return best / scale;
+}
+
+std::vector<double> median5(const std::vector<double>& d) {
+    std::vector<double> o(d.size(), std::nan(""));
+    for (size_t i = 0; i < d.size(); ++i) {
+        std::vector<double> w;
+        for (int j = (int)i - 2; j <= (int)i + 2; ++j)
+            if (j >= 0 && j < (int)d.size() && std::isfinite(d[j])) w.push_back(d[j]);
+        if (w.size() < 3) continue;
+        std::nth_element(w.begin(), w.begin() + w.size() / 2, w.end());
+        o[i] = w[w.size() / 2];
+    }
+    return o;
+}
+
+}  // namespace
+
+UvGrid uv_fuse_border(const UvGrid& a, const UvGrid& b, const cv::Mat& mask, double scale, FuseStats* st, double miss, int min_run,
+                      double min_radius) {
+    FuseStats s;
+    if (st) *st = s;
+    if (!a.ok || !b.ok || a.turned != b.turned || mask.empty() || a.gw < 4 || a.gh < 4 || b.gw < 4 || b.gh < 4) return a;
+    const double size = 0.5 * (cv::norm(grid_uv(a, 0, 0) - grid_uv(a, 1, 1)) + cv::norm(grid_uv(a, 1, 0) - grid_uv(a, 0, 1))) / std::sqrt(2.0);
+    const double reach = 0.15 * size, thr = miss * size;
+    const auto sides = fuse_sides();
+    // the runs taken from b: their samples' (u, v); the border samples where b itself misses the paper (no bump
+    // reaches them: a bump that did would carry b's miss into the page)
+    std::vector<std::vector<SideSample>> runs;
+    std::vector<SideSample> b_bad;
+    s.worst_a = s.worst_b = 0;
+    // every side's misses first: each grid's own baseline (the median over its border: the mask's edge runs a few px
+    // outside both nets' borders) is taken off before they are compared
+    std::array<std::vector<double>, 4> MA, MB;
+    std::vector<double> all_a, all_b;
+    for (int k = 0; k < 4; ++k) {
+        std::vector<double> ma(kFuseSamples), mb(kFuseSamples);
+        for (int i = 0; i < kFuseSamples; ++i) {
+            ma[i] = border_miss(a, sides[k][i].u, sides[k][i].v, mask, scale, reach);
+            mb[i] = border_miss(b, sides[k][i].u, sides[k][i].v, mask, scale, reach);
+        }
+        MA[k] = median5(ma);
+        MB[k] = median5(mb);
+        for (double x : MA[k]) if (std::isfinite(x)) all_a.push_back(x);
+        for (double x : MB[k]) if (std::isfinite(x)) all_b.push_back(x);
+    }
+    auto median_of = [](std::vector<double> v) {
+        if (v.empty()) return 0.0;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2];
+    };
+    const double base_a = median_of(all_a), base_b = median_of(all_b);
+    for (int k = 0; k < 4; ++k) {
+        std::vector<double>& ma = MA[k];
+        std::vector<double>& mb = MB[k];
+        for (double& x : ma) x -= base_a;
+        for (double& x : mb) x -= base_b;
+        if (std::getenv("FS_FUSE_DEBUG")) {
+            std::fprintf(stderr, "fuse side %d a:", k);
+            for (double x : ma) std::fprintf(stderr, " %.0f", std::isfinite(x) ? 1000 * x / size : -999.0);
+            std::fprintf(stderr, "\nfuse side %d b:", k);
+            for (double x : mb) std::fprintf(stderr, " %.0f", std::isfinite(x) ? 1000 * x / size : -999.0);
+            std::fprintf(stderr, "\n");
+        }
+        std::vector<char> take(kFuseSamples, 0);
+        for (int i = 0; i < kFuseSamples; ++i) {
+            if (std::isfinite(ma[i])) s.worst_a = std::max(s.worst_a, std::fabs(ma[i]) / size);
+            if (std::isfinite(mb[i])) s.worst_b = std::max(s.worst_b, std::fabs(mb[i]) / size);
+            if (std::isfinite(mb[i]) && std::fabs(mb[i]) > 1.5 * thr) b_bad.push_back(sides[k][i]);
+            if (!std::isfinite(ma[i]) || !std::isfinite(mb[i])) continue;
+            const double ea = std::fabs(ma[i]), eb = std::fabs(mb[i]);
+            take[i] = ea > thr && eb <= 0.5 * ea && ea - eb >= 0.75 * thr;
+        }
+        for (int i = 0; i < kFuseSamples;) {
+            if (!take[i]) { ++i; continue; }
+            int j = i;
+            while (j < kFuseSamples && take[j]) ++j;
+            if (j - i >= min_run) runs.emplace_back(sides[k].begin() + i, sides[k].begin() + j);
+            i = j;
+        }
+    }
+    s.runs = (int)runs.size();
+    if (runs.empty()) {
+        if (st) *st = s;
+        return a;
+    }
+    // each run's bump radius: its length (at least min_radius), but short of b's own misses
+    std::vector<double> radius;
+    for (const auto& run : runs) {
+        const double len = std::hypot(run.back().u - run.front().u, run.back().v - run.front().v);
+        double rad = std::max(min_radius, len), bad = 1e300;
+        for (const auto& q : b_bad)
+            for (const auto& p : run) bad = std::min(bad, std::hypot(p.u - q.u, p.v - q.v));
+        radius.push_back(std::min(rad, 0.8 * bad));
+    }
+    // the weight of b at each of a's grid points: a bump around each run, in (u, v)
+    UvGrid o = a;
+    int heavy = 0;
+    for (int r = 0; r < a.gh; ++r)
+        for (int c = 0; c < a.gw; ++c) {
+            const double u = (double)c / (a.gw - 1), v = (double)r / (a.gh - 1);
+            double w = 0;
+            for (size_t ri = 0; ri < runs.size(); ++ri) {
+                const auto& run = runs[ri];
+                const double rad = radius[ri];
+                if (rad < 0.03) continue;
+                double d = 1e300;
+                for (const auto& q : run) d = std::min(d, std::hypot(u - q.u, v - q.v));
+                w = std::max(w, smooth01(1.0 - d / rad));
+            }
+            if (w <= 0) continue;
+            heavy += w > 0.5;
+            cv::Point2d& p = o.pts[(size_t)r * a.gw + c];
+            const cv::Point2d delta = (grid_uv(b, u, v) - p) * w;
+            s.moved_px = std::max(s.moved_px, cv::norm(delta));
+            p += delta;
+        }
+    s.area = (double)heavy / a.pts.size();
+    if (st) *st = s;
+    return o;
 }
 
 }  // namespace fs

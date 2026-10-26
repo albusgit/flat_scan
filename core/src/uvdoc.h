@@ -95,6 +95,13 @@ double uv_agreement(const UvGrid& g, const cv::Mat& mask, double scale);
 double uv_paper_share(const UvGrid& g, const cv::Mat& mask, double scale, const cv::Mat& photo_bgr = cv::Mat());
 // the same against the corner quad (no mask: corners set by hand)
 double uv_agreement(const UvGrid& g, const std::array<cv::Point2d, 4>& quad, cv::Size photo);
+// How a grid holds together as a sheet of paper: the share of its cells' triangles turned over against the rest
+// (the map folds back on itself), of cells shrunk below a tenth of the median cell (collapsed), and of its points
+// outside the photo (> 1 px)
+struct GridValidity {
+    double folded = -1, collapsed = -1, outside = -1;
+};
+GridValidity uv_grid_validity(const UvGrid& g, cv::Size photo);
 // IoU of two grids' outlines (the same page found twice: another crop or another net)
 double uv_agreement(const UvGrid& a, const UvGrid& b);
 
@@ -105,6 +112,21 @@ double uv_agreement(const UvGrid& a, const UvGrid& b);
 // its edges sit where the paper is. A side with too few edges found (photo border, no mask edge near) is not
 // moved. Stats: median / max displacement (photo px), the sides moved and the sides most of whose points needed
 // more than lost x the page's size (the net lost the page there).
+// Two nets' grids of the same page (the same turn): a, the chosen one, keeps the page except where its border
+// misses the paper (the page finder's mask, as for uv_agreement) and b's border there fits it - two of the three
+// agree. Each side's border is measured at FuseSamples points against the mask's edge along the outward normal
+// (signed: + the paper goes on beyond the border, - the border is on the background). A run of at least min_run
+// samples where a misses by more than miss x the page's size, b by at most half of that and by miss x 0.75 less, is
+// taken from b: a bump around the run (radius: the run's length, at least min_radius of the page), blended into a.
+struct FuseStats {
+    int runs = 0;                   // border runs taken from b
+    double worst_a = -1, worst_b = -1;   // the largest border miss of each grid, / the page's size
+    double moved_px = 0;            // the largest move of a grid point (photo px)
+    double area = 0;                // the share of the page whose weight is above 0.5
+};
+UvGrid uv_fuse_border(const UvGrid& a, const UvGrid& b, const cv::Mat& mask, double scale, FuseStats* st = nullptr,
+                      double miss = 0.015, int min_run = 3, double min_radius = 0.12);
+
 struct BorderSnap {
     double median_px = 0, max_px = 0;
     int sides_moved = 0, sides_lost = 0;

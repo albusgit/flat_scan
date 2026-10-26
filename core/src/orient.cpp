@@ -3,6 +3,7 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 #include "nputil.h"
@@ -148,6 +149,82 @@ Orientation decide_orientation(const cv::Mat& page, double min_conf, double min_
         o.rot = -1;
     }
     return o;
+}
+
+namespace {
+
+const int kOPatch = 128, kOStride = 96, kOMax = 32;
+const double kOInkMin = 0.03, kOInkMax = 0.45;
+
+// tools/orientnet/orientnet.py ink_mask: dark marks on the local background
+cv::Mat orient_ink(const cv::Mat& g) {
+    cv::Mat bg, ink;
+    cv::dilate(g, bg, cv::Mat::ones(5, 5, CV_8U));
+    cv::medianBlur(bg, bg, 21);
+    cv::Mat d;
+    cv::subtract(bg, g, d, cv::noArray(), CV_16S);
+    ink = d > 30;
+    return ink;
+}
+
+}  // namespace
+
+bool orient_net_turn(const cv::Mat& page, const OrientNetFn& net, int* turn, double* margin, int* patches) {
+    if (!net || page.empty()) return false;
+    cv::Mat gray;
+    if (page.channels() == 4) cv::cvtColor(page, gray, cv::COLOR_BGRA2GRAY);
+    else if (page.channels() == 3) cv::cvtColor(page, gray, cv::COLOR_BGR2GRAY);
+    else gray = page;
+    struct Cand { cv::Mat p; double f; };
+    std::vector<Cand> cand;
+    for (int L : {1024, 1536}) {
+        const double s = (double)L / std::max(gray.cols, gray.rows);
+        cv::Mat g;
+        cv::resize(gray, g, cv::Size(std::max(kOPatch, (int)(gray.cols * s)), std::max(kOPatch, (int)(gray.rows * s))), 0, 0,
+                   s < 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+        cv::Mat ink = orient_ink(g);
+        for (int y = 0; y <= std::max(0, g.rows - kOPatch); y += kOStride)
+            for (int x = 0; x <= std::max(0, g.cols - kOPatch); x += kOStride) {
+                const cv::Rect r(x, y, kOPatch, kOPatch);
+                if (r.br().x > g.cols || r.br().y > g.rows) continue;
+                const double f = cv::countNonZero(ink(r)) / (double)(kOPatch * kOPatch);
+                if (f >= kOInkMin && f <= kOInkMax) cand.push_back({g(r), f});
+            }
+    }
+    if (cand.empty()) return false;
+    std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.f > b.f; });
+    if ((int)cand.size() > kOMax) cand.resize(kOMax);
+    const int n = (int)cand.size();
+    std::vector<float> in((size_t)n * kOPatch * kOPatch);
+    for (int i = 0; i < n; ++i) {
+        // each patch to its own mean / spread (orientnet.py to_input)
+        cv::Mat f;
+        cand[i].p.convertTo(f, CV_32F, 1.0 / 255);
+        cv::Scalar m, sd;
+        cv::meanStdDev(f, m, sd);
+        f = (f - m[0]) / (sd[0] + 0.05);
+        float* o = in.data() + (size_t)i * kOPatch * kOPatch;
+        for (int y = 0; y < kOPatch; ++y) std::memcpy(o + (size_t)y * kOPatch, f.ptr<float>(y), sizeof(float) * kOPatch);
+    }
+    std::vector<float> lg;
+    if (!net(in, n, lg) || lg.size() != (size_t)n * 4) return false;
+    double mean[4] = {0, 0, 0, 0};
+    for (int i = 0; i < n; ++i) {
+        const float* l = lg.data() + (size_t)i * 4;
+        const double mx = std::max({l[0], l[1], l[2], l[3]});
+        double se = 0;
+        for (int k = 0; k < 4; ++k) se += std::exp(l[k] - mx);
+        for (int k = 0; k < 4; ++k) mean[k] += (l[k] - mx - std::log(se)) / n;
+    }
+    int best = 0, second = -1;
+    for (int k = 1; k < 4; ++k)
+        if (mean[k] > mean[best]) best = k;
+    for (int k = 0; k < 4; ++k)
+        if (k != best && (second < 0 || mean[k] > mean[second])) second = k;
+    if (turn) *turn = best;
+    if (margin) *margin = mean[best] - mean[second];
+    if (patches) *patches = n;
+    return true;
 }
 
 }  // namespace fs

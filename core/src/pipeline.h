@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "corners.h"
+#include "orient.h"
 #include "pagefind.h"
 #include "resample.h"
 #include "surface.h"
@@ -92,6 +93,18 @@ struct PipelineOptions {
     // magazine page 0.15, a cookbook 0.06 - 0.09, a curled coupon strip 0.056), the homography replaces the grid
     // (0: off)
     double flat_edge_bow = 0.012;
+    // both nets accepted: where the chosen grid's border misses the paper by more than fuse_miss x the page's size
+    // and the other's fits it, the other grid is blended in around there (uv_fuse_border). 0: off.
+    double fuse_miss = 0.015;
+    // ... and only when the other net's whole outline fits the paper (mask IoU) better by at least this: where it
+    // fits worse overall, its border near the paper's edge has followed something else (a shadow, the table)
+    double fuse_min_gain = 0.003;
+    // the surface model is fitted to the page finder's outline only: where fewer than surface_min_sides of its sides
+    // are the paper's own edge (the rest lie on the photo's edge: the paper runs out of the photo, side_edge >
+    // side_edge_max), or every such side is straight (flat_edge_bow), it has nothing to model and the homography
+    // is stage 1 (a page that fills the photo came out with an empty band where the model curled it). 0: off.
+    int surface_min_sides = 2;
+    double side_edge_max = 0.5;
     const float* uv_shading = nullptr;   // SyntheticDoc's shading map (3 x in_h x in_w) for uv_shading_crop
     UvCrop uv_shading_crop;
     bool remove_shadows = true;       // divide the page by the shading map
@@ -185,6 +198,10 @@ struct PipelineOptions {
     // 2 x h x w rule probabilities [horizontal, vertical] (RuleNetFn). Empty / false: the line stage
     // finds rules from the darkness map alone.
     RuleNetFn rule_net;
+    // The orientation net (orient.h OrientNetFn, orientnet.onnx): set, it decides the page's turn (any of the four)
+    // when its margin is at least orient_net_margin; below that, or unset, the text-axis rule decides as before.
+    OrientNetFn orient_net;
+    double orient_net_margin = 2.0;   // 0 wrong turns in 1200 tests (dir300 scans x 4 turns)
     // The flattening nets for the zoomed second pass (uv_zoom): net(model, io) replaces the net's
     // input with its grid. Empty: no zoomed pass.
     UvNetFn uv_net;
@@ -209,15 +226,24 @@ struct PipelineResult {
     PageCorners detection;            // the automatic detection (finder info); ok = false if not run
     double uv_agreement = -1;         // UVDoc outline vs the page (IoU); -1: UVDoc not run
     double uv_consistency = -1;       // ... vs the first pass's outline (-1: no first pass)
+    double uv_grid_check[2][3] = {{-1, -1, -1}, {-1, -1, -1}};   // each net's grid: folded, collapsed, outside (uv_grid_validity)
+    double uv_agree_quad[2] = {-1, -1}, uv_agree_mask[2] = {-1, -1};   // each net's outline against the corners, the mask (IoU)
     double uv_paper_share[2] = {-1, -1};   // share of each net's page that the page finder's mask calls paper (-1: not measured)
     double snap_px[2] = {-1, -1};     // border snap: median / max displacement (photo px; -1: not run)
     int snap_sides = -1;              // ... sides moved
     double side_bow[4] = {-1, -1, -1, -1};   // page finder's sides (top, right, bottom, left): p95 bow from the chord / its length
+    int side_n[4] = {0, 0, 0, 0};             // the outline points on each side
+    double side_edge[4] = {-1, -1, -1, -1};  // their share on the photo's own edge (the paper runs out of the photo there)
     double uv_flat_resid[3] = {-1, -1, -1};   // the grid's distance from its best homography (page px: p50, p95, max)
     bool uv_lost_page = false;        // ... a side was far off the paper's edge: the net was set aside
     bool uv_defines_page = false;     // the grid was used over the page finder's disagreement: corners and paper from it
     int uv_model = -1;                // the net whose grid was used (UvCrop::model); -1: none
     double uv_spread[2] = {-1, -1};   // text-row angle spread of each net's stage-1 page (deg; -1: not measured)
+    int fuse_runs = 0;                 // border runs taken from the other net (uv_fuse_border)
+    double fuse_worst[2] = {-1, -1};   // the chosen, the other grid's largest border miss / page size
+    double fuse_moved_px = 0, fuse_area = 0;
+    bool fuse_rejected = false;        // the blend folded the grid: not used
+    bool surface_unfounded = false;   // the surface model was set aside: no paper edge to fit, or all of them straight
     bool flat_page = false;           // the net's grid was set aside: the paper is flat (PipelineOptions::flat_edge_bow)
     bool uv_rejected = false;         // UVDoc ran but disagreed with the page finder (fallback used)
     int uv_zoom_quarters = -1;        // zoomed pass: quarters whose grid was used (-1: not run)
@@ -252,6 +278,9 @@ struct PipelineResult {
     SurfaceModel model;
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;
+    int orient_net_turn = -1, orient_net_patches = 0;   // the orientation net's answer (k x 90 deg cw), its patches
+    double orient_net_margin = -1;
+    bool orient_by_net = false;
     GridMap final_map;                // backward map (photo px), rotated frame, 4-px grid, analysis size
     double page_hw = -1;              // height / width of the paper itself, measured along final_map (-1: not measured)
     GridMap render_map;               // the same map at the output resolution (used for the resample)

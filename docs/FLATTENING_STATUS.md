@@ -1,93 +1,77 @@
-# Page flattening: where FlatScan stands (2026-10-26)
+# Page flattening: where FlatScan stands (round 17, 2026-10-26)
 
-A brief for anyone reviewing how to close the remaining quality gap with CamScanner. All numbers below were
-measured on the desktop build of the app's pipeline (`tools/desktop_check/pipeline_cli`). Every verdict comes
-from looking at the output pages side by side, not from a metric.
+A brief for anyone planning the next steps toward CamScanner's quality. All numbers were measured on the desktop
+build of the app's pipeline (`tools/desktop_check/pipeline_cli`). A change ships only after its changed pages were
+looked at side by side and better clearly outnumbered worse. Round 16's brief is at commit 9bf7dc5.
 
 ## Pipeline (photo -> page)
 `core/src/pipeline.cpp` `run_photo`, in order:
-1. **Page finder:** segmentation net + contour → 4 corners, a paper mask and outline points per side
-   (`detect_corners`, `corners.h`).
+1. **Page finder:** a segmentation net plus a contour give 4 corners, a paper mask and outline points per side.
 2. **Stage 1 geometry**, one of:
    - **homography** between the corners;
-   - **surface model** (`surface.cpp`): a sheet bent along one axis, plus camera pose, fitted to the outline;
-   - **flattening net** grid:
-     - SyntheticDoc-HR (UVDoc architecture, 1024×1440 in, 177×121 backward map) runs first;
-     - UVDoc is the fallback (`uvdoc.cpp`, crops and checks in `run_photo`).
-     - A grid is accepted when its outline agrees with the page finder's mask (IoU ≥ 0.93 for HR).
-     - A grid can also define the page itself when it agrees with a first pass on the whole photo (`uv_defines_page`).
-3. **Flat-paper rule** (new, `flat_edge_bow`): if every side of the page finder's outline is straight
-   (p95 bow ≤ 1.2% of the side's length), the homography replaces the net's grid.
-4. **Line stage:** text rows and rules traced and straightened on top (`warpmap.cpp`, `neural_line_stage`).
-5. **Shadow net** on the flattened page, then the app's "Auto color" filter at 0.7 (`cleanup.h`).
+   - **surface model** (`surface.cpp`), a sheet bent along one axis plus the camera pose, fitted to the outline;
+   - **flattening-net grid**: SyntheticDoc-HR (1024×1440 in, 177×121 backward map) first, UVDoc as the fallback.
+     UVDoc's whole-photo pass 1 decides SD-HR's crop. A grid is accepted when its outline agrees with the page
+     finder's mask.
+3. **Rules after stage 1:**
+   - **Flat paper** (`flat_edge_bow`): four straight sides mean the homography replaces the net.
+   - **New, `surface_min_sides`:** a surface page with fewer than 2 real paper edges uses the homography. Sides lying on the photo's own edge used to read as "straight".
+   - **New, two-net border fusion** (`uvdoc.cpp` `uv_fuse_border`): where the chosen net's border misses the paper and the other net's border fits it, the other net is blended in locally.
+4. **Line stage:** text rows and rules are traced and straightened (`warpmap.cpp`).
+5. **Orientation:** the text-axis rule, plus a new small orientation net (`tools/orientnet`, `orient.cpp` `orient_net_turn`). It is trusted for 180° turns by itself, and for quarter turns only when the rule agrees.
+6. **Shadow net**, then the "Auto color" filter.
 
-## What the tests showed
-**Attribution, 8 problem photos:**
-- Perspective only vs net only vs net + line stage: the line stage made no visible difference on any of them.
-- All the warping comes from the net.
+The core renders every page A4-shaped. Its true shape is measured (`map_page_hw`), and the app's Auto shape
+(the default) rescales the page to it, so a receipt or a bill is not shown as A4. See open problem 1.
 
-**Where each method wins:**
-
-| Better | Photos |
+## Round 17 results (121 regression photos; 591 including dir300 and WarpDoc)
+| Change | Result |
 |---|---|
-| Net | curled pages: magazine, cookbook, folded coupon, a magazine page whose crop the page finder got wrong |
-| Plain perspective | flat small objects: a dollar bill (the net bowed it), a receipt (the net invented a wider page) |
+| True page proportions: the camera correction is always applied, measured through the corners' homography | Synthetic tilted A4, bill and receipt within 1–2.5%; bill 3.8% off → 0.9% |
+| `surface_min_sides` | 39 pages changed: 22 better (Hi-TEC empty band gone, tax form), 16 same, 0 worse |
+| Two-net border fusion | Coupon reads "SAVE $1" (was "$7"): 3 better, 4 same, 0 worse. Without the "other net fits the mask better" condition, 3 pages got worse |
+| Orientation net | 24 pages changed, all corrections, 0 wrong. dir300 turned 4 ways: 0 wrong of 1,200. Synthetic Hebrew / Latin / Cyrillic: 144/144 |
+| Pass-2 crop from the page finder's corners | 5 better, 7 worse: not shipped (it helps exactly where the finder is right) |
+| Corner-curl geometry from the outline alone (Coons push-out; a two-panel fold model) | Worse in both versions: not shipped |
+| Grid validity (folded cells, collapsed cells, points outside) | No accepted grid folds today; it is logged only |
 
-**The net alone cannot tell flat from curled.** Its grid's distance from the best homography (p95, page px) is:
+**R16 → now on the 8 complaint photos:** 3 better (coupon, Hi-TEC, tax form), 5 same, 0 worse.
 
-| Page | Net's departure from flat |
+## Which method wins (670 real photos with flat scans: dir300, DocReal, WarpDoc; MS-SSIM)
+| | Mean |
 |---|---|
-| Flat bill | 84 |
-| Receipt | 51 |
-| Curled magazine | 31 |
+| App default (SD-HR first) | 0.467 |
+| UVDoc only | 0.489 |
+| No nets | 0.424 |
+| Best of these per photo (oracle) | 0.532 |
+| Gradient-boosted selector on the pipeline's own JSON signals, 5-fold CV grouped by document | 0.497, and never below the default on any set |
 
-**The photo can.** The p95 bow of the page finder's sides, divided by side length:
+UVDoc wins on dir300 and DocReal; SD-HR wins on WarpDoc. These sets are research-licensed, so the shipped selector must be trained on licence-clean labels. Plan: inv3d real (MIT), plus synthetic photos with exact flat pages.
 
-| Page | Side bow |
-|---|---|
-| Bill | ≤ 0.010 |
-| Magazine | 0.15 |
-| Cookbook | 0.06–0.09 |
-| Coupon | 0.056 |
-
-Since paper bends but doesn't stretch, a sheet with four straight edges is flat. That is the rule now in use.
-On 121 real photos it changed 6 pages: 3 better (including the bill), 3 the same, 0 worse.
-
-## Tried and dropped (each measured on 121 photos, every changed page inspected)
-
-| Attempt | Result | Why it failed |
-|---|---|---|
-| Rules on whose outline wins (net vs page finder): paper share by mask, then by paper colour | fixed the receipt; 5 of 6 other changed pages worse | the page finder's frame is worse on cluttered photos |
-| Snapping the net grid's border onto the page finder's mask edge (Coons-patch spread inwards) | 2 better, 12 worse | the mask edge is rough (shadows, fingers), so every bump bent the text |
-| Flat test from Hough lines bent by the net | thresholds unstable; broke other pages | — |
-| Surface model as the base | wavier than perspective on most pages | — |
-
-## Compared with CamScanner (3 shared photos, the app's default filter)
-- **Magazine:** equal.
-- **Coupon:** about equal. Our rows are straighter, but see open problem 1.
-- **Hi-TEC page with a leaf shadow:**
-  - CamScanner removes the shadow completely.
-  - Our shipped shadow net leaves it; a retrained shadow net (not yet shipped) removes most of it.
-  - Our crop has an empty band at the top.
+## Training (`docs/TRAINING_PLAN.md`)
+- **Exact-ground-truth generator** (`tools/train/flat2`):
+  - a virtual sheet is bent (flat, near flat, curl, lifted corner, folds, waves) and photographed by a pinhole camera;
+  - papers: A4, letter, receipts, bills, cards, coupon strips, books, landscape; multi-script text pages with pictures, bands and barcodes;
+  - targets are cropped and turned exactly as the app feeds SD-HR.
+- **SD-HR fine-tune** (`train_sdhr.py`):
+  - losses: grid L1, derivatives, curvature on flat kinds, border, fold-over;
+  - an anchor set of real licence-clean photos with the original net as teacher (learning without forgetting);
+  - the checkpoint is chosen on dir300 run through the app's two passes;
+  - first full run: overnight 2026-10-26 on a local RTX 5060.
+- **Next jobs:** the selector (CPU only), then UVDoc pass 1 on the same data, then the page finder (shadows, clutter), and the shadow net (trained, awaiting sign-off).
 
 ## Open problems
-1. **Corner curl** (the coupon's "SAVE $1" strip):
-   - The strip's top-right corner lifts off the table.
-   - The net flattens most of the page but leaves the corner curled, and the bent "1" reads as "7".
-   - The page finder's outline sees the curl (sides bow 0.047–0.056).
-2. **The Hi-TEC crop:** both nets were rejected there, and the surface model left an empty band at the top.
-3. **Net noise on near-flat pages:**
-   - SD-HR adds wavy text on gently curved pages.
-   - Its training data (SyntheticDoc) is all A4 and all curled, with no flat or narrow pages.
-4. **Proportions:**
-   - `map_page_hw` measures the page's height/width along the map in photo pixels, so perspective shortens it.
-   - The app's Auto shape trusts it over a perspective-correct corner estimate.
+1. **The page's shape outside the app's Auto path.** The core's page is always A4, and only the app's Auto shape rescales it to the measured shape.
+   - Measured values for the CamScanner photos: coupon 1.75, magazine 1.47, Hi-TEC 1.26. CamScanner's coupon is about 1.79.
+   - Rendering at A4 and then rescaling also resamples twice.
+   - In progress: the core renders at the measured shape (snapped to A4 / Letter within 4%, as Auto does).
+2. **Receipts in clutter:** the Kassazettel receipt keeps the coffee beans; the page finder takes them in.
+3. **SD-HR on near-flat and narrow pages:** wavy text, and receipts get 3–8% grid error on synthetic checks against 0.4–1% on A4. The fine-tune targets this.
+4. **The selector** is measured but not built.
+5. **Paper whiteness:** CamScanner's paper is whiter on the Hi-TEC photo.
 
 ## Questions for a reviewer
-- How do strong scanners handle a curled corner on an otherwise flat page? A local developable model
-  (a flat page plus a cylindrical curl beyond a fold line at any angle, fitted to the outline), a
-  second net pass on the corner, or something else?
-- Is fine-tuning SD-HR with flat, near-flat-with-corner-curl and narrow pages (receipts, bills, cards), with
-  ground truth made from SyntheticDoc's UV maps, the right next investment? Or is a selector worth training
-  instead? A selector would need labels for which method is best per photo, which we don't have yet.
-- Anything in the acceptance checks (`run_photo` net block) that is structurally wrong?
+- Given the oracle gap (0.467 → 0.532), what is the best way to choose per photo between SD-HR, UVDoc, fusion and the homography? A learned selector, a better acceptance rule, or running both nets and merging their grids?
+- Is the SD-HR fine-tune set up right? See the data mix, losses, checkpoint choice and anchor set in `train_sdhr.py`.
+- Should the core render at the page's true shape? What breaks downstream (page edits stored as fractions, exports, book spreads)?
+- What would make the page finder robust to clutter (receipt among coffee beans) without the crop-from-corners regressions?

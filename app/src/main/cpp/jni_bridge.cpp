@@ -501,6 +501,30 @@ std::vector<uint8_t> load_model(std::string file) {
     return v;
 }
 
+// assets/models/<file> is in the APK (checked once per file)
+bool has_model(const std::string& file) {
+    static std::mutex mu;
+    static std::map<std::string, bool> known;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = known.find(file);
+        if (it != known.end()) return it->second;
+    }
+    AAssetManager* mgr;
+    {
+        std::unique_lock<std::mutex> lk(g_nets_mu);
+        mgr = assets_locked(lk);
+    }
+    bool ok = false;
+    if (mgr) {
+        AAsset* a = AAssetManager_open(mgr, ("models/" + file).c_str(), AASSET_MODE_UNKNOWN);
+        if (a) { ok = true; AAsset_close(a); }
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    known[file] = ok;
+    return ok;
+}
+
 // assets/models/<file> in place: the APK's uncompressed asset (noCompress tflite), mapped while the view lives;
 // no data (missing, or the static-model .onnx names): load_model copies it instead
 ModelView map_model(const std::string& file) {
@@ -1114,6 +1138,12 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     if (rules) {
         rule.g = group(g_rule);
         o.rule_net = rule.fn();
+    }
+    // the orientation net (orientnet.onnx), on the rule net's group, when the app ships it
+    std::shared_ptr<NetGroup> orient_g;
+    if (has_model("orientnet.tflite")) {
+        orient_g = group(g_rule);
+        o.orient_net = orient_net_fn(*orient_g->inf);
     }
     o.progress = [&](int pct, const char* stage) { progress(pct, stage); };
     auto t1 = Clock::now();
@@ -2005,6 +2035,11 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
             rr.g = group(g_rule);
             o.rule_net = rr.fn();
         }
+        std::shared_ptr<NetGroup> og;
+        if (has_model("orientnet.tflite")) {
+            og = group(g_rule);
+            o.orient_net = orient_net_fn(*og->inf);
+        }
         // the flattening nets as the app runs them (FS_NETS=1): inside run_photo, beside its CPU stages,
         // on its detection's corners
         NetsRequest rq;
@@ -2056,7 +2091,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
               << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << cli_num(r.fingers_erased)
               << ", \"uv_model\": " << r.uv_model << ", \"uv_consistency\": " << cli_num(r.uv_consistency)
               << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"orient\": [" << cli_num(r.orient_sh) << ", "
-              << cli_num(r.orient_sv) << ", " << cli_num(r.orient_upright) << "]" << ", \"uv_spread\": [" << cli_num(r.uv_spread[0]) << ", "
+              << cli_num(r.orient_sv) << ", " << cli_num(r.orient_upright) << "]" << ", \"orient_net\": [" << r.orient_net_turn << ", " << cli_num(r.orient_net_margin) << ", " << r.orient_net_patches << ", " << (r.orient_by_net ? 1 : 0) << "]" << ", \"uv_spread\": [" << cli_num(r.uv_spread[0]) << ", "
               << cli_num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed
               << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": ["
               << cli_num(r.second_pass[0]) << ", " << cli_num(r.second_pass[1]) << ", " << cli_num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0)

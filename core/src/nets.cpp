@@ -16,6 +16,21 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// NetsRequest::crop_from_corners: corners that outline a found page - inside the photo, 5-120 % of it, and not all
+// four at the photo's corners (the page finder's whole-frame fallback)
+bool corners_found_page(const std::array<cv::Point2d, 4>& c, cv::Size photo) {
+    const double w = photo.width, h = photo.height, tol = 0.02 * std::max(w, h);
+    bool at_corners = true;
+    std::vector<cv::Point2f> q;
+    for (const auto& p : c) {
+        if (std::max(std::max(-p.x, p.x - w), std::max(-p.y, p.y - h)) > tol) return false;
+        at_corners &= std::min(p.x, w - 1 - p.x) < tol && std::min(p.y, h - 1 - p.y) < tol;
+        q.emplace_back((float)p.x, (float)p.y);
+    }
+    const double area = std::fabs(cv::contourArea(q)) / (w * h);
+    return !at_corners && area >= 0.05 && area <= 1.2;
+}
+
 }  // namespace
 
 const char* backend_name(Backend b) {
@@ -144,6 +159,10 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
     }
     // false: no first-pass grid and no page corners (corners_fn found no page)
     auto crop_for = [&](int model, UvCrop& c) {
+        if (rq.crop_from_corners && !rq.corners_edited) {
+            const std::array<cv::Point2d, 4>* q = rq.corners_fn ? rq.corners_fn() : &rq.corners;
+            if (q && corners_found_page(*q, photo.size())) { c = uv_crop(photo.size(), *q, model); return true; }
+        }
         if (!r.grid_pass1.empty()) {
             UvGrid g = uv_grid(r.grid_pass1.data(), r.crop_pass1);
             if (g.ok) { c = uv_crop_on_grid(photo.size(), g, model); return true; }
@@ -318,6 +337,26 @@ RuleNetFn rule_net_fn(Inference& inf, double* ms) {
         if (y.empty() || (y[0].data.size() != (size_t)2 * w * h && y[0].data.size() != (size_t)4 * w * h)) return false;   // rules (+ text lines)
         io = std::move(y[0].data);
         if (ms) *ms += inf.last_ms(NetId::RuleNet);
+        return true;
+    };
+}
+
+OrientNetFn orient_net_fn(Inference& inf, double* ms) {
+    return [&inf, ms](const std::vector<float>& in, int n, std::vector<float>& logits) {
+        // the model takes a fixed batch of 32 patches (tools/orientnet/export.py): fewer are padded with zeros
+        const int B = 32;
+        if (n <= 0 || n > B || in.size() != (size_t)n * 128 * 128) return false;
+        Tensor x{{B, 1, 128, 128}, in};
+        x.data.resize((size_t)B * 128 * 128, 0.f);
+        std::vector<Tensor> y;
+        std::string err;
+        if (!inf.run(NetId::OrientNet, x, y, &err)) {
+            LOGI("orientation net: %s", err.c_str());
+            return false;
+        }
+        if (y.empty() || y[0].data.size() != (size_t)B * 4) return false;
+        logits.assign(y[0].data.begin(), y[0].data.begin() + (size_t)n * 4);
+        if (ms) *ms += inf.last_ms(NetId::OrientNet);
         return true;
     };
 }

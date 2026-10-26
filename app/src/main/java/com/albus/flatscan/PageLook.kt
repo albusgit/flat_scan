@@ -187,25 +187,28 @@ fun measuredPageHw(corners: List<Offset>, photoW: Int, photoH: Int, focalPx: Flo
     val k3 = dot(cross(m1, m4), m2) / d3
     val n2 = DoubleArray(3) { k2 * m2[it] - m1[it] }
     val n3 = DoubleArray(3) { k3 * m3[it] - m1[it] }
-    val ratioWh: Double
-    if (abs(n2[2]) < 1e-6 || abs(n3[2]) < 1e-6) {
-        // no perspective along one direction: the plain side lengths
-        ratioWh = sqrt((n2[0] * n2[0] + n2[1] * n2[1]) / (n3[0] * n3[0] + n3[1] * n3[1]))
-    } else {
-        var f2 = focalPx.toDouble().let { it * it }
-        if (f2 <= 0) {
-            f2 = -((n2[0] * n3[0] - (n2[0] * n3[2] + n2[2] * n3[0]) * u0 + n2[2] * n3[2] * u0 * u0) +
-                (n2[1] * n3[1] - (n2[1] * n3[2] + n2[2] * n3[1]) * v0 + n2[2] * n3[2] * v0 * v0)) / (n2[2] * n3[2])
-        }
-        if (f2 <= 0 || f2.isNaN()) return simple.toFloat()
-        // n^T (A^-T A^-1) n with A = [[f, 0, u0], [0, f, v0], [0, 0, 1]]
-        fun q(n: DoubleArray): Double {
-            val x = (n[0] - u0 * n[2])
-            val y = (n[1] - v0 * n[2])
-            return (x * x + y * y) / f2 + n[2] * n[2]
-        }
-        ratioWh = sqrt(q(n2) / q(n3))
+    // the camera correction always applies: a page tilted one way only (no convergence across) still has its
+    // other direction foreshortened (skipping it made an A4 tilted 15 deg 1.62 instead of 1.41). The focal length:
+    // the given one, else from the quad when both directions converge enough to tell, else 0.72 x the long side
+    // (surface.cpp's default; the result depends little on it)
+    val longSide = maxOf(photoW, photoH).toDouble()
+    fun converges(n: DoubleArray) = abs(n[2]) * longSide / maxOf(1e-9, hypot(n[0], n[1])) > 0.02
+    var f2 = focalPx.toDouble().let { it * it }
+    if (f2 <= 0 && converges(n2) && converges(n3)) {
+        f2 = -((n2[0] * n3[0] - (n2[0] * n3[2] + n2[2] * n3[0]) * u0 + n2[2] * n3[2] * u0 * u0) +
+            (n2[1] * n3[1] - (n2[1] * n3[2] + n2[2] * n3[1]) * v0 + n2[2] * n3[2] * v0 * v0)) / (n2[2] * n3[2])
     }
+    // a quad that barely converges measures the focal length badly (0.29 to 1.78 x the long side on real photos;
+    // phone cameras are about 0.7 - 1.0, 26 mm equivalent: 0.72): outside 0.5 - 2 x, the default
+    if (focalPx <= 0f && !(f2 >= 0.25 * longSide * longSide && f2 <= 4.0 * longSide * longSide)) f2 = (0.72 * longSide).let { it * it }
+    if (!(f2 > 0)) f2 = (0.72 * longSide).let { it * it }
+    // n^T (A^-T A^-1) n with A = [[f, 0, u0], [0, f, v0], [0, 0, 1]]
+    fun q(n: DoubleArray): Double {
+        val x = (n[0] - u0 * n[2])
+        val y = (n[1] - v0 * n[2])
+        return (x * x + y * y) / f2 + n[2] * n[2]
+    }
+    val ratioWh = sqrt(q(n2) / q(n3))
     val hw = 1.0 / ratioWh
     // a wild estimate (near-degenerate quad) is worse than the side lengths
     if (hw.isNaN() || hw <= 0 || abs(kotlin.math.ln(hw / simple)) > 0.7) return simple.toFloat()

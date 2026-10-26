@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <fstream>
@@ -100,19 +101,39 @@ int main(int argc, char** argv) {
     // FS_RULE_NET: "1" the repo's rulenet.onnx, else a model file
     const char* rule_model = std::getenv("FS_RULE_NET");
     const std::string rule_file = rule_model && std::string(rule_model) != "1" ? rule_model : "";
+    // FS_ORIENT_NET: "1" the repo's orientnet.onnx, "0" none, else a model file (default: the repo's, when it is there)
+    const char* orient_env = std::getenv("FS_ORIENT_NET");
+    const std::string orient_file = orient_env && std::string(orient_env) != "1" && std::string(orient_env) != "0" ? orient_env : "";
     auto inference = [&]() -> Inference& {
         if (!inf_store) {
             InferConfig cfg;
             if (!parse_backends(backend_arg, cfg.preference)) std::fprintf(stderr, "unknown backend in \"%s\"; using cpu\n", backend_arg.c_str());
             // FS_SHADE_NET=MODEL.onnx is the CPU ShadeNet model
             std::string shade = shade_model ? shade_model : "";
-            cfg.load = [models, shade, rule_file](const std::string& file) {
+            cfg.load = [models, shade, rule_file, orient_file](const std::string& file) {
                 if (file == "rulenet.onnx" && !rule_file.empty()) return read_file(rule_file);
+                if (file == "orientnet.onnx" && !orient_file.empty()) return read_file(orient_file);
                 if (file == "inpaint.onnx" && std::getenv("FS_INPAINT")) return read_file(std::getenv("FS_INPAINT"));
                 return read_file(file == "shadenet.onnx" && !shade.empty() ? shade : models + "/" + file);
             };
             if (const char* t = std::getenv("FS_ORT_THREADS")) cfg.threads = std::atoi(t);
             if (const char* c = std::getenv("FS_ORT_CACHE")) cfg.cache_dir = c;
+            // FS_NET_CACHE=DIR: every net's outputs stored there per model file (path, size, time) and exact input;
+            // a stored output is used without loading the model (tests that change only what follows the nets)
+            if (const char* nc = std::getenv("FS_NET_CACHE")) {
+                cfg.output_cache_dir = nc;
+                cfg.output_cache_tag = [models, shade, rule_file, orient_file](const std::string& file) {
+                    std::string p = models + "/" + file;
+                    if (file == "rulenet.onnx" && !rule_file.empty()) p = rule_file;
+                    else if (file == "orientnet.onnx" && !orient_file.empty()) p = orient_file;
+                    else if (file == "shadenet.onnx" && !shade.empty()) p = shade;
+                    else if (file == "inpaint.onnx" && std::getenv("FS_INPAINT")) p = std::getenv("FS_INPAINT");
+                    std::error_code ec;
+                    const auto size = std::filesystem::file_size(p, ec);
+                    const auto t = std::filesystem::last_write_time(p, ec);
+                    return p + "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long)t.time_since_epoch().count());
+                };
+            }
             inf_store = Inference::create(cfg);
         }
         return *inf_store;
@@ -235,6 +256,11 @@ int main(int argc, char** argv) {
     // FS_NO_FLAT: no flat-paper test; FS_FLAT_BOW: its threshold (side bow / side length)
     if (std::getenv("FS_NO_FLAT")) o.flat_edge_bow = 0;
     if (const char* fb = std::getenv("FS_FLAT_BOW")) o.flat_edge_bow = std::atof(fb);
+    // FS_FUSE_MISS: PipelineOptions::fuse_miss (0: no border fusion of the two nets)
+    if (const char* fm = std::getenv("FS_FUSE_MISS")) o.fuse_miss = std::atof(fm);
+    if (const char* fg = std::getenv("FS_FUSE_GAIN")) o.fuse_min_gain = std::atof(fg);
+    // FS_SURF_SIDES: PipelineOptions::surface_min_sides (0: the surface model kept whatever its outline)
+    if (const char* ss = std::getenv("FS_SURF_SIDES")) o.surface_min_sides = std::atoi(ss);
     // FS_ZOOM=1: the zoomed second flattening pass (uv_zoom), the repo's ONNX models in-process
     if (std::getenv("FS_ZOOM")) {
         o.zoom_pass = true;
@@ -286,6 +312,14 @@ int main(int argc, char** argv) {
             };
         }
     }
+    // the orientation net (PipelineOptions::orient_net); FS_ORIENT_MARGIN: its margin
+    {
+        const std::string of = !orient_file.empty() ? orient_file : models + "/orientnet.onnx";
+        std::error_code ec;
+        const bool off = orient_env && std::string(orient_env) == "0";
+        if (!off && std::filesystem::exists(of, ec)) o.orient_net = orient_net_fn(inference());
+        if (const char* om = std::getenv("FS_ORIENT_MARGIN")) o.orient_net_margin = std::atof(om);
+    }
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
         size_t p = 0;
@@ -327,6 +361,8 @@ int main(int argc, char** argv) {
         rq.perspective_only = o.perspective_only;
         rq.nets = std::string(flat_nets) == "uv" ? FlatNets::UVDocOnly : std::string(flat_nets) == "hr" ? FlatNets::SynthDocOnly : FlatNets::Both;
         rq.seg_logits = logits;
+        // FS_CROP_CORNERS=1: NetsRequest::crop_from_corners
+        rq.crop_from_corners = std::getenv("FS_CROP_CORNERS") && std::atoi(std::getenv("FS_CROP_CORNERS")) != 0;
         FlatNetsFn fn = flat_nets_fn(img, rq, inference(), &nets);
         if (const char* d = std::getenv("FS_NET_DELAY_MS")) {
             const int delay = std::atoi(d);
@@ -448,8 +484,9 @@ int main(int argc, char** argv) {
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"user_lines_used\": " << r.user_lines_used << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"page_hw\": " << num(r.page_hw) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"edges_bent\": " << (r.edges_bent ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
+      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_grid_check\": [[" << num(r.uv_grid_check[0][0]) << ", " << num(r.uv_grid_check[0][1]) << ", " << num(r.uv_grid_check[0][2]) << "], [" << num(r.uv_grid_check[1][0]) << ", " << num(r.uv_grid_check[1][1]) << ", " << num(r.uv_grid_check[1][2]) << "]], \"uv_agree_quad\": [" << num(r.uv_agree_quad[0]) << ", " << num(r.uv_agree_quad[1]) << "], \"uv_agree_mask\": [" << num(r.uv_agree_mask[0]) << ", " << num(r.uv_agree_mask[1]) << "]" << ", \"fuse\": [" << r.fuse_runs << ", " << num(r.fuse_worst[0]) << ", " << num(r.fuse_worst[1]) << ", " << num(r.fuse_moved_px) << ", " << num(r.fuse_area) << ", " << (r.fuse_rejected ? 1 : 0) << "]" << ", \"surface_unfounded\": " << (r.surface_unfounded ? "true" : "false") << ", \"side_n\": [" << r.side_n[0] << ", " << r.side_n[1] << ", " << r.side_n[2] << ", " << r.side_n[3] << "], \"side_edge\": [" << num(r.side_edge[0]) << ", " << num(r.side_edge[1]) << ", " << num(r.side_edge[2]) << ", " << num(r.side_edge[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
+      << ", \"orient_net\": [" << r.orient_net_turn << ", " << num(r.orient_net_margin) << ", " << r.orient_net_patches << ", " << (r.orient_by_net ? 1 : 0) << "]"
       << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"flat_page\": " << (r.flat_page ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": [" << num(r.second_pass[0]) << ", " << num(r.second_pass[1]) << ", " << num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0) << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
       << ", \"net\": [" << r.warp.net.dropped << ", " << r.warp.net.added << ", " << r.warp.net.joined << ", " << r.warp.S2.n_net_kept << "], \"spots_dropped\": "
       << (r.lines_spots_dropped ? "true" : "false") << ", \"straightness\": [" << num(r.line_straightness[0]) << ", " << num(r.line_straightness[1]) << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
@@ -574,6 +611,27 @@ int main(int argc, char** argv) {
         std::vector<float> h = rows(r.warp.S2.h), v = rows(r.warp.S2.v), H = lines(r.warp.H), V = lines(r.warp.V);
         write_npz(ds, {{"h", NpyArray::f32({h.size() / 3, 3}, h.data())}, {"v", NpyArray::f32({v.size() / 3, 3}, v.data())},
                        {"H", NpyArray::f32({H.size() / 5, 5}, H.data())}, {"V", NpyArray::f32({V.size() / 5, 5}, V.data())}});
+    }
+    // FS_DUMP_OUTLINE=P.npz: the page finder's outline in full-resolution photo px: its contour ("contour": n x 2),
+    // the points given to each side ("side0".."side3"), its corners ("corners": 4 x 2, TL TR BR BL) and the
+    // detection's own corners ("det_corners")
+    if (const char* dol = std::getenv("FS_DUMP_OUTLINE"); dol && r.detection.ok) {
+        const PageCorners& pc = r.detection;
+        const double k = 1.0 / std::min(1.0, pc.scale);
+        auto pts = [&](const std::vector<cv::Point2d>& v) {
+            std::vector<float> f;
+            for (const auto& p : v) { f.push_back((float)(p.x * k)); f.push_back((float)(p.y * k)); }
+            return f;
+        };
+        std::vector<cv::Point2d> cont(pc.det.contour.begin(), pc.det.contour.end());
+        std::vector<cv::Point2d> dc(pc.det.corners.begin(), pc.det.corners.end());
+        std::vector<float> c, s[4], d = pts(dc), co = pts(cont);
+        for (const auto& p : pc.pts) { c.push_back((float)p.x); c.push_back((float)p.y); }
+        for (int q = 0; q < 4; ++q) s[q] = pts(pc.det.side_pts[q]);
+        write_npz(dol, {{"contour", NpyArray::f32({co.size() / 2, 2}, co.data())}, {"corners", NpyArray::f32({4, 2}, c.data())},
+                        {"det_corners", NpyArray::f32({4, 2}, d.data())}, {"side0", NpyArray::f32({s[0].size() / 2, 2}, s[0].data())},
+                        {"side1", NpyArray::f32({s[1].size() / 2, 2}, s[1].data())}, {"side2", NpyArray::f32({s[2].size() / 2, 2}, s[2].data())},
+                        {"side3", NpyArray::f32({s[3].size() / 2, 2}, s[3].data())}});
     }
     // FS_DUMP_MAP=P.npz: the final backward map on its 4-px grid ("x", "y": gh x gw, photo / scan px)
     if (const char* dm = std::getenv("FS_DUMP_MAP"); dm && r.ok) {
