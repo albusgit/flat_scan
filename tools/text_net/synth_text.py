@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'rule_net'))
 import synth, synth2   # noqa: E402
 
-FONT_DIR = 'C:/Windows/Fonts/'
+FONT_DIR = os.path.join(os.environ.get('TN_FONT_DIR', 'C:/Windows/Fonts'), '')   # Linux: tools/train/setup puts every font in one folder
 CORPUS = os.environ.get('TN_CORPUS', 'E:/fs_datasets/textnet/corpus.json')
 # relative chance of a page's script (the rest 1 each): the owner's documents first, then the most used scripts
 SCRIPT_W = {'LATIN': 6, 'HEBREW': 4, 'ARABIC': 2.5, 'CYRILLIC': 2, 'HAN': 2, 'JAPANESE': 1.5, 'HANGUL': 1.2, 'DEVANAGARI': 1.5,
@@ -441,10 +441,11 @@ def text_layout(rng, h, w):
     return pg, script
 
 
-def sample(rng, size=400):
-    """img uint8 size x size x 3, mask float32 4 x size x size [rule h, rule v, text h, text v], edge uint8, script"""
+def sample(rng, size=400, layout=None):
+    """img uint8 size x size x 3, mask float32 4 x size x size [rule h, rule v, text h, text v], edge uint8, script.
+    layout(rng, h, w) -> (TPage, script): text_layout, or another page kind (tools/train/rules/synth_mag.py)"""
     H = W = 2 * size + 64
-    pg, script = text_layout(rng, H, W)
+    pg, script = (layout or text_layout)(rng, H, W)
     mx, my = synth.warp_field(rng, H, W)
     img = cv2.remap(pg.ink, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(1, 1, 1))
     lab = np.dstack([pg.mh, pg.mv, pg.th, pg.tv, pg.eh, pg.ev])

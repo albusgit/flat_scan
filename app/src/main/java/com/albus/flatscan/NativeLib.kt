@@ -102,6 +102,16 @@ object NativeLib {
     @JvmStatic external fun prewarmFinder()
 
     /**
+     * Camera guidance (ui/CameraGuide.kt): one camera analysis frame, RGBA_8888 rows of [rowStride] bytes in the
+     * direct buffer [frame], turned upright by [rotation] (ImageInfo.rotationDegrees). [findPage]: the page finder
+     * at 256 on its own 2-thread CPU session and the detection's quad step (no edge snapping); off: luma and
+     * sharpness only. -> [found, x0, y0 .. x3, y3 (TL TR BR BL, upright frame px), upright width, height, paper
+     * share, luma 0..1, glare (share of the page's pixels blown out), sharpness (Laplacian variance), ms]
+     * ([PreviewFrame.from]), or null.
+     */
+    @JvmStatic external fun previewPage(frame: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int, rotation: Int, findPage: Boolean): FloatArray?
+
+    /**
      * The app's GPU sessions made ahead of the first page: one run on a blank input of every net and shape its
      * group runs on the GPU (the rule net portrait and landscape), so the GPU compiles and tunes there. -> one line
      * per net: setup ms and backend.

@@ -43,6 +43,7 @@ struct PageCorners {
     bool whole_frame = false;         // no page found: the whole frame (net: info['fallback'])
     bool spread = false;              // net: a straight gutter split the page (pages may still be 1)
     double net_margin = -1, edge_strength = -1, edge_at_limit = -1;   // net quality signals (-1: n/a)
+    double area_frac = -1;            // net: share of the photo its paper covers (-1: n/a)
     cv::Point2d centroid;             // page outline centroid, photo px (book page order)
 };
 
@@ -86,6 +87,11 @@ struct PipelineOptions {
     UvCrop uv_crop2;                  // are tried, the straighter stage-1 page wins (see uv_prefer_margin)
     double uv_prefer_margin = 3.0;    // the second net is chosen only if its text-row angle spread is lower by this (deg)
                                       // (DocUNet: UVDoc's straighter rows mostly came with uneven stretch; 0.3 lost 0.45 LD)
+    // flat paper (round 16): a net can invent a curl on a flat sheet (a dollar bill on a table came out bowed). When
+    // every side of the page finder's outline is straight (side_bow at most flat_edge_bow: the bill 0.010, a curled
+    // magazine page 0.15, a cookbook 0.06 - 0.09, a curled coupon strip 0.056), the homography replaces the grid
+    // (0: off)
+    double flat_edge_bow = 0.012;
     const float* uv_shading = nullptr;   // SyntheticDoc's shading map (3 x in_h x in_w) for uv_shading_crop
     UvCrop uv_shading_crop;
     bool remove_shadows = true;       // divide the page by the shading map
@@ -102,6 +108,16 @@ struct PipelineOptions {
     const float* uv_out_pass1 = nullptr;
     UvCrop uv_crop_pass1;
     double uv_min_consistency = 0.95;
+    // ... and only when at least this share of the grid's page is paper by the page finder's mask (round 16: a
+    // self-consistent net drew a receipt's page into the coffee cups beside it; 0: off)
+    double uv_own_min_paper = 0;   // off: at 0.9 the receipt improved, 5 of 6 other pages got the page finder's worse crop
+    // Border snap (round 16, uvdoc.h uv_snap_border): the grid's border onto the page finder's paper edge, searched
+    // within snap_search x the page's size; displacements below snap_dead_px (photo px) are left; a side most of
+    // whose points need more than snap_lost x the page's size: the net lost the page (the page before the nets)
+    bool snap_border = false;   // off: on 121 photos 2 pages better (coupon, bill a little), 12 worse (the mask edge is too rough: wavy text)
+    double snap_search = 0.08;
+    double snap_dead_px = 3.0;
+    double snap_lost = 0.06;
     double uv_consistent_floor = 0.5;
     // The flattening nets run by run_photo itself (nets.h flat_nets_fn), instead of uv_out* given in
     // advance; their grids fill those slots. overlap_nets: on a worker thread, started before the
@@ -177,6 +193,8 @@ struct PipelineOptions {
     int zoom_nu = 1, zoom_nv = 2;     // parts across / down: halves along the long side (quarters: 2.32 deg, two cut edges each)
     double zoom_max_worse = 0.1;      // deg of text-row spread the zoomed grid may lose and still be kept
     int shade_long_side = 512;
+    // the map's clamp: a pixel is brightened by at most 1 / shade_floor (the net of round 16 is trained for 0.12)
+    float shade_floor = 0.3f;
     bool scan_flattened = false;      // run_scan: the input is a page another method flattened (neural-page line stage + guards)
     bool shade_after_uv = false;
 };
@@ -191,9 +209,16 @@ struct PipelineResult {
     PageCorners detection;            // the automatic detection (finder info); ok = false if not run
     double uv_agreement = -1;         // UVDoc outline vs the page (IoU); -1: UVDoc not run
     double uv_consistency = -1;       // ... vs the first pass's outline (-1: no first pass)
+    double uv_paper_share[2] = {-1, -1};   // share of each net's page that the page finder's mask calls paper (-1: not measured)
+    double snap_px[2] = {-1, -1};     // border snap: median / max displacement (photo px; -1: not run)
+    int snap_sides = -1;              // ... sides moved
+    double side_bow[4] = {-1, -1, -1, -1};   // page finder's sides (top, right, bottom, left): p95 bow from the chord / its length
+    double uv_flat_resid[3] = {-1, -1, -1};   // the grid's distance from its best homography (page px: p50, p95, max)
+    bool uv_lost_page = false;        // ... a side was far off the paper's edge: the net was set aside
     bool uv_defines_page = false;     // the grid was used over the page finder's disagreement: corners and paper from it
     int uv_model = -1;                // the net whose grid was used (UvCrop::model); -1: none
     double uv_spread[2] = {-1, -1};   // text-row angle spread of each net's stage-1 page (deg; -1: not measured)
+    bool flat_page = false;           // the net's grid was set aside: the paper is flat (PipelineOptions::flat_edge_bow)
     bool uv_rejected = false;         // UVDoc ran but disagreed with the page finder (fallback used)
     int uv_zoom_quarters = -1;        // zoomed pass: quarters whose grid was used (-1: not run)
     double uv_zoom_spread[2] = {-1, -1};   // ... text-row spread with the first / the zoomed grid
@@ -207,6 +232,7 @@ struct PipelineResult {
     double nets_join_ms = -1;         // ... run_photo's start to the grids in hand
     double line_distortion = -1;      // UVDoc pages: the line refinement's local area change (p99)
     bool lines_rejected = false;      // ... too large: the UVDoc page was kept without it
+    bool edges_bent = false;          // a line-stage candidate bent a straight edge of the page (and was not kept)
     bool lines_spots_dropped = false; // ... too large at first: kept without the lines through the overstretched spots
     double second_pass[3] = {-1, -1, -1};   // ... the second pass: its distortion, its rules' deviation before / after (px)
     bool second_pass_kept = false;
@@ -227,6 +253,7 @@ struct PipelineResult {
     int rot = -1;                     // applied cv::ROTATE_* code
     double orient_sh = 0, orient_sv = 0, orient_upright = 0;
     GridMap final_map;                // backward map (photo px), rotated frame, 4-px grid, analysis size
+    double page_hw = -1;              // height / width of the paper itself, measured along final_map (-1: not measured)
     GridMap render_map;               // the same map at the output resolution (used for the resample)
     cv::Mat page;                     // BGRA, unwarped (before cleanup)
     cv::Mat stage1;                   // stage-1 page the warp map was estimated on (BGR)

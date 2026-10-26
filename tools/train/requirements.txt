@@ -1,0 +1,11 @@
+# on top of a PyTorch CUDA image (torch >= 2.4 with Triton for torch.compile)
+numpy
+opencv-python-headless
+pillow
+h5py
+onnx
+onnxruntime
+wordfreq
+fonttools
+PySide6-Essentials
+scipy

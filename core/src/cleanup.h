@@ -78,6 +78,7 @@ struct PageParams {
     cv::Mat bgv;              // CV_32F, quarter grid: local background luminance of v (B&W, specks)
     cv::Mat pic;              // CV_32F, quarter grid: picture weight 0..1 (B&W tones, specks)
     cv::Mat tint;             // CV_32F, quarter grid: light-colour weight 0..1 (white point, cleanup, specks)
+    cv::Mat samples;          // CV_32F, quarter grid: the paper samples (1) the estimates above come from
     float wb[3] = {1, 1, 1};  // per-channel paper colour / paper luminance
     float sigma = 0.02f;      // paper noise of luma(v)
     float ink = 0.3f;         // median luma(v) of ink on paper (Scan's black point)

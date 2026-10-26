@@ -109,6 +109,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.albus.flatscan.DocumentName
 import com.albus.flatscan.ScanViewModel
+import com.albus.flatscan.TagEdit
+import com.albus.flatscan.Tags
 
 private enum class PagesSheet { None, Save, Share }
 
@@ -122,7 +124,7 @@ private data class AddTarget(val before: String?)
  * The page editor of the open document: open a page; hold and drag to reorder (the grid scrolls at its
  * edges); select pages to rotate, duplicate, move (to the start, the end or another document) or delete;
  * reverse all pages; insert pages from the camera, photos or a PDF before any page; split the document;
- * undo / redo every change of the session; rename, save and share.
+ * undo / redo every change of the session; rename, tag, save and share.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -152,6 +154,10 @@ fun PagesScreen(vm: ScanViewModel) {
     val ready = n > 0 && !exporter.busy
     val docName = vm.docTitle
     var renaming by remember { mutableStateOf(false) }
+    var tagging by remember { mutableStateOf(false) }
+    // the open document's tags and every tag of the library (the tag sheet); null while loading
+    val allDocs by vm.library.documents.collectAsState(initial = null)
+    val docTags = allDocs?.let { all -> Tags.parse(all.firstOrNull { it.id == vm.docId }?.tags.orEmpty()) }
     // pages that left the document (undo, move) leave the selection
     LaunchedEffect(vm.pages.toList()) { selected = selected.filter { it in vm.pages }.toSet() }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
@@ -210,6 +216,7 @@ fun PagesScreen(vm: ScanViewModel) {
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         )
+        if (!selecting && docTags != null) DocumentTagsRow(docTags, onEdit = { tagging = true }, modifier = Modifier.padding(horizontal = 8.dp))
         ReorderablePageGrid(
             pages = vm.pages,
             onMove = { from, to -> vm.dragMove(from, to) },
@@ -281,6 +288,12 @@ fun PagesScreen(vm: ScanViewModel) {
     if (sheet != PagesSheet.None) {
         val share = sheet == PagesSheet.Share
         ExportSheet(vm, share, n, vm.docTitle, onRename = { vm.renameDocument(it) }, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = PagesSheet.None })
+    }
+    if (tagging) {
+        TagSheet(
+            subtitle = docName, edit = TagEdit(mapOf((vm.docId ?: "") to docTags.orEmpty())), known = Tags.ranked(allDocs.orEmpty()),
+            onSet = { t, on -> vm.setOpenDocumentTag(t, on) }, onDismiss = { tagging = false },
+        )
     }
     if (renaming) {
         var text by remember { mutableStateOf(docName ?: "") }

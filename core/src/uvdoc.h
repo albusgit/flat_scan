@@ -88,10 +88,29 @@ UvGrid uv_zoom(const cv::Mat& photo_bgr, const UvGrid& g, int model, const UvNet
 // IoU of the grid's outline with a page mask (CV_8U, non-zero = page) whose pixels are photo
 // pixels * scale (the analysis copy), measured at <= 800 px.
 double uv_agreement(const UvGrid& g, const cv::Mat& mask, double scale);
+// The share of the grid's page (inside its outline) that is paper: what the mask calls paper, plus - given
+// the photo - the part outside the mask that looks like the paper inside it (a page finder that cut off
+// part of a page: the net's page there is still paper). Low when the grid's page reaches into the
+// background (the mask as for uv_agreement).
+double uv_paper_share(const UvGrid& g, const cv::Mat& mask, double scale, const cv::Mat& photo_bgr = cv::Mat());
 // the same against the corner quad (no mask: corners set by hand)
 double uv_agreement(const UvGrid& g, const std::array<cv::Point2d, 4>& quad, cv::Size photo);
 // IoU of two grids' outlines (the same page found twice: another crop or another net)
 double uv_agreement(const UvGrid& a, const UvGrid& b);
+
+// The grid's border pulled onto the paper's edge: for each border point, the mask's (CV_8U, photo px *
+// scale) paper-to-background edge nearest along the border's normal (within search x the page's size); per
+// side, smoothed along the side (median, then Gaussian) with dead_px taken off every displacement, and spread
+// into the page as a Coons patch (exact on the border, smooth inside). The net keeps its bend inside the page;
+// its edges sit where the paper is. A side with too few edges found (photo border, no mask edge near) is not
+// moved. Stats: median / max displacement (photo px), the sides moved and the sides most of whose points needed
+// more than lost x the page's size (the net lost the page there).
+struct BorderSnap {
+    double median_px = 0, max_px = 0;
+    int sides_moved = 0, sides_lost = 0;
+};
+UvGrid uv_snap_border(const UvGrid& g, const cv::Mat& mask, double scale, BorderSnap* st = nullptr, double search = 0.08,
+                      double dead_px = 3.0, double lost = 0.06);
 
 // The page's corners along a grid, TL, TR, BR, BL of the output page (landscape when turned), photo px.
 std::array<cv::Point2d, 4> uv_corners(const UvGrid& g);

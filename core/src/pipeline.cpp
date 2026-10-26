@@ -1,5 +1,6 @@
 #include "pipeline.h"
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/photo.hpp>
 #include <algorithm>
@@ -313,9 +314,9 @@ cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H
 
 // The shadow net on the flattened page (PipelineOptions::shade_net): the page at long_side,
 // portrait (landscape pages turned for the net and back), its shading map bilinearly back at page
-// size, the page divided by it: brighten only, by at most 1 / 0.3 (cast shadows on paper keep
-// >= ~0.45 of the light; anything darker is ink, which a misread map must not blow out).
-bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side) {
+// size, the page divided by it: brighten only, by at most 1 / floor (PipelineOptions::shade_floor; the map
+// is clamped there so that a misread map cannot blow out ink).
+bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side, float shade_floor) {
     if (page_bgra.empty() || !fn) return false;
     cv::Mat bgr;
     cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
@@ -337,7 +338,7 @@ bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<fl
     for (int y = 0; y < nh; ++y) {
         cv::Vec3f* q = S.ptr<cv::Vec3f>(y);
         for (int x = 0; x < nw; ++x)
-            for (int c = 0; c < 3; ++c) q[x][c] = std::min(1.f, std::max(0.3f, buf[c * plane + (size_t)y * nw + x]));
+            for (int c = 0; c < 3; ++c) q[x][c] = std::min(1.f, std::max(shade_floor, buf[c * plane + (size_t)y * nw + x]));
     }
     if (turned) cv::rotate(S, S, cv::ROTATE_90_COUNTERCLOCKWISE);
     cv::resize(S, S, page_bgra.size(), 0, 0, cv::INTER_LINEAR);
@@ -864,6 +865,7 @@ PageCorners make_corners(const cv::Mat& photo, const cv::Mat& small, const PageF
         pc.whole_frame = f->whole_frame;
         pc.spread = f->spread;
         pc.net_margin = f->net_margin;
+        pc.area_frac = f->area_frac;
         const FoundPage& fp = f->pages[pc.page_index];
         pc.edge_strength = fp.edge_strength;
         pc.edge_at_limit = fp.edge_at_limit;
@@ -1192,6 +1194,89 @@ double straightness_through(const PageTraces& T, const GridMap* m) {
     return T.pts.empty() ? 0.0 : sum / T.pts.size();
 }
 
+// Long straight edges of a page (Canny + Hough at half size: segments of a quarter of the short side
+// or more, within 2 degrees of the axes, away from the outer 25 px), sampled every 8 px: what is
+// already straight on the nets' page, for straight_edges_kept.
+PageTraces straight_edges(const cv::Mat& page) {
+    PageTraces S;
+    cv::Mat g, e;
+    cv::cvtColor(page, g, page.channels() == 4 ? cv::COLOR_BGRA2GRAY : cv::COLOR_BGR2GRAY);
+    cv::resize(g, g, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+    cv::Canny(g, e, 60, 150);
+    std::vector<cv::Vec4i> L;
+    const double len = 0.25 * std::min(g.cols, g.rows);
+    cv::HoughLinesP(e, L, 1, CV_PI / 360, 80, len, 4);
+    for (const auto& l : L) {
+        cv::Point2d a(2.0 * l[0], 2.0 * l[1]), b(2.0 * l[2], 2.0 * l[3]);
+        const double dx = std::fabs(b.x - a.x), dy = std::fabs(b.y - a.y);
+        const bool hz = dx > dy;
+        if ((hz ? dy / dx : dx / dy) > std::tan(2.0 * CV_PI / 180)) continue;
+        if (std::min({a.x, b.x, a.y, b.y}) < 25 || std::max(a.x, b.x) > page.cols - 26 || std::max(a.y, b.y) > page.rows - 26) continue;
+        const int n = (int)(std::hypot(b.x - a.x, b.y - a.y) / 8);
+        std::vector<cv::Point2d> p;
+        for (int i = 0; i <= n; ++i) p.push_back(a + (b - a) * ((double)i / std::max(1, n)));
+        S.pts.push_back(std::move(p));
+        S.hz.push_back(hz);
+    }
+    return S;
+}
+
+// The line stage straightens what it traced, and the guards below measure that; nothing measured
+// what it bends. On an illustration it took the long outlines of the drawing for rules, and making
+// them axis-straight waved the straight frame and bar beside them (a 2-cm S on a magazine page). A
+// candidate must leave every long straight edge of the page within kEdgeBend px of straight (p95
+// distance from its fitted line, after the map, versus before).
+const double kEdgeBend = 3.0;
+
+bool straight_edges_kept(const PageTraces& S, const GridMap& m) {
+    for (size_t l = 0; l < S.pts.size(); ++l) {
+        double before = 0, after = 0;
+        for (int k = 0; k < 2; ++k) {
+            Vec t, c;
+            for (const auto& s : S.pts[l]) {
+                cv::Point2d p = s;
+                if (k == 1)
+                    for (int it = 0; it < 10; ++it) { cv::Point2d q = map_at(m, p.x, p.y); p += s - q; }
+                t.push_back(S.hz[l] ? p.x : p.y); c.push_back(S.hz[l] ? p.y : p.x);
+            }
+            Vec f = polyfit(t, c, 1), d;
+            for (size_t i = 0; i < t.size(); ++i) d.push_back(std::fabs(c[i] - polyval(f, t[i])));
+            std::sort(d.begin(), d.end());
+            (k == 0 ? before : after) = d[(size_t)(0.95 * (d.size() - 1))];
+        }
+        if (after > before + kEdgeBend) return false;
+    }
+    return true;
+}
+
+// Height / width of the paper as it lies in the photo, measured along a flattening map: the median
+// length of its columns over that of its rows (photo px). Along the map, not between the corners: a
+// curled or crumpled sheet is longer than the chord between its corners (a curled magazine page
+// measured 1.25 from its corners, 1.44 along the map; it is A4, 1.41), and the core's page is A4
+// whatever the paper, so the app takes the paper's own shape from this.
+double map_page_hw(const GridMap& m) {
+    if (m.gw < 3 || m.gh < 3) return -1;
+    Vec rows, cols;
+    for (int i = 0; i < m.gh; ++i) {
+        double s = 0;
+        for (int j = 0; j + 1 < m.gw; ++j) {
+            size_t a = (size_t)i * m.gw + j;
+            s += std::hypot(m.x[a + 1] - m.x[a], m.y[a + 1] - m.y[a]);
+        }
+        rows.push_back(s);
+    }
+    for (int j = 0; j < m.gw; ++j) {
+        double s = 0;
+        for (int i = 0; i + 1 < m.gh; ++i) {
+            size_t a = (size_t)i * m.gw + j;
+            s += std::hypot(m.x[a + m.gw] - m.x[a], m.y[a + m.gw] - m.y[a]);
+        }
+        cols.push_back(s);
+    }
+    const double w = median(rows);
+    return w > 0 ? median(cols) / w : -1;
+}
+
 // The line stage on a page the nets flattened, with its guards. The page is already flat, so a
 // correction that stretches or squeezes it locally (|det J - 1| p99 above max_line_distortion, or
 // more than max_line_distortion_frac of the cells above 0.2) is a tracing failure (dense staves,
@@ -1225,6 +1310,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     const PageTraces T = page_traces(w0);
     const double s_page = straightness_through(T, nullptr);
     r.line_straightness[0] = s_page;
+    const PageTraces E = straight_edges(page);
     // a candidate is kept if it neither overstretches the page nor leaves those rules less straight
     // than the page as it is (a fallback that drops some lines can bend the rules they were on)
     auto take = [&](WarpDebug& w, GridMap& m) {
@@ -1234,6 +1320,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         if (opt.max_local_rescale > 0) r.bumps_faded = soften_bumps(m, opt.max_local_rescale, extension_support(w, m.gw, m.gh, m.stride));
         double st = straightness_through(T, &m);
         if (T.pts.size() >= 3 && st > s_page - 0.1) return false;
+        if (!straight_edges_kept(E, m)) { r.edges_bent = true; return false; }
         r.line_straightness[1] = st;
         r.line_distortion = q;
         r.warp = std::move(w);
@@ -1373,6 +1460,17 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             return r;
         }
         corners = pc.pts;
+        // how far each side of the page finder's outline bows away from the straight line between its corners
+        // (p95 distance / the side's length): measured on the photo, independent of the nets
+        for (int k = 0; k < 4; ++k) {
+            const cv::Point2d a = pc.det.corners[k], b = pc.det.corners[(k + 1) % 4];
+            const double L = cv::norm(b - a);
+            if (L < 1 || pc.det.side_pts[k].size() < 5) continue;
+            Vec d;
+            for (const auto& p : pc.det.side_pts[k]) d.push_back(std::fabs((b - a).cross(p - a)) / L);
+            std::sort(d.begin(), d.end());
+            r.side_bow[k] = d[(size_t)(0.95 * (d.size() - 1))] / L;
+        }
     } else {
         corners = opt.corners;
     }
@@ -1475,11 +1573,26 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     // outline agrees with the page finder (or with corners set by hand); with two nets, the first is
     // kept unless the second's stage-1 page has far straighter text rows (uv_prefer_margin). The line
     // stage still runs on top.
+    // the stage-1 unroll before the nets, for a net set aside by the border snap below
+    const Unroll U_pre = U;
+    const GeomMode mode_pre = r.mode;
+    const bool fell_back_pre = r.fell_back;
     if (opt.uv_out && !opt.perspective_only) {
         auto t_uv = Clock::now();
         const bool use_mask = !opt.corners_edited && pc.ok && !pc.det.paper.empty();
         const double need = use_mask ? opt.uv_min_agreement : opt.uv_min_agreement_quad;
-        struct Cand { UvGrid g; double agree = 0, consist = -1; int model = 0; bool own = false; };
+        // paper that fills the photo (every corner at a photo corner, and the page finder's paper covers
+        // kFillsPhoto of it): its edges are outside the photo, and a grid that outlines a page inside it has
+        // invented them (the nets learnt pages on a background) - it would crop away the photo's edges with
+        // what is printed there. Such a grid does not define the page. Corners at the photo corners around
+        // less paper are the finder's failure (a sheet half under a box): there the grid's outline is the help.
+        const double kFillsPhoto = 0.9;
+        bool fills_photo = pc.area_frac < 0 || pc.area_frac >= kFillsPhoto;
+        for (const auto& c : corners) {
+            const double tol = 0.02 * std::max(photo.cols, photo.rows);
+            fills_photo &= std::min(c.x, photo.cols - 1 - c.x) < tol && std::min(c.y, photo.rows - 1 - c.y) < tol;
+        }
+        struct Cand { UvGrid g; double agree = 0, consist = -1, paper = -1; int model = 0; bool own = false; };
         std::vector<Cand> ok;
         double best_agree = 0;
         UvGrid pass1;
@@ -1498,7 +1611,11 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             if (!c.g.ok) continue;
             bool by_finder = c.g.turned == landscape && c.agree >= (c.model == 2 && use_mask ? opt.uv_min_agreement_hr : need);
             if (pass1.ok) c.consist = uv_agreement(c.g, pass1);
-            c.own = !by_finder && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor;
+            // a grid that outlines its own page must outline paper (the page finder's mask): one that reaches into
+            // the background has invented the page (a receipt between coffee cups came out with the cups)
+            if (use_mask) c.paper = r.uv_paper_share[k] = uv_paper_share(c.g, pc.det.paper, pc.scale, photo);
+            c.own = !by_finder && !fills_photo && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor &&
+                    (c.paper < 0 || c.paper >= opt.uv_own_min_paper);
             if (by_finder || c.own) ok.push_back(std::move(c));
         }
         r.uv_agreement = best_agree;
@@ -1572,6 +1689,70 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 }
                 r.ms.emplace_back("zoomed flattening pass", ms_since(tz));
             }
+            // how far the grid is from a flat sheet: the homography that best maps its points (photo) to the page,
+            // and the points' distance from it on the page (page px; p50, p95, max)
+            {
+                std::vector<cv::Point2f> ph, pg;
+                const UvGrid& G = U.uv;
+                for (int i = 0; i < G.gh; ++i)
+                    for (int j = 0; j < G.gw; ++j) {
+                        const cv::Point2d& q = G.pts[(size_t)i * G.gw + j];
+                        ph.emplace_back((float)q.x, (float)q.y);
+                        // the page as the net saw it (portrait); turned: x along the photo's long side
+                        const double u = (double)j / (G.gw - 1), v = (double)i / (G.gh - 1);
+                        pg.emplace_back(G.turned ? cv::Point2f((float)(v * (W - 1)), (float)((1 - u) * (H - 1)))
+                                                 : cv::Point2f((float)(u * (W - 1)), (float)(v * (H - 1))));
+                    }
+                cv::Mat Hf = cv::findHomography(ph, pg, 0);
+                if (!Hf.empty()) {
+                    std::vector<cv::Point2f> pr;
+                    cv::perspectiveTransform(ph, pr, Hf);
+                    Vec d;
+                    for (size_t k = 0; k < pr.size(); ++k) d.push_back(cv::norm(pr[k] - pg[k]));
+                    std::sort(d.begin(), d.end());
+                    r.uv_flat_resid[0] = d[d.size() / 2];
+                    r.uv_flat_resid[1] = d[(size_t)(0.95 * (d.size() - 1))];
+                    r.uv_flat_resid[2] = d.back();
+                }
+            }
+            // the border onto the paper's edge (the page finder's mask): where the paper is is measured, not the
+            // net's to decide (it drew a bill's edge bowed into the table, a coupon's curled corner with the table
+            // in it). Not when the grid drew the page itself (the mask was overruled). A net that needs more than
+            // snap_lost x the page's size on most of a side has lost the page: the page before the nets is kept.
+            bool snapped_lost = false;
+            if (opt.snap_border && use_mask && !r.uv_defines_page) {
+                auto tb = Clock::now();
+                BorderSnap bs;
+                UvGrid sg = uv_snap_border(U.uv, pc.det.paper, pc.scale, &bs, opt.snap_search, opt.snap_dead_px, opt.snap_lost);
+                r.snap_px[0] = bs.median_px;
+                r.snap_px[1] = bs.max_px;
+                r.snap_sides = bs.sides_moved;
+                if (bs.sides_lost > 0) {
+                    snapped_lost = true;
+                    U = U_pre;
+                    r.mode = mode_pre;
+                    r.fell_back = fell_back_pre;
+                    r.uv_rejected = true;
+                    r.uv_lost_page = true;
+                } else {
+                    U.uv = std::move(sg);
+                }
+                r.ms.emplace_back("border snap", ms_since(tb));
+            }
+            // flat paper: paper bends but does not stretch, so a sheet whose four edges are all straight in the photo
+            // (side_bow, measured on the page finder's outline) is flat; a grid that bends it has invented the curl
+            // (the nets learnt that pages are curled: a dollar bill on a table came out bowed, as much as a curled
+            // magazine page - the grid alone cannot tell them apart). The homography between the corners is stage 1.
+            // Not when the grid drew the page itself (the page finder's outline was overruled).
+            if (opt.flat_edge_bow > 0 && !r.uv_defines_page && !snapped_lost) {
+                bool straight = true;
+                for (double b : r.side_bow) straight &= b >= 0 && b <= opt.flat_edge_bow;
+                if (straight) {
+                    U = Uh;
+                    r.mode = GeomMode::Homography;
+                    r.flat_page = true;
+                }
+            }
         } else {
             r.uv_rejected = true;
         }
@@ -1636,6 +1817,8 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     t0 = Clock::now();
     report(opt, 85, "Composing the map");
     r.final_map = compose(U, warp4, r.rot, true);
+    // a perspective-only page: the map is a homography, its lengths are the photo's foreshortened ones
+    if (!opt.perspective_only) r.page_hw = map_page_hw(r.final_map);
     cv::Mat beyond = beyond_page(warp4, W, H, r.rot);
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");
@@ -1645,7 +1828,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     auto shade = [&] {
         auto ts = Clock::now();
         report(opt, 92, "Removing shadows");
-        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side);
+        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side, opt.shade_floor);
         r.shadows_removed |= r.shade_net;
         r.ms.emplace_back("shadow net", ms_since(ts));
     };

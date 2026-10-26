@@ -13,9 +13,27 @@ import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import android.os.SystemClock
+import android.util.Size
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.compose.foundation.Canvas
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import com.albus.flatscan.CameraGuide
+import com.albus.flatscan.GuideState
+import com.albus.flatscan.NativeLib
+import com.albus.flatscan.PreviewFrame
+import java.util.concurrent.Executors
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
@@ -132,14 +150,62 @@ private fun CameraPreview(vm: ScanViewModel) {
     var torch by remember { mutableStateOf(false) }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
     val previewView = remember { PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FIT_CENTER } }
+    // camera guidance: small frames (about 320 x 240, 4:3 like the preview and the photo) on their own thread
+    val analysis = remember { guideAnalysis() }
+    val guideExec = remember { Executors.newSingleThreadExecutor { r -> Thread(r, "flatscan-guide") } }
+    val guide = remember { CameraGuide() }
+    var guideState by remember { mutableStateOf(GuideState()) }
+    var guiding by remember { mutableStateOf(false) }   // the analysis is bound (some cameras take only preview + photo)
+    val findPage = vm.captureMode == CaptureMode.Document && vm.settings.pageFinderNet
+    val findPageNow by rememberUpdatedState(findPage)
+    LaunchedEffect(findPage) {
+        guide.reset()
+        guideState = guide.state
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            analysis.clearAnalyzer()
+            guideExec.shutdown()
+        }
+    }
+    // the analyzer runs while the shutter is free: a photo being taken gets the CPU to itself
+    DisposableEffect(guiding, busy) {
+        if (guiding && !busy) {
+            val main = ContextCompat.getMainExecutor(ctx)
+            var last = 0L
+            analysis.setAnalyzer(guideExec) { image ->
+                image.use {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - last < GUIDE_INTERVAL_MS) return@use
+                    last = now
+                    val searched = findPageNow
+                    val plane = it.planes[0]
+                    val a = runCatching {
+                        NativeLib.previewPage(plane.buffer, it.width, it.height, plane.rowStride, it.imageInfo.rotationDegrees, searched)
+                    }.onFailure { e -> Log.e("FlatScan", "camera guidance failed", e) }.getOrNull()
+                    val frame = a?.let { PreviewFrame.from(it, searched) } ?: return@use
+                    main.execute { if (frame.searched == findPageNow) guideState = guide.update(frame) }
+                }
+            }
+        }
+        onDispose { analysis.clearAnalyzer() }
+    }
     DisposableEffect(Unit) {
         val future = ProcessCameraProvider.getInstance(ctx)
         future.addListener({
             val provider = future.get()
-            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            val preview = Preview.Builder().setResolutionSelector(ratio43()).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
             try {
                 provider.unbindAll()
-                val cam = provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+                // preview, photo and the guidance's frames; a camera that cannot stream all three gets the first two
+                val cam = try {
+                    provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture, analysis).also { guiding = true }
+                } catch (e: Exception) {
+                    Log.w("FlatScan", "camera bind with guidance failed: without it", e)
+                    provider.unbindAll()
+                    guiding = false
+                    provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+                }
                 camera = cam
                 // focal length per pixel of the long side, from the camera's own data (EXIF is preferred if present)
                 val info = Camera2CameraInfo.from(cam.cameraInfo)
@@ -182,15 +248,22 @@ private fun CameraPreview(vm: ScanViewModel) {
     }
     Box(Modifier.fillMaxSize().background(Editor.Ground)) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        val frame = guideState.frame
+        val quad = guideState.quad
+        if (quad != null && frame != null && !busy) GuideQuad(quad, frame.width, frame.height, guideState.ready)
         if (flash.value > 0f) Box(Modifier.fillMaxSize().graphicsLayer { alpha = flash.value }.background(Color.White))
-        // top: close, a hint, the torch
+        // top: close, the guidance's hint, the torch
         Row(Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             RoundButton(onClick = { vm.back() }) { Icon(Icons.Outlined.Close, "Close the camera", tint = Editor.Text) }
             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                val ready = guideState.ready
+                val hasTorch = camera?.cameraInfo?.hasFlashUnit() == true
                 Text(
-                    if (vm.captureMode == CaptureMode.Whiteboard) "Fit the whole board in view" else "Fit the whole page in view",
-                    style = MaterialTheme.typography.labelLarge, color = Editor.Text,
-                    modifier = Modifier.clip(RoundedCornerShape(17.dp)).background(Editor.Ground.copy(alpha = 0.6f)).padding(horizontal = 14.dp, vertical = 8.dp),
+                    CameraGuide.text(guideState.hint, vm.captureMode == CaptureMode.Whiteboard, hasTorch && !torch),
+                    style = MaterialTheme.typography.labelLarge, color = if (ready) Editor.Ground else Editor.Text,
+                    modifier = Modifier.clip(RoundedCornerShape(17.dp)).background(if (ready) Editor.Accent else Editor.Ground.copy(alpha = 0.6f))
+                        .semantics { liveRegion = LiveRegionMode.Polite }.testTag("cameraHint")
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
                 )
             }
             // the torch for dim rooms (a flash would glare on glossy paper)
@@ -245,6 +318,41 @@ private fun CameraPreview(vm: ScanViewModel) {
                 }
             }
         }
+    }
+}
+
+/** At most this often a frame goes to the guidance (about 10 a second: two CPU cores busy for less of the time). */
+private const val GUIDE_INTERVAL_MS = 100L
+
+/** 4:3, the photo's shape, so the preview and the guidance's frames show the same field of view. */
+private fun ratio43(): ResolutionSelector =
+    ResolutionSelector.Builder().setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build()
+
+/** The guidance's frames: RGBA, about 320 x 240, only the latest kept (a slow frame never builds a queue). */
+private fun guideAnalysis(): ImageAnalysis = ImageAnalysis.Builder()
+    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+    .setResolutionSelector(
+        ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy(Size(320, 240), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+            .build(),
+    )
+    .build()
+
+/** The page the guidance found, outlined on the preview (frame fractions [quad] of a [frameW] x [frameH] frame); the accent when Ready. */
+@Composable
+private fun GuideQuad(quad: FloatArray, frameW: Int, frameH: Int, ready: Boolean) {
+    val line = if (ready) Editor.Accent else Color.White.copy(alpha = 0.85f)
+    Canvas(Modifier.fillMaxSize()) {
+        val p = CameraGuide.toView(quad, frameW, frameH, size.width, size.height)
+        val path = Path().apply {
+            moveTo(p[0], p[1])
+            for (k in 1 until 4) lineTo(p[2 * k], p[2 * k + 1])
+            close()
+        }
+        drawPath(path, line.copy(alpha = if (ready) 0.18f else 0.1f))
+        drawPath(path, line, style = Stroke(width = 3.dp.toPx(), join = StrokeJoin.Round))
     }
 }
 

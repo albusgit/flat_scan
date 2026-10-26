@@ -2006,6 +2006,20 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { library.deleteForever(ids) }
     }
 
+    // ------------------------------------------------------------------ tags (feature round 5)
+    /** Home's tag filter: the chips picked; the list shows the documents that have all of them. */
+    var tagFilter by mutableStateOf<List<String>>(emptyList())
+
+    /** Puts [tag] on ([on]) or takes it off documents [ids] (the tag sheet). */
+    fun setTag(ids: Collection<String>, tag: String, on: Boolean) {
+        viewModelScope.launch { runCatching { library.setTag(ids, tag, on) }.onFailure { Log.e(TAG, "tagging failed", it) } }
+    }
+
+    /** The same for the open document (the pages screen; made now if it has none yet, as a rename does). */
+    fun setOpenDocumentTag(tag: String, on: Boolean) {
+        viewModelScope.launch { runCatching { library.setTag(listOf(ensureDocument()), tag, on) }.onFailure { Log.e(TAG, "tagging failed", it) } }
+    }
+
     /** Space used, for Settings > Storage (null while it is measured). */
     var storage by mutableStateOf<StorageUsage?>(null)
         private set
@@ -2212,8 +2226,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 pageVersions[id] = 0
             }
             saveOrderNow()
-            // the measured shape in the page's frame: a sideways page was turned a quarter (rot 0 / 2)
-            val hw = if (quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 }) 1f / quadHw else quadHw
+            // the measured shape in the page's frame: the core's, measured along its map (already in the page's
+            // frame; a curled or crumpled sheet is longer than the chord between its corners), else from the
+            // corners (a perspective-only page), where a sideways page was turned a quarter (rot 0 / 2)
+            val mapHw = info.optDouble("page_hw", -1.0).toFloat()
+            val hw = when {
+                mapHw > 0f -> mapHw
+                quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 } -> 1f / quadHw
+                else -> quadHw
+            }
             val geomL = geom.copy(look = startLook.copy(measuredHw = hw)).let { g ->
                 if (startEdits == null) g
                 else g.copy(erase = startEdits.erase, fingersAuto = startEdits.fingersAuto, fingerStrokes = startEdits.strokes, fingerFill = startEdits.fill)

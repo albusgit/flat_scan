@@ -20,6 +20,7 @@ import kotlin.math.sqrt
  * erased and ignored areas stay where they are).
  */
 enum class PageShape(val label: String, val caption: String) {
+    Auto("Auto", "A4 or US Letter when the page is close to one, otherwise its own proportions"),
     AsScanned("A4", "The page as processed: A4 proportions"),
     Measured("As photographed", "The page's own proportions, measured from its corners (receipts, cards, letters)"),
     Letter("US Letter", "8.5 x 11 in"),
@@ -80,11 +81,25 @@ data class PageLook(
         if (w <= 0 || h <= 0) return null
         val portrait = w <= h
         return when (shape) {
+            PageShape.Auto -> autoHw(w, h)
             PageShape.AsScanned -> null
             PageShape.Measured -> measuredHw.takeIf { it > 0f }
             PageShape.Letter -> if (portrait) 11f / 8.5f else 8.5f / 11f
             PageShape.IdCard -> if (portrait) 85.6f / 54f else 54f / 85.6f
         }?.takeIf { abs(it * w / h - 1f) > 0.005f }
+    }
+
+    // the core's A4 page when the measured shape is within kSnap of it, US Letter when within kSnap of that,
+    // else the measured shape: a cropped page, a coupon or a receipt is not stretched to A4, and the small
+    // error of a measurement from corners does not make an A4 sheet a little off A4
+    private fun autoHw(w: Int, h: Int): Float? {
+        val m = measuredHw.takeIf { it > 0f } ?: return null
+        val letter = if (w <= h) 11f / 8.5f else 8.5f / 11f
+        return when {
+            abs(m * w / h - 1f) < kSnap -> null
+            abs(m / letter - 1f) < kSnap -> letter
+            else -> m
+        }
     }
 
     /**
@@ -103,6 +118,8 @@ data class PageLook(
         .put("measured_hw", measuredHw.toDouble())
 
     companion object {
+        private const val kSnap = 0.04f
+
         fun fromJson(j: JSONObject?): PageLook {
             if (j == null) return PageLook()
             fun f(k: String) = j.optDouble(k, 0.0).toFloat().takeIf { !it.isNaN() } ?: 0f

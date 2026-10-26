@@ -7,6 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.albus.flatscan.DocumentStore
 import com.albus.flatscan.PageMeta
 import com.albus.flatscan.RenderParams
+import com.albus.flatscan.Tags
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -91,6 +92,32 @@ class LibraryTest {
         val d = lib.document(a.id)!!
         assertEquals("Tax 2025", d.title)
         assertEquals("tax,receipts", d.tags)
+    }
+
+    @Test
+    fun aTagGoesOnSeveralDocumentsAndOnlyChangedOnesAreTouched() = runBlocking {
+        val a = lib.createDocument("A")
+        val b = lib.createDocument("B")
+        val c = lib.createDocument("C")
+        lib.setTags(a.id, listOf("Tax"))
+        val before = now
+        now += 1000
+        // a has it already (in another case): only b changes; c is not in the selection
+        lib.setTag(listOf(a.id, b.id), " tax ", on = true)
+        assertEquals("Tax", lib.document(a.id)!!.tags)
+        assertEquals(before, lib.document(a.id)!!.modifiedAt)
+        assertEquals("tax", lib.document(b.id)!!.tags)
+        assertEquals(now, lib.document(b.id)!!.modifiedAt)
+        assertEquals("", lib.document(c.id)!!.tags)
+        // one chip for both spellings, spelt as the newest document (b) has it; the filter finds both
+        assertEquals(listOf("tax"), Tags.ranked(lib.documents.first()))
+        assertEquals(setOf("A", "B"), Tags.filter(lib.documents.first(), listOf("TAX")).map { it.title }.toSet())
+        // off again, ignoring case; a blank tag does nothing
+        now += 1000
+        lib.setTag(listOf(a.id, b.id, c.id), "TAX", on = false)
+        lib.setTag(listOf(a.id), "  ", on = true)
+        assertEquals(listOf("", "", ""), listOf(a, b, c).map { lib.document(it.id)!!.tags })
+        assertEquals(before, lib.document(c.id)!!.modifiedAt)
     }
 
     @Test

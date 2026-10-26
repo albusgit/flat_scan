@@ -1,8 +1,10 @@
 package com.albus.flatscan.data
 
 import android.content.Context
+import androidx.room.withTransaction
 import com.albus.flatscan.DocumentStore
 import com.albus.flatscan.LegacyDocument
+import com.albus.flatscan.Tags
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -53,9 +55,28 @@ class Library(
 
     suspend fun rename(doc: String, title: String) = io { dao.rename(doc, title.trim(), clock()) }
 
+    /** [doc]'s tags become [tags] (cleaned, [Tags.format]). */
     suspend fun setTags(doc: String, tags: List<String>) = io {
         val d = dao.document(doc) ?: return@io
-        dao.updateDocument(d.copy(tags = tags.map { it.trim().replace(",", " ") }.filter { it.isNotEmpty() }.distinct().joinToString(","), modifiedAt = clock()))
+        val v = Tags.format(tags)
+        if (v != d.tags) dao.setTags(doc, v, clock())
+    }
+
+    /**
+     * Puts [tag] on ([on]) or takes it off each of [docs] (feature round 5, the tag sheet). Only documents
+     * whose tags change are touched; their modified date moves, so the next upload sends the new tags.
+     */
+    suspend fun setTag(docs: Collection<String>, tag: String, on: Boolean) = io {
+        if (Tags.clean(tag).isEmpty()) return@io
+        db.withTransaction {
+            val now = clock()
+            for (id in docs.distinct()) {
+                val d = dao.document(id) ?: continue
+                val old = Tags.parse(d.tags)
+                val v = Tags.format(if (on) Tags.plus(old, tag) else Tags.minus(old, tag))
+                if (v != d.tags) dao.setTags(id, v, now)
+            }
+        }
     }
 
     suspend fun touch(doc: String) = io { dao.touch(doc, clock()) }

@@ -98,7 +98,7 @@ object LookPrefs {
     /** A new page's look: the defaults with the page shape chosen last. */
     fun newPageLook(ctx: Context): PageLook {
         val name = prefs(ctx).getString("shape", null)
-        return PageLook(shape = PageShape.entries.firstOrNull { it.name == name } ?: PageShape.AsScanned)
+        return PageLook(shape = PageShape.entries.firstOrNull { it.name == name } ?: PageShape.Auto)
     }
 
     fun rememberShape(ctx: Context, shape: PageShape) {

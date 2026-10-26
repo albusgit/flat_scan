@@ -22,16 +22,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import synth
 from synth import font, FONTS
 
-WF = 'C:/Windows/Fonts/'
+WF = os.path.join(os.environ.get('RN_FONT_DIR', 'C:/Windows/Fonts'), '')
 def _have(fs):
     return [WF + f for f in fs if os.path.exists(WF + f)] or FONTS
+# the Windows faces first; on Linux (RN_FONT_DIR: tools/train/setup's font folder) the open Google fonts stand in
 HEAVY_LAT = _have(['impact.ttf', 'ariblk.ttf', 'seguibl.ttf', 'bahnschrift.ttf', 'GOTHICB.TTF', 'framd.ttf', 'ARIALNB.TTF',
-                   'verdanab.ttf', 'georgiab.ttf', 'trebucbd.ttf', 'Candarab.ttf', 'corbelb.ttf', 'consolab.ttf', 'BOOKOSB.TTF'])
-HEAVY_HEB = _have(['ahronbd.ttf', 'arialbd.ttf', 'gishabd.ttf', 'davidbd.ttf', 'tahomabd.ttf', 'timesbd.ttf', 'courbd.ttf'])
+                   'verdanab.ttf', 'georgiab.ttf', 'trebucbd.ttf', 'Candarab.ttf', 'corbelb.ttf', 'consolab.ttf', 'BOOKOSB.TTF',
+                   'SuezOne-Regular.ttf', 'Karantina-Bold.ttf', 'PT_Sans-Web-Bold.ttf', 'Tinos-Bold.ttf', 'Cousine-Bold.ttf', 'PT_Serif-Web-Bold.ttf'])
+HEAVY_HEB = _have(['ahronbd.ttf', 'arialbd.ttf', 'gishabd.ttf', 'davidbd.ttf', 'tahomabd.ttf', 'timesbd.ttf', 'courbd.ttf',
+                   'SecularOne-Regular.ttf', 'SuezOne-Regular.ttf', 'Alef-Bold.ttf', 'DavidLibre-Bold.ttf', 'Karantina-Bold.ttf'])
 LAT_FONTS = _have(['GARA.TTF', 'CENTURY.TTF', 'BKANT.TTF', 'pala.ttf', 'georgia.ttf', 'verdana.ttf', 'trebuc.ttf', 'cambriai.ttf',
-                   'constan.ttf', 'corbel.ttf', 'consola.ttf', 'lucon.ttf', 'SitkaVF.ttf', 'ARIALN.TTF', 'GOTHIC.TTF'])
+                   'constan.ttf', 'corbel.ttf', 'consola.ttf', 'lucon.ttf', 'SitkaVF.ttf', 'ARIALN.TTF', 'GOTHIC.TTF',
+                   'Tinos-Regular.ttf', 'PT_Serif-Web-Regular.ttf', 'PT_Sans-Web-Regular.ttf', 'Cousine-Regular.ttf', 'Bellefair-Regular.ttf',
+                   'VarelaRound-Regular.ttf', 'Amiri-Regular.ttf'])
 HAND = _have(['Inkfree.ttf', 'segoesc.ttf', 'segoepr.ttf', 'LHANDW.TTF', 'BRADHITC.TTF', 'comic.ttf', 'mvboli.ttf',
-              'FREESCPT.TTF', 'ITCKRIST.TTF', 'PRISTINA.TTF', 'MISTRAL.TTF', 'TEMPSITC.TTF'])
+              'FREESCPT.TTF', 'ITCKRIST.TTF', 'PRISTINA.TTF', 'MISTRAL.TTF', 'TEMPSITC.TTF',
+              'IndieFlower-Regular.ttf', 'Kalam-Regular.ttf', 'Kalam-Light.ttf', 'PatrickHand-Regular.ttf', 'AmaticSC-Regular.ttf'])
 LAT = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 

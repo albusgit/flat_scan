@@ -31,7 +31,7 @@ data class DocumentEntity(
     val title: String,
     @ColumnInfo(name = "created_at") val createdAt: Long,
     @ColumnInfo(name = "modified_at") val modifiedAt: Long,
-    /** Comma-separated, trimmed; empty = none. */
+    /** Comma-separated, trimmed, unique ignoring case ([com.albus.flatscan.Tags]); empty = none. */
     val tags: String = "",
     @ColumnInfo(name = "deleted_at") val deletedAt: Long? = null,
     @ColumnInfo(name = "sync_status") val syncStatus: SyncStatus = SyncStatus.None,
@@ -114,6 +114,10 @@ interface LibraryDao {
 
     @Query("UPDATE documents SET modified_at = :now WHERE id = :id")
     suspend fun touch(id: String, now: Long)
+
+    /** [tags]: a documents.tags value ([com.albus.flatscan.Tags.format]). */
+    @Query("UPDATE documents SET tags = :tags, modified_at = :now WHERE id = :id")
+    suspend fun setTags(id: String, tags: String, now: Long)
 
     @Query("UPDATE documents SET sync_status = :status, sync_error = :error WHERE id = :id")
     suspend fun setSync(id: String, status: SyncStatus, error: String?)

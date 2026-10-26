@@ -58,6 +58,7 @@ import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material.icons.outlined.LocalOffer
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.RestoreFromTrash
@@ -97,6 +98,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -111,6 +114,8 @@ import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.Screen
+import com.albus.flatscan.TagEdit
+import com.albus.flatscan.Tags
 import com.albus.flatscan.data.DocumentSummary
 import com.albus.flatscan.data.Library
 import com.albus.flatscan.data.SyncStatus
@@ -180,7 +185,8 @@ private fun ageOf(t: Long, now: Long): Age {
 /**
  * The home screen: carry on with the open document, find one (title or page text), the documents
  * as a ruled list grouped by age or as their first pages laid out, and Scan / Import at the bottom
- * under the thumb. Long press selects (rename, upload, trash). With nothing scanned yet it shows
+ * under the thumb. Tag chips over the list show only the documents with every chip picked (AND). Long
+ * press selects (rename, tag, upload, trash). With nothing scanned yet it shows
  * what the app does instead.
  */
 @Composable
@@ -194,9 +200,14 @@ fun HomeScreen(vm: ScanViewModel) {
     var pagesView by remember { mutableStateOf(vm.settings.homePages) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     var renaming by remember { mutableStateOf<DocumentSummary?>(null) }
+    var tagging by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     val all = docs.orEmpty()
     val shown = remember(docs, query, vm.searchTextVersion) { filterDocuments(all, query) { vm.searchText(it) } }
+    // the tag chips (most used first) and the documents with every chip picked; a tag no document has any more drops out
+    val tags = remember(docs) { Tags.ranked(all) }
+    val tagFilter = vm.tagFilter.filter { Tags.has(tags, it) }
+    val browsing = remember(docs, tagFilter) { Tags.filter(all, tagFilter) }
     val open = all.firstOrNull { it.id == vm.docId }
     val selecting = selected.isNotEmpty()
     val empty = docs?.isEmpty() == true
@@ -209,7 +220,7 @@ fun HomeScreen(vm: ScanViewModel) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             when {
-                selecting -> SelectionTopBar(selected.size, onClear = { selected = emptySet() }, onAll = { selected = (if (searching) shown else all).map { it.id }.toSet() })
+                selecting -> SelectionTopBar(selected.size, onClear = { selected = emptySet() }, onAll = { selected = (if (searching) shown else browsing).map { it.id }.toSet() })
                 searching -> SearchTopBar(query, hasText = vm.hasOcrText, onQuery = { query = it }, onClose = stopSearch)
                 else -> AppTopBar(onSettings = { vm.open(Screen.Settings) })
             }
@@ -228,11 +239,21 @@ fun HomeScreen(vm: ScanViewModel) {
                         item("search_field") {
                             SearchField(vm.hasOcrText, Modifier.padding(top = 14.dp)) { searching = true; selected = emptySet() }
                         }
-                        item("count") {
-                            CountRow(all.size, all.sumOf { it.pageCount }, pagesView) { pagesView = it; vm.settings.homePages = it }
+                        if (tags.isNotEmpty()) item("tags") {
+                            TagFilterRow(
+                                tags, tagFilter, modifier = Modifier.padding(top = 10.dp),
+                                onToggle = { t -> vm.tagFilter = if (Tags.has(tagFilter, t)) Tags.minus(tagFilter, t) else Tags.plus(tagFilter, t) },
+                                onClear = { vm.tagFilter = emptyList() },
+                            )
                         }
-                        if (pagesView) laidOutPages(vm, all, selected, tap, toggle)
-                        else ruledList(vm, all, selected, tap, toggle)
+                        item("count") {
+                            CountRow(browsing.size, browsing.sumOf { it.pageCount }, pagesView) { pagesView = it; vm.settings.homePages = it }
+                        }
+                        if (browsing.isEmpty()) item("no_tag_match") {
+                            NoTagMatch { vm.tagFilter = emptyList() }
+                        }
+                        else if (pagesView) laidOutPages(vm, browsing, selected, tap, toggle)
+                        else ruledList(vm, browsing, selected, tap, toggle)
                         item("trash") {
                             TrashLine(trashed.size, last = !pagesView) { vm.open(Screen.Trash) }
                         }
@@ -244,6 +265,7 @@ fun HomeScreen(vm: ScanViewModel) {
             selecting -> SelectionActions(
                 Modifier.align(Alignment.BottomCenter), canRename = selected.size == 1,
                 onRename = { renaming = all.firstOrNull { it.id in selected } },
+                onTag = { tagging = true },
                 onUpload = { vm.uploadDocuments(selected); selected = emptySet() },
                 onTrash = { confirmDelete = true },
             )
@@ -260,6 +282,15 @@ fun HomeScreen(vm: ScanViewModel) {
                 TextButton(onClick = { vm.renameDocument(d.id, text); renaming = null; selected = emptySet() }) { Text("Rename") }
             },
             dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
+        )
+    }
+    if (tagging) {
+        val chosen = all.filter { it.id in selected }
+        TagSheet(
+            subtitle = chosen.singleOrNull()?.title ?: "${chosen.size} documents",
+            edit = TagEdit(chosen.associate { it.id to Tags.parse(it.tags) }), known = tags,
+            onSet = { t, on -> vm.setTag(chosen.map { it.id }, t, on) },
+            onDismiss = { tagging = false; selected = emptySet() },
         )
     }
     if (confirmDelete) {
@@ -487,6 +518,7 @@ private fun LedgerRow(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(pageCount(d.pageCount), style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = muted, maxLines = 1)
                 SyncLine(d, Modifier.padding(start = 8.dp))
+                DocTags(d, Modifier.padding(start = 8.dp).weight(1f, fill = false))
             }
         }
         when {
@@ -758,12 +790,13 @@ private fun HomeDock(modifier: Modifier, onImport: () -> Unit, onScan: () -> Uni
 
 /** What a selection can do, labelled, where the dock was. */
 @Composable
-private fun SelectionActions(modifier: Modifier, canRename: Boolean, onRename: () -> Unit, onUpload: () -> Unit, onTrash: () -> Unit) {
+private fun SelectionActions(modifier: Modifier, canRename: Boolean, onRename: () -> Unit, onTag: () -> Unit, onUpload: () -> Unit, onTrash: () -> Unit) {
     Row(
         modifier.fillMaxWidth().shadow(8.dp).background(MaterialTheme.colorScheme.surfaceContainerLowest)
             .navigationBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         SelectionAction(Icons.Outlined.Edit, "Rename", enabled = canRename, onClick = onRename)
+        SelectionAction(Icons.Outlined.LocalOffer, "Tag", tag = "tag_selected", onClick = onTag)
         SelectionAction(Icons.Outlined.CloudUpload, "Upload", onClick = onUpload)
         SelectionAction(Icons.Outlined.Delete, "Trash", tint = MaterialTheme.colorScheme.error, tag = "delete_selected", onClick = onTrash)
     }
@@ -821,6 +854,30 @@ private fun PaperRow(selected: Boolean, outlined: Boolean, modifier: Modifier, o
             Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) { content() }
+    }
+}
+
+/** A document's tags in its list row, after the page count; nothing without tags. */
+@Composable
+private fun DocTags(d: DocumentSummary, modifier: Modifier = Modifier) {
+    val tags = remember(d.tags) { Tags.parse(d.tags) }
+    if (tags.isEmpty()) return
+    Text(
+        tags.joinToString(" · "), style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+        color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        modifier = modifier.semantics { contentDescription = "Tags: " + tags.joinToString(", ") },
+    )
+}
+
+/** The tag chips picked leave no document (none has all of them). */
+@Composable
+private fun NoTagMatch(onClear: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "No document has all of these tags.", style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onClear) { Text("Show all") }
     }
 }
 

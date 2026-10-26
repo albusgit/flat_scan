@@ -37,6 +37,7 @@
 #include "overlay.h"
 #include "pagefind.h"
 #include "pipeline.h"
+#include "preview.h"
 #include "uvdoc.h"
 
 #ifdef FS_WITH_ORT
@@ -1169,7 +1170,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
     std::ostringstream f;
     f << "{\"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << escape(r.error) << "\", \"mode\": \""
       << geom_mode_name(r.mode) << "\", \"fell_back\": " << (r.fell_back ? "true" : "false")
-      << ", \"fit_median_px\": " << r.fit_median_px << ", \"rot\": " << r.rot << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false")
+      << ", \"fit_median_px\": " << r.fit_median_px << ", \"rot\": " << r.rot << ", \"page_hw\": " << json_num(r.page_hw) << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false")
       << ", \"legend_px\": " << s->legend_px << ", \"has_paper_mask\": " << (r.paper.empty() ? "false" : "true")
       << ", \"needs_manual_crop\": " << json_strings(r.needs_manual_crop)
       << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
@@ -1177,6 +1178,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"fingers_over_text\": " << (r.fingers_over_text ? "true" : "false") << ", \"user_lines_used\": " << r.user_lines_used << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
+      << ", \"flat_page\": " << (r.flat_page ? "true" : "false")
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
       << ", \"screen\": {\"detected\": " << (s->screen.screen ? "true" : "false") << ", \"score\": " << json_num(s->screen.score)
       << ", \"threshold\": " << json_num(kScreenThreshold) << "}"
@@ -2115,3 +2117,67 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
 }
 
 }  // extern "C"
+
+// ---- camera guidance (NativeLib.previewPage, CameraGuide.kt): the camera's analysis frames, several a second
+// while the camera screen is open. The page finder runs here on its own session (a CPU-only group with 2 threads,
+// made on first use), so it neither waits for nor slows the photo's page finder, and the frames never touch the
+// groups configureNets sets.
+namespace {
+
+std::shared_ptr<NetGroup> g_preview;   // guarded by g_nets_mu
+const int kPreviewThreads = 2;
+
+std::shared_ptr<NetGroup> preview_group() {
+    std::lock_guard<std::mutex> lk(g_nets_mu);
+    if (!g_preview) {
+        auto g = std::make_shared<NetGroup>();
+        InferConfig c;
+        c.load = load_model;
+        c.map = map_model;
+        c.threads = kPreviewThreads;
+        g->inf = Inference::create(c);
+        g_preview = g;
+    }
+    return g_preview;
+}
+
+}  // namespace
+
+// One analysis frame: RGBA_8888 rows of rowStride bytes in a direct buffer, turned upright by rotation (degrees
+// clockwise, ImageInfo.rotationDegrees). findPage: the page finder at 256 and the detection's quad step (no edge
+// snapping, no surface fit); off: luma and sharpness only. -> [found, x0, y0 .. x3, y3 (TL TR BR BL, upright frame
+// px), upright width, height, paper share, luma, glare, sharpness, ms], or null (an unreadable buffer).
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_previewPage(JNIEnv* env, jclass, jobject buf, jint w, jint h,
+                                                                                      jint row_stride, jint rotation, jboolean find_page) {
+    auto t0 = Clock::now();
+    uint8_t* px = buf ? (uint8_t*)env->GetDirectBufferAddress(buf) : nullptr;
+    const jlong cap = buf ? env->GetDirectBufferCapacity(buf) : -1;
+    if (!px || w <= 0 || h <= 0 || row_stride < 4 * w || cap < (jlong)row_stride * (h - 1) + 4 * w) return nullptr;
+    float out[16] = {0};
+    try {
+        cv::Mat rgba(h, w, CV_8UC4, px, (size_t)row_stride), bgr;
+        cv::cvtColor(rgba, bgr, cv::COLOR_RGBA2BGR);
+        const int rot = ((rotation % 360) + 360) % 360;
+        if (rot == 90) cv::rotate(bgr, bgr, cv::ROTATE_90_CLOCKWISE);
+        else if (rot == 180) cv::rotate(bgr, bgr, cv::ROTATE_180);
+        else if (rot == 270) cv::rotate(bgr, bgr, cv::ROTATE_90_COUNTERCLOCKWISE);
+        std::vector<float> lg;
+        if (find_page && !page_finder_logits(bgr, *preview_group()->inf, lg)) lg.clear();
+        PreviewPage p = preview_page(bgr, lg.empty() ? nullptr : lg.data());
+        out[0] = p.found ? 1.f : 0.f;
+        for (int k = 0; k < 4; ++k) { out[1 + 2 * k] = (float)p.pts[k].x; out[2 + 2 * k] = (float)p.pts[k].y; }
+        out[9] = (float)bgr.cols;
+        out[10] = (float)bgr.rows;
+        out[11] = (float)p.area;
+        out[12] = (float)p.luma;
+        out[13] = (float)p.glare;
+        out[14] = (float)p.sharpness;
+    } catch (const std::exception& e) {
+        LOGI("previewPage failed: %s", e.what());
+        return nullptr;
+    }
+    out[15] = (float)ms_since(t0);
+    jfloatArray a = env->NewFloatArray(16);
+    env->SetFloatArrayRegion(a, 0, 16, out);
+    return a;
+}
