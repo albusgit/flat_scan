@@ -3,7 +3,9 @@ project(flatscan CXX)
 # OpenCV 4.11.0, the same version as the reference:
 #  * FS_OPENCV_MIN (app/build.gradle.kts: opencv.min.dir): the slim static build of tools/opencv_min (only the modules
 #    the core uses, the AAR's HALs, dispatch and TBB), linked into libflatscan; its unused code is dropped at link
-#    time (--gc-sections, and --exclude-libs so that the static libraries' symbols are not exported);
+#    time (--gc-sections, and --exclude-libs so that the static libraries' symbols are not exported); the core and the
+#    bridge are linked with ThinLTO and identical code folded (--icf=all): 0.29 MB less (arm64), the same output
+#    (-ffp-contract=off stays with each function);
 #  * otherwise the org.opencv:opencv AAR's libopencv_java4.so (prefab).
 set(FS_OPENCV_MIN "" CACHE PATH "tools/opencv_min install folder (sdk/native/jni/OpenCVConfig.cmake)")
 if(FS_OPENCV_MIN)
@@ -22,5 +24,7 @@ target_link_libraries(flatscan_core PUBLIC dl)
 add_library(flatscan SHARED jni_bridge.cpp)
 target_link_libraries(flatscan PRIVATE flatscan_core jnigraphics android log)
 if(FS_OPENCV_MIN)
-  target_link_options(flatscan PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+  target_link_options(flatscan PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--icf=all -flto=thin)
+  target_compile_options(flatscan_core PRIVATE -flto=thin)
+  target_compile_options(flatscan PRIVATE -flto=thin)
 endif()

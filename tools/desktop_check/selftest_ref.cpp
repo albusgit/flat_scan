@@ -1,6 +1,6 @@
-// The self-test's map-parity reference (app/src/main/assets/selftest/photo1_reference_warpmap.npz): the
+// The self-test's map-parity reference (app/src/debug/assets/selftest/photo1_reference_warpmap.npz, debug builds only): the
 // final map of run_photo with PipelineOptions defaults (no nets), as NativeLib.selfTest makes it.
-//   selftest_ref PHOTO OUT.npz   (PHOTO: assets/selftest/photo1.webp)
+//   selftest_ref PHOTO OUT.npz   (PHOTO: app/src/debug/assets/selftest/photo1.webp)
 // Keys: map_x, map_y (gh x gw float32, photo px), stride, shape (out_h, out_w). Rebuild it whenever the
 // core's map changes on purpose; the self-test's limit is 0.1 px.
 #include <opencv2/imgcodecs.hpp>

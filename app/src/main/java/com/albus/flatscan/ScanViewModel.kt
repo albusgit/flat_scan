@@ -16,6 +16,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -28,6 +29,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import com.albus.flatscan.data.Library
+import com.albus.flatscan.data.StorageUsage
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
@@ -35,7 +38,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Licenses, Trash, Sync, Advanced, Storage }
 
 enum class ImportSource { Camera, Gallery }
 
@@ -79,12 +82,33 @@ private class SpreadPage(
  */
 class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val settings = Settings(app)
-    private val store = DocumentStore(app)
+    val library = Library.get(app)
+    private val store = library.store
 
     var screen by mutableStateOf(Screen.Home)
+
+    /** The paper screens' theme (Settings > Appearance): Settings.THEME_LIGHT, THEME_DARK or THEME_SYSTEM. */
+    var themeMode by mutableStateOf(settings.themeMode)
+        private set
+
+    fun setTheme(mode: String) {
+        settings.themeMode = mode
+        themeMode = settings.themeMode
+    }
     private var returnTo = Screen.Home
     private var pagesReturnTo = Screen.Home
     var message by mutableStateOf<String?>(null)
+
+    /** An action offered with one message ([showMessage]); shown only while that message is. */
+    class MessageAction(val message: String, val label: String, val run: () -> Unit)
+    var messageAction by mutableStateOf<MessageAction?>(null)
+        private set
+
+    /** [text] with an action button ([label], e.g. Undo) for 5 s. */
+    fun showMessage(text: String, label: String, run: () -> Unit) {
+        messageAction = MessageAction(text, label, run)
+        message = text
+    }
 
     private val nativeExec = Executors.newSingleThreadExecutor { r -> Thread(r, "flatscan-native") }
     private val nativeCtx = nativeExec.asCoroutineDispatcher()
@@ -94,6 +118,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private val buffers = arrayOfNulls<Bitmap>(2)
 
     // ---- document
+    /** The open document (null: none yet; one is created when its first page is added). */
+    var docId by mutableStateOf<String?>(null)
+        private set
+    /** Its title. */
+    var docTitle by mutableStateOf<String?>(null)
+        private set
     /** Page ids in document order. */
     val pages = mutableStateListOf<String>()
     /** Bumped whenever a page's out.jpg is rewritten (thumbnail cache key). */
@@ -101,6 +131,23 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** The page with the live session (result screen). */
     var currentId by mutableStateOf<String?>(null)
         private set
+    /** Document or whiteboard mode for new scans and imports (the camera screen's switch, remembered). */
+    var captureMode by mutableStateOf(settings.captureMode)
+        private set
+
+    fun chooseCaptureMode(m: CaptureMode) {
+        captureMode = m
+        settings.captureMode = m
+    }
+
+    /** The mode of the page on the result screen. */
+    val pageMode: CaptureMode get() = sessionGeomState?.mode ?: CaptureMode.Document
+
+    /** The mode of the photo on the crop screen: its page's, or [captureMode] for a new page. */
+    private var cropMode = CaptureMode.Document
+    /** Whiteboard mode: the board detection saw a dark slide (the Dark slide filter for the new page). */
+    private var boardDark = false
+
     /** Imported images still to go through crop -> processing. */
     val pending = mutableStateListOf<Uri>()
     var pendingTotal by mutableIntStateOf(0)
@@ -144,6 +191,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private var spreadNext: SpreadPage? = null
     /** The spread page being processed now (the second one). */
     private var spreadCurrent: SpreadPage? = null
+
+    /** The page being processed is one page of a book spread (the processing animation curls it at the gutter). */
+    val processingBookPage: Boolean get() = spreadCurrent != null
+
+    /** The processing animation has landed (PaperUnfold's onFinished) for this run: the result screen waits for it. */
+    var unfoldLanded by mutableStateOf(false)
+
+    /** A page's finger and erase edits (PageMeta's), carried over when it is processed again. */
+    private class PageEdits(val erase: FloatArray, val fingersAuto: Boolean, val strokes: FloatArray, val fill: Int)
 
     private class CropBackup(
         val photo: Bitmap, val display: Bitmap?, val corners: List<Offset>, val detected: List<Offset>?,
@@ -220,6 +276,18 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         private set
     /** The ignore areas differ from the ones the current page was flattened with. */
     val ignoreChanged: Boolean get() = ignore != (sessionGeomState?.ignore?.toList() ?: emptyList<Float>())
+    /** Lines drawn along rules the unwarp missed (PageMeta.userLines layout, being edited). */
+    var userLines by mutableStateOf(listOf<Float>())
+        private set
+    /** The line editor's own undo: (ignore, userLines) before each of its edits, since it opened. */
+    private val lineHistory = ArrayList<Pair<List<Float>, List<Float>>>()
+    /** How many line edits Undo can take back. */
+    var lineUndoSteps by mutableIntStateOf(0)
+        private set
+    /** The line editor has changes to flatten with: ignore areas or drawn lines. */
+    val lineEditsChanged: Boolean get() = ignoreChanged || userLines != (sessionGeomState?.userLines?.toList() ?: emptyList<Float>())
+    /** The page's shadows are removed (Page panel switch). */
+    val removeShadows: Boolean get() = sessionGeomState?.removeShadows != false
     /** The user turned the unwarp off for the current page (perspective correction only). */
     val perspectiveOnly: Boolean get() = sessionGeomState?.perspectiveOnly == true
     /** The page was flattened again from the line editor: the result screen opens it again. */
@@ -243,12 +311,26 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            val order = withContext(Dispatchers.IO) { store.loadOrder().also { store.prune(it) } }
-            pages.clear()
-            pages.addAll(order)
+            // the single document of earlier versions (in the cache) becomes the first document of the history
+            val legacy = runCatching { library.importLegacy(DocumentStore.legacy(app)) }
+                .onFailure { Log.e(TAG, "legacy import failed", it) }.getOrNull()
+            runCatching { library.purgeTrash() }.onFailure { Log.e(TAG, "trash purge failed", it) }
+            refreshSearchText()
+            val doc = (legacy ?: settings.lastDocument)?.let { library.document(it) }?.takeIf { it.deletedAt == null }
+            if (doc != null && docId == null && pages.isEmpty()) {
+                docId = doc.id
+                docTitle = doc.title
+                pages.addAll(library.pageIds(doc.id))
+            }
+            runCatching {
+                library.dropEmpty(docId)
+                library.pruneOrphans(keep = pages + listOfNotNull(photoPageId, currentId))
+            }.onFailure { Log.e(TAG, "library clean-up failed", it) }
         }
         viewModelScope.launch { renderLoop() }
-        viewModelScope.launch { trackEdits(this@ScanViewModel, history) }
+        // dispatched (not Main.immediate): trackEdits reads editState() at once, whose fields (fingersAuto...) are
+        // declared further down and not yet initialised while this init block runs
+        viewModelScope.launch(Dispatchers.Main) { trackEdits(this@ScanViewModel, history) }
     }
 
     // ---- self-test / benchmark
@@ -261,7 +343,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** [report] (debug batch mode `--ez selftest true`): the report is also written there. */
     fun runSelfTest(runs: Int = 5, report: java.io.File? = null) {
-        if (selfTestRunning) return
+        if (selfTestRunning || !hasSelfTest) return
         selfTestRunning = true
         selfTestReport = ""
         viewModelScope.launch {
@@ -286,13 +368,29 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** The bundled self-test photo (assets/selftest/photo1.webp, 1659 x 2212: lossless WebP, the pixels of the earlier photo1.png). */
-    private fun selfTestPhoto(): Bitmap {
+    /**
+     * The self-test's photo (assets/selftest/photo1.webp, 1659 x 2212: lossless WebP, the pixels of the earlier
+     * photo1.png) and its reference warp map: debug builds only (src/debug/assets), release builds have no self-test.
+     */
+    val hasSelfTest: Boolean by lazy {
+        runCatching { getApplication<Application>().assets.list("selftest").orEmpty().contains("photo1.webp") }.getOrDefault(false)
+    }
+
+    private fun selfTestPhoto(): Bitmap = assetPhoto("selftest/photo1.webp")
+
+    /**
+     * Auto's benchmark photo (assets/bench/photo1.webp): the self-test photo as lossy WebP (quality 85, 0.5 MB
+     * instead of 2.3), in every build. The benchmark compares each backend's nets with the CPU's on the same
+     * input, so it needs no exact pixels.
+     */
+    private fun benchPhoto(): Bitmap = assetPhoto("bench/photo1.webp")
+
+    private fun assetPhoto(path: String): Bitmap {
         val opts = android.graphics.BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
             inScaled = false
         }
-        return getApplication<Application>().assets.open("selftest/photo1.webp").use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
+        return getApplication<Application>().assets.open(path).use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }!!
     }
 
     /**
@@ -310,7 +408,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     synchronized(netsLock) {
                         val stage = { s: String -> viewModelScope.launch(Dispatchers.Main) { selfTestStage = s }; Unit }
                         val stored = runAutoBenchmark(stage, candidates)
-                        if (settings.acceleration == Accel.AUTO) configureNets(currentPlan())
+                        if (settings.acceleration == Accel.AUTO) {
+                            configureNets(currentPlan())
+                            if (!currentPlan().cpuOnly) warmGpu(stage)
+                        }
                         formatBench(stored)
                     }
                 }.getOrElse { "Acceleration benchmark FAILED: ${it.message ?: it}" }
@@ -324,7 +425,37 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     // ---- the nets' backends (Settings > Acceleration)
     /** The groups' backends as last given to [NativeLib.configureNets]. */
     @Volatile private var netPlan = Accel.Plan(Accel.CPU, "", "", "", "", "")
+
+    /** Debug (`--ei threads N`): the CPU nets' threads; 0: the default, min(cores, 4). */
+    @Volatile var netThreads = 0
     private val netsLock = Any()
+    /** [configureNets] ran at least once. */
+    @Volatile private var netsConfigured = false
+    /** [configureNets]' own lock (not [netsLock]: a benchmark under it may be waiting for the first configuration). Before
+     *  init, which starts the first configuration on the native thread. */
+    private val configLock = Any()
+    /**
+     * Debug (`--ez gpu_warm true`): every group on the GPU, the GPU sessions made as after Auto's benchmark
+     * ([warmGpu]), the setup ms of each net in [report]; then the setting's backends again.
+     */
+    fun debugWarmGpu(report: File) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val lines = mutableListOf<String>()
+            synchronized(netsLock) {
+                configureNets(Accel.fixed(Accel.GPU)!!)
+                val t0 = System.nanoTime()
+                warmGpu { lines += it }
+                lines += "total ${msSince(t0).roundToInt()} ms; " + NativeLib.prewarmGpu(null).lineSequence().filter { it.isNotBlank() }.joinToString("; ", "again: ")
+                configureNets(currentPlan())
+            }
+            runCatching { report.parentFile?.mkdirs(); report.writeText(lines.joinToString("\n") + "\n") }
+        }
+    }
+
+    /** The launch's GPU set-up ([setUpGpu]) while it runs: its stage text; null: none running. Before init, which starts it. */
+    @Volatile private var gpuSetup: String? = null
+    /** Processing waiting for that set-up ([ensureNets]): where its stage texts go. */
+    @Volatile private var gpuSetupSink: ((String) -> Unit)? = null
 
     init {
         // a crash in guarded native work last time (CrashGuard): report it, and keep the nets off a GPU that crashed
@@ -335,8 +466,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             message = r.lineSequence().first() + (if (CrashGuard.gpuDisabled(app)) " - the GPU is off now" else "") + " (details: Settings > Self-test)"
         }
         Accel.gpuOff = CrashGuard.gpuDisabled(app)
-        // the CPU until processing asks for the setting's backends (ensureNets)
-        configureNets(netPlan)
+        // the CPU until processing asks for the setting's backends (ensureNets). On the native thread: the first
+        // NativeLib call loads libflatscan.so (0.85 s on the emulator), which kept the first frame waiting on the
+        // main thread; a net asked for before this ran waits for it (jni_bridge.cpp assets_locked)
+        viewModelScope.launch(nativeCtx) { synchronized(configLock) { if (!netsConfigured) configureNets(netPlan) } }
+        setUpGpu()
     }
 
     /** Settings: the user asks for the GPU again after a crash turned it off. */
@@ -351,12 +485,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun currentPlan(): Accel.Plan = Accel.fixed(settings.acceleration) ?: Accel.autoPlan(settings.autoChoice)
         ?: Accel.Plan(Accel.AUTO, "", "", "", "", "", "not benchmarked yet")
 
-    private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) {
+    private fun configureNets(plan: Accel.Plan, staticModels: Boolean = false) = synchronized(configLock) {
         val app = getApplication<Application>()
         // the LiteRT GPU's serialised kernels (the folder kept its earlier name)
         val cache = File(app.noBackupFilesDir, "qnn_cache").apply { mkdirs() }
-        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, plan.rule, 0, staticModels)
+        NativeLib.configureNets(app.assets, cache.absolutePath, plan.finder, plan.flat, plan.hr, plan.shade, plan.rule, netThreads, staticModels)
         netPlan = plan
+        netsConfigured = true
     }
 
     /**
@@ -364,16 +499,67 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * version yet, the benchmark runs first ([stage]: its progress; it takes seconds to a minute, as the GPU
      * compiles its kernels on first use; none on a phone without a GPU candidate) and its choice is kept.
      */
-    private fun ensureNets(stage: (String) -> Unit): Accel.Plan = synchronized(netsLock) {
-        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
-            stage("Choosing the acceleration (once per phone and app version)")
-            runAutoBenchmark(stage)
+    private fun ensureNets(stage: (String) -> Unit): Accel.Plan {
+        // the launch's set-up (setUpGpu) may hold netsLock: its stage texts meanwhile
+        gpuSetup?.let { stage(it) }
+        gpuSetupSink = stage
+        try {
+            return synchronized(netsLock) { benchAndWarm(stage) }
+        } finally {
+            gpuSetupSink = null
         }
-        currentPlan().also { if (it != netPlan) configureNets(it) }
     }
 
     /**
-     * Auto's benchmark on the self-test photo ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice].
+     * Auto's benchmark when this SoC and app version has none, the setting's backends, and after a benchmark the
+     * app's GPU sessions (NativeLib.prewarmGpu: the benchmark left the groups empty, and the GPU would compile and
+     * tune on the page). Caller holds [netsLock].
+     */
+    private fun benchAndWarm(stage: (String) -> Unit): Accel.Plan {
+        var benched = false
+        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) {
+            stage(GPU_SETUP)
+            runAutoBenchmark(stage)
+            benched = true
+        }
+        val plan = currentPlan().also { if (it != netPlan) configureNets(it) }
+        if (benched && !plan.cpuOnly) warmGpu(stage)
+        return plan
+    }
+
+    private fun warmGpu(stage: (String) -> Unit) {
+        val r = runCatching {
+            CrashGuard.guard(getApplication(), "setting up the GPU", gpu = true) { NativeLib.prewarmGpu { _, s -> stage("$GPU_SETUP: $s") } }
+        }.onFailure { Log.e(TAG, "GPU warm-up failed", it) }.getOrNull()
+        Log.i(TAG, "GPU warm-up: ${r?.trim()}")
+        r?.let { stage(it.trim()) }
+    }
+
+    /**
+     * After an install or a system update (Auto with no benchmark for this SoC and app version): Auto's benchmark
+     * and the app's GPU sessions at launch, in the background, instead of inside the first page's processing (where
+     * the user watched it for minutes). Processing that comes first waits for it, with its stage text. Nothing without
+     * Auto, with a stored choice, or without a GPU candidate (ensureNets then stores the CPU at once).
+     */
+    private fun setUpGpu() {
+        if (settings.acceleration != Accel.AUTO || Accel.autoPlan(settings.autoChoice) != null) return
+        viewModelScope.launch(Dispatchers.Default) {
+            runCatching {
+                if (Accel.candidates().isEmpty()) return@runCatching
+                gpuSetup = GPU_SETUP
+                synchronized(netsLock) {
+                    benchAndWarm { s ->
+                        gpuSetup = s
+                        gpuSetupSink?.invoke(s)
+                    }
+                }
+            }.onFailure { Log.e(TAG, "GPU set-up at launch failed", it) }
+            gpuSetup = null
+        }
+    }
+
+    /**
+     * Auto's benchmark on [benchPhoto] ([NativeLib.benchBackends]); keeps it as [Settings.autoChoice].
      * No candidate (no GPU on this phone): the CPU at once, without running anything.
      */
     private fun runAutoBenchmark(stage: (String) -> Unit, cand: String = Accel.candidates()): JSONObject {
@@ -381,11 +567,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val bench = if (cand.isEmpty()) JSONObject().put("ok", true).put("runs", 0)
             .put("choice", JSONObject().put("finder", "cpu").put("flat", "cpu").put("hr", "cpu").put("shade", "cpu").put("rule", "cpu"))
         else CrashGuard.guard(getApplication(), "the acceleration benchmark (GPU)", gpu = true) {
-            JSONObject(NativeLib.benchBackends(selfTestPhoto(), cand, 3) { pct, s -> stage("$s ($pct%)") })
+            // one timed run per net: the backends differ by large factors; the stage says what it is (not the page's progress)
+            JSONObject(NativeLib.benchBackends(benchPhoto(), cand, 1) { pct, s -> stage("$GPU_SETUP: ${s.removePrefix("Auto: ")}, $pct %") })
         }
         val stored = JSONObject().put("soc", NetEnv.soc).put("app", BuildConfigInfo.VERSION).put("at", at).put("candidates", cand).put("bench", bench)
         if (cand.isEmpty()) stored.put("note", "no GPU on this phone: ${NetEnv.gpuWhy}")
-        settings.autoChoice = stored.toString()
+        // the fp16 backends (gpu16, cpu16: debug `--es bench`) are measured, not kept as Auto's choice
+        if (cand.split(',').none { it.trim().endsWith("16") }) settings.autoChoice = stored.toString()
+        else stored.put("note", "fp16 candidates: measured only, Auto's choice unchanged")
         Log.i(TAG, "auto acceleration $stored")
         return stored
     }
@@ -464,7 +653,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val detectMs = msSince(td)
             val c = FloatArray(8) { i -> if (i % 2 == 0) pg.corners[i / 2].x else pg.corners[i / 2].y }
             val h = NativeLib.process(
-                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, null,
+                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, false, true, null, null,
             )
             val pageMs = msSince(t0)
             val info = if (h != 0L) JSONObject(NativeLib.info(h)).also { NativeLib.release(h) } else null
@@ -600,7 +789,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val outDir = File(root, "batch_out/" + (out ?: "${set}_$setting")).apply { mkdirs() }
         File(outDir, "done.txt").delete()
         File(outDir, "run.json").writeText(NetEnv.toJson(plan).put("set", set).put("photos", photos.size).put("shade", doShade).put("rule_net", doRules)
-            .put("ext", pageExt).put("static_models", staticModels).put("app", BuildConfigInfo.VERSION)
+            .put("ext", pageExt).put("static_models", staticModels).put("threads", netThreads).put("app", BuildConfigInfo.VERSION)
             .put("started", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())).toString(1))
         val timesFile = File(outDir, "times_phone.txt")
         val times = runCatching { JSONObject(timesFile.readText()) }.getOrDefault(JSONObject())
@@ -759,10 +948,16 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             Screen.Result -> {
                 persist()
                 adjustOpen = false
+                documentDone()
                 Screen.Home
             }
-            Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home
+            Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home.also { documentDone() }
             Screen.Settings -> returnTo
+            Screen.Licenses -> Screen.Settings
+            Screen.Trash -> Screen.Home
+            Screen.Sync -> Screen.Settings
+            Screen.Advanced -> Screen.Settings
+            Screen.Storage -> Screen.Settings
             else -> {
                 batch = false
                 Screen.Home
@@ -780,7 +975,37 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         lastSource = ImportSource.Camera
         persist()
         screen = Screen.Camera
+        prewarmFinder()
     }
+
+    private var finderWarm = false
+
+    /** The page finder's session, made while the camera is open (its first photo would otherwise wait for it). */
+    private fun prewarmFinder() {
+        if (finderWarm || !settings.pageFinderNet) return
+        finderWarm = true
+        viewModelScope.launch(Dispatchers.IO) { runCatching { NativeLib.prewarmFinder() }.onFailure { Log.e(TAG, "page finder warm-up failed", it) } }
+    }
+
+    /** Home > Scan: the camera, into a new document. */
+    fun scanNew() {
+        viewModelScope.launch {
+            closeDocument()
+            startCamera()
+        }
+    }
+
+    /** Home > Import: the picked photos become a new document. */
+    fun importNew(uris: List<Uri>) {
+        viewModelScope.launch {
+            closeDocument()
+            importUris(uris)
+        }
+    }
+
+    /** Recognised text of a document for search (none until OCR has run on it), and its change counter. */
+    fun searchText(doc: String): String? = searchTexts[doc]
+    val hasOcrText: Boolean get() = searchTexts.isNotEmpty()
 
     /** Gallery import: every picked image becomes a page, one after the other. */
     fun importUris(uris: List<Uri>) {
@@ -817,6 +1042,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         val n = pendingTotal
         batch = false
+        flatImport = false
+        insertAt = null
         open(Screen.Pages)
         message = "$n photos imported"
     }
@@ -839,19 +1066,24 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             spreadCurrent = null
             screen = if (batch && !settings.reviewCrops) Screen.Processing else Screen.Crop
             try {
-                val p = withContext(Dispatchers.IO) { loadPhoto(getApplication(), uri, focalMmPerLongSide) }
-                discardStaging()
+                // a PDF page still being rendered: its file first (a failed render fails the read below)
+                pdfPages[uri]?.let { runCatching { it.await() } }
                 val id = store.newId()
+                // the photo is kept byte for byte and processed from that copy (re-edits later start from the same pixels)
+                val p = withContext(Dispatchers.IO) {
+                    val app = getApplication<Application>()
+                    val f = (app.contentResolver.openInputStream(uri) ?: error("cannot open $uri")).use { store.saveOriginal(id, extensionOf(app, uri), it) }
+                    runCatching { loadPhotoFile(f, focalMmPerLongSide) }.onFailure { store.delete(id) }.getOrThrow()
+                }
+                discardStaging()
                 photoPageId = id
                 cropMeta = null
+                cropMode = captureMode
                 usePhoto(p.bitmap)
                 focalPx = p.focalPx
                 userRotated = false
                 cropRotation = 0
-                // the upright photo is the page's source on disk (re-processing, re-crop)
-                sourceJob = viewModelScope.launch(Dispatchers.IO) {
-                    runCatching { store.saveSource(id, p.bitmap) }.onFailure { Log.e(TAG, "source save failed", it) }
-                }
+                sourceJob = null
                 detect(auto = true)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -868,6 +1100,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val id = photoPageId ?: return
         if (id in pages || id == currentId) return
         photoPageId = null
+        runCatching { NativeLib.cancelPrecompute() }
         val job = sourceJob
         viewModelScope.launch(Dispatchers.IO) {
             job?.join()
@@ -902,8 +1135,28 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun detect(auto: Boolean = false) {
         val p = photo ?: return
+        if (cropMode == CaptureMode.Whiteboard) {
+            detectBoard(p, auto)
+            return
+        }
+        if (flatImport) {
+            // a PDF page: the whole image is the page, already flat
+            detected = listOf(Offset(0f, 0f), Offset(p.width - 1f, 0f), Offset(p.width - 1f, p.height - 1f), Offset(0f, p.height - 1f))
+            corners = detected!!
+            cropPageIndex = 0
+            cropReasons = emptyList()
+            forceHomography = true
+            spreadNext = null
+            detecting = false
+            if (auto) process(perspective = true)
+            if (pending.isEmpty()) flatImport = false
+            return
+        }
         detecting = true
         val focal = focalPx
+        // with automatic corners the flattening nets need only the photo and the page finder's output: they
+        // start before the detection, beside it and the crop screen
+        netsAhead(p)
         val res = withContext(Dispatchers.Default) {
             runCatching { JSONObject(NativeLib.detect(p, logitsFor(p), focal)) }
                 .onFailure { Log.e(TAG, "detect failed", it) }.getOrElse { JSONObject() }
@@ -922,10 +1175,78 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             firstId = photoPageId ?: "", photo = p, page = second, firstCentroid = first.centroid,
             focalPx = focalPx, cropRotation = cropRotation, userRotated = userRotated,
         ) else null
+        // no page found: the corners will be set by hand, the nets ahead are of no use
+        if (first == null) runCatching { NativeLib.cancelPrecompute() }
         detecting = false
         val doubtful = first == null || cropReasons.isNotEmpty()
         if (first == null && !(batch && !settings.reviewCrops)) message = "Page not found - drag the corners to the page"
         if (auto && !settings.reviewCrops && (!doubtful || batch)) process()
+    }
+
+    /**
+     * The flattening nets for the photo [detect] is about to find the page of, started at once
+     * ([NativeLib.precomputeNets]): processing it with the detected corners then takes their grids. Not where
+     * processing would run no flattening nets, nor before Auto's benchmark has chosen the backends
+     * (processing runs it first). Registers them before it returns, so that processing cannot miss them.
+     */
+    /** Debug builds (MainActivity `--ez no_ahead true`): [netsAhead] off, for A/B checks. */
+    var netsAheadOff = false
+
+    private suspend fun netsAhead(p: Bitmap) {
+        if (netsAheadOff || !settings.uvDoc || cropMode == CaptureMode.Whiteboard) return
+        if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) return
+        val nets = settings.flatNets
+        val plan = withContext(Dispatchers.Default) {
+            runCatching {
+                val pl = synchronized(netsLock) { currentPlan().also { if (it != netPlan) configureNets(it) } }
+                NativeLib.precomputeNets(p, logitsFor(p), 0, nets)
+                pl
+            }.onFailure { Log.e(TAG, "nets ahead failed", it) }.getOrNull()
+        } ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                CrashGuard.guard(getApplication(), "the flattening nets on the crop screen", gpu = !plan.cpuOnly) { NativeLib.runPrecompute() }
+            }.onFailure { Log.e(TAG, "nets ahead failed", it) }
+        }
+    }
+
+    /**
+     * Whiteboard mode: the board's or screen's corners (core/src/board.cpp). Found: processed straight away
+     * (unless Settings > Check every crop). Not found: the whole photo, on the crop screen to set the
+     * corners by hand. Corners always lie inside the photo, so nothing from outside it is ever shown.
+     */
+    private suspend fun detectBoard(p: Bitmap, auto: Boolean) {
+        val b = withContext(Dispatchers.Default) { runCatching { NativeLib.detectBoard(p) }.onFailure { Log.e(TAG, "board detection failed", it) }.getOrNull() }
+        if (photo !== p) return
+        val frame = listOf(Offset(1f, 1f), Offset(p.width - 2f, 1f), Offset(p.width - 2f, p.height - 2f), Offset(1f, p.height - 2f))
+        val found = b?.let { List(4) { i -> Offset(it[2 * i], it[2 * i + 1]) } }
+        detected = found ?: frame
+        corners = detected!!
+        boardDark = b != null && b[10] > 0.5f
+        cropPageIndex = 0
+        cropReasons = if (found == null) listOf("No board edges found: drag the corners to the board or screen") else emptyList()
+        forceHomography = true
+        spreadNext = null
+        detecting = false
+        if (found == null && !(batch && !settings.reviewCrops)) message = "Board not found - drag the corners"
+        if (auto && !settings.reviewCrops && (found != null || batch)) process()
+    }
+
+    /** Page panel: the page's shadows removed or left as photographed (processed again). */
+    fun setRemoveShadows(on: Boolean) {
+        val g = sessionGeomState ?: return
+        if (g.removeShadows == on || !sourceAvailable(g.id)) return
+        sessionGeomState = g.copy(removeShadows = on)
+        reflatten()
+    }
+
+    /** Switches the page on the result screen between document and whiteboard processing (processed again). */
+    fun setPageMode(m: CaptureMode) {
+        val g = sessionGeomState ?: return
+        if (g.mode == m || !sourceAvailable(g.id)) return
+        sessionGeomState = g.copy(mode = m)
+        params = params.copy(filter = if (m == CaptureMode.Whiteboard) FilterKind.Whiteboard else settings.defaultFilter)
+        reflatten()
     }
 
     /** The second page of a book spread: same photo, its own corners and gate, a new document page. */
@@ -988,8 +1309,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (i < 0 || j < 0) return
         pages[i] = b
         pages[j] = a
-        val order = pages.toList()
-        viewModelScope.launch(Dispatchers.IO) { store.saveOrder(order) }
+        saveOrder()
     }
 
     private fun defaultCorners(p: Bitmap): List<Offset> {
@@ -1006,25 +1326,49 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         return corners.zip(d).any { (a, b) -> hypot(a.x - b.x, a.y - b.y) > tol }
     }
 
+    /** Crop screen > Whole photo: the corners on the photo's corners (the photo is the page; homography path). */
+    fun cropWholePhoto() {
+        val p = photo ?: return
+        val w = p.width - 1f
+        val h = p.height - 1f
+        corners = listOf(Offset(0f, 0f), Offset(w, 0f), Offset(w, h), Offset(0f, h))
+    }
+
     /** Rotate the photo 90 degrees clockwise (corners follow). Disables auto orientation. */
+    private var rotating = false
+
     fun rotatePhoto() {
         val p = photo ?: return
-        val h = p.height.toFloat()
-        val rot = { o: Offset -> Offset(h - 1 - o.y, o.x) }
-        // after a clockwise turn the old bottom-left corner is the new top-left
-        val reorder = { l: List<Offset> -> listOf(rot(l[3]), rot(l[0]), rot(l[1]), rot(l[2])) }
-        corners = reorder(corners)
-        detected = detected?.let(reorder)
-        usePhoto(p.rotatedQuarterTurns(1))
-        userRotated = true
-        cropRotation = (cropRotation + 1) % 4
-        // a waiting second page of a book spread turns with the photo
-        spreadNext = spreadNext?.let { sp ->
-            val q = sp.page
-            SpreadPage(
-                firstId = sp.firstId, photo = photo!!, page = DetectedPage(q.ok, reorder(q.corners), q.reasons, rot(q.centroid)),
-                firstCentroid = rot(sp.firstCentroid), focalPx = sp.focalPx, cropRotation = cropRotation, userRotated = true,
-            )
+        if (rotating) return
+        rotating = true
+        viewModelScope.launch {
+            try {
+                // the turn of a full-size photo and its display copy: off the main thread
+                val (turned, display) = withContext(Dispatchers.Default) { p.rotatedQuarterTurns(1).let { it to it.forDisplay() } }
+                if (photo !== p) return@launch
+                val h = p.height.toFloat()
+                val rot = { o: Offset -> Offset(h - 1 - o.y, o.x) }
+                // after a clockwise turn the old bottom-left corner is the new top-left
+                val reorder = { l: List<Offset> -> listOf(rot(l[3]), rot(l[0]), rot(l[1]), rot(l[2])) }
+                corners = reorder(corners)
+                detected = detected?.let(reorder)
+                photo = turned
+                photoDisplay = display
+                userRotated = true
+                cropRotation = (cropRotation + 1) % 4
+                // a waiting second page of a book spread turns with the photo
+                spreadNext = spreadNext?.let { sp ->
+                    val q = sp.page
+                    SpreadPage(
+                        firstId = sp.firstId, photo = turned, page = DetectedPage(q.ok, reorder(q.corners), q.reasons, rot(q.centroid)),
+                        firstCentroid = rot(sp.firstCentroid), focalPx = sp.focalPx, cropRotation = cropRotation, userRotated = true,
+                    )
+                }
+                // the nets ahead were for the photo as it was
+                if (detected != null && cropMode != CaptureMode.Whiteboard) netsAhead(turned) else runCatching { NativeLib.cancelPrecompute() }
+            } finally {
+                rotating = false
+            }
         }
     }
 
@@ -1087,6 +1431,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private fun setCrop(m: PageMeta, bmp: Bitmap) {
         photoPageId = m.id
         cropMeta = m
+        cropMode = m.mode
         usePhoto(bmp)
         corners = List(4) { Offset(m.corners[2 * it], m.corners[2 * it + 1]) }
         detected = m.detected?.let { d -> List(4) { Offset(d[2 * it], d[2 * it + 1]) } }
@@ -1104,6 +1449,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun recrop() {
         val id = currentId ?: return
         val geom = currentMeta() ?: return
+        if (!sourceAvailable(id)) return
         val p = photo
         if (photoPageId == id && p != null) {
             recropBackup = CropBackup(p, photoDisplay, corners, detected, userRotated, cropRotation, cropReasons, forceHomography, cropPageIndex)
@@ -1116,7 +1462,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             photoDisplay = null
             screen = Screen.Crop
             try {
-                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(geom.cropRotation) }
                 discardStaging()
                 setCrop(geom, bmp)
                 recropBackup = CropBackup(bmp, photoDisplay, corners, detected, userRotated, cropRotation, cropReasons, forceHomography, cropPageIndex)
@@ -1132,6 +1478,14 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------ pages
+    /** The page still has its original photo (re-crop, unwarp changes); otherwise says why not. */
+    private fun sourceAvailable(id: String): Boolean {
+        if (photoPageId == id && photo != null) return true
+        if (store.hasSource(id)) return true
+        message = "The original photo of this page was removed to save space: it can no longer be re-cropped"
+        return false
+    }
+
     private fun geometryKey(m: PageMeta) =
         m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
             "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=9|rulenet=" + settings.ruleNet + "|pass1=1|hrfirst=2|fold=1" +
@@ -1168,7 +1522,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun openStored(id: String) {
         try {
             val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
-            val stored = withContext(Dispatchers.IO) { store.loadSession(id, geometryKey(m)) }
+            // without its original photo (Settings > Storage) a page is shown as it was processed
+            val stored = withContext(Dispatchers.IO) {
+                store.loadSession(id, geometryKey(m)) ?: if (!store.hasSource(id)) store.loadAnySession(id) else null
+            }
             if (stored != null) {
                 handle = 0L
                 resetResultState()
@@ -1191,7 +1548,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 Log.w(TAG, "stored session of $id unreadable: re-processing")
             }
-            val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(m.cropRotation) }
+            val bmp = withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(m.cropRotation) }
             discardStaging()
             recropBackup = null
             setCrop(m, bmp)
@@ -1204,48 +1561,496 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun deletePage(id: String) {
-        viewModelScope.launch {
-            if (id == currentId) closeSession()
-            if (photoPageId == id) photoPageId = null
-            pages.remove(id)
-            pageVersions.remove(id)
-            val order = pages.toList()
-            withContext(Dispatchers.IO) {
-                store.delete(id)
-                store.saveOrder(order)
-            }
-            if (pages.isEmpty() && screen == Screen.Pages) screen = Screen.Home
-        }
-    }
+    fun deletePage(id: String) = deletePages(setOf(id))
 
     fun movePage(id: String, delta: Int) {
         val i = pages.indexOf(id)
-        val j = i + delta
-        if (i < 0 || j !in pages.indices) return
-        pages[i] = pages[j]
-        pages[j] = id
-        val order = pages.toList()
-        viewModelScope.launch(Dispatchers.IO) { store.saveOrder(order) }
+        editPages { PageOps.moveOne(it, i, i + delta) }
     }
 
-    /** Clears the document (all pages and the live session). */
-    fun newDocument() {
-        viewModelScope.launch {
-            closeSession()
-            pages.clear()
-            pageVersions.clear()
-            pending.clear()
-            pendingTotal = 0
-            photo = null
-            photoDisplay = null
-            photoPageId = null
-            sourceJob?.join()
-            withContext(Dispatchers.IO) { store.deleteAll() }
+    // ------------------------------------------------------------------ page editor (feature 2)
+    /**
+     * Undo / redo of the page editor: one history per open document, covering every structural edit of
+     * the session (order, delete, insert, duplicate, rotate, split, move to another document). Pages a
+     * state still refers to keep their files until the session ends ([endPageSession]).
+     */
+    private var pagesHistory: PagesHistory? = null
+    /** Result rotation of each page the session turned, before its first turn (undo target). */
+    private val baseRotations = mutableMapOf<String, Int>()
+    var canUndoPages by mutableStateOf(false)
+        private set
+    var canRedoPages by mutableStateOf(false)
+        private set
+    /** New pages (camera, photos, PDF) go here instead of the end; null: the end. */
+    var insertAt by mutableStateOf<Int?>(null)
+        private set
+    private val pagesMutex = Mutex()
+
+    private fun pagesSession(): PagesHistory? {
+        val d = docId ?: return null
+        val h = pagesHistory
+        if (h != null && h.state.current == d) return h
+        return PagesHistory(PagesState(d, mapOf(d to pages.toList()))).also {
+            pagesHistory = it
+            baseRotations.clear()
+            updateUndoFlags()
         }
     }
 
-    suspend fun thumbnail(id: String): Bitmap? = withContext(Dispatchers.IO) { runCatching { store.loadThumbnail(id, 480) }.getOrNull() }
+    private fun updateUndoFlags() {
+        canUndoPages = pagesHistory?.canUndo == true
+        canRedoPages = pagesHistory?.canRedo == true
+    }
+
+    /** Applies one structural edit [f] to the open document as an undo step, and writes it. */
+    private fun editPages(f: suspend (PagesState) -> PagesState) {
+        viewModelScope.launch {
+            pagesMutex.withLock {
+                val h = pagesSession() ?: return@withLock
+                // a live change (drag and drop, a new page) becomes its own step first
+                val folded = h.state.pages != pages.toList()
+                if (folded) h.apply(h.state.copy(docs = h.state.docs + (h.state.current to pages.toList())))
+                val next = f(h.state)
+                if (next != h.state) h.apply(next) else if (!folded) return@withLock
+                commitPagesState(h.state)
+                updateUndoFlags()
+            }
+        }
+    }
+
+    fun undoPages() = walkPages { it.undo() }
+    fun redoPages() = walkPages { it.redo() }
+
+    private fun walkPages(step: (PagesHistory) -> PagesState?) {
+        viewModelScope.launch {
+            pagesMutex.withLock {
+                val h = pagesSession() ?: return@withLock
+                val s = step(h) ?: return@withLock
+                commitPagesState(s)
+                updateUndoFlags()
+            }
+        }
+    }
+
+    /** Makes [s] true on screen, in the database and in the pages' rotations. */
+    private suspend fun commitPagesState(s: PagesState) {
+        val now = s.pages
+        if (currentId != null && currentId !in now) closeSession()
+        if (pages.toList() != now) {
+            pages.clear()
+            pages.addAll(now)
+        }
+        for ((doc, ids) in s.docs) runCatching { library.setPages(doc, ids) }.onFailure { Log.e(TAG, "page order of $doc failed", it) }
+        // rotations: every page the session ever turned goes to the state's value, or back to where it started
+        for ((id, base) in baseRotations) {
+            val want = s.rotations[id] ?: base
+            if (id == currentId && handle != 0L) {
+                if (rotation != want) { rotation = want; outVersion++ }
+            } else if (store.exists(id)) {
+                val m = withContext(Dispatchers.IO) { runCatching { store.loadMeta(id) }.getOrNull() } ?: continue
+                if (m.rotation != want && rotateStoredPage(id, m, want)) pageVersions[id] = (pageVersions[id] ?: 0) + 1
+            }
+        }
+    }
+
+    /** Page [id] (not the live one) with result rotation [rot]: rendered again from its session, else its out.jpg turned. */
+    private suspend fun rotateStoredPage(id: String, m: PageMeta, rot: Int): Boolean = runCatching {
+        if (renderStoredPage(id, m.params, m.look, rot)) return@runCatching true
+        withContext(Dispatchers.IO) {
+            val b = android.graphics.BitmapFactory.decodeFile(store.outputFile(id).absolutePath) ?: return@withContext false
+            val t = b.rotatedQuarterTurns(rot - m.rotation)
+            store.saveOutput(id, t)
+            store.saveMeta(m.copy(rotation = rot))
+            true
+        }
+    }.onFailure { Log.e(TAG, "rotate $id failed", it) }.getOrDefault(false)
+
+    /** Ends the editing session of the open document: pages no state refers to any more are deleted. */
+    private suspend fun endPageSession() {
+        pagesHistory = null
+        baseRotations.clear()
+        insertAt = null
+        updateUndoFlags()
+        runCatching {
+            library.dropEmpty(docId)
+            library.pruneOrphans(keep = pages + listOfNotNull(photoPageId, currentId))
+        }.onFailure { Log.e(TAG, "page clean-up failed", it) }
+    }
+
+    /** Drag and drop on the pages screen: the order changes live ([dragMove]), one undo step at the drop ([dragEnd]). */
+    fun dragMove(from: Int, to: Int) {
+        if (from !in pages.indices || to !in pages.indices || from == to) return
+        pages.add(to, pages.removeAt(from))
+    }
+
+    fun dragEnd() = editPages { it }   // records the live order (editPages folds it in as one step)
+
+    fun deletePages(sel: Set<String>) {
+        if (photoPageId in sel && currentId !in sel) photoPageId = null
+        editPages { PageOps.delete(it, sel) }
+    }
+
+    fun reversePages() = editPages { PageOps.reverse(it) }
+
+    fun movePagesTo(sel: Set<String>, to: Int) = editPages { PageOps.move(it, sel, to) }
+
+    fun rotatePages(sel: Set<String>, quarters: Int) = editPages { s ->
+        commitCurrent()
+        for (id in sel) if (id !in baseRotations) baseRotations[id] = if (id == currentId) rotation
+            else withContext(Dispatchers.IO) { runCatching { store.loadMeta(id).rotation }.getOrDefault(0) }
+        PageOps.rotate(s, sel, quarters) { baseRotations[it] ?: 0 }
+    }
+
+    fun duplicatePages(sel: Set<String>) = editPages { s ->
+        commitCurrent()
+        val (next, copies) = PageOps.duplicate(s, sel) { store.newId() }
+        withContext(Dispatchers.IO) { copies.forEach { (from, to) -> store.copyPage(from, to) } }
+        copies.forEach { (from, to) -> baseRotations[from]?.let { baseRotations[to] = it } }
+        next
+    }
+
+    /** Pages from [page] on become a new document ("<title> (2)"). */
+    fun splitAt(page: String) = editPages { s ->
+        val at = s.pages.indexOf(page)
+        if (at <= 0) return@editPages s
+        commitCurrent()
+        val d = library.createDocument("${docTitle ?: DocumentName.default()} (2)")
+        message = "Pages ${at + 1}-${s.pages.size} moved to \"${d.title}\""
+        PageOps.split(s, at, d.id)
+    }
+
+    /** The selected pages go to the end of document [target] (null: a new document). */
+    fun movePagesToDocument(sel: Set<String>, target: String?) = editPages { s ->
+        commitCurrent()
+        val t = target?.let { library.document(it) } ?: library.createDocument()
+        message = if (sel.size == 1) "Page moved to \"${t.title}\"" else "${sel.size} pages moved to \"${t.title}\""
+        PageOps.moveToDocument(s, sel, t.id, library.pageIds(t.id))
+    }
+
+    /** New pages are inserted before [page] (null: at the end) until the import or scan is done. */
+    fun insertBefore(page: String?) {
+        insertAt = page?.let { pages.indexOf(it).takeIf { i -> i >= 0 } }
+    }
+
+    /** Pages of a PDF ([uri]) imported as pages (rendered at up to 200 dpi, perspective only, no page finding). */
+    fun importPdf(uri: Uri) {
+        // the import starts with the first page written; the others render (and encode) meanwhile, and loadUri
+        // waits for a page whose file is not written yet (pdfPages)
+        pdfJob?.cancel()
+        pdfPages.values.forEach { it.cancel() }
+        pdfPages.clear()
+        val first = CompletableDeferred<List<Uri>>()
+        var uris = emptyList<Uri>()
+        pdfJob = viewModelScope.launch {
+            try {
+                renderPdfPages(
+                    getApplication(), uri,
+                    onCount = { files ->
+                        uris = files.map { Uri.fromFile(it) }
+                        uris.forEach { pdfPages[it] = CompletableDeferred() }
+                        if (uris.isEmpty()) first.complete(uris)
+                    },
+                    onPage = { i ->
+                        pdfPages[uris[i]]?.complete(Unit)
+                        if (i == 0) first.complete(uris)
+                    },
+                )
+            } catch (e: Throwable) {
+                if (e !is CancellationException) Log.e(TAG, "PDF import failed", e)
+                first.completeExceptionally(e)
+                pdfPages.values.forEach { it.completeExceptionally(e) }
+            }
+        }
+        viewModelScope.launch {
+            val files = runCatching { first.await() }.getOrNull()
+            if (files.isNullOrEmpty()) {
+                message = "Could not read the PDF"
+                return@launch
+            }
+            flatImport = true
+            importUris(files)
+        }
+    }
+
+    /** The PDF pages being rendered ([importPdf]); null job: none. */
+    private var pdfJob: Job? = null
+    /** A PDF page's file is written (or failed): loadUri waits for it. */
+    private val pdfPages = java.util.concurrent.ConcurrentHashMap<Uri, CompletableDeferred<Unit>>()
+
+    /** The photos being imported are already flat pages (PDF pages): no detection, perspective only. */
+    private var flatImport = false
+
+    /** Writes the page order of the open document (creating the document for its first page). */
+    private fun saveOrder() {
+        viewModelScope.launch { saveOrderNow() }
+    }
+
+    private val orderMutex = Mutex()
+
+    private suspend fun saveOrderNow() = orderMutex.withLock {
+        val order = pages.toList()
+        val d = docId ?: if (order.isEmpty()) return@withLock else ensureDocument()
+        runCatching { library.setPages(d, order) }.onFailure { Log.e(TAG, "page order save failed", it) }
+    }
+
+    private suspend fun ensureDocument(): String {
+        docId?.let { return it }
+        val d = library.createDocument()
+        docId = d.id
+        docTitle = d.title
+        settings.lastDocument = d.id
+        return d.id
+    }
+
+    /** Closes the open document (it stays in the history); the next scan starts a new one. */
+    fun newDocument() {
+        viewModelScope.launch { closeDocument() }
+    }
+
+    private suspend fun closeDocument() {
+        docId?.let { backgroundOcr(it); autoUpload(it) }
+        closeSession()
+        endPageSession()
+        val old = docId
+        // before the pages go: a staged photo that is one of them (a re-crop) must not be deleted
+        discardStaging()
+        pages.clear()
+        pageVersions.clear()
+        pending.clear()
+        pendingTotal = 0
+        photo = null
+        photoDisplay = null
+        photoPageId = null
+        docId = null
+        docTitle = null
+        settings.lastDocument = null
+        // a document whose scan was abandoned before its first page has nothing to keep
+        if (old != null) runCatching { library.dropEmpty(null) }
+    }
+
+    // ------------------------------------------------------------------ sync (feature 6)
+    val syncConfig by lazy { com.albus.flatscan.sync.SyncConfig(app) }
+
+    /** Back to the history from the open document: it is finished for now (automatic upload). */
+    private fun documentDone() {
+        val d = docId ?: return
+        viewModelScope.launch {
+            commitCurrent()
+            backgroundOcr(d)
+            autoUpload(d)
+        }
+    }
+
+    /** Queues [doc] when automatic upload is on and it changed since its last upload. */
+    /** Recognises the text of [doc]'s pages in the background (search), when Settings > Recognise text is on. */
+    private fun backgroundOcr(doc: String) {
+        if (!settings.ocrAfterScan) return
+        runCatching { com.albus.flatscan.output.Ocr.enqueue(getApplication(), doc) }.onFailure { Log.e(TAG, "OCR queue failed", it) }
+    }
+
+    /** The text recognition pack (output/OcrPack.kt): download size of this phone's pack, null when there is none. */
+    val ocrPackBytes: Long? by lazy { com.albus.flatscan.output.OcrPack.pack(getApplication())?.size }
+
+    /**
+     * Downloads the text recognition pack (Settings, the export sheet's searchable text); then, with Recognise text
+     * after scanning on, every document's pages are recognised in the background (search).
+     */
+    fun downloadOcr() {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            if (!com.albus.flatscan.output.OcrPack.download(app)) return@launch
+            if (settings.ocrAfterScan) {
+                val docs = runCatching { library.documents.first() }.getOrDefault(emptyList())
+                for (d in docs) backgroundOcr(d.id)
+            }
+        }
+    }
+
+    /** Removes the text recognition pack (text already recognised stays searchable). */
+    fun removeOcr() = com.albus.flatscan.output.OcrPack.remove(getApplication())
+
+    /**
+     * Debug batch mode (`--es ocr_test PHOTO`): the pack downloaded if needed, then [photo] (a file under
+     * files/batch, internal or external files) recognised; the lines, the time and the pack state in files/batch_out/ocr_test.txt.
+     */
+    fun runOcrTest(photo: String, report: java.io.File) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.IO) {
+                val ok = com.albus.flatscan.output.OcrPack.download(app)
+                val sb = StringBuilder("pack: ${com.albus.flatscan.output.OcrPack.state} (download ok $ok)\n")
+                if (ok) runCatching {
+                    val f = java.io.File(app.filesDir, "batch/$photo").takeIf { it.isFile } ?: java.io.File(app.getExternalFilesDir(null), "batch/$photo")
+                    val bmp = android.graphics.BitmapFactory.decodeFile(f.absolutePath) ?: error("cannot read $f")
+                    val t0 = System.nanoTime()
+                    val lines = com.albus.flatscan.output.Ocr(app).recognise(bmp)
+                    sb.append("photo ${f.name} ${bmp.width} x ${bmp.height}: ${lines.size} lines, ${lines.sumOf { it.words.size }} words in ${(System.nanoTime() - t0) / 1_000_000} ms\n")
+                    for (l in lines) sb.append(if (l.rtl) "R " else "L ").append(l.words.joinToString(" ") { it.text }).append('\n')
+                }.onFailure { sb.append("FAILED: ").append(Log.getStackTraceString(it)) }
+                sb.toString()
+            }
+            runCatching { report.parentFile?.mkdirs(); report.writeText(text) }
+            Log.i(TAG, "OCR test: ${text.lineSequence().take(2).joinToString(" | ")}")
+        }
+    }
+
+    private suspend fun autoUpload(doc: String) {
+        val c = syncConfig
+        if (!c.autoUpload || !c.configured) return
+        val d = library.document(doc) ?: return
+        if (d.deletedAt != null || library.pageIds(doc).isEmpty()) return
+        if (d.uploadedModified == d.modifiedAt) return
+        runCatching { com.albus.flatscan.sync.SyncWorker.enqueue(getApplication(), doc) }.onFailure { Log.e(TAG, "upload queue failed", it) }
+    }
+
+    /** Uploads the documents now (history selection, pages screen). */
+    fun uploadDocuments(ids: Collection<String>) {
+        if (!syncConfig.configured) {
+            message = "Set up sync first: Settings > Sync to your server"
+            return
+        }
+        viewModelScope.launch {
+            if (docId in ids) commitCurrent()
+            ids.forEach { runCatching { com.albus.flatscan.sync.SyncWorker.enqueue(getApplication(), it) } }
+            message = if (ids.size == 1) "Upload queued" else "${ids.size} uploads queued"
+        }
+    }
+
+    /** Opens document [id] of the history on the pages screen. */
+    fun openDocument(id: String) {
+        if (id == docId) {
+            open(Screen.Pages)
+            return
+        }
+        viewModelScope.launch {
+            closeDocument()
+            val d = library.document(id) ?: return@launch
+            docId = d.id
+            docTitle = d.title
+            settings.lastDocument = d.id
+            pages.addAll(library.pageIds(d.id))
+            open(Screen.Pages)
+        }
+    }
+
+    /** File name of exports of the open document: its title, else "Scan" and the date. */
+    fun exportName(): String = DocumentName.clean(docTitle ?: DocumentName.default()).ifEmpty { DocumentName.default() }
+
+    // ------------------------------------------------------------------ output (feature 3)
+    val exporter by lazy { Exporter(app, library) }
+
+    /** The file name exports of the open document get with [o] (no extension). */
+    fun exportFileName(o: OutputOptions): String =
+        FileNameTemplate.render(o.template, docTitle ?: DocumentName.default(), System.currentTimeMillis(), pages.size, o.dateFormat)
+
+    /**
+     * The open document's pages encoded for [o] (and recognised when [o] wants searchable text; the text
+     * also goes to the database for search). Null without pages.
+     */
+    suspend fun prepareExport(o: OutputOptions, progress: (String, Float) -> Unit): Exporter.Prepared? {
+        commitCurrent()
+        if (pages.isEmpty()) return null
+        val d = library.document(ensureDocument()) ?: return null
+        val doc = ExportDoc(d.title, d.createdAt, d.modifiedAt, pages.toList())
+        val p = withContext(Dispatchers.Default) { exporter.prepare(doc, o, progress) }
+        doc.pages.zip(p.pages).forEach { (id, pg) -> pg.text?.let { t -> runCatching { library.setPageText(id, t.text) } } }
+        if (p.pages.any { it.text != null }) refreshSearchText()
+        return p
+    }
+
+    /** Recognised text per document, for the history search. */
+    private var searchTexts by mutableStateOf<Map<String, String>>(emptyMap())
+    var searchTextVersion by mutableIntStateOf(0)
+        private set
+
+    fun refreshSearchText() {
+        viewModelScope.launch {
+            searchTexts = runCatching { library.searchTexts() }.getOrDefault(emptyMap())
+            searchTextVersion++
+        }
+    }
+
+    /** Renames the open document. */
+    fun renameDocument(title: String?) {
+        val t = title?.let { DocumentName.clean(it) }?.takeIf { it.isNotEmpty() }
+        viewModelScope.launch {
+            val d = ensureDocument()
+            val name = t ?: Library.defaultTitle(System.currentTimeMillis())
+            library.rename(d, name)
+            docTitle = name
+        }
+    }
+
+    fun renameDocument(id: String, title: String) {
+        val t = DocumentName.clean(title).takeIf { it.isNotEmpty() } ?: return
+        viewModelScope.launch {
+            library.rename(id, t)
+            if (id == docId) docTitle = t
+        }
+    }
+
+    /** Moves documents to the trash (the open one is closed first). */
+    fun trashDocuments(ids: Collection<String>) {
+        viewModelScope.launch {
+            if (docId in ids) closeDocument()
+            library.trash(ids)
+            message = if (ids.size == 1) "Moved to the trash" else "${ids.size} documents moved to the trash"
+        }
+    }
+
+    fun restoreDocuments(ids: Collection<String>) {
+        viewModelScope.launch { library.restore(ids) }
+    }
+
+    fun deleteForever(ids: Collection<String>) {
+        viewModelScope.launch { library.deleteForever(ids) }
+    }
+
+    // ------------------------------------------------------------------ tags (feature round 5)
+    /** Home's tag filter: the chips picked; the list shows the documents that have all of them. */
+    var tagFilter by mutableStateOf<List<String>>(emptyList())
+
+    /** Puts [tag] on ([on]) or takes it off documents [ids] (the tag sheet). */
+    fun setTag(ids: Collection<String>, tag: String, on: Boolean) {
+        viewModelScope.launch { runCatching { library.setTag(ids, tag, on) }.onFailure { Log.e(TAG, "tagging failed", it) } }
+    }
+
+    /** The same for the open document (the pages screen; made now if it has none yet, as a rename does). */
+    fun setOpenDocumentTag(tag: String, on: Boolean) {
+        viewModelScope.launch { runCatching { library.setTag(listOf(ensureDocument()), tag, on) }.onFailure { Log.e(TAG, "tagging failed", it) } }
+    }
+
+    /** Space used, for Settings > Storage (null while it is measured). */
+    var storage by mutableStateOf<StorageUsage?>(null)
+        private set
+
+    fun measureStorage() {
+        viewModelScope.launch { storage = library.usage() }
+    }
+
+    /** Settings > Storage: deletes the original photos of documents older than [days] days. */
+    fun dropOriginals(days: Int) {
+        viewModelScope.launch {
+            commitCurrent()
+            val freed = library.dropOriginalsOlderThan(days)
+            message = if (freed == 0L) "No original photos to remove" else "Freed ${formatBytes(freed)}"
+            storage = library.usage()
+        }
+    }
+
+    suspend fun thumbnail(id: String): Bitmap? = withContext(Dispatchers.IO) {
+        runCatching {
+            // the lists ask again whenever they are composed: decoded once per file version (its time and size)
+            val f = store.thumbFile(id).takeIf { it.exists() } ?: store.outputFile(id)
+            val key = "$id ${f.lastModified()} ${f.length()}"
+            thumbCache.get(key) ?: store.loadThumbnail(id, 480)?.also { thumbCache.put(key, it) }
+        }.getOrNull()
+    }
+
+    /** Decoded thumbnails ([thumbnail]), up to 24 MB. */
+    private val thumbCache = object : android.util.LruCache<String, Bitmap>(24 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount
+    }
 
     /** The rendered pages in order, for export (writes the current page first). */
     suspend fun exportPages(): List<File> {
@@ -1286,7 +2091,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * Processes the photo on the crop screen. [ignoreAreas] / [perspective]: the line editor's
      * settings; null keeps the page's own (its ignore areas only while the corners are unchanged).
      */
-    fun process(ignoreAreas: List<Float>? = null, perspective: Boolean? = null) {
+    fun process(ignoreAreas: List<Float>? = null, perspective: Boolean? = null, drawnLines: List<Float>? = null) {
         val p = photo ?: return
         val id = photoPageId ?: return
         if (corners.size != 4) return
@@ -1298,23 +2103,30 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val same = id == currentId
         val stored = cropMeta?.takeIf { it.id == id }
         val prev = if (same) sessionGeom else stored
-        val ig = ignoreAreas
-            ?: prev?.takeIf { it.corners.contentEquals(c) && it.cropRotation == cropRotation }?.ignore?.toList()
-            ?: emptyList()
-        val po = perspective ?: prev?.perspectiveOnly ?: false
+        val samePlace = prev?.takeIf { it.corners.contentEquals(c) && it.cropRotation == cropRotation }
+        val ig = ignoreAreas ?: samePlace?.ignore?.toList() ?: emptyList()
+        // drawn lines sit where the user saw them on this crop: a new crop drops them
+        val drawn = (if (samePlace != null) drawnLines ?: samePlace.userLines.toList() else null) ?: emptyList()
+        val removeSh = prev?.removeShadows ?: true
+        // the page's mode: a page keeps its own (setPageMode changes it); a new page takes the crop's
+        val mode = prev?.mode ?: cropMode
+        val board = mode == CaptureMode.Whiteboard
+        // a board is flat: perspective correction only, whatever the unwarp switch says
+        val po = board || (perspective ?: prev?.perspectiveOnly ?: false)
         val geom = PageMeta(
             id = id, corners = c, detected = detected?.let { d -> FloatArray(8) { i -> if (i % 2 == 0) d[i / 2].x else d[i / 2].y } },
             cropRotation = cropRotation, userRotated = userRotated, focalPx = focalPx,
             params = RenderParams(), protect = FloatArray(0), rotation = 0,
             pageIndex = pageIndex, forceHomography = force,
             spreadWith = spread?.firstId ?: stored?.spreadWith ?: (if (same) sessionGeom?.spreadWith else null),
-            ignore = ig.toFloatArray(), perspectiveOnly = po,
+            ignore = ig.toFloatArray(), perspectiveOnly = po, mode = mode, removeShadows = removeSh, userLines = drawn.toFloatArray(),
         )
         val key = geometryKey(geom)
         val defaults = settings.defaultParams()
         val startParams = when {
             same -> params
             stored != null -> stored.params
+            board -> defaults.copy(filter = if (boardDark) FilterKind.ProjectorDark else FilterKind.Whiteboard, solid = false, screen = ScreenMode.Off)
             else -> defaults
         }
         val startProtect = when {
@@ -1330,20 +2142,33 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val startLook = when {
             same -> look
             stored != null -> stored.look
+            // a board keeps its own proportions (measured from its corners), not A4's
+            board -> PageLook(shape = PageShape.Measured)
             else -> LookPrefs.newPageLook(getApplication())
         }
+        // the page's finger and erase edits stay when it is processed again (the iron switched off or on, lines
+        // added) on the same crop: page fractions, so they sit on the same parts of the page; a new crop drops them
+        val startEdits = when {
+            samePlace == null -> null
+            same -> PageEdits(erase.toFloatArray(), fingersAuto, fingerStrokes.toFloatArray(), fingerFill)
+            stored != null -> PageEdits(stored.erase, stored.fingersAuto, stored.fingerStrokes, stored.fingerFill)
+            else -> null
+        }
         val quadHw = measuredPageHw(corners, p.width, p.height, focalPx)
-        val autoOrient = settings.autoRotate && !userRotated
+        // whiteboard mode: no orientation decision (its cue is tuned on printed text), no shadow net (trained
+        // on paper), no rule net, no finger erase (core: PipelineOptions::erase_fingers)
+        val autoOrient = settings.autoRotate && !userRotated && !board
         val width = settings.outputWidth
-        val useUv = settings.uvDoc
+        val useUv = settings.uvDoc && !board
         val nets = settings.flatNets
-        val shadows = settings.neuralShadows
-        val rules = settings.ruleNet
+        val shadows = settings.neuralShadows && !board && removeSh
+        val rules = settings.ruleNet && !board
         val focal = focalPx
         recropBackup = null
         screen = Screen.Processing
         progress = 0f
         stage = "Starting"
+        unfoldLanded = false
         viewModelScope.launch {
             if (!same) commitCurrent()
             sourceJob?.join()
@@ -1358,12 +2183,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 val hh = try {
                     val plan = if ((useUv && !po) || shadows) ensureNets { s -> viewModelScope.launch(Dispatchers.Main) { stage = s } } else netPlan
                     val reused = synchronized(logitsLock) { logitsCache?.first === p }
-                    val logits = logitsFor(p)
+                    val logits = if (board) null else logitsFor(p)
                     val finder = if (logits != null) finderTiming(p) else null
                     accel = { j -> j.put("accel", accelJson(j.optJSONObject("accel"), finder, reused, plan)) }
                     CrashGuard.guard(getApplication(), "processing a page", gpu = !plan.cpuOnly) {
                         NativeLib.process(
-                            p, c, edited, focal, autoOrient, width, true, logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules,
+                            p, c, edited || board, focal, autoOrient, width, true, if (board) null else logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules, board,
+                            removeSh, drawn.toFloatArray(),
                         ) { pct, s ->
                             viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                         }
@@ -1386,20 +2212,37 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.Crop
                 return@launch
             }
+            // the core's last report is 95 % (Finishing): done, so the animation plays its last beats
+            progress = 1f
             if (id !in pages) {
                 val i = spread?.let { pages.indexOf(it.firstId) } ?: -1
-                if (spread != null && i >= 0) pages.add(if (secondGoesFirst(spread)) i else i + 1, id) else pages.add(id)
+                val at = insertAt
+                when {
+                    spread != null && i >= 0 -> pages.add(if (secondGoesFirst(spread)) i else i + 1, id)
+                    at != null && at <= pages.size -> { pages.add(at, id); insertAt = at + 1 }
+                    else -> pages.add(id)
+                }
+                pagesHistory?.let { h -> if (h.state.current == docId) { h.apply(h.state.copy(docs = h.state.docs + (h.state.current to pages.toList()))); updateUndoFlags() } }
                 pageVersions[id] = 0
             }
-            val order = pages.toList()
-            // the measured shape in the page's frame: a sideways page was turned a quarter (rot 0 / 2)
-            val hw = if (quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 }) 1f / quadHw else quadHw
-            val geomL = geom.copy(look = startLook.copy(measuredHw = hw))
+            saveOrderNow()
+            // the measured shape in the page's frame: the core's, measured along its map (already in the page's
+            // frame; a curled or crumpled sheet is longer than the chord between its corners), else from the
+            // corners (a perspective-only page), where a sideways page was turned a quarter (rot 0 / 2)
+            val mapHw = info.optDouble("page_hw", -1.0).toFloat()
+            val hw = when {
+                mapHw > 0f -> mapHw
+                quadHw > 0f && info.optInt("rot", -1).let { it == 0 || it == 2 } -> 1f / quadHw
+                else -> quadHw
+            }
+            val geomL = geom.copy(look = startLook.copy(measuredHw = hw)).let { g ->
+                if (startEdits == null) g
+                else g.copy(erase = startEdits.erase, fingersAuto = startEdits.fingersAuto, fingerStrokes = startEdits.strokes, fingerFill = startEdits.fill)
+            }
             val meta = geomL.copy(params = startParams, protect = startProtect.toFloatArray(), rotation = startRotation)
             withContext(Dispatchers.IO) {
                 runCatching {
                     store.saveMeta(meta)
-                    store.saveOrder(order)
                     // the first page of the spread learns its partner
                     if (spread != null) store.saveMeta(store.loadMeta(spread.firstId).copy(spreadWith = id))
                 }.onFailure { Log.e(TAG, "meta save failed", it) }
@@ -1409,6 +2252,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 message = "Book spread: added as 2 pages (${if (settings.bookRightToLeft) "right" else "left"} page first)"
             }
             val text = describe(info, edited, force, po, ig.size / 4)
+            val drawnCount = countDrawnLines(drawn)
+            if (!po && drawnCount > info.optInt("user_lines_used", drawnCount)) {
+                message = if (drawnCount == 1) "The drawn line found no printed line to follow" else "A drawn line found no printed line to follow"
+            }
             // the processed page is kept on disk: opening it again needs no re-processing
             storeSession(id, key, info, text, withContext(nativeCtx) { if (h == nativeHandle) NativeLib.snapshot(h) else 0L })
             activate(h, geomL, startParams, startProtect, startRotation, text, restored = false)
@@ -1436,10 +2283,22 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         look = geom.look
         lines = ln
         ignore = geom.ignore.toList()
+        userLines = geom.userLines.toList()
+        forgetLineEdits()
         erase = geom.erase.toList()
-        if (erase.isNotEmpty()) {
+        fingersAuto = geom.fingersAuto
+        fingerStrokes = geom.fingerStrokes.toList()
+        fingerFill = geom.fingerFill
+        fingerOverlay = null
+        val pageInfo = runCatching { JSONObject(withContext(nativeCtx) { NativeLib.info(h) }) }.getOrNull()
+        fingersOverText = pageInfo?.optBoolean("fingers_over_text") ?: false
+        edgeDoubt = pageInfo?.optBoolean("edge_doubt") ?: false
+        if (geom.hasEdits) {
             val rects = erase.toFloatArray()
-            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setErase(h, rects) }
+            val fa = fingersAuto
+            val st = fingerStrokes.toFloatArray()
+            val ff = fingerFill
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, rects, fa, st, ff) }
         }
         outVersion++
         details = text
@@ -1449,6 +2308,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         awaitRender()
         // a stored session renders what out.jpg already holds
         if (restored) committedVersion = outVersion
+        // the processing animation ends 0.4-0.9 s after the core (the page thumps flat, the light band, the landing)
+        if (!restored && screen == Screen.Processing) withTimeoutOrNull(1500) { snapshotFlow { unfoldLanded }.first { it } }
         if (screen == Screen.Processing && !batch) screen = Screen.Result
         fetchBefore(h)
         if (showWrinkles) fetchOverlay(h)
@@ -1479,11 +2340,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun reflatten(perspective: Boolean? = null) {
         val id = currentId ?: return
         val geom = currentMeta() ?: return
+        if (!sourceAvailable(id)) return
         val areas = ignore
+        val drawn = userLines
         reopenLines = true
         val p = photo
         if (photoPageId == id && p != null && recropBackup == null) {
-            process(areas, perspective)
+            process(areas, perspective, drawn)
             return
         }
         viewModelScope.launch {
@@ -1491,11 +2354,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             progress = 0f
             stage = "Opening the photo"
             try {
-                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).rotatedQuarterTurns(geom.cropRotation) }
+                val bmp = withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(geom.cropRotation) }
                 discardStaging()
                 recropBackup = null
                 setCrop(geom, bmp)
-                process(areas, perspective)
+                process(areas, perspective, drawn)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "reflatten failed", e)
@@ -1505,14 +2368,34 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Remembers the line edits as they are, before a change (Undo goes back to them). */
+    private fun noteLineEdit() {
+        lineHistory += ignore to userLines
+        lineUndoSteps = lineHistory.size
+    }
+
+    /** Line editor: takes back the last line edit (a line left out or used again, a box, a line added or removed). */
+    fun undoLineEdit() {
+        val last = lineHistory.removeLastOrNull() ?: return
+        ignore = last.first
+        userLines = last.second
+        lineUndoSteps = lineHistory.size
+    }
+
+    private fun forgetLineEdits() {
+        lineHistory.clear()
+        lineUndoSteps = 0
+    }
+
     /** Line editor: ignores line [i] of [lines] (or uses it again when it is ignored). */
     fun toggleLine(i: Int) {
         val l = lines
         if (5 * i + 4 >= l.size) return
+        noteLineEdit()
         val cx = (l[5 * i + 1] + l[5 * i + 3]) / 2
         val cy = (l[5 * i + 2] + l[5 * i + 4]) / 2
         if (ignoreAt(cx, cy) >= 0) {
-            removeIgnoreAt(cx, cy)
+            ignore = ignoreWithout(cx, cy)
             return
         }
         val pad = 0.008f
@@ -1535,8 +2418,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Removes every ignore area containing the page point. */
     fun removeIgnoreAt(x: Float, y: Float) {
-        ignore = ignore.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
+        val kept = ignoreWithout(x, y)
+        if (kept.size == ignore.size) return
+        noteLineEdit()
+        ignore = kept
     }
+
+    private fun ignoreWithout(x: Float, y: Float) = ignore.chunked(4).filterNot { x >= it[0] && x <= it[2] && y >= it[1] && y <= it[3] }.flatten()
 
     /** Line editor: ignores every line inside the rectangle (page fractions, any corner order). */
     fun addIgnore(x0: Float, y0: Float, x1: Float, y1: Float) {
@@ -1545,17 +2433,97 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val c = maxOf(x0, x1).coerceIn(0f, 1f)
         val d = maxOf(y0, y1).coerceIn(0f, 1f)
         if (c - a < 0.01f || d - b < 0.01f) return
+        noteLineEdit()
         ignore = ignore + listOf(a, b, c, d)
     }
 
     fun clearIgnore() {
+        if (ignore.isEmpty()) return
+        noteLineEdit()
         ignore = emptyList()
     }
 
-    /** Line editor closed without flattening again: back to the areas the page uses. */
+    /** Line editor closed without flattening again: back to the areas and drawn lines the page uses. */
     fun revertIgnore() {
         ignore = sessionGeomState?.ignore?.toList() ?: emptyList()
+        userLines = sessionGeomState?.userLines?.toList() ?: emptyList()
+        forgetLineEdits()
     }
+
+    /**
+     * Line editor > Add line: a line drawn along a rule the unwarp missed ([points]: page fractions x0, y0, ...).
+     * Lines drawn since the page was last flattened share a group (they were all drawn on the same page).
+     */
+    fun addUserLine(points: List<Float>) {
+        if (points.size < 4) return
+        val xs = points.filterIndexed { i, _ -> i % 2 == 0 }
+        val ys = points.filterIndexed { i, _ -> i % 2 == 1 }
+        if (maxOf(xs.max() - xs.min(), ys.max() - ys.min()) < 0.04f) return   // a tap or a short wiggle
+        val group = 1 + (drawnLineGroups(sessionGeomState?.userLines?.toList() ?: emptyList()).maxOrNull() ?: 0)
+        // at most 64 points along it
+        val n = points.size / 2
+        val step = maxOf(1, (n + 63) / 64)
+        val kept = (0 until n step step).toMutableList().also { if (it.last() != n - 1) it += n - 1 }
+        noteLineEdit()
+        userLines = userLines + listOf(group.toFloat(), kept.size.toFloat()) + kept.flatMap { listOf(points[2 * it], points[2 * it + 1]) }
+    }
+
+    /**
+     * Line editor > Add line: the printed line a rough stroke was swept along ([points]: page fractions x0, y0, ...),
+     * found on the page (NativeLib.findLine: the stroke only has to come near it, and the line is followed past the
+     * stroke's ends) and added along its length. No line there: a message and no line (flattening could not use it).
+     */
+    fun traceUserLine(points: List<Float>) {
+        val h = handle
+        if (h == 0L || points.size < 4) return
+        viewModelScope.launch {
+            val found = withContext(nativeCtx) { if (h == nativeHandle) NativeLib.findLine(h, points.toFloatArray()) else FloatArray(0) }
+            if (handle != h) return@launch
+            if (found.size < 4) {
+                message = "No printed line along that stroke: sweep along the line itself"
+                return@launch
+            }
+            addUserLine(found.toList())
+        }
+    }
+
+    /** Line editor: removes every drawn line. */
+    fun clearUserLines() {
+        if (userLines.isEmpty()) return
+        noteLineEdit()
+        userLines = emptyList()
+    }
+
+    /** Line editor: removes the drawn line nearest the page point (a tap on a straightened drawn line). */
+    fun removeUserLineNear(x: Float, y: Float) {
+        val l = userLines
+        val starts = drawnLineStarts(l)
+        var best = -1
+        var bestD = Float.MAX_VALUE
+        for ((k, s) in starts.withIndex()) {
+            val n = l[s + 1].toInt()
+            for (i in 0 until n) {
+                val dx = l[s + 2 + 2 * i] - x
+                val dy = l[s + 3 + 2 * i] - y
+                val d = dx * dx + dy * dy
+                if (d < bestD) { bestD = d; best = k }
+            }
+        }
+        if (best < 0) return
+        val a = starts[best]
+        val b = starts.getOrNull(best + 1) ?: l.size
+        noteLineEdit()
+        userLines = l.take(a) + l.drop(b)
+    }
+
+    /** Drawn lines not flattened yet (page fractions x0, y0, ... each): the line editor draws them as drawn. */
+    val pendingUserLines: List<FloatArray>
+        get() {
+            val stored = sessionGeomState?.userLines?.toList() ?: emptyList()
+            val done = drawnLineGroups(stored).maxOrNull() ?: 0
+            val l = userLines
+            return drawnLineStarts(l).filter { l[it].toInt() > done }.map { s -> l.subList(s + 2, s + 2 + 2 * l[s + 1].toInt()).toFloatArray() }
+        }
 
     /**
      * The processing details' "accel" object: the core's (nets: per net, keys of [NET_LABELS], run_ms,
@@ -1600,6 +2568,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 else -> "Geometry: $mode"
             },
         )
+        if (info.optBoolean("edge_doubt")) sb.append("\nEdges: the two flattening nets disagree on where an edge is (check the corners)")
         if (info.has("rot")) sb.append("\nOrientation: ").append(
             when (info.optInt("rot")) { 0 -> "turned 90 degrees clockwise"; 2 -> "turned 90 degrees counter-clockwise"; 1 -> "turned 180 degrees"; else -> "as photographed" },
         )
@@ -1637,7 +2606,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun currentMeta(): PageMeta? =
-        sessionGeom?.copy(params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray(), look = look)
+        sessionGeom?.copy(
+            params = params, protect = protect.toFloatArray(), rotation = rotation, erase = erase.toFloatArray(), look = look,
+            fingersAuto = fingersAuto, fingerStrokes = fingerStrokes.toFloatArray(), fingerFill = fingerFill,
+        )
 
     /**
      * Writes the current page's settings and (if it changed) its rendered output to disk.
@@ -1665,6 +2637,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             if (ok && snap != null) {
                 committedVersion = v
                 pageVersions[id] = (pageVersions[id] ?: 0) + 1
+                docId?.let { d -> runCatching { library.touch(d) } }
             }
         }
     }
@@ -1673,7 +2646,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun selectFilter(f: FilterKind) {
         if (f == params.filter) return
         params = params.copy(filter = f)
-        settings.defaultFilter = f
+        // the default for new pages is a document filter; whiteboard pages start from the board filters
+        if (pageMode == CaptureMode.Document) settings.defaultFilter = f
         requestRender(false)
     }
 
@@ -1773,13 +2747,124 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun setEraseRects(rects: List<Float>) {
+        erase = rects
+        applyPageEdits()
+    }
+
+    // ---- finger brush (feature 5)
+    /** The automatic finger removal applies to the page on the result screen. */
+    var fingersAuto by mutableStateOf(true)
+        private set
+    /** Brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ...] repeated. */
+    var fingerStrokes by mutableStateOf(listOf<Float>())
+        private set
+    /** The finger mask shown while brushing (translucent orange, page size), and its share of the page. */
+    var fingerOverlay by mutableStateOf<Bitmap?>(null)
+        private set
+    var fingerShare by mutableFloatStateOf(0f)
+        private set
+
+    /**
+     * Finger tool > Smart select: the finger (or other area) under the page point ([x], [y], fractions) is found
+     * and filled ([add]) or brought back.
+     */
+    fun smartSelectFinger(x: Float, y: Float, add: Boolean) {
         val h = handle
         if (h == 0L) return
-        erase = rects
-        val arr = rects.toFloatArray()
         viewModelScope.launch {
             rendering = true
-            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setErase(h, arr) }
+            val poly = withContext(nativeCtx) { if (h == nativeHandle) NativeLib.fingerSelect(h, x, y) else FloatArray(0) }
+            rendering = false
+            if (handle != h) return@launch
+            if (poly.size < 6) {
+                message = "Nothing to select there: tap on the finger"
+                return@launch
+            }
+            fingerStrokes = fingerStrokes + listOf(if (add) 2f else 3f, 0f, (poly.size / 2).toFloat()) + poly.toList()
+            applyPageEdits()
+        }
+    }
+
+    /** A brush stroke over the page ([points]: page fractions x0, y0, ...): [add] fills it as a finger, else brings the photo back there. */
+    fun addFingerStroke(add: Boolean, radius: Float, points: List<Float>) {
+        if (points.size < 2) return
+        fingerStrokes = fingerStrokes + listOf(if (add) 1f else 0f, radius, (points.size / 2).toFloat()) + points
+        applyPageEdits()
+    }
+
+    fun undoFingerStroke() {
+        var i = 0
+        var last = -1
+        val s = fingerStrokes
+        while (i + 3 <= s.size) { last = i; i += 3 + 2 * s[i + 2].toInt() }
+        if (last >= 0) { fingerStrokes = s.take(last); applyPageEdits() }
+    }
+
+    fun clearFingerStrokes() {
+        if (fingerStrokes.isNotEmpty()) { fingerStrokes = emptyList(); applyPageEdits() }
+    }
+
+    /** Removed fingers: 0 filled with the paper around them, 1 painted in by the inpainting net (MI-GAN). */
+    var fingerFill by mutableStateOf(0)
+        private set
+
+    fun chooseFingerFill(f: Int) {
+        if (f != fingerFill) { fingerFill = f; applyPageEdits() }
+    }
+
+    fun setFingersAutoOn(on: Boolean) {
+        if (on != fingersAuto) { fingersAuto = on; applyPageEdits() }
+    }
+
+    /** The finger tool is closed: its overlay goes. */
+    fun closeFingerTool() {
+        fingerOverlay = null
+    }
+
+    /** Text ran under a removed finger on this page (its area is outlined in the page). */
+    var fingersOverText by mutableStateOf(false)
+        private set
+
+    /**
+     * The two flattening nets disagree on where an edge of this page is (core PipelineResult::edge_doubt): a strip of
+     * the table may show, or a corner may be cut. The result screen offers the corner screen; dismissed per page.
+     */
+    var edgeDoubt by mutableStateOf(false)
+        private set
+
+    fun dismissEdgeDoubt() {
+        edgeDoubt = false
+    }
+
+    /** Refreshes the brush overlay (the finger tool is open). */
+    fun refreshFingerOverlay() {
+        val h = handle
+        if (h == 0L || pageWidth == 0) return
+        val fa = fingersAuto
+        val st = fingerStrokes.toFloatArray()
+        viewModelScope.launch {
+            val r = withContext(nativeCtx) {
+                if (h != nativeHandle) return@withContext null
+                val b = Bitmap.createBitmap(pageWidth, pageHeight, Bitmap.Config.ARGB_8888)
+                b to NativeLib.fingerOverlay(h, fa, st, b)
+            }
+            if (r != null && handle == h) { fingerOverlay = r.first; fingerShare = r.second }
+        }
+    }
+
+    /** The Erase rectangles and the finger mask applied to the live page (from its unedited state). */
+    private fun applyPageEdits() {
+        val h = handle
+        if (h == 0L) return
+        val arr = erase.toFloatArray()
+        val fa = fingersAuto
+        val st = fingerStrokes.toFloatArray()
+        val ff = fingerFill
+        val overlayShown = fingerOverlay != null
+        viewModelScope.launch {
+            rendering = true
+            withContext(nativeCtx) { if (h == nativeHandle) NativeLib.setEdits(h, arr, fa, st, ff) }
+            if (overlayShown) refreshFingerOverlay()
             if (handle != h) return@launch
             thumbKey = null
             histKey = null
@@ -1800,6 +2885,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         outVersion++
     }
 
+    /** A quarter turn the other way (the result screen's Page tab). */
+    fun rotateResultLeft() {
+        rotation = (rotation + 3) % 4
+        outVersion++
+    }
+
     /** One tap for an upside-down page (there is no automatic 180-degree turn). */
     fun rotateResult180() {
         rotation = (rotation + 2) % 4
@@ -1815,7 +2906,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The edits [history] tracks, as they are now. */
-    fun editState() = EditState(params, look, rotation, protect, erase)
+    fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes, fingerFill)
 
     fun undo() {
         // a change still inside the debounce is the one to undo
@@ -1837,7 +2928,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             rotation = s.rotation
             outVersion++
         }
-        if (s.erase != erase) setEraseRects(s.erase)
+        if (s.erase != erase || s.fingersAuto != fingersAuto || s.fingerStrokes != fingerStrokes || s.fingerFill != fingerFill) {
+            erase = s.erase
+            fingersAuto = s.fingersAuto
+            fingerStrokes = s.fingerStrokes
+            fingerFill = s.fingerFill
+            applyPageEdits()
+        }
     }
 
     /**
@@ -1872,8 +2969,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Page [id] (not the live one) rendered again with [p] and the colours of [lk]: its meta and out.jpg. */
-    private suspend fun renderStoredPage(id: String, p: RenderParams, lk: PageLook): Boolean {
+    /** Page [id] (not the live one) rendered again with [p], the colours of [lk] and result rotation [rot] (null: its own): its meta and out.jpg. */
+    private suspend fun renderStoredPage(id: String, p: RenderParams, lk: PageLook, rot: Int? = null): Boolean {
         val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
         val dir = withContext(Dispatchers.IO) { store.sessionDir(id) } ?: return false
         val look2 = m.look.withColorsOf(lk)
@@ -1881,7 +2978,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val h = NativeLib.restoreSession(dir.absolutePath, true)
             if (h == 0L) return@withContext null
             try {
-                if (m.erase.isNotEmpty()) NativeLib.setErase(h, m.erase)
+                if (m.hasEdits) NativeLib.setEdits(h, m.erase, m.fingersAuto, m.fingerStrokes, m.fingerFill)
                 val size = NativeLib.pageSize(h)
                 val b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
                 val ok = JSONObject(NativeLib.render(h, p.toArray(), m.protect, true, b)).optBoolean("ok")
@@ -1890,10 +2987,11 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 NativeLib.release(h)
             }
         } ?: return false
-        val fin = finishPage(bmp, m.rotation, look2)
+        val r = rot ?: m.rotation
+        val fin = finishPage(bmp, r, look2)
         if (fin !== bmp) bmp.recycle()
         withContext(Dispatchers.IO) {
-            store.saveMeta(m.copy(params = p, look = look2))
+            store.saveMeta(m.copy(params = p, look = look2, rotation = r))
             store.saveOutput(id, fin)
         }
         fin.recycle()
@@ -1982,7 +3080,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 val tw = THUMB_W
                 val th = (THUMB_W.toFloat() * pageHeight / pageWidth.coerceAtLeast(1)).roundToInt().coerceIn(32, 4 * THUMB_W)
                 var complete = true
-                for (f in FilterKind.entries) {
+                for (f in FilterKind.forMode(pageMode)) {
                     if (handle != h || wantedKey() != key) { complete = false; break }
                     val b = withContext(nativeCtx) {
                         if (h != nativeHandle) return@withContext null
@@ -2063,6 +3161,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val TAG = "FlatScan"
+        /** The stage text of the GPU's first set-up (Auto's benchmark, the GPU sessions). */
+        const val GPU_SETUP = "Setting up the GPU for this phone (once per install)"
         const val RENDER_DEBOUNCE_MS = 120L
         const val THUMB_W = 96
         /** [openingPreview]: out.jpg decoded at full size up to this side (a page is 1600 x 2263 by default) */
@@ -2080,3 +3180,20 @@ fun Bitmap.rotatedCopy(q: Int): Bitmap {
     val n = ((q % 4) + 4) % 4
     return if (n == 0) copy(Bitmap.Config.ARGB_8888, false) else rotatedQuarterTurns(n)
 }
+
+/** Where each drawn line starts in a PageMeta.userLines list ([group, n, x0, y0, ...] repeated). */
+internal fun drawnLineStarts(l: List<Float>): List<Int> {
+    val out = ArrayList<Int>()
+    var i = 0
+    while (i + 2 <= l.size) {
+        val n = l[i + 1].toInt()
+        if (n < 0 || i + 2 + 2 * n > l.size) break
+        out += i
+        i += 2 + 2 * n
+    }
+    return out
+}
+
+internal fun drawnLineGroups(l: List<Float>): List<Int> = drawnLineStarts(l).map { l[it].toInt() }
+
+internal fun countDrawnLines(l: List<Float>): Int = drawnLineStarts(l).size

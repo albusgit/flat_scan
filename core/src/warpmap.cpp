@@ -6,9 +6,12 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
 #include <numeric>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <cstdlib>
 #include <thread>
 
@@ -199,21 +202,23 @@ void dewarp_detect(const cv::Mat& img, std::vector<DLine>& Hs, std::vector<DLine
     cv::dilate(g, bg, cv::Mat::ones(9, 9, CV_8U));
     cv::medianBlur(bg, bg, 41);
     cv::Mat ink(g.size(), CV_8U);
-    for (int y = 0; y < g.rows; ++y)
-        for (int x = 0; x < g.cols; ++x) ink.at<uint8_t>(y, x) = ((int)bg.at<uint8_t>(y, x) - (int)g.at<uint8_t>(y, x)) > 45 ? 255 : 0;
-    cv::Mat hm, vm;
-    cv::morphologyEx(ink, hm, cv::MORPH_OPEN, rect(120, 1));
-    cv::morphologyEx(ink, vm, cv::MORPH_OPEN, rect(1, 120));
-    if (faint) {
-        cv::Mat Df;
-        cv::subtract(bg, g, Df, cv::noArray(), CV_32F);
-        hm |= faint_rules(Df, true, 120);
-        vm |= faint_rules(Df, false, 120);
-    }
-    cv::morphologyEx(hm, hm, cv::MORPH_CLOSE, rect(25, 3));
-    cv::morphologyEx(vm, vm, cv::MORPH_CLOSE, rect(3, 25));
-    Hs = merge_lines(comp_samples(hm, true, 250));
-    Vs = merge_lines(comp_samples(vm, false, 250));
+    cv::parallel_for_(cv::Range(0, g.rows), [&](const cv::Range& R) {
+        for (int y = R.start; y < R.end; ++y)
+            for (int x = 0; x < g.cols; ++x) ink.at<uint8_t>(y, x) = ((int)bg.at<uint8_t>(y, x) - (int)g.at<uint8_t>(y, x)) > 45 ? 255 : 0;
+    });
+    cv::Mat Df;
+    if (faint) cv::subtract(bg, g, Df, cv::noArray(), CV_32F);
+    // the two directions side by side
+    auto lines = [&](bool hz) {
+        cv::Mat m;
+        cv::morphologyEx(ink, m, cv::MORPH_OPEN, hz ? rect(120, 1) : rect(1, 120));
+        if (faint) m |= faint_rules(Df, hz, 120);
+        cv::morphologyEx(m, m, cv::MORPH_CLOSE, hz ? rect(25, 3) : rect(3, 25));
+        return merge_lines(comp_samples(m, hz, 250));
+    };
+    auto vs = std::async(std::launch::async, lines, false);
+    Hs = lines(true);
+    Vs = vs.get();
 }
 
 void dl_trace(const DLine& L, Vec& tc, Vec& vc, double step = 20) {
@@ -305,18 +310,21 @@ struct Stencil {
         int n = gw * gh;
         M.n = n;
         M.ptr.assign(n + 1, 0);
-        M.idx.reserve((size_t)n * NOFF);
-        M.val.reserve((size_t)n * NOFF);
+        M.idx.resize((size_t)n * NOFF);
+        M.val.resize((size_t)n * NOFF);
+        size_t k = 0;
         for (int iy = 0; iy < gh; ++iy)
             for (int ix = 0; ix < gw; ++ix) {
                 for (int o = 0; o < NOFF; ++o) {
                     int y = iy + OFF_DY[o], x = ix + OFF_DX[o];
                     if (y < 0 || y >= gh || x < 0 || x >= gw) continue;
-                    M.idx.push_back(y * gw + x);
-                    M.val.push_back(a[((size_t)iy * gw + ix) * NOFF + o]);
+                    M.idx[k] = y * gw + x;
+                    M.val[k++] = a[((size_t)iy * gw + ix) * NOFF + o];
                 }
-                M.ptr[iy * gw + ix + 1] = (int)M.idx.size();
+                M.ptr[iy * gw + ix + 1] = (int)k;
             }
+        M.idx.resize(k);
+        M.val.resize(k);
         return M;
     }
 };
@@ -359,6 +367,26 @@ void add_regularizer(Stencil& S) {
     for (size_t i = 0; i < (size_t)gw * gh; ++i) S.a[i * NOFF + 6] += 1e-9;
 }
 
+// The regulariser's stencil of a grid size, kept for the next fields of that size (a page's fields
+// use three sizes: the global, coarse and fine grids)
+std::shared_ptr<const Stencil> regularizer(int gw, int gh) {
+    static std::mutex mu;
+    static std::vector<std::shared_ptr<const Stencil>> cache;   // most recent last
+    std::lock_guard<std::mutex> lock(mu);
+    for (size_t i = 0; i < cache.size(); ++i)
+        if (cache[i]->gw == gw && cache[i]->gh == gh) {
+            auto r = cache[i];
+            cache.erase(cache.begin() + (long)i);
+            cache.push_back(r);
+            return r;
+        }
+    auto S = std::make_shared<Stencil>(gw, gh);
+    add_regularizer(*S);
+    cache.push_back(S);
+    if (cache.size() > 3) cache.erase(cache.begin());
+    return S;
+}
+
 // The fields' CG tolerance (warpmap.h: set_warp_cg_rtol). 1e-6 (the reference: 1e-8).
 constexpr double kCgRtol = 1e-6;
 static std::atomic<double>& cg_rtol_store() {
@@ -370,13 +398,11 @@ static std::atomic<double>& cg_rtol_store() {
     return v;
 }
 
-// warpmap.solve: regularised least squares on a G-px grid
-Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh,
-                  int G, const Field* warm, int* iters) {
-    int64_t n = (int64_t)gw * gh;
-    Stencil S(gw, gh);
-    add_regularizer(S);
-    std::vector<double> rhs(n, 0.0);
+// warpmap.solve's normal equations: the samples' bilinear data terms added to S (the regulariser), and
+// for each of the nv value sets its right-hand side
+void add_samples(const std::vector<std::array<double, 2>>& xy, const Vec* const* values, std::vector<double>* const* rhs, int nv,
+                 const Vec* weights, int G, Stencil& S) {
+    const int gw = S.gw, gh = S.gh;
     for (size_t s = 0; s < xy.size(); ++s) {
         double gx = xy[s][0] / G, gy = xy[s][1] / G;
         long x0 = std::min(std::max((long)std::floor(gx), 0L), (long)gw - 2);
@@ -387,10 +413,21 @@ Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& value
         double ws = weights ? (*weights)[s] : 1.0;
         for (int a = 0; a < 4; ++a) {
             int ia = yy[a] * gw + xx[a];
-            rhs[ia] += w[a] * (ws * values[s]);
+            for (int k = 0; k < nv; ++k) (*rhs[k])[ia] += w[a] * (ws * (*values[k])[s]);
             for (int b = 0; b < 4; ++b) S.a[(size_t)ia * NOFF + off_index(yy[b] - yy[a], xx[b] - xx[a])] += w[a] * ws * w[b];
         }
     }
+}
+
+// warpmap.solve: regularised least squares on a G-px grid
+Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh,
+                  int G, const Field* warm, int* iters) {
+    int64_t n = (int64_t)gw * gh;
+    Stencil S = *regularizer(gw, gh);
+    std::vector<double> rhs(n, 0.0);
+    const Vec* v[1] = {&values};
+    std::vector<double>* r[1] = {&rhs};
+    add_samples(xy, v, r, 1, weights, G, S);
     Csr M = S.to_csr();
     std::vector<double> x0;
     if (warm) x0 = warm->v;
@@ -400,6 +437,28 @@ Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& value
     F.v = solve_spd_grid(M, rhs, gw, gh, warm ? &x0 : nullptr, warp_cg_rtol(), 1000, &st);
     if (iters) *iters = st.iterations;
     return F;
+}
+
+// Two fields from the same samples without weights (the global stage's x and y): one operator and
+// one hierarchy, the two solves side by side. The same fields as two solve_field calls.
+void solve_field_pair(const std::vector<std::array<double, 2>>& xy, const Vec& vx, const Vec& vy, int gw, int gh, int G,
+                      Field& Fx, Field& Fy, int* iters_x, int* iters_y) {
+    const size_t n = (size_t)gw * gh;
+    Stencil S = *regularizer(gw, gh);
+    std::vector<double> rx(n, 0.0), ry(n, 0.0);
+    const Vec* v[2] = {&vx, &vy};
+    std::vector<double>* r[2] = {&rx, &ry};
+    add_samples(xy, v, r, 2, nullptr, G, S);
+    const Csr M = S.to_csr();
+    const SpdGridSolver solver(M, gw, gh);
+    SolveStats sx, sy;
+    Fx = Field{gw, gh, G, {}};
+    Fy = Field{gw, gh, G, {}};
+    std::thread tx([&] { Fx.v = solver.solve(rx, nullptr, warp_cg_rtol(), 1000, &sx); });
+    Fy.v = solver.solve(ry, nullptr, warp_cg_rtol(), 1000, &sy);
+    tx.join();
+    *iters_x = sx.iterations;
+    *iters_y = sy.iterations;
 }
 
 // warpmap._grid_to_grid: cv2.remap(F.astype(f32), gx*g_to/g_from, ..., LINEAR, REPLICATE)
@@ -586,6 +645,16 @@ Lines merge_gap(Lines L, double tol = 8, double maxgap = 60) {
 }
 
 // ------------------------------------------------------------------ tracing (numba kernels)
+// the rule net's highest rule probability within +-r px across the line at (along k, across c)
+inline float prob_at(const cv::Mat& P, bool hz, long k, double c, int r) {
+    const int n_a = hz ? P.cols : P.rows, n_c = hz ? P.rows : P.cols;
+    if (k < 0 || k >= n_a) return 0.f;
+    long c0 = std::max(0L, (long)std::lround(c) - r), c1 = std::min((long)n_c - 1, (long)std::lround(c) + r);
+    float m = 0.f;
+    for (long q = c0; q <= c1; ++q) m = std::max(m, hz ? P.at<float>((int)q, (int)k) : P.at<float>((int)k, (int)q));
+    return m;
+}
+
 struct DView {
     const float* p;
     int rows, cols;
@@ -621,8 +690,12 @@ inline void measure(const DView& D, bool hz, long col, double guess, double w, d
 }
 
 // warpmap.trace_w2 -> t (integers), c, wd
+// P (app, the rule net's map of the line's direction): a hit must lie on a rule the net marks (probability >= 0.3
+// within +-2 px, as extend_trace). A dark area against a rule (a coloured table cell) merges with the rule's run
+// and moves its centre a little at each step, inside the step test; the trace slid 7 px off a table's column rule
+// across a green cell and lost it below (the map then bent the rest of the rule by that much).
 void trace_w2(const DView& D, double pos, double a, double b, bool hz, std::vector<long>& t, Vec& c, Vec& wd,
-              long maxrun, const Vec* prior, double win = 16, double thr = 60, long max_gap = 90) {
+              long maxrun, const Vec* prior, double win = 16, double thr = 60, long max_gap = 90, const cv::Mat* P = nullptr) {
     long t0 = pyint(a), t1 = pyint(b);
     t.clear();
     for (long k = t0; k <= t1; ++k) t.push_back(k);
@@ -658,6 +731,7 @@ void trace_w2(const DView& D, double pos, double a, double b, bool hz, std::vect
                 measure(D, hz, t[k], g2, 8.0, thr, maxrun, n_c, v2, ww2);
                 if (!std::isnan(v2) && std::fabs(v2 - g2) < 3) { v = v2; ww = ww2; ok = true; }
             }
+            if (ok && P && prob_at(*P, hz, t[k], v, 2) < 0.3f) ok = false;
             if (ok) {
                 c[k] = v; wd[k] = ww;
                 ht[nh] = (double)t[k]; hc[nh] = v; ++nh;
@@ -739,16 +813,6 @@ std::vector<char> chain_trace(const std::vector<long>& t, const Vec& c, const Ve
 }
 
 // ------------------------------------------------------------------ rule net (app)
-// the net's highest rule probability within +-r px across the line at (along k, across c)
-inline float prob_at(const cv::Mat& P, bool hz, long k, double c, int r) {
-    const int n_a = hz ? P.cols : P.rows, n_c = hz ? P.rows : P.cols;
-    if (k < 0 || k >= n_a) return 0.f;
-    long c0 = std::max(0L, (long)std::lround(c) - r), c1 = std::min((long)n_c - 1, (long)std::lround(c) + r);
-    float m = 0.f;
-    for (long q = c0; q <= c1; ++q) m = std::max(m, hz ? P.at<float>((int)q, (int)k) : P.at<float>((int)k, (int)q));
-    return m;
-}
-
 // share of the stretch [a, b] along a line at pos (every 2 px) the net marks as a rule of the
 // line's direction (probability >= 0.5 within +-r px)
 double net_cover(const cv::Mat& P, bool hz, double pos, double a, double b, int r) {
@@ -974,9 +1038,10 @@ cv::Mat darkness_fast(const cv::Mat& img) {
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* PH, const cv::Mat* PV, NetLineStats* stats) {
     cv::Mat ink = D > 45.f;   // 0 / 255
     cv::Mat ink_h = ink, ink_v = ink;
-    if (faint) {   // app: faint printed rules too (faint_rules)
+    if (faint) {   // app: faint printed rules too (faint_rules; the two directions side by side)
+        auto fv = std::async(std::launch::async, [&] { return faint_rules(D, false, 100); });
         ink_h = ink | faint_rules(D, true, 100);
-        ink_v = ink | faint_rules(D, false, 100);
+        ink_v = ink | fv.get();
         // ... and leaning vertical ones: a 3-px rule leaning 5 deg leaves a 1-px column after
         // ~30 px, so the short box sides where a page curls (the receipt's totals boxes) were never
         // seen. Widened by 2 px across the line, rules up to ~7 deg give long runs; the tracer then
@@ -984,8 +1049,9 @@ void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint, const cv::Mat* 
         // for horizontal rules: there it joins the letters of a text row into false rules.
         cv::dilate(ink_v, ink_v, rect(5, 1));
     }
+    auto sv = std::async(std::launch::async, [&] { return segments(ink_v, false); });
     H = segments(ink_h, true);
-    V = segments(ink_v, false);
+    V = sv.get();
     Lines Vs = short_segments(ink_v, false, V, H, faint, &D);
     Lines HV = V;
     HV.insert(HV.end(), Vs.begin(), Vs.end());
@@ -1166,7 +1232,7 @@ Samples collect(const DView& D, const Lines& H, const Lines& V, const Field* pri
                 }
                 if (!pk.empty()) thr = std::min(60.0, std::max(25.0, 0.75 * median(pk)));
             }
-            trace_w2(D, p, a2, b2, hz, t, c, wd, maxrun, prior, 16, thr);
+            trace_w2(D, p, a2, b2, hz, t, c, wd, maxrun, prior, 16, thr, 90, P);
             std::vector<char> ok = chain_trace(t, c, wd, prior);
             size_t n = t.size();
             auto count = [&] { size_t s = 0; for (char q : ok) s += q; return s; };
@@ -1465,30 +1531,52 @@ std::vector<std::array<double, 3>> text_margins(const cv::Mat& Dm, const Lines& 
 // leaning bottle - is no residual warp) and straight like a rule (3 px + 1 % of its length), except
 // that one over 500 px may bow by 4 % of its length: that long a step is a cell or column boundary,
 // and its wave is what the net left.
-void colour_edges(const cv::Mat& img, const Lines& H, const Lines& V, std::vector<std::array<double, 3>>& eh,
-                  std::vector<std::array<double, 3>>& ev, Lines& EH, Lines& EV, int& nbowed) {
+// colour_edges in two parts: the step maps and their segments from the page alone (made beside the
+// line search, unwarp_map), then the lines. S[0], segs[0]: horizontal edges (steps along y).
+struct ColourEdgeMaps {
+    cv::Mat S[2];
+    Lines segs[2];
+};
+
+// cancel: set when the maps are no longer wanted (they are then left unfinished)
+ColourEdgeMaps colour_edge_maps(const cv::Mat& img, const std::atomic<bool>& cancel) {
     const int h = img.rows, w = img.cols, border = 25;
+    ColourEdgeMaps E;
     cv::Mat cl, lab;
     cv::morphologyEx(img, cl, cv::MORPH_CLOSE, cv::Mat::ones(9, 9, CV_8U));
     cv::cvtColor(cl, lab, cv::COLOR_BGR2Lab);
     lab.convertTo(lab, CV_32FC3);
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < 2 && !cancel; ++pass) {
         const bool hz = pass == 0;   // horizontal edges: steps along y
         cv::Mat B;
         cv::blur(lab, B, hz ? cv::Size(5, 8) : cv::Size(8, 5));
         cv::Mat S(h, w, CV_32F, cv::Scalar(0));
-        for (int y = border; y < h - border; ++y)
-            for (int x = border; x < w - border; ++x) {
-                const cv::Vec3f &q1 = hz ? B.at<cv::Vec3f>(y + 5, x) : B.at<cv::Vec3f>(y, x + 5),
-                                &q0 = hz ? B.at<cv::Vec3f>(y - 5, x) : B.at<cv::Vec3f>(y, x - 5);
-                cv::Vec3f d = q1 - q0;
-                S.at<float>(y, x) = std::min(255.f, 2.5f * std::sqrt(d.dot(d)));
-            }
+        cv::parallel_for_(cv::Range(border, std::max(border, h - border)), [&](const cv::Range& R) {
+            for (int y = R.start; y < R.end; ++y)
+                for (int x = border; x < w - border; ++x) {
+                    const cv::Vec3f &q1 = hz ? B.at<cv::Vec3f>(y + 5, x) : B.at<cv::Vec3f>(y, x + 5),
+                                    &q0 = hz ? B.at<cv::Vec3f>(y - 5, x) : B.at<cv::Vec3f>(y, x - 5);
+                    cv::Vec3f d = q1 - q0;
+                    S.at<float>(y, x) = std::min(255.f, 2.5f * std::sqrt(d.dot(d)));
+                }
+        });
         cv::Mat mask = S > 30.f;
         cv::dilate(mask, mask, hz ? rect(1, 5) : rect(5, 1));
         // pieces unjoined: a column boundary is a step only where the cells on either side differ,
         // and one trace from the middle of the whole column stops at the first such gap
-        Lines segs = segments(mask, hz, 100, 150, false, 7);
+        E.segs[pass] = segments(mask, hz, 100, 150, false, 7);
+        E.S[pass] = S;
+    }
+    return E;
+}
+
+void colour_edges(const ColourEdgeMaps& E, const Lines& H, const Lines& V, std::vector<std::array<double, 3>>& eh,
+                  std::vector<std::array<double, 3>>& ev, Lines& EH, Lines& EV, int& nbowed) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool hz = pass == 0;   // horizontal edges: steps along y
+        const cv::Mat& S = E.S[pass];
+        const Lines& segs = E.segs[pass];
+        const int h = S.rows, w = S.cols;
         const Lines& ink = hz ? H : V;
         Lines keep;
         for (const auto& s : segs) {
@@ -1788,7 +1876,7 @@ std::vector<std::array<double, 3>> text_rows_net(const cv::Mat& P_in, bool hz, i
 }
 
 GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bool share_rows, bool faint, bool robust, bool edges,
-                   const RuleNetFn* rule_net, const cv::Mat* drop_lines) {
+                   const RuleNetFn* rule_net, const cv::Mat* drop_lines, const WarpDebug* resume) {
     WarpDebug local;
     WarpDebug& d = dbg ? *dbg : local;
     const bool masked = ignore && !ignore->empty() && ignore->size() == src.size();
@@ -1825,6 +1913,120 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     };
     const int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     int h = src.rows, w = src.cols;
+    // the lines drop_lines leaves out whole
+    auto drop_lines_whole = [&] {
+        drop_whole(d.M, false);
+        drop_whole(d.EH, true);
+        drop_whole(d.EV, false);
+        drop_whole(d.S1.h, true);
+        drop_whole(d.S1.v, false);
+        drop_whole(d.T, true);
+        drop_whole(d.TVs, false);
+    };
+    // ---- the solve passes on the traced lines (local_field, after the tracing below)
+    auto solve_fields = [&](Clock::time_point t0) -> GridMap {
+        const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
+        const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
+        DView D{d.D.ptr<float>(), d.D.rows, d.D.cols};
+        const int GC = 16, GF = 8;
+        Field Fx_prev, Fy_prev;
+        for (int it = 0; it < 2; ++it) {
+            int G = it == 1 ? GF : GC;
+            int gw2 = w / G + 2, gh2 = h / G + 2;
+            const Samples& S = it == 0 ? d.S1 : d.S2;
+            if (it == 1) {
+                auto tc = Clock::now();
+                d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
+                if (share_rows && faint) corner_junctions(d.S2, d.H, d.V);
+                drop(d.S2.h, true);
+                drop(d.S2.v, false);
+                drop_whole(d.S2.h, true);
+                drop_whole(d.S2.v, false);
+                d.ms.emplace_back("trace pass2", ms_since(tc));
+            }
+            const Samples& SS = it == 0 ? d.S1 : d.S2;
+            (void)S;
+            std::vector<std::array<double, 2>> xy;
+            Vec val, wts;
+            for (const auto& r : SS.h) {
+                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
+            }
+            for (const auto& r : d.T) {
+                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);   // TEXT_W = 1
+            }
+            for (const auto& r : d.EH) {
+                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
+            }
+            Field warm_y, warm_x;
+            if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
+            std::vector<std::array<double, 2>> xyv;
+            Vec valv;
+            for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
+                                                                  (const std::vector<std::array<double, 3>>*)&d.EV,
+                                                                  (const std::vector<std::array<double, 3>>*)&d.TVs})
+                for (const auto& r : *src) {
+                    double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
+                    xyv.push_back({r[1], ys}); valv.push_back(r[2]);
+                }
+            Field Fy, Fx;
+            // every sample of one direction ignored: nothing to straighten that way
+            std::thread ty([&] {
+                Fy = xy.empty() ? zero_field(gw2, gh2, G) : solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]);
+            });
+            Fx = xyv.empty() ? zero_field(gw2, gh2, G) : solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
+            ty.join();
+            // robust (app): a line the solved field does not follow - one that is not straight on the
+            // paper (a curve, a mis-trace, two pieces forced to one height) - is down-weighted as a
+            // whole, w = 1 / (1 + (median |residual| / 3 px)^2), and the fields solved again (IRLS:
+            // 2 reweights on the coarse pass, 1 on the fine one). Whole lines, not samples: a correct
+            // line with one sharp bend keeps its weight. A line's samples share its ideal position
+            // (the y of a horizontal sample, the x of a vertical one), which groups them.
+            if (robust) {
+                const double c = 3.0;
+                auto line_weights = [&](const std::vector<std::array<double, 2>>& pos, const Vec& v, const Field& F, int key) {
+                    std::map<double, std::vector<size_t>> groups;
+                    for (size_t i = 0; i < pos.size(); ++i) groups[pos[i][key]].push_back(i);
+                    Vec w(pos.size(), 1.0);
+                    for (const auto& kv : groups) {
+                        Vec r;
+                        for (size_t i : kv.second) r.push_back(std::fabs(v[i] - F.sample(pos[i][0], pos[i][1])));
+                        double m = median(r) / c, q = 1 / (1 + m * m);
+                        for (size_t i : kv.second) w[i] = q;
+                    }
+                    return w;
+                };
+                for (int rw = 0; rw < (it == 0 ? 2 : 1); ++rw) {
+                    Vec wy = line_weights(xy, val, Fy, 1), wx = line_weights(xyv, valv, Fx, 0);
+                    for (size_t i = 0; i < wy.size(); ++i) wy[i] *= wts[i];
+                    Field Fy0 = Fy, Fx0 = Fx;
+                    std::thread t2([&] { if (!xy.empty()) Fy = solve_field(xy, val, &wy, gw2, gh2, G, &Fy0, nullptr); });
+                    if (!xyv.empty()) Fx = solve_field(xyv, valv, &wx, gw2, gh2, G, &Fx0, nullptr);
+                    t2.join();
+                    double down = 0;
+                    for (double q : wx) down += q < 0.5;
+                    for (size_t i = 0; i < wy.size(); ++i) down += wy[i] < 0.5 * wts[i];
+                    d.n_downweighted = (int)down;
+                }
+            }
+            if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
+            Fy_prev = Fy; Fx_prev = Fx;
+        }
+        d.Fx = Fx_prev; d.Fy = Fy_prev;
+        d.ms.emplace_back("solves", ms_since(t0));
+        return compose_maps(d, w, h);
+    };
+    if (resume && resume->traced) {   // the first attempt's global stage and traces, then this call's drop_lines
+        auto t0 = Clock::now();
+        d = *resume->traced;
+        d.traced.reset();
+        d.ms.clear();
+        drop_lines_whole();
+        d.ms.emplace_back("lines: the first attempt's", ms_since(t0));
+        return solve_fields(Clock::now());
+    }
     auto t0 = Clock::now();
     // ---- global stage (global_grid)
     std::vector<DLine> Hs, Vs;
@@ -1895,10 +2097,8 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.n_ctrl = 0;
         d.GX = zero_field(gw, gh, GG);
         d.GY = zero_field(gw, gh, GG);
-    } else {   // the x and y fields are independent solves
-        std::thread tx([&] { d.GX = solve_field(cxy, vx, nullptr, gw, gh, GG, nullptr, &d.cg_iters[0]); });
-        d.GY = solve_field(cxy, vy, nullptr, gw, gh, GG, nullptr, &d.cg_iters[1]);
-        tx.join();
+    } else {   // the x and y fields: one operator, two right-hand sides
+        solve_field_pair(cxy, vx, vy, gw, gh, GG, d.GX, d.GY, &d.cg_iters[0], &d.cg_iters[1]);
     }
     d.ms.emplace_back("global", ms_since(t0));
     t0 = Clock::now();
@@ -1913,42 +2113,50 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         // (remapped with the page below) the CPU path runs
     } else {
         d.A_img.create(h, w, src.type());
+        if (!P0h.empty()) { d.PH.create(h, w, CV_32F); d.PV.create(h, w, CV_32F); }
+        if (!P0th.empty()) { d.TH.create(h, w, CV_32F); d.TV.create(h, w, CV_32F); }
+        // the 64-row bands are independent: on all cores, each with its own map rows
         const int band = 64;
-        cv::Mat mx(band, w, CV_32F), my(band, w, CV_32F);
-        for (int y0 = 0; y0 < h; y0 += band) {
-            int y1 = std::min(h, y0 + band);
-            for (int y = y0; y < y1; ++y) {
-                int iy = y >> 5;
-                float ay = (y & 31) * (1.f / 32), vy0 = 1.f - ay;
-                for (int x = 0; x < w; ++x) {
-                    int ix = x >> 5;
-                    float ax = (x & 31) * (1.f / 32), vx0 = 1.f - ax;
-                    size_t i00 = (size_t)iy * gw + ix;
-                    float ddx = gx[i00] * (vy0 * vx0) + gx[i00 + 1] * (vy0 * ax) + gx[i00 + gw] * (ay * vx0) + gx[i00 + gw + 1] * (ay * ax);
-                    float ddy = gy[i00] * (vy0 * vx0) + gy[i00 + 1] * (vy0 * ax) + gy[i00 + gw] * (ay * vx0) + gy[i00 + gw + 1] * (ay * ax);
-                    mx.at<float>(y - y0, x) = (float)x + ddx;
-                    my.at<float>(y - y0, x) = (float)y + ddy;
+        cv::parallel_for_(cv::Range(0, (h + band - 1) / band), [&](const cv::Range& R) {
+            cv::Mat mx(band, w, CV_32F), my(band, w, CV_32F);
+            for (int b = R.start; b < R.end; ++b) {
+                int y0 = b * band, y1 = std::min(h, y0 + band);
+                for (int y = y0; y < y1; ++y) {
+                    int iy = y >> 5;
+                    float ay = (y & 31) * (1.f / 32), vy0 = 1.f - ay;
+                    for (int x = 0; x < w; ++x) {
+                        int ix = x >> 5;
+                        float ax = (x & 31) * (1.f / 32), vx0 = 1.f - ax;
+                        size_t i00 = (size_t)iy * gw + ix;
+                        float ddx = gx[i00] * (vy0 * vx0) + gx[i00 + 1] * (vy0 * ax) + gx[i00 + gw] * (ay * vx0) + gx[i00 + gw + 1] * (ay * ax);
+                        float ddy = gy[i00] * (vy0 * vx0) + gy[i00 + 1] * (vy0 * ax) + gy[i00 + gw] * (ay * vx0) + gy[i00 + gw + 1] * (ay * ax);
+                        mx.at<float>(y - y0, x) = (float)x + ddx;
+                        my.at<float>(y - y0, x) = (float)y + ddy;
+                    }
+                }
+                cv::Mat dst = d.A_img.rowRange(y0, y1);
+                cv::remap(src, dst, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar::all(255));
+                if (!P0h.empty()) {
+                    cv::Mat ph = d.PH.rowRange(y0, y1), pv = d.PV.rowRange(y0, y1);
+                    cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                    cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                }
+                if (!P0th.empty()) {
+                    cv::Mat th = d.TH.rowRange(y0, y1), tv = d.TV.rowRange(y0, y1);
+                    cv::remap(P0th, th, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+                    cv::remap(P0tv, tv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
                 }
             }
-            cv::Mat dst = d.A_img.rowRange(y0, y1);
-            cv::remap(src, dst, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar::all(255));
-            if (!P0h.empty()) {
-                if (d.PH.empty()) { d.PH.create(h, w, CV_32F); d.PV.create(h, w, CV_32F); }
-                cv::Mat ph = d.PH.rowRange(y0, y1), pv = d.PV.rowRange(y0, y1);
-                cv::remap(P0h, ph, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-                cv::remap(P0v, pv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-            }
-            if (!P0th.empty()) {
-                if (d.TH.empty()) { d.TH.create(h, w, CV_32F); d.TV.create(h, w, CV_32F); }
-                cv::Mat th = d.TH.rowRange(y0, y1), tv = d.TV.rowRange(y0, y1);
-                cv::remap(P0th, th, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-                cv::remap(P0tv, tv, mx.rowRange(0, y1 - y0), my.rowRange(0, y1 - y0), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
-            }
-        }
+        });
     }
     d.D = darkness_fast(d.A_img);
     d.ms.emplace_back("global_remap+darkness", ms_since(t0));
     t0 = Clock::now();
+    // colour_edges' maps need only the page: made beside the line search below (abandoned if no
+    // line is found)
+    std::atomic<bool> no_edges{false};
+    std::future<ColourEdgeMaps> edge_maps;
+    if (edges && share_rows) edge_maps = std::async(std::launch::async, [&] { return colour_edge_maps(d.A_img, no_edges); });
     // ---- local stage (local_field)
     const cv::Mat* PH = d.PH.empty() ? nullptr : &d.PH;
     const cv::Mat* PV = d.PV.empty() ? nullptr : &d.PV;
@@ -1956,8 +2164,9 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     // app: the text lines from the text-line net (any script; ink blobs otherwise, text_rows below)
     if (!d.TH.empty()) {
         d.text_net = true;
+        auto tv = std::async(std::launch::async, [&] { return text_rows_net(d.TV, false, d.n_text_v); });
         d.T = text_rows_net(d.TH, true, d.n_text);
-        d.TVs = text_rows_net(d.TV, false, d.n_text_v);
+        d.TVs = tv.get();
     }
     const int GC = 16, GF = 8;
     // (app: lines of one direction alone are straightened too - a ruled sheet, a receipt with only
@@ -1968,6 +2177,7 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
         // pages then get the surface model only (without the text-line net).
         d.n_text = 0;
+        no_edges = true;
         d.Fx = d.Fy = d.Fx1 = d.Fy1 = zero_field(w / GF + 2, h / GF + 2, GF);
         d.ms.emplace_back("lines (none: zero field)", ms_since(t0));
         return compose_maps(d, w, h);
@@ -1979,117 +2189,32 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
     if (faint) {   // app: aligned text-column edges as vertical lines (text_margins)
         d.M = text_margins(d.D, d.H, d.V, d.n_margins);
         drop(d.M, false);
-        drop_whole(d.M, false);
     }
     if (edges && share_rows) {
         Lines eh, ev;
-        colour_edges(d.A_img, d.H, d.V, d.EH, d.EV, eh, ev, d.n_edge_bowed);
+        colour_edges(edge_maps.get(), d.H, d.V, d.EH, d.EV, eh, ev, d.n_edge_bowed);
         d.n_edges_h = (int)eh.size();
         d.E_lines = eh;
         d.E_lines.insert(d.E_lines.end(), ev.begin(), ev.end());
         drop(d.EH, true);
         drop(d.EV, false);
-        drop_whole(d.EH, true);
-        drop_whole(d.EV, false);
     }
     drop(d.S1.h, true);
     drop(d.S1.v, false);
     drop(d.T, true);
     drop(d.TVs, false);
-    drop_whole(d.S1.h, true);
-    drop_whole(d.S1.v, false);
-    drop_whole(d.T, true);
-    drop_whole(d.TVs, false);
+    // nothing above depends on drop_lines: a retry with other drop_lines starts here (resume)
+    if (dbg && dbg->keep_traced) d.traced = std::make_shared<const WarpDebug>(d);
+    drop_lines_whole();
     d.ms.emplace_back("lines+trace pass1+text", ms_since(t0));
     t0 = Clock::now();
-    Field Fx_prev, Fy_prev;
-    for (int it = 0; it < 2; ++it) {
-        int G = it == 1 ? GF : GC;
-        int gw2 = w / G + 2, gh2 = h / G + 2;
-        const Samples& S = it == 0 ? d.S1 : d.S2;
-        if (it == 1) {
-            auto tc = Clock::now();
-            d.S2 = collect(D, d.H, d.V, &Fx_prev, &Fy_prev, threads, share_rows, faint, PH, PV);
-            if (share_rows && faint) corner_junctions(d.S2, d.H, d.V);
-            drop(d.S2.h, true);
-            drop(d.S2.v, false);
-            drop_whole(d.S2.h, true);
-            drop_whole(d.S2.v, false);
-            d.ms.emplace_back("trace pass2", ms_since(tc));
-        }
-        const Samples& SS = it == 0 ? d.S1 : d.S2;
-        (void)S;
-        std::vector<std::array<double, 2>> xy;
-        Vec val, wts;
-        for (const auto& r : SS.h) {
-            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
-        }
-        for (const auto& r : d.T) {
-            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);   // TEXT_W = 1
-        }
-        for (const auto& r : d.EH) {
-            double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-            xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
-        }
-        Field warm_y, warm_x;
-        if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
-        std::vector<std::array<double, 2>> xyv;
-        Vec valv;
-        for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
-                                                              (const std::vector<std::array<double, 3>>*)&d.EV,
-                                                              (const std::vector<std::array<double, 3>>*)&d.TVs})
-            for (const auto& r : *src) {
-                double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
-                xyv.push_back({r[1], ys}); valv.push_back(r[2]);
-            }
-        Field Fy, Fx;
-        // every sample of one direction ignored: nothing to straighten that way
-        std::thread ty([&] {
-            Fy = xy.empty() ? zero_field(gw2, gh2, G) : solve_field(xy, val, &wts, gw2, gh2, G, it == 1 ? &warm_y : nullptr, &d.cg_iters[2 + 2 * it]);
-        });
-        Fx = xyv.empty() ? zero_field(gw2, gh2, G) : solve_field(xyv, valv, nullptr, gw2, gh2, G, it == 1 ? &warm_x : nullptr, &d.cg_iters[3 + 2 * it]);
-        ty.join();
-        // robust (app): a line the solved field does not follow - one that is not straight on the
-        // paper (a curve, a mis-trace, two pieces forced to one height) - is down-weighted as a
-        // whole, w = 1 / (1 + (median |residual| / 3 px)^2), and the fields solved again (IRLS:
-        // 2 reweights on the coarse pass, 1 on the fine one). Whole lines, not samples: a correct
-        // line with one sharp bend keeps its weight. A line's samples share its ideal position
-        // (the y of a horizontal sample, the x of a vertical one), which groups them.
-        if (robust) {
-            const double c = 3.0;
-            auto line_weights = [&](const std::vector<std::array<double, 2>>& pos, const Vec& v, const Field& F, int key) {
-                std::map<double, std::vector<size_t>> groups;
-                for (size_t i = 0; i < pos.size(); ++i) groups[pos[i][key]].push_back(i);
-                Vec w(pos.size(), 1.0);
-                for (const auto& kv : groups) {
-                    Vec r;
-                    for (size_t i : kv.second) r.push_back(std::fabs(v[i] - F.sample(pos[i][0], pos[i][1])));
-                    double m = median(r) / c, q = 1 / (1 + m * m);
-                    for (size_t i : kv.second) w[i] = q;
-                }
-                return w;
-            };
-            for (int rw = 0; rw < (it == 0 ? 2 : 1); ++rw) {
-                Vec wy = line_weights(xy, val, Fy, 1), wx = line_weights(xyv, valv, Fx, 0);
-                for (size_t i = 0; i < wy.size(); ++i) wy[i] *= wts[i];
-                Field Fy0 = Fy, Fx0 = Fx;
-                std::thread t2([&] { if (!xy.empty()) Fy = solve_field(xy, val, &wy, gw2, gh2, G, &Fy0, nullptr); });
-                if (!xyv.empty()) Fx = solve_field(xyv, valv, &wx, gw2, gh2, G, &Fx0, nullptr);
-                t2.join();
-                double down = 0;
-                for (double q : wx) down += q < 0.5;
-                for (size_t i = 0; i < wy.size(); ++i) down += wy[i] < 0.5 * wts[i];
-                d.n_downweighted = (int)down;
-            }
-        }
-        if (it == 0) { d.Fx1 = Fx; d.Fy1 = Fy; }
-        Fy_prev = Fy; Fx_prev = Fx;
-    }
-    d.Fx = Fx_prev; d.Fy = Fy_prev;
-    d.ms.emplace_back("solves", ms_since(t0));
-    return compose_maps(d, w, h);
+    return solve_fields(t0);
 }
+
+Field solve_field_at(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh, int G) {
+    return solve_field(xy, values, weights, gw, gh, G, nullptr, nullptr);
+}
+
+Field zeros_field(int gw, int gh, int g) { return zero_field(gw, gh, g); }
 
 }  // namespace fs

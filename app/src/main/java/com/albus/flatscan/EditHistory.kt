@@ -15,6 +15,9 @@ data class EditState(
     val rotation: Int,
     val protect: List<Float>,
     val erase: List<Float>,
+    val fingersAuto: Boolean = true,
+    val fingerStrokes: List<Float> = emptyList(),
+    val fingerFill: Int = 0,
 )
 
 /**
@@ -95,7 +98,7 @@ object LookPrefs {
     /** A new page's look: the defaults with the page shape chosen last. */
     fun newPageLook(ctx: Context): PageLook {
         val name = prefs(ctx).getString("shape", null)
-        return PageLook(shape = PageShape.entries.firstOrNull { it.name == name } ?: PageShape.AsScanned)
+        return PageLook(shape = PageShape.entries.firstOrNull { it.name == name } ?: PageShape.Auto)
     }
 
     fun rememberShape(ctx: Context, shape: PageShape) {

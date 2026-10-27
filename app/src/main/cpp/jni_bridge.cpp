@@ -1,12 +1,14 @@
 // JNI bridge: Android Bitmaps (RGBA_8888) <-> the C++ core (BGR / BGRA cv::Mat).
 // Implements app/src/main/java/com/albus/flatscan/NativeLib.kt exactly.
 #include <android/asset_manager_jni.h>
+#include "board.h"
 #include <android/bitmap.h>
 #include <jni.h>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +19,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -25,6 +28,7 @@
 
 #include "cleanup.h"
 #include "screen.h"
+#include "linefind.h"
 #include "gpu.h"
 #include "infer.h"
 #include "log.h"
@@ -33,6 +37,7 @@
 #include "overlay.h"
 #include "pagefind.h"
 #include "pipeline.h"
+#include "preview.h"
 #include "uvdoc.h"
 
 #ifdef FS_WITH_ORT
@@ -59,6 +64,7 @@ struct Session {
     std::string before_file;  // restored sessions: the before page, read on first use (before_page)
     std::vector<std::pair<cv::Size, cv::Mat>> small;   // paper-filled page, INTER_AREA, by size
     cv::Mat page_orig, paper_orig;   // the page before the Erase tool (kept from its first use)
+    cv::Mat ai_mask, ai_page;        // the finger mask the AI fill last painted, and the page it made (setEdits)
     bool use_gpu = true;
     std::string accel;        // the nets' timings and backends: the members of info()'s "accel" object
 
@@ -141,6 +147,7 @@ Session* session(jlong h) { return reinterpret_cast<Session*>(h); }
 // process()), so a snapshot is cheap to take and can be written on another thread.
 struct Snapshot {
     cv::Mat page, paper, before;
+    cv::Mat page_unerased, paper_unerased, finger_mask;   // the finger brush's base (empty: no finger found)
     GridMap disp;
     std::vector<std::array<float, 5>> lines;
     float legend_px = 1.f;
@@ -227,6 +234,12 @@ bool write_snapshot(const Snapshot& s, const std::string& dir) {
         if (s.before.channels() == 4) cv::cvtColor(s.before, bgr, cv::COLOR_BGRA2BGR);
         else bgr = s.before;
         if (!cv::imwrite(dir + "/before.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 90})) return false;
+    }
+    if (!s.finger_mask.empty() && !s.page_unerased.empty()) {
+        cv::cvtColor(s.page_unerased, bgr, cv::COLOR_BGRA2BGR);
+        if (!cv::imwrite(dir + "/page_unerased.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 95})) return false;
+        if (!cv::imwrite(dir + "/fingers.png", s.finger_mask, {cv::IMWRITE_PNG_COMPRESSION, 1})) return false;
+        if (!s.paper_unerased.empty() && !cv::imwrite(dir + "/paper_unerased.png", s.paper_unerased, {cv::IMWRITE_PNG_COMPRESSION, 1})) return false;
     }
     const GridMap& g = s.disp;
     if (!write_floats(dir + "/disp.bin", {g.out_w, g.out_h, g.gw, g.gh, g.stride}, {&g.x, &g.y})) return false;
@@ -448,18 +461,28 @@ struct NetGroup {
 
 std::mutex g_nets_mu;             // guards everything below
 std::shared_ptr<NetGroup> g_finder, g_flat, g_hr, g_shade, g_rule;
+std::shared_ptr<NetGroup> g_inpaint;   // the finger AI fill (MI-GAN): CPU only, its own Inference
 jobject g_assets = nullptr;       // global reference: keeps the AAssetManager alive
 AAssetManager* g_mgr = nullptr;
+std::condition_variable g_mgr_cv;  // configureNets set g_mgr
 std::string g_cache_dir;          // compiled-model cache (the LiteRT GPU's serialised kernels)
 int g_threads = 0;
+bool g_gpu_exhaustive = false;    // the LiteRT GPU's exhaustive work-group tuning (debug, setGpuTuning)
 bool g_static_models = false;     // the CPU loads the fixed-shape UVDoc / SyntheticDoc copies (HUMAN GATE A-1)
+
+// The asset manager; a net asked for before the first configureNets (the app makes that call on its native
+// thread at start, off the main thread) waits for it, up to 10 s. Caller holds lk (g_nets_mu).
+AAssetManager* assets_locked(std::unique_lock<std::mutex>& lk) {
+    g_mgr_cv.wait_for(lk, std::chrono::seconds(10), [] { return g_mgr != nullptr; });
+    return g_mgr;
+}
 
 // assets/models/<file>, or empty (missing: that net or backend is unavailable)
 std::vector<uint8_t> load_model(std::string file) {
     AAssetManager* mgr;
     {
-        std::lock_guard<std::mutex> lk(g_nets_mu);
-        mgr = g_mgr;
+        std::unique_lock<std::mutex> lk(g_nets_mu);
+        mgr = assets_locked(lk);
         if (g_static_models && file == "uvdoc.onnx") file = "uvdoc_static.onnx";
         if (g_static_models && file == "syntheticdoc_hr.onnx") file = "syntheticdoc_hr_static.onnx";
     }
@@ -478,18 +501,68 @@ std::vector<uint8_t> load_model(std::string file) {
     return v;
 }
 
+// assets/models/<file> is in the APK (checked once per file)
+bool has_model(const std::string& file) {
+    static std::mutex mu;
+    static std::map<std::string, bool> known;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = known.find(file);
+        if (it != known.end()) return it->second;
+    }
+    AAssetManager* mgr;
+    {
+        std::unique_lock<std::mutex> lk(g_nets_mu);
+        mgr = assets_locked(lk);
+    }
+    bool ok = false;
+    if (mgr) {
+        AAsset* a = AAssetManager_open(mgr, ("models/" + file).c_str(), AASSET_MODE_UNKNOWN);
+        if (a) { ok = true; AAsset_close(a); }
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    known[file] = ok;
+    return ok;
+}
+
+// assets/models/<file> in place: the APK's uncompressed asset (noCompress tflite), mapped while the view lives;
+// no data (missing, or the static-model .onnx names): load_model copies it instead
+ModelView map_model(const std::string& file) {
+    AAssetManager* mgr;
+    {
+        std::unique_lock<std::mutex> lk(g_nets_mu);
+        mgr = assets_locked(lk);
+    }
+    ModelView v;
+    if (!mgr) return v;
+    AAsset* a = AAssetManager_open(mgr, ("models/" + file).c_str(), AASSET_MODE_BUFFER);
+    if (!a) return v;
+    const void* p = AAsset_getBuffer(a);
+    const off_t n = AAsset_getLength(a);
+    if (!p || n <= 0 || (uintptr_t)p % 4 != 0) {   // TFLite wants a 4-byte aligned buffer
+        AAsset_close(a);
+        return v;
+    }
+    v.data = (const uint8_t*)p;
+    v.size = (size_t)n;
+    v.keep = std::shared_ptr<const void>(a, [](const void* x) { AAsset_close((AAsset*)x); });
+    return v;
+}
+
 // caller holds g_nets_mu
 std::shared_ptr<NetGroup> make_group(const std::string& pref) {
     auto g = std::make_shared<NetGroup>();
     g->pref = pref;
     InferConfig c;
     c.load = load_model;
+    c.map = map_model;
     if (!parse_backends(pref, c.preference)) {
         LOGI("nets: unknown backend in \"%s\": CPU only", pref.c_str());
         c.preference.clear();
     }
     c.cache_dir = g_cache_dir;
     c.threads = g_threads;
+    c.gpu_exhaustive_tuning = g_gpu_exhaustive;
     g->inf = Inference::create(c);
     return g;
 }
@@ -574,9 +647,192 @@ std::vector<double> grid_px(const std::vector<float>& a, const std::vector<float
     return d;
 }
 
+// ---- the flattening nets ahead of processing (precomputeNets): while the crop screen is open. With
+// automatic corners they depend only on the photo, the page finder's output, the page of a spread and
+// the nets setting (a first UVDoc pass on the whole photo finds the page; the detection's corners only
+// where that pass fails, and the detection is the same function of the photo). process() takes them
+// when it runs with the same inputs on the same net groups (configureNets makes new ones), so the page
+// is the same; otherwise they are cancelled and process runs its own.
+uint64_t fnv(uint64_t h, const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, b + i, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// the photo and the page finder's output
+uint64_t photo_key(const cv::Mat& bgr, const std::vector<float>& logits) {
+    uint64_t h = 1469598103934665603ull;
+    const int head[2] = {bgr.cols, bgr.rows};
+    h = fnv(h, head, sizeof head);
+    for (int y = 0; y < bgr.rows; ++y) h = fnv(h, bgr.ptr(y), bgr.cols * bgr.elemSize());
+    return fnv(h, logits.data(), logits.size() * sizeof(float));
+}
+
+uint64_t nets_key(uint64_t photo, int page_index, int flat_nets) {
+    const int v[2] = {page_index, flat_nets};
+    return fnv(photo, v, sizeof v);
+}
+
+// ---- the crop screen's detection for process(): NativeLib.detect's pages of the last photo (assess_pages),
+// keyed by the photo, the page finder's output and the focal length. process() with automatic corners takes the
+// page's corners and surface fit (PipelineOptions::assessed: the same values, not made again).
+struct Assessed {
+    uint64_t key = 0;
+    std::vector<PageAssessment> pages;
+};
+std::mutex g_assessed_mu;
+Assessed g_assessed;
+
+uint64_t assessed_key(uint64_t photo, float focal_px) { return fnv(photo, &focal_px, sizeof focal_px); }
+
+// their grids, and whether every net that was to run ran (false: cancelled, process then runs its own)
+struct AheadResult {
+    NetsResult nets;
+    bool complete = false;
+};
+
+struct AheadNets {
+    uint64_t key = 0;
+    std::shared_ptr<NetGroup> flat, hr;   // the groups they run on
+    cv::Mat bgr;                          // the inputs, until run_ahead takes them
+    std::vector<float> logits;
+    int page_index = 0, nets = 0;
+    bool started = false;
+    std::shared_ptr<std::promise<AheadResult>> done;
+    std::shared_future<AheadResult> result;
+    std::shared_ptr<std::atomic<bool>> cancel;
+};
+std::mutex g_ahead_mu;
+AheadNets g_ahead;
+
+// caller holds g_ahead_mu. A set that never started is answered at once (incomplete); one that runs stops
+// before its next net and answers then.
+void drop_ahead() {
+    if (g_ahead.cancel) *g_ahead.cancel = true;
+    if (g_ahead.done && !g_ahead.started) g_ahead.done->set_value(AheadResult());
+    g_ahead = AheadNets();
+}
+
+// Runs the registered set on the calling thread; returns when its nets are done or cancelled (at once if
+// there is none, or it runs or ran elsewhere).
+void run_ahead() {
+    AheadNets a;
+    {
+        std::lock_guard<std::mutex> lk(g_ahead_mu);
+        if (!g_ahead.done || g_ahead.started) return;
+        g_ahead.started = true;
+        a = g_ahead;
+        g_ahead.bgr.release();
+        g_ahead.logits.clear();
+    }
+    AheadResult res;
+    try {
+        NetsRequest rq;
+        rq.nets = (FlatNets)a.nets;
+        rq.seg_logits = a.logits.empty() ? nullptr : a.logits.data();
+        rq.page_index = a.page_index;
+        rq.cancel = a.cancel.get();
+        // as run_photo's: the detection's corners, asked for only without a first-pass grid
+        PageCorners pc;
+        bool detected = false;
+        rq.corners_fn = [&]() -> const std::array<cv::Point2d, 4>* {
+            if (!detected) {
+                pc = detect_corners(a.bgr, PipelineOptions().max_analysis_side, rq.seg_logits, a.page_index);
+                detected = true;
+            }
+            return pc.ok ? &pc.pts : nullptr;
+        };
+        res.nets = run_flat_nets(a.bgr, rq, *a.flat->inf, a.hr->inf.get());
+        res.complete = !*a.cancel;
+    } catch (const std::exception& e) {
+        LOGI("flattening nets ahead failed: %s", e.what());
+        res = AheadResult();
+    }
+    a.done->set_value(std::move(res));
+}
+
 }  // namespace
 
 extern "C" {
+
+// The flattening nets for this photo with automatic corners (see AheadNets), in two steps: this call
+// registers them (from here on a process() of the same inputs waits for them instead of running its own),
+// runPrecompute runs them. Replaces (and cancels) an earlier set.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_precomputeNets(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,
+                                                                        jint page_index, jint flat_nets) {
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    std::vector<float> lg = read_logits(env, logits);
+    std::lock_guard<std::mutex> lk(g_ahead_mu);
+    drop_ahead();
+    if (bgr.empty()) return;
+    AheadNets& a = g_ahead;
+    a.nets = std::min(2, std::max(0, (int)flat_nets));
+    a.key = nets_key(photo_key(bgr, lg), page_index, a.nets);
+    a.flat = group(g_flat);
+    a.hr = group(g_hr);
+    a.bgr = bgr;
+    a.logits = std::move(lg);
+    a.page_index = page_index;
+    a.cancel = std::make_shared<std::atomic<bool>>(false);
+    a.done = std::make_shared<std::promise<AheadResult>>();
+    a.result = a.done->get_future().share();
+}
+
+// Runs the registered set on the calling thread (run_ahead).
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_runPrecompute(JNIEnv*, jclass) { run_ahead(); }
+
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_cancelPrecompute(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lk(g_ahead_mu);
+    drop_ahead();
+}
+
+// Whiteboard mode: the board or projector screen in the photo (board.cpp find_board). Returns
+// [x0, y0, ... x3, y3 (TL, TR, BR, BL, photo px), confidence, area share, dark (1: a dark slide)] or null
+// when no reliable quadrilateral is found (the app then offers the whole frame for manual corners).
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_detectBoard(JNIEnv* env, jclass, jobject bmp) {
+    cv::Mat bgr = bitmap_to_bgr(env, bmp);
+    if (bgr.empty()) return nullptr;
+    BoardQuad q = find_board(bgr);
+    if (!q.ok) return nullptr;
+    bool dark = board_is_dark(bgr, q);
+    float out[11];
+    for (int i = 0; i < 4; ++i) { out[2 * i] = (float)q.pts[i].x; out[2 * i + 1] = (float)q.pts[i].y; }
+    out[8] = (float)q.confidence;
+    out[9] = (float)q.area;
+    out[10] = dark ? 1.f : 0.f;
+    jfloatArray a = env->NewFloatArray(11);
+    env->SetFloatArrayRegion(a, 0, 11, out);
+    return a;
+}
+
+// Export (feature 3): a one-channel (grayscale) JPEG of an RGBA_8888 bitmap at [quality]; Android's own
+// encoder writes only three-channel JPEGs. Luma as in the BT.601 conversion of cv::cvtColor. Null on failure.
+JNIEXPORT jbyteArray JNICALL Java_com_albus_flatscan_NativeLib_encodeGrayJpeg(JNIEnv* env, jclass, jobject bitmap, jint quality) {
+    AndroidBitmapInfo info;
+    void* px = nullptr;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &px) != ANDROID_BITMAP_RESULT_SUCCESS) return nullptr;
+    std::vector<uchar> buf;
+    bool ok = false;
+    try {
+        cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, px, info.stride), gray;
+        cv::cvtColor(rgba, gray, cv::COLOR_RGBA2GRAY);
+        ok = cv::imencode(".jpg", gray, buf, {cv::IMWRITE_JPEG_QUALITY, (int)quality});
+    } catch (const std::exception& e) {
+        LOGI("encodeGrayJpeg failed: %s", e.what());
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+    if (!ok) return nullptr;
+    jbyteArray out = env->NewByteArray((jsize)buf.size());
+    env->SetByteArrayRegion(out, 0, (jsize)buf.size(), reinterpret_cast<const jbyte*>(buf.data()));
+    return out;
+}
 
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_gpuInfo(JNIEnv* env, jclass) {
     bool ok = Gpu::instance().available();
@@ -597,6 +853,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_configureNets(JNIEnv* e
     if (!g_assets && assets) {
         g_assets = env->NewGlobalRef(assets);
         g_mgr = AAssetManager_fromJava(env, g_assets);
+        g_mgr_cv.notify_all();
     }
     const bool same = cd == g_cache_dir && threads == g_threads && (bool)static_models == g_static_models;
     g_cache_dir = cd;
@@ -656,6 +913,63 @@ JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_pageFinder(JNIEn
     return a;
 }
 
+// The page finder's session made ahead of its first photo (the camera screen): one run on a blank input. The
+// first photo's entry then says first_use false, as its run no longer makes the session.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_prewarmFinder(JNIEnv*, jclass) {
+    auto g = group(g_finder);
+    if (!g->first_use(NetId::PageFinder)) return;
+    Tensor x{{1, 3, SEG_SIZE, SEG_SIZE}, std::vector<float>((size_t)SEG_INPUT_LEN, 0.f)};
+    std::vector<Tensor> y;
+    std::string err;
+    if (!g->inf->run(NetId::PageFinder, x, y, &err)) LOGI("page finder warm-up: %s", err.c_str());
+}
+
+// Debug: the LiteRT GPU's exhaustive work-group tuning instead of the fast one (infer.h), from the next
+// sessions: the groups are made again.
+JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_setGpuTuning(JNIEnv*, jclass, jboolean exhaustive) {
+    std::lock_guard<std::mutex> lk(g_nets_mu);
+    if ((bool)exhaustive == g_gpu_exhaustive) return;
+    g_gpu_exhaustive = exhaustive;
+    for (std::shared_ptr<NetGroup>* s : {&g_finder, &g_flat, &g_hr, &g_shade, &g_rule})
+        if (*s) *s = make_group((*s)->pref);
+}
+
+// The app's GPU sessions made ahead of the first page (after Auto's benchmark, which leaves the app's groups
+// empty): one run on a blank input of every net and shape the groups run on the GPU (UVDoc, SyntheticDoc high-res,
+// the shadow net at its GPU shape, the rule net portrait and landscape); the GPU compiles and tunes its kernels
+// there, not mid-page. Groups on the CPU are left alone. -> text, one line per net: its setup ms and backend.
+JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_prewarmGpu(JNIEnv* env, jclass, jobject listener) {
+    Progress progress(env, listener);
+    struct Warm { std::shared_ptr<NetGroup>* slot; NetId net; int h, w; const char* name; };
+    const UvSpec& uv = uv_spec(0);
+    const UvSpec& hr = uv_spec(2);
+    const std::vector<Warm> all = {
+        {&g_flat, NetId::UVDoc, uv.in_h, uv.in_w, "UVDoc"},
+        {&g_hr, NetId::SynthDocHR, hr.in_h, hr.in_w, "SyntheticDoc high-res"},
+        {&g_shade, NetId::ShadeNet, 512, 352, "the shadow net"},
+        {&g_rule, NetId::RuleNet, 1152, 800, "the rule net (portrait)"},
+        {&g_rule, NetId::RuleNet, 800, 1152, "the rule net (landscape)"},
+    };
+    std::ostringstream o;
+    for (size_t i = 0; i < all.size(); ++i) {
+        const Warm& w = all[i];
+        auto g = group(*w.slot);
+        if (g->pref.find("gpu") == std::string::npos) continue;
+        progress((int)(100 * i / all.size()), w.name);
+        g->first_use(w.net);   // the session is made here: the page's own first run is not its first use
+        Tensor x{{1, 3, w.h, w.w}, std::vector<float>((size_t)3 * w.h * w.w, 0.f)};
+        std::vector<Tensor> y;
+        std::string err;
+        auto t0 = Clock::now();
+        const bool ok = g->inf->run(w.net, x, y, &err);
+        o << w.name << " " << w.h << "x" << w.w << ": " << std::lround(ms_since(t0)) << " ms on " << backend_name(g->inf->backend(w.net))
+          << (ok ? "" : " (failed: " + err + ")") << "\n";
+    }
+    progress(100, "Done");
+    LOGI("GPU warm-up:\n%s", o.str().c_str());
+    return env->NewStringUTF(o.str().c_str());
+}
+
 // -> JSON {"ok", "error", "finder", ..., "pages": [{"corners": [x0, y0, ... x3, y3] (bitmap px, TL TR BR BL),
 //    "ok", "fit_median_px", "needs_manual_crop": [reasons], finder fields}, ...]} (2 pages: book spread)
 JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, jclass, jobject bmp, jfloatArray logits,
@@ -666,6 +980,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_detect(JNIEnv* env, 
     std::vector<PageAssessment> pages;
     try {
         pages = assess_pages(bgr, lg.empty() ? nullptr : lg.data(), focal_px);
+        std::lock_guard<std::mutex> lk(g_assessed_mu);
+        g_assessed.key = assessed_key(photo_key(bgr, lg), focal_px);
+        g_assessed.pages = pages;
     } catch (const std::exception& e) {
         LOGI("detect failed: %s", e.what());
         return env->NewStringUTF((std::string("{\"ok\": false, \"error\": \"") + escape(e.what()) + "\", \"pages\": []}").c_str());
@@ -694,7 +1011,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jboolean flatten, jint flat_nets, jboolean shadows, jboolean rules,
-                                                                  jobject listener) {
+                                                                  jboolean board, jboolean remove_shadows, jfloatArray user_lines, jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -716,10 +1033,44 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     std::vector<float> lg = read_logits(env, logits);
     o.seg_logits = lg.empty() ? nullptr : lg.data();
     o.page_index = page_index;
+    // automatic corners: what the crop screen found for this photo (NativeLib.detect), and the nets ahead, are
+    // taken when they were made from the same inputs
+    const uint64_t pkey = o.corners_edited ? 0 : photo_key(bgr, lg);
+    PageAssessment assessed;
+    if (!o.corners_edited) {
+        std::lock_guard<std::mutex> lk(g_assessed_mu);
+        if (g_assessed.key == assessed_key(pkey, focal_px) && page_index >= 0 && page_index < (int)g_assessed.pages.size() &&
+            g_assessed.pages[page_index].pc.ok) {
+            assessed = g_assessed.pages[page_index];
+            o.assessed = &assessed;
+        }
+    }
     o.force_homography = force_homography;
     o.perspective_only = perspective_only;
     for (const Rect01& q : parse_protect(env, ignore)) o.ignore.push_back({q.x0, q.y0, q.x1, q.y1});
+    // the line editor's drawn lines: [group, n, x0, y0, ... x(n-1), y(n-1)] repeated, output-page fractions
+    if (user_lines) {
+        jsize n = env->GetArrayLength(user_lines);
+        std::vector<float> v(n);
+        if (n) env->GetFloatArrayRegion(user_lines, 0, n, v.data());
+        size_t i = 0;
+        while (i + 2 <= v.size()) {
+            PipelineOptions::UserLine l;
+            l.group = (int)std::lround(v[i]);
+            size_t np = (size_t)std::max(0.f, v[i + 1]);
+            i += 2;
+            if (i + 2 * np > v.size()) break;
+            for (size_t k = 0; k < np; ++k) l.pts.emplace_back(v[i + 2 * k], v[i + 2 * k + 1]);
+            i += 2 * np;
+            if (l.pts.size() >= 2) o.user_lines.push_back(std::move(l));
+        }
+    }
+    // the page's Remove shadows switch: off, neither the shading map nor the shadow net
+    o.remove_shadows = remove_shadows;
     o.auto_orient = auto_orient;
+    // whiteboard mode: a board is not held by fingers (and skin-coloured drawings must stay)
+    if (board) o.erase_fingers = false;
+    o.keep_unerased = true;   // the finger brush (setEdits) starts from the page before the fill
     o.render_w = render_w;
     o.use_gpu = use_gpu;
     Progress progress(env, listener);
@@ -729,6 +1080,7 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     // They run on a worker thread, which must not touch JNI: their entries are made after run_photo.
     std::ostringstream acc;   // the "accel" nets entries (info)
     NetsResult nets;
+    bool nets_ahead = false;   // the grids came from precomputeNets
     std::shared_ptr<NetGroup> flat_g, hr_g;
     if (flatten && !perspective_only) {
         flat_g = group(g_flat);
@@ -738,7 +1090,40 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         rq.nets = (FlatNets)std::min(2, std::max(0, (int)flat_nets));
         rq.seg_logits = o.seg_logits;
         rq.page_index = page_index;
-        o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
+        // the nets started on the crop screen, if they ran on this photo with these inputs (precomputeNets)
+        std::shared_future<AheadResult> ahead;
+        {
+            std::lock_guard<std::mutex> lk(g_ahead_mu);
+            if (g_ahead.result.valid()) {
+                if (!o.corners_edited && g_ahead.flat == flat_g && g_ahead.hr == hr_g && g_ahead.key == nets_key(pkey, page_index, (int)rq.nets))
+                    ahead = g_ahead.result;
+                else
+                    drop_ahead();
+            }
+        }
+        if (ahead.valid()) {
+            nets_ahead = true;
+            FlatNetsFn own = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
+            o.flat_nets = [ahead, own, &nets, &nets_ahead](const NetCornersFn& corners) {
+                run_ahead();   // not started yet: here (this set, or a replaced one, already answered)
+                const AheadResult& a = ahead.get();
+                if (!a.complete) {   // cancelled before it ran every net: this run's own
+                    nets_ahead = false;
+                    return own(corners);
+                }
+                nets = a.nets;
+                FlatNetGrids g;
+                g.grid1 = nets.grid1;
+                g.grid2 = nets.grid2;
+                g.grid_pass1 = nets.grid_pass1;
+                g.crop1 = nets.crop1;
+                g.crop2 = nets.crop2;
+                g.crop_pass1 = nets.crop_pass1;
+                return g;
+            };
+        } else {
+            o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
+        }
     }
     // the shadow net, after SyntheticDoc's grid (as with the Kotlin ShadeNet)
     NetCall shade;
@@ -753,6 +1138,12 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     if (rules) {
         rule.g = group(g_rule);
         o.rule_net = rule.fn();
+    }
+    // the orientation net (orientnet.onnx), on the rule net's group, when the app ships it
+    std::shared_ptr<NetGroup> orient_g;
+    if (has_model("orientnet.tflite")) {
+        orient_g = group(g_rule);
+        o.orient_net = orient_net_fn(*orient_g->inf);
     }
     o.progress = [&](int pct, const char* stage) { progress(pct, stage); };
     auto t1 = Clock::now();
@@ -793,7 +1184,9 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
     if (rule.calls > 0) acc << (acc.tellp() > 0 ? ", " : "") << "\"rulenet\": " << rule.entry();
     std::ostringstream a;
     a << "\"nets\": {" << acc.str() << "}, \"flattening_nets_ms\": " << std::lround(std::max(0.0, r.nets_ms)) << ", \"nets_overlap\": " << r.nets_overlap
-      << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"process_ms\": " << std::lround(ms_since(t1));
+      << ", \"nets_wait_ms\": " << std::lround(std::max(0.0, r.nets_wait_ms)) << ", \"nets_ahead\": " << (nets_ahead ? "true" : "false")
+      << ", \"detection_reused\": " << (o.assessed ? "true" : "false")
+      << ", \"process_ms\": " << std::lround(ms_since(t1));
     s->accel = a.str();
     if (!r.ok) LOGI("pipeline failed: %s", r.error.c_str());
     progress(100, "Done");
@@ -807,14 +1200,17 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
     std::ostringstream f;
     f << "{\"ok\": " << (r.ok ? "true" : "false") << ", \"error\": \"" << escape(r.error) << "\", \"mode\": \""
       << geom_mode_name(r.mode) << "\", \"fell_back\": " << (r.fell_back ? "true" : "false")
-      << ", \"fit_median_px\": " << r.fit_median_px << ", \"rot\": " << r.rot << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false")
+      << ", \"fit_median_px\": " << r.fit_median_px << ", \"rot\": " << r.rot << ", \"page_hw\": " << json_num(r.page_hw) << ", \"gpu_resample\": " << (r.gpu_resample ? "true" : "false")
       << ", \"legend_px\": " << s->legend_px << ", \"has_paper_mask\": " << (r.paper.empty() ? "false" : "true")
       << ", \"needs_manual_crop\": " << json_strings(r.needs_manual_crop)
       << ", \"fit_median_full_px\": " << json_num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1)
       << ", \"uv_agreement\": " << json_num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << json_num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false")
-      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
+      << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"fingers_over_text\": " << (r.fingers_over_text ? "true" : "false") << ", \"user_lines_used\": " << r.user_lines_used << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
+      << ", \"flat_page\": " << (r.flat_page ? "true" : "false")
+      << ", \"edge_doubt\": " << (r.edge_doubt ? "true" : "false") << ", \"net_edge_gap\": [" << json_num(r.net_edge_gap[0]) << ", "
+      << json_num(r.net_edge_gap[1]) << ", " << json_num(r.net_edge_gap[2]) << ", " << json_num(r.net_edge_gap[3]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
       << ", \"screen\": {\"detected\": " << (s->screen.screen ? "true" : "false") << ", \"score\": " << json_num(s->screen.score)
       << ", \"threshold\": " << json_num(kScreenThreshold) << "}"
@@ -938,19 +1334,88 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_release(JNIEnv*, jclass
 
 // Erase tool: the page as processed, then every rectangle (page fractions [x0, y0, x1, y1, ...])
 // filled with the paper around it. An empty array restores the page.
-JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setErase(JNIEnv* env, jclass, jlong h, jfloatArray rects) {
+// Finger brush strokes: [mode (1 add, 0 remove), radius (page-width fraction), n, x0, y0, ... x(n-1), y(n-1)]
+// repeated, points as page fractions; drawn into [mask] (255 add, 0 remove) in order. Modes 2 (add) and 3
+// (remove): the points outline an area (smart select), filled; the radius is not used.
+void draw_strokes(JNIEnv* env, jfloatArray strokes, cv::Mat& mask) {
+    if (!strokes) return;
+    jsize n = env->GetArrayLength(strokes);
+    std::vector<float> v(n);
+    if (n) env->GetFloatArrayRegion(strokes, 0, n, v.data());
+    size_t i = 0;
+    while (i + 3 <= v.size()) {
+        const int mode = (int)std::lround(v[i]);
+        const bool add = mode == 1 || mode == 2;
+        int th = std::max(1, (int)std::lround(2 * v[i + 1] * mask.cols));
+        size_t np = (size_t)std::max(0.f, v[i + 2]);
+        i += 3;
+        if (i + 2 * np > v.size()) break;
+        cv::Scalar c(add ? 255 : 0);
+        if (mode >= 2) {
+            std::vector<cv::Point> poly;
+            for (size_t k = 0; k < np; ++k) poly.emplace_back((int)std::lround(v[i + 2 * k] * mask.cols), (int)std::lround(v[i + 2 * k + 1] * mask.rows));
+            if (poly.size() >= 3) cv::fillPoly(mask, std::vector<std::vector<cv::Point>>{poly}, c, cv::LINE_8);
+            i += 2 * np;
+            continue;
+        }
+        for (size_t k = 0; k < np; ++k) {
+            cv::Point p((int)std::lround(v[i + 2 * k] * mask.cols), (int)std::lround(v[i + 2 * k + 1] * mask.rows));
+            cv::circle(mask, p, th / 2, c, cv::FILLED);
+            if (k + 1 < np) {
+                cv::Point q((int)std::lround(v[i + 2 * k + 2] * mask.cols), (int)std::lround(v[i + 2 * k + 3] * mask.rows));
+                cv::line(mask, p, q, c, th);
+            }
+        }
+        i += 2 * np;
+    }
+}
+
+// The finger mask a render uses: the automatic one (unless [auto_on] is false) with the brush strokes.
+cv::Mat finger_mask_for(JNIEnv* env, const PipelineResult& r, cv::Size size, bool auto_on, jfloatArray strokes) {
+    cv::Mat m = auto_on && !r.finger_mask.empty() && r.finger_mask.size() == size ? r.finger_mask.clone() : cv::Mat::zeros(size, CV_8U);
+    draw_strokes(env, strokes, m);
+    return m;
+}
+
+// The page's edits after processing: the finger mask (the automatic one when [fingers_auto], plus brush
+// [strokes]) filled with paper (fill_finger) - [fill] 1: then painted in by the inpainting net (inpaint_fill) -,
+// then the Erase tool's rectangles [rects] (page fractions).
+// Starts from the page before any finger fill, so removing a stroke or turning the automatic mask off
+// brings the photo's pixels back.
+JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setEdits(JNIEnv* env, jclass, jlong h, jfloatArray rects, jboolean fingers_auto, jfloatArray strokes,
+                                                                   jint fill) {
     Session* s = session(h);
     if (!s || !s->result.ok) return JNI_FALSE;
     std::vector<Rect01> rs = parse_protect(env, rects);
     PipelineResult& r = s->result;
     try {
         if (s->page_orig.empty()) {
-            if (rs.empty()) return JNI_TRUE;
             s->page_orig = r.page.clone();
             s->paper_orig = r.paper.clone();
         }
-        r.page = s->page_orig.clone();
-        r.paper = s->paper_orig.clone();
+        const bool has_base = !r.page_unerased.empty();
+        r.page = (has_base ? r.page_unerased : s->page_orig).clone();
+        r.paper = (has_base ? r.paper_unerased : s->paper_orig).clone();
+        if (has_base || (strokes && env->GetArrayLength(strokes) > 0)) {
+            cv::Mat fm = finger_mask_for(env, r, r.page.size(), fingers_auto, strokes);
+            if (cv::countNonZero(fm) > 0) {
+                fill_finger(r.page, fm, r.paper.empty() ? nullptr : &r.paper);
+                // fill 1: the AI fill over the paper fill (the same mask again: its last result)
+                if (fill == 1) {
+                    cv::Mat diff;
+                    if (!s->ai_mask.empty() && s->ai_mask.size() == fm.size() && s->ai_page.size() == r.page.size()) cv::bitwise_xor(fm, s->ai_mask, diff);
+                    if (!diff.empty() && cv::countNonZero(diff) == 0) {
+                        s->ai_page.copyTo(r.page);
+                    } else {
+                        auto g = group(g_inpaint);
+                        if (inpaint_fill(r.page, fm, *g->inf, r.paper_unerased.empty() ? nullptr : &r.paper_unerased)) {
+                            s->ai_mask = fm.clone();
+                            s->ai_page = r.page.clone();
+                        }
+                    }
+                }
+            }
+        }
         if (!rs.empty()) {
             cv::Mat mask = cv::Mat::zeros(r.page.size(), CV_8U);
             for (const Rect01& q : rs) {
@@ -964,10 +1429,124 @@ JNIEXPORT jboolean JNICALL Java_com_albus_flatscan_NativeLib_setErase(JNIEnv* en
         s->pp = page_params(r.page, s->use_gpu);
         s->page_changed();   // screen detection; drops the downscaled and descreened caches
     } catch (const std::exception& e) {
-        LOGI("setErase failed: %s", e.what());
+        LOGI("setEdits failed: %s", e.what());
         return JNI_FALSE;
     }
     return JNI_TRUE;
+}
+
+// The finger brush's view: [out] (page size, ARGB) cleared, the mask a render with these settings fills
+// painted translucent orange. Returns the share of the page in the mask.
+JNIEXPORT jfloat JNICALL Java_com_albus_flatscan_NativeLib_fingerOverlay(JNIEnv* env, jclass, jlong h, jboolean fingers_auto, jfloatArray strokes, jobject out) {
+    Session* s = session(h);
+    if (!s || !s->result.ok) return 0.f;
+    AndroidBitmapInfo info;
+    void* px = nullptr;
+    if (AndroidBitmap_getInfo(env, out, &info) != ANDROID_BITMAP_RESULT_SUCCESS || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return 0.f;
+    cv::Mat m = finger_mask_for(env, s->result, s->result.page.size(), fingers_auto, strokes);
+    if (m.cols != (int)info.width || m.rows != (int)info.height) cv::resize(m, m, cv::Size(info.width, info.height), 0, 0, cv::INTER_NEAREST);
+    if (AndroidBitmap_lockPixels(env, out, &px) != ANDROID_BITMAP_RESULT_SUCCESS) return 0.f;
+    cv::Mat o((int)info.height, (int)info.width, CV_8UC4, px, info.stride);
+    o.setTo(cv::Scalar(0, 0, 0, 0));
+    o.setTo(cv::Scalar(255, 140, 40, 120), m);   // RGBA memory order
+    AndroidBitmap_unlockPixels(env, out);
+    return (float)cv::countNonZero(m) / std::max(1, m.cols * m.rows);
+}
+
+// The finger tool's smart select: the area around page point (fx, fy) (fractions) that belongs with it - a
+// finger, a thumb - on the page before any finger fill: GrabCut in a box around the tap, the tap itself
+// certain, the colour-alike area flood-filled from it likely, the rest of the box unsure. The piece joined
+// to the tap, holes filled, 2 px wider (the finger's soft edge). Returns its outline as page fractions
+// [x0, y0, x1, y1, ...]; empty when nothing was found or it would cover more than a quarter of the page
+// (a tap on blank paper).
+// The line editor's Add line: the printed line a rough stroke (page fractions x0, y0, x1, y1, ...) was drawn along
+// on this page (core/src/linefind.h), as page fractions along it; empty if there is none under most of the stroke.
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_findLine(JNIEnv* env, jclass, jlong h, jfloatArray stroke) {
+    std::vector<float> out;
+    Session* s = session(h);
+    if (s && s->result.ok && stroke) {
+        try {
+            const PipelineResult& r = s->result;
+            const cv::Mat& page = !r.page_unerased.empty() ? r.page_unerased : (!s->page_orig.empty() ? s->page_orig : r.page);
+            const int W = page.cols, H = page.rows;
+            std::vector<float> v((size_t)env->GetArrayLength(stroke));
+            if (!v.empty()) env->GetFloatArrayRegion(stroke, 0, (jsize)v.size(), v.data());
+            std::vector<cv::Point2f> pts;
+            for (size_t i = 0; i + 1 < v.size(); i += 2) pts.emplace_back(v[i] * W, v[i + 1] * H);
+            for (const auto& p : find_drawn_line(page, pts)) {
+                out.push_back(p.x / W);
+                out.push_back(p.y / H);
+            }
+        } catch (const std::exception& e) {
+            LOGI("findLine failed: %s", e.what());
+            out.clear();
+        }
+    }
+    jfloatArray a = env->NewFloatArray((jsize)out.size());
+    if (!out.empty()) env->SetFloatArrayRegion(a, 0, (jsize)out.size(), out.data());
+    return a;
+}
+
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_fingerSelect(JNIEnv* env, jclass, jlong h, jfloat fx, jfloat fy) {
+    std::vector<float> out;
+    Session* s = session(h);
+    if (s && s->result.ok) {
+        try {
+            const PipelineResult& r = s->result;
+            const cv::Mat& src = !r.page_unerased.empty() ? r.page_unerased : (!s->page_orig.empty() ? s->page_orig : r.page);
+            cv::Mat bgr;
+            if (src.channels() == 4) cv::cvtColor(src, bgr, cv::COLOR_BGRA2BGR);
+            else bgr = src.clone();
+            const double k = std::min(1.0, 700.0 / std::max(bgr.cols, bgr.rows));
+            if (k < 1) cv::resize(bgr, bgr, cv::Size(), k, k, cv::INTER_AREA);
+            const int W = bgr.cols, H = bgr.rows;
+            cv::Point seed(std::min(W - 1, std::max(0, (int)(fx * W))), std::min(H - 1, std::max(0, (int)(fy * H))));
+            cv::Mat lab, smooth;
+            cv::GaussianBlur(bgr, smooth, cv::Size(5, 5), 0);
+            cv::cvtColor(smooth, lab, cv::COLOR_BGR2Lab);
+            cv::Mat ff = cv::Mat::zeros(H + 2, W + 2, CV_8U);
+            cv::floodFill(lab, ff, seed, cv::Scalar(), nullptr, cv::Scalar(5, 4, 4), cv::Scalar(5, 4, 4), 4 | cv::FLOODFILL_MASK_ONLY | (255 << 8));
+            cv::Mat alike = ff(cv::Rect(1, 1, W, H)).clone();
+            if (cv::countNonZero(alike) > 0.25 * W * H) return env->NewFloatArray(0);   // blank paper
+            const int half = std::max(W, H) / 7;
+            cv::Rect box = cv::Rect(seed.x - half, seed.y - half, 2 * half, 2 * half) | cv::boundingRect(alike);
+            box &= cv::Rect(0, 0, W, H);
+            cv::Mat gc(H, W, CV_8U, cv::Scalar(cv::GC_BGD));
+            gc(box).setTo(cv::GC_PR_BGD);
+            gc.setTo(cv::GC_PR_FGD, alike);
+            cv::circle(gc, seed, std::max(2, W / 120), cv::Scalar(cv::GC_FGD), cv::FILLED);
+            cv::Mat bgd, fgd;
+            cv::grabCut(bgr, gc, box, bgd, fgd, 4, cv::GC_INIT_WITH_MASK);
+            cv::Mat fg = (gc == cv::GC_FGD) | (gc == cv::GC_PR_FGD);
+            cv::morphologyEx(fg, fg, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+            cv::Mat lbl;
+            cv::connectedComponents(fg, lbl, 8, CV_32S);
+            const int keep = lbl.at<int>(seed);
+            if (keep == 0) return env->NewFloatArray(0);
+            fg = lbl == keep;
+            std::vector<std::vector<cv::Point>> cs;
+            cv::findContours(fg, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            if (cs.empty()) return env->NewFloatArray(0);
+            cv::Mat filled = cv::Mat::zeros(H, W, CV_8U);
+            cv::drawContours(filled, cs, -1, cv::Scalar(255), cv::FILLED);
+            cv::dilate(filled, filled, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+            if (cv::countNonZero(filled) > 0.25 * W * H) return env->NewFloatArray(0);
+            cs.clear();
+            cv::findContours(filled, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            size_t big = 0;
+            for (size_t i = 1; i < cs.size(); ++i)
+                if (cv::contourArea(cs[i]) > cv::contourArea(cs[big])) big = i;
+            std::vector<cv::Point> poly;
+            cv::approxPolyDP(cs[big], poly, 1.0, true);
+            for (const auto& q : poly) { out.push_back((q.x + 0.5f) / W); out.push_back((q.y + 0.5f) / H); }
+        } catch (const std::exception& e) {
+            LOGI("fingerSelect failed: %s", e.what());
+            out.clear();
+        }
+    }
+    jfloatArray a = env->NewFloatArray((jsize)out.size());
+    if (!out.empty()) env->SetFloatArrayRegion(a, 0, (jsize)out.size(), out.data());
+    return a;
 }
 
 // lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...] as page fractions (PipelineResult::lines)
@@ -989,6 +1568,9 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_snapshot(JNIEnv*, jcla
     sn->page = s->result.page;
     sn->paper = s->result.paper;
     sn->before = s->before_page();
+    sn->page_unerased = s->result.page_unerased;
+    sn->paper_unerased = s->result.paper_unerased;
+    sn->finger_mask = s->result.finger_mask;
     sn->disp = s->result.disp;
     sn->lines = s->result.lines;
     sn->legend_px = s->legend_px;
@@ -1026,6 +1608,15 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_restoreSession(JNIEnv*
         if (!r.paper.empty() && r.paper.size() != r.page.size()) r.paper.release();
         // the before page: on first use (compare, the next snapshot)
         if (std::ifstream(path + "/before.jpg").good()) s->before_file = path + "/before.jpg";
+        if (std::ifstream(path + "/fingers.png").good()) {
+            r.finger_mask = cv::imread(path + "/fingers.png", cv::IMREAD_GRAYSCALE);
+            r.page_unerased = read_bgra(path + "/page_unerased.jpg");
+            if (std::ifstream(path + "/paper_unerased.png").good()) r.paper_unerased = cv::imread(path + "/paper_unerased.png", cv::IMREAD_GRAYSCALE);
+            if (r.finger_mask.size() != r.page.size() || r.page_unerased.size() != r.page.size()) {
+                r.finger_mask.release(); r.page_unerased.release(); r.paper_unerased.release();
+            }
+            if (!r.paper_unerased.empty() && r.paper_unerased.size() != r.page.size()) r.paper_unerased.release();
+        }
         std::vector<int32_t> head;
         std::vector<float> data;
         if (read_floats(path + "/disp.bin", head, 5, data) && head[2] > 0 && head[3] > 0 &&
@@ -1205,6 +1796,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             std::lock_guard<std::mutex> lk(g_nets_mu);
             c.cache_dir = g_cache_dir;
             c.threads = g_threads;
+            c.gpu_exhaustive_tuning = g_gpu_exhaustive;
             return Inference::create(c);
         };
         // Memory: only one backend's sessions at a time. The app's own sessions go first (each group keeps
@@ -1252,7 +1844,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_benchBackends(JNIEnv
             in.push_back({"shadenet", NetId::ShadeNet, BENCH_SHADE, std::move(t)});
         }
         {
-            // the rule net's GPU shape (rulenet_1152x800): the page through the found corners, else the photo
+            // the rule net's GPU shape (1152 x 800, infer.cpp kRuleGpuHw): the page through the found corners, else the photo
             const int rw = 800, rh = 1152;
             cv::Mat pg;
             if (pc.ok) {
@@ -1445,6 +2037,11 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
             rr.g = group(g_rule);
             o.rule_net = rr.fn();
         }
+        std::shared_ptr<NetGroup> og;
+        if (has_model("orientnet.tflite")) {
+            og = group(g_rule);
+            o.orient_net = orient_net_fn(*og->inf);
+        }
         // the flattening nets as the app runs them (FS_NETS=1): inside run_photo, beside its CPU stages,
         // on its detection's corners
         NetsRequest rq;
@@ -1496,7 +2093,7 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
               << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << cli_num(r.fingers_erased)
               << ", \"uv_model\": " << r.uv_model << ", \"uv_consistency\": " << cli_num(r.uv_consistency)
               << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"orient\": [" << cli_num(r.orient_sh) << ", "
-              << cli_num(r.orient_sv) << ", " << cli_num(r.orient_upright) << "]" << ", \"uv_spread\": [" << cli_num(r.uv_spread[0]) << ", "
+              << cli_num(r.orient_sv) << ", " << cli_num(r.orient_upright) << "]" << ", \"orient_net\": [" << r.orient_net_turn << ", " << cli_num(r.orient_net_margin) << ", " << r.orient_net_patches << ", " << (r.orient_by_net ? 1 : 0) << "]" << ", \"uv_spread\": [" << cli_num(r.uv_spread[0]) << ", "
               << cli_num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed
               << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": ["
               << cli_num(r.second_pass[0]) << ", " << cli_num(r.second_pass[1]) << ", " << cli_num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0)
@@ -1557,3 +2154,67 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
 }
 
 }  // extern "C"
+
+// ---- camera guidance (NativeLib.previewPage, CameraGuide.kt): the camera's analysis frames, several a second
+// while the camera screen is open. The page finder runs here on its own session (a CPU-only group with 2 threads,
+// made on first use), so it neither waits for nor slows the photo's page finder, and the frames never touch the
+// groups configureNets sets.
+namespace {
+
+std::shared_ptr<NetGroup> g_preview;   // guarded by g_nets_mu
+const int kPreviewThreads = 2;
+
+std::shared_ptr<NetGroup> preview_group() {
+    std::lock_guard<std::mutex> lk(g_nets_mu);
+    if (!g_preview) {
+        auto g = std::make_shared<NetGroup>();
+        InferConfig c;
+        c.load = load_model;
+        c.map = map_model;
+        c.threads = kPreviewThreads;
+        g->inf = Inference::create(c);
+        g_preview = g;
+    }
+    return g_preview;
+}
+
+}  // namespace
+
+// One analysis frame: RGBA_8888 rows of rowStride bytes in a direct buffer, turned upright by rotation (degrees
+// clockwise, ImageInfo.rotationDegrees). findPage: the page finder at 256 and the detection's quad step (no edge
+// snapping, no surface fit); off: luma and sharpness only. -> [found, x0, y0 .. x3, y3 (TL TR BR BL, upright frame
+// px), upright width, height, paper share, luma, glare, sharpness, ms], or null (an unreadable buffer).
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_previewPage(JNIEnv* env, jclass, jobject buf, jint w, jint h,
+                                                                                      jint row_stride, jint rotation, jboolean find_page) {
+    auto t0 = Clock::now();
+    uint8_t* px = buf ? (uint8_t*)env->GetDirectBufferAddress(buf) : nullptr;
+    const jlong cap = buf ? env->GetDirectBufferCapacity(buf) : -1;
+    if (!px || w <= 0 || h <= 0 || row_stride < 4 * w || cap < (jlong)row_stride * (h - 1) + 4 * w) return nullptr;
+    float out[16] = {0};
+    try {
+        cv::Mat rgba(h, w, CV_8UC4, px, (size_t)row_stride), bgr;
+        cv::cvtColor(rgba, bgr, cv::COLOR_RGBA2BGR);
+        const int rot = ((rotation % 360) + 360) % 360;
+        if (rot == 90) cv::rotate(bgr, bgr, cv::ROTATE_90_CLOCKWISE);
+        else if (rot == 180) cv::rotate(bgr, bgr, cv::ROTATE_180);
+        else if (rot == 270) cv::rotate(bgr, bgr, cv::ROTATE_90_COUNTERCLOCKWISE);
+        std::vector<float> lg;
+        if (find_page && !page_finder_logits(bgr, *preview_group()->inf, lg)) lg.clear();
+        PreviewPage p = preview_page(bgr, lg.empty() ? nullptr : lg.data());
+        out[0] = p.found ? 1.f : 0.f;
+        for (int k = 0; k < 4; ++k) { out[1 + 2 * k] = (float)p.pts[k].x; out[2 + 2 * k] = (float)p.pts[k].y; }
+        out[9] = (float)bgr.cols;
+        out[10] = (float)bgr.rows;
+        out[11] = (float)p.area;
+        out[12] = (float)p.luma;
+        out[13] = (float)p.glare;
+        out[14] = (float)p.sharpness;
+    } catch (const std::exception& e) {
+        LOGI("previewPage failed: %s", e.what());
+        return nullptr;
+    }
+    out[15] = (float)ms_since(t0);
+    jfloatArray a = env->NewFloatArray(16);
+    env->SetFloatArrayRegion(a, 0, 16, out);
+    return a;
+}

@@ -64,8 +64,12 @@
 
 namespace fs {
 
-enum class Filter : int { Original = 0, Lighten = 1, AutoColor = 2, Grayscale = 3, HighContrast = 4, BlackWhite = 5, Scan = 6 };
-const int kFilterCount = 7;
+enum class Filter : int { Original = 0, Lighten = 1, AutoColor = 2, Grayscale = 3, HighContrast = 4, BlackWhite = 5, Scan = 6,
+                          Whiteboard = 7, ProjectorDark = 8 };
+const int kFilterCount = 9;
+// Whiteboard mode's filters (board.h board_filter): their own cleanup, no paper model, no adjustments
+// except strength; the document filters above are untouched by them.
+inline bool is_board(Filter f) { return f == Filter::Whiteboard || f == Filter::ProjectorDark; }
 const char* filter_name(Filter f);
 
 struct PageParams {
@@ -74,6 +78,7 @@ struct PageParams {
     cv::Mat bgv;              // CV_32F, quarter grid: local background luminance of v (B&W, specks)
     cv::Mat pic;              // CV_32F, quarter grid: picture weight 0..1 (B&W tones, specks)
     cv::Mat tint;             // CV_32F, quarter grid: light-colour weight 0..1 (white point, cleanup, specks)
+    cv::Mat samples;          // CV_32F, quarter grid: the paper samples (1) the estimates above come from
     float wb[3] = {1, 1, 1};  // per-channel paper colour / paper luminance
     float sigma = 0.02f;      // paper noise of luma(v)
     float ink = 0.3f;         // median luma(v) of ink on paper (Scan's black point)

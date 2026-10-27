@@ -6,7 +6,10 @@ Environment: TN_HOURS (training time budget, default 7.5: the learning rate foll
 iteration cap, default 400000), TN_CH (widths, default 12,24,32,48,64,96), TN_TEXT_P (share of text samples, 0.65),
 TN_BATCH (16), TN_CROP (384), TN_SMALL_FRAC (0.75) / TN_SMALL_CROP (256) / TN_SMALL_BATCH (32): progressive resizing,
 TN_COMPILE (1), TN_CL (0: channels_last), TN_LR (2e-3), TN_WORKERS (12), TN_VAL (validation every N its, 3000), TN_MEM
-(GPU memory fraction, 0.85). Loss, augmentation, EMA and checkpoints as tools/rule_net/train2.py (picture edges count
+(GPU memory fraction, 0.85), TN_INIT (a best.pt / last.pt to fine-tune from: the shipped net is
+E:/fs_datasets/textnet/run1/best.pt), TN_VAL_MAG (an extra validation pool, e.g. magazine pages from TN_LAYOUT=mag; it
+counts in the mean F1 that picks best.pt), TN_PATIENCE (stop after this many validations without a better score, in the
+full-crop phase; default 0: run the whole budget). Loss, augmentation, EMA and checkpoints as tools/rule_net/train2.py (picture edges count
 as rules: RN_EDGE pos); a transposed sample swaps h and v of both pairs. OUT_DIR: best.pt (best mean F1 over the
 validation pools' labelled channels), last.pt, log.jsonl. Keeps Windows awake while it runs.
 v2 of train_text.py (from a GPU review, not yet run): the input in bf16 (the full-resolution cat with x was upcast to
@@ -172,7 +175,9 @@ def validate(net, VAL):
     res = {}
     for name, (X, T) in VAL.items():
         c = f1_counts(net, X, T).sum(0)
-        res[name] = f1(c).round(4).tolist()
+        f = f1(c)
+        # a channel with nothing to find in this pool (no vertical text on magazine pages) does not count
+        res[name] = [None if c[k, 0] + c[k, 2] == 0 else round(float(f[k]), 4) for k in range(len(f))]
     net.train()
     return res
 
@@ -188,9 +193,14 @@ def train(fast):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     VAL = {'text': val_set(vtext), 'rules': val_set(vrule)}
+    if os.environ.get('TN_VAL_MAG'):
+        VAL['mag'] = val_set(os.environ['TN_VAL_MAG'])
     cl = fast and os.environ.get('TN_CL', '0') == '1'
     fmt = torch.channels_last if cl else torch.contiguous_format
     net = RuleNet(CH, 4).cuda().to(memory_format=fmt)
+    if os.environ.get('TN_INIT'):   # fine-tune: start from a trained net (its widths must match TN_CH)
+        net.load_state_dict(torch.load(os.environ['TN_INIT'], map_location='cpu')['state'])
+        print('init from', os.environ['TN_INIT'], flush=True)
     ema = RuleNet(CH, 4).cuda().to(memory_format=fmt); ema.load_state_dict(net.state_dict()); ema.eval()
     for p in ema.parameters(): p.requires_grad_(False)
     print(f'{sum(p.numel() for p in net.parameters()) / 1e6:.3f} M params, ch {CH}, {HOURS} h, channels_last {cl}', flush=True)
@@ -234,15 +244,16 @@ def train(fast):
             fwd, loss_f = net, loss_fn
             opt.zero_grad(set_to_none=True)
             print('torch.compile failed, eager:', repr(e)[:300], flush=True)
-    best, run, it = -1, 0.0, 0
+    best, run, it, since_best = -1, 0.0, 0, 0
+    patience = int(os.environ.get('TN_PATIENCE', 0))
     if os.path.exists(os.path.join(out, 'best.pt')):   # a fallback run keeps the first run's best unless it beats it
-        best = float(np.mean([v for vs in torch.load(os.path.join(out, 'best.pt'), map_location='cpu')['val'].values() for v in vs]))
+        best = float(np.mean([v for vs in torch.load(os.path.join(out, 'best.pt'), map_location='cpu')['val'].values() for v in vs if v is not None]))
     es, ns = ema.state_dict(), net.state_dict()
     ema_f = [es[k] for k in es if es[k].dtype.is_floating_point]; net_f = [ns[k] for k in es if es[k].dtype.is_floating_point]
     ema_i = [(es[k], ns[k]) for k in es if not es[k].dtype.is_floating_point]
     logf = open(os.path.join(out, 'log.jsonl'), 'a')
     while True:
-        if phase == 'small' and time.time() - t0 >= small_frac * budget:
+        if phase == 'small' and max((time.time() - t0) / budget, it / ITERS) >= small_frac:   # time or TN_ITERS
             del dl
             phase, dl = 'full', loader(C, B)
             print(f'it {it}: phase full ({C} crops, batch {B})', flush=True)
@@ -272,13 +283,17 @@ def train(fast):
         if it % VAL_EVERY == 0 or done:
             for pe, pn in ema_i: pe.copy_(pn)
             r = validate(ema, VAL)
-            score = float(np.mean([v for vs in r.values() for v in vs]))
+            score = float(np.mean([v for vs in r.values() for v in vs if v is not None]))
             print(f'  it {it} val {json.dumps(r)} mean {score:.4f}', flush=True)
             logf.write(json.dumps({'it': it, 'val': r, 'score': score, 'loss': run, 't': time.time() - t0}) + '\n'); logf.flush()
             ck = {'ch': CH, 'n_out': 4, 'state': {k: v.cpu() for k, v in ema.state_dict().items()}, 'it': it, 'val': r}
             torch.save(ck, os.path.join(out, 'last.pt'))
             if score > best:
-                best = score; torch.save(ck, os.path.join(out, 'best.pt'))
+                best = score; since_best = 0; torch.save(ck, os.path.join(out, 'best.pt'))
+            else:
+                since_best += 1
+                if patience and phase == 'full' and since_best >= patience:
+                    print(f'early stop at {it}', flush=True); done = True
         if done:
             break
     print('best mean F1', best, 'its', it, flush=True)

@@ -1,14 +1,17 @@
 #include "pipeline.h"
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/photo.hpp>
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <future>
 #include <map>
 #include <memory>
+#include <set>
 #include <thread>
 
 #include "gpu.h"
@@ -100,7 +103,29 @@ OrientInput orient_input(const cv::Mat& op, const Unroll& U, const PipelineOptio
 
 Orientation orient_decide(cv::Mat op, const OrientInput& in, const PipelineOptions& opt) {
     if (in.rows > 0) cv::resize(op, op, cv::Size(op.cols, in.rows), 0, 0, in.area ? cv::INTER_AREA : cv::INTER_LINEAR);
-    return decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : in.min_ratio);
+    Orientation o = decide_orientation(op, opt.reference_orient ? 0.0 : opt.orient_min_conf, opt.reference_orient ? 1.0 : in.min_ratio);
+    // the orientation net, on the same page at its own shape: any of the four turns, when it is sure
+    if (opt.orient_net && !opt.reference_orient) {
+        int k = -1, n = 0;
+        double m = -1;
+        if (orient_net_turn(op, opt.orient_net, &k, &m, &n)) {
+            o.net_turn = k;
+            o.net_margin = m;
+            o.net_patches = n;
+            // a half turn: the net alone (the text-axis rule never turns a page over); a quarter turn: only when the
+            // rule also finds the page's text running sideways (a portrait page with a table printed across it reads
+            // sideways to the net, and stays as printed), the net then choosing which way; upright: the net
+            if (m >= opt.orient_net_margin) {
+                static const int code[4] = {-1, cv::ROTATE_90_CLOCKWISE, cv::ROTATE_180, cv::ROTATE_90_COUNTERCLOCKWISE};
+                const bool rule_sideways = o.rot == cv::ROTATE_90_CLOCKWISE || o.rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+                if (k == 0 || k == 2 || rule_sideways) {
+                    o.rot = code[k];
+                    o.by_net = true;
+                }
+            }
+        }
+    }
+    return o;
 }
 
 // two homography unrolls with the same page and matrix (the same page image)
@@ -201,15 +226,35 @@ cv::Mat to_bgra(const cv::Mat& m) {
     return o;
 }
 
+// The output page's size for a map g of the A4 analysis page: render_w wide (portrait) or the analysis size, and
+// with render_true_shape at the paper's own height / width hw (the map's frame): A4 when hw is within
+// true_shape_snap of it, US Letter when within that of Letter, else hw; the same number of pixels. A receipt or a
+// bill is then not drawn A4-shaped (before round 17 only the app's Auto shape fixed that, by resampling again).
+cv::Size render_size(const GridMap& g, const PipelineOptions& opt, double hw) {
+    const bool portrait = g.out_w <= g.out_h;
+    int w = g.out_w, h = g.out_h;
+    if (opt.render_w > 0 && opt.render_w != opt.out_w) {
+        int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
+        w = portrait ? opt.render_w : long_side;
+        h = portrait ? long_side : opt.render_w;
+    }
+    if (!opt.render_true_shape || !(hw > 0)) return {w, h};
+    const double a4 = (double)h / w, letter = portrait ? 11.0 / 8.5 : 8.5 / 11.0;
+    if (std::fabs(hw / a4 - 1) < opt.true_shape_snap) return {w, h};
+    if (std::fabs(hw / letter - 1) < opt.true_shape_snap) hw = letter;
+    hw = std::min(8.0, std::max(0.125, hw));
+    const int nw = std::max(16, (int)std::lround(std::sqrt((double)w * h / hw)));
+    return {nw, std::max(16, (int)std::lround(nw * hw))};
+}
+
+GridMap at_size(const GridMap& g, cv::Size s) {
+    return s.width == g.out_w && s.height == g.out_h ? g : rescale_grid(g, s.width, s.height);
+}
+
 void final_resample(const cv::Mat& photo, PipelineResult& r, const PipelineOptions& opt) {
     auto t0 = Clock::now();
     cv::Mat src = to_bgra(photo);
-    r.render_map = r.final_map;
-    if (opt.render_w > 0 && opt.render_w != opt.out_w) {
-        bool portrait = r.final_map.out_w <= r.final_map.out_h;
-        int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
-        r.render_map = rescale_grid(r.final_map, portrait ? opt.render_w : long_side, portrait ? long_side : opt.render_w);
-    }
+    r.render_map = at_size(r.final_map, render_size(r.final_map, opt, r.page_hw));
     r.gpu_resample = opt.use_gpu && Gpu::instance().resample(src, r.render_map, r.page);
     if (!r.gpu_resample) r.page = resample_cpu(src, r.render_map);
     r.ms.emplace_back(r.gpu_resample ? "final resample (GPU)" : "final resample (CPU)", ms_since(t0));
@@ -243,11 +288,9 @@ GridMap identity_grid(int W, int H) {
     return g;
 }
 
-GridMap at_render_size(const GridMap& g, const PipelineOptions& opt) {
-    if (opt.render_w <= 0 || opt.render_w == opt.out_w) return g;
-    bool portrait = g.out_w <= g.out_h;
-    int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
-    return rescale_grid(g, portrait ? opt.render_w : long_side, portrait ? long_side : opt.render_w);
+// the before page (perspective only) at the size of the output page, hw as render_size
+GridMap at_render_size(const GridMap& g, const PipelineOptions& opt, double hw = -1) {
+    return at_size(g, render_size(g, opt, hw));
 }
 
 void resample_any(const cv::Mat& src_bgra, const GridMap& g, bool gpu, cv::Mat& out) {
@@ -311,9 +354,9 @@ cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H
 
 // The shadow net on the flattened page (PipelineOptions::shade_net): the page at long_side,
 // portrait (landscape pages turned for the net and back), its shading map bilinearly back at page
-// size, the page divided by it: brighten only, by at most 1 / 0.3 (cast shadows on paper keep
-// >= ~0.45 of the light; anything darker is ink, which a misread map must not blow out).
-bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side) {
+// size, the page divided by it: brighten only, by at most 1 / floor (PipelineOptions::shade_floor; the map
+// is clamped there so that a misread map cannot blow out ink).
+bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side, float shade_floor) {
     if (page_bgra.empty() || !fn) return false;
     cv::Mat bgr;
     cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
@@ -335,7 +378,7 @@ bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<fl
     for (int y = 0; y < nh; ++y) {
         cv::Vec3f* q = S.ptr<cv::Vec3f>(y);
         for (int x = 0; x < nw; ++x)
-            for (int c = 0; c < 3; ++c) q[x][c] = std::min(1.f, std::max(0.3f, buf[c * plane + (size_t)y * nw + x]));
+            for (int c = 0; c < 3; ++c) q[x][c] = std::min(1.f, std::max(shade_floor, buf[c * plane + (size_t)y * nw + x]));
     }
     if (turned) cv::rotate(S, S, cv::ROTATE_90_COUNTERCLOCKWISE);
     cv::resize(S, S, page_bgra.size(), 0, 0, cv::INTER_LINEAR);
@@ -355,11 +398,87 @@ bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<fl
 // (YCrCb skin box). They are filled with the paper colour around them (a smooth Telea fill at
 // 1/4 size, so a line crossing the edge fades instead of ending in a hard cut) and marked as
 // paper. Text under a finger is not invented: it is paper. Returns the share of the page filled.
-double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
+// Skin colour sampled from the photo around the page (finger rule 2): the largest skin-like region outside
+// the page's footprint (the hand and arm holding it), as a Gaussian in CrCb plus its luma range.
+struct SkinModel {
+    bool ok = false;
+    double cr = 0, cb = 0, icov[3] = {0, 0, 0};   // mean, inverse covariance (a, b, c of [[a, b], [b, c]])
+    double ymin = 0, ymax = 255;
+    double ring_share = 0;   // share of a band around the page in this colour: high = a table or wall, not a hand
+    bool skin(double y, double cr_, double cb_) const {
+        double dr = cr_ - cr, db = cb_ - cb;
+        return y >= ymin && y <= ymax && icov[0] * dr * dr + 2 * icov[1] * dr * db + icov[2] * db * db < 9.0;
+    }
+};
+
+SkinModel skin_model_outside(const cv::Mat& photo_bgr, const GridMap& g) {
+    SkinModel m;
+    const double k = 512.0 / std::max(photo_bgr.cols, photo_bgr.rows);
+    cv::Mat small, ycc;
+    cv::resize(photo_bgr, small, cv::Size(), k, k, cv::INTER_AREA);
+    cv::cvtColor(small, ycc, cv::COLOR_BGR2YCrCb);
+    cv::Mat foot = cv::Mat::zeros(small.size(), CV_8U);
+    for (int i = 0; i + 1 < g.gh; i += 2)
+        for (int j = 0; j + 1 < g.gw; j += 2) {
+            int i1 = std::min(g.gh - 1, i + 2), j1 = std::min(g.gw - 1, j + 2);
+            std::vector<cv::Point> q;
+            for (auto [ii, jj] : {std::pair{i, j}, {i, j1}, {i1, j1}, {i1, j}})
+                q.emplace_back((int)std::lround(g.x[(size_t)ii * g.gw + jj] * k), (int)std::lround(g.y[(size_t)ii * g.gw + jj] * k));
+            cv::fillConvexPoly(foot, q, cv::Scalar(255));
+        }
+    int d = std::max(3, (int)(0.03 * std::max(small.cols, small.rows)));
+    cv::dilate(foot, foot, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * d + 1, 2 * d + 1)));
+    cv::Mat cand;
+    cv::inRange(ycc, cv::Scalar(40, 135, 80), cv::Scalar(250, 180, 130), cand);
+    cand.setTo(0, foot);
+    for (int y = 0; y < ycc.rows; ++y)
+        for (int x = 0; x < ycc.cols; ++x) {
+            const cv::Vec3b& p = ycc.at<cv::Vec3b>(y, x);
+            if (std::abs(p[1] - 128) + std::abs(p[2] - 128) < 12) cand.at<uint8_t>(y, x) = 0;   // near grey: not skin
+        }
+    cv::Mat lab, st, cen;
+    int n = cv::connectedComponentsWithStats(cand, lab, st, cen, 8);
+    int best = 0, best_area = 0;
+    for (int i = 1; i < n; ++i)
+        if (st.at<int>(i, 4) > best_area) best_area = st.at<int>(i, 4), best = i;
+    if (best_area < 0.003 * small.total()) return m;
+    {
+        cv::Mat outer, ring;
+        cv::dilate(foot, outer, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * d + 1, 2 * d + 1)));
+        ring = outer & ~foot;
+        const double n_ring = cv::countNonZero(ring);
+        m.ring_share = n_ring > 0 ? cv::countNonZero((lab == best) & ring) / n_ring : 1.0;
+    }
+    std::vector<double> crs, cbs, ys;
+    for (int y = 0; y < lab.rows; ++y)
+        for (int x = 0; x < lab.cols; ++x)
+            if (lab.at<int>(y, x) == best) {
+                const cv::Vec3b& p = ycc.at<cv::Vec3b>(y, x);
+                ys.push_back(p[0]); crs.push_back(p[1]); cbs.push_back(p[2]);
+            }
+    auto mean = [](const std::vector<double>& v) { double s = 0; for (double x : v) s += x; return s / v.size(); };
+    m.cr = mean(crs); m.cb = mean(cbs);
+    double a = 0, b = 0, c = 0;
+    for (size_t i = 0; i < crs.size(); ++i) {
+        double dr = crs[i] - m.cr, db = cbs[i] - m.cb;
+        a += dr * dr; b += dr * db; c += db * db;
+    }
+    a = a / crs.size() + 4; b /= crs.size(); c = c / crs.size() + 4;   // + a floor: noise, JPEG
+    double det = a * c - b * b;
+    if (det <= 0) return m;
+    m.icov[0] = c / det; m.icov[1] = -b / det; m.icov[2] = a / det;
+    std::sort(ys.begin(), ys.end());
+    m.ymin = 0.6 * ys[ys.size() / 20];
+    m.ymax = std::min(255.0, 1.25 * ys[ys.size() * 19 / 20]);
+    m.ok = true;
+    return m;
+}
+
+double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper, cv::Mat* mask_out, int rules, const SkinModel* model) {
     const int w = page_bgra.cols, h = page_bgra.rows;
     cv::Mat hole = paper < 128;
     int n_hole = cv::countNonZero(hole);
-    if (n_hole == 0 || n_hole > 0.25 * w * h) return 0;
+    if ((n_hole == 0 && !(rules & kFingerSkinRegion)) || n_hole > 0.25 * w * h) return 0;
     cv::Mat bgr, ycc;
     cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
     cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
@@ -370,14 +489,42 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
     cv::Scalar pc = cv::mean(ycc, paper_px);
     cv::Mat skin;
     cv::inRange(ycc, cv::Scalar(40, std::max(140.0, pc[1] + 7), 77), cv::Scalar(255, 180, std::min(125.0, pc[2] - 4)), skin);
+    if ((rules & kFingerAdaptiveSkin) && model && model->ok) {
+        // the holding hand's own colour (sampled outside the page), still redder / less blue than this paper
+        skin.setTo(0);
+        for (int y = 0; y < h; ++y) {
+            const cv::Vec3b* q = ycc.ptr<cv::Vec3b>(y);
+            uint8_t* o = skin.ptr<uint8_t>(y);
+            for (int x = 0; x < w; ++x)
+                if (q[x][1] >= pc[1] + 7 && q[x][2] <= pc[2] - 4 && model->skin(q[x][0], q[x][1], q[x][2])) o[x] = 255;
+        }
+    }
     // fingers are smooth: ink strokes (text, rules) inside a candidate mean it is page content
     cv::Mat gray, edges;
     cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
     cv::Canny(gray, edges, 60, 150);
     cv::Mat lab, st, cen;
     int n = cv::connectedComponentsWithStats(hole, lab, st, cen, 8);
-    cv::Mat fill = cv::Mat::zeros(h, w, CV_8U);
     const int border = std::max(4, w / 100);
+    cv::Mat fill = cv::Mat::zeros(h, w, CV_8U);
+    // kFingerHandColour: a candidate is kept only if it is, on average, clearly redder and less blue than the
+    // paper; and hands hold a page from at most two sides: candidates coming in from three or four sides are the
+    // table, a box's flaps or a coloured frame around the page, and none is filled
+    int sides = 0;
+    auto accept = [&](int x, int y, int bw, int bh, const cv::Mat& comp) {
+        if (rules & kFingerHandColour) {
+            cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
+            if (cm[1] - pc[1] < 10 || cm[2] - pc[2] > -10) return;
+            // the side it comes in from: of the sides it touches, the one it runs along furthest (a hand along
+            // the whole bottom edge touches the left and right sides too)
+            int side = 0, run = -1;
+            const int touch[4] = {x <= border ? bh : -1, y <= border ? bw : -1, x + bw >= w - border ? bh : -1, y + bh >= h - border ? bw : -1};
+            for (int k = 0; k < 4; ++k)
+                if (touch[k] > run) run = touch[k], side = 1 << k;
+            sides |= side;
+        }
+        fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
+    };
     for (int i = 1; i < n; ++i) {
         int x = st.at<int>(i, 0), y = st.at<int>(i, 1), bw = st.at<int>(i, 2), bh = st.at<int>(i, 3), area = st.at<int>(i, 4);
         bool at_border = x <= border || y <= border || x + bw >= w - border || y + bh >= h - border;
@@ -394,18 +541,84 @@ double erase_fingers(cv::Mat& page_bgra, cv::Mat& paper) {
         if (std::getenv("FS_DEBUG_FINGERS")) {
             cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
             double whole = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & comp) / area;
-            std::fprintf(stderr, "finger cand %d,%d %dx%d area %d skin %.3f reach %d edge %.4f whole %.4f dY %.1f dCr %.1f dCb %.1f\n", x, y, bw, bh, area,
-                         skin_frac, reach, edge_frac, whole, cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2]);
+            cv::Mat dist;
+            cv::distanceTransform(comp, dist, cv::DIST_L2, 3);
+            double mx;
+            cv::minMaxLoc(dist, nullptr, &mx);
+            std::fprintf(stderr, "finger cand %d,%d %dx%d area %d skin %.3f reach %d edge %.4f whole %.4f dY %.1f dCr %.1f dCb %.1f thick %.3f\n", x, y, bw, bh, area,
+                         skin_frac, reach, edge_frac, whole, cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2], 2 * mx / w);
         }
         // skin >= 35%: the hole often takes in the background strip beside the finger too (receipt: 0.499)
         if (skin_frac < 0.35 || reach < 2 * border || edge_frac > 0.03) continue;
-        fill(cv::Rect(x, y, bw, bh)).setTo(255, comp);
+        if (rules & kFingerContact) {
+            // location prior: a finger comes in over the page edge, so the candidate itself (not just its
+            // bounding box) lies along the border for at least 1.5 border widths
+            cv::Mat band = cv::Mat::zeros(h, w, CV_8U);
+            cv::rectangle(band, cv::Rect(0, 0, w, h), cv::Scalar(255), 2 * border);
+            cv::Mat touch = band(cv::Rect(x, y, bw, bh)) & comp;
+            cv::Rect tb = cv::boundingRect(touch);
+            if (std::max(tb.width, tb.height) < 1.5 * border) continue;
+        }
+        if (rules & kFingerShape) {
+            // a finger's width: its thickest point (twice the largest distance to its outline) between 2 and
+            // 16 % of the page width; wider skin-coloured areas are a picture, a table, a sleeve
+            cv::Mat dist;
+            cv::distanceTransform(comp, dist, cv::DIST_L2, 3);
+            double mx;
+            cv::minMaxLoc(dist, nullptr, &mx);
+            double thick = 2 * mx / w;
+            if (thick < 0.02 || thick > 0.16) continue;
+        }
+        accept(x, y, bw, bh, comp);
     }
+    if (std::getenv("FS_DEBUG_FINGERS") && model) std::fprintf(stderr, "skin model ok %d ring share %.2f\n", (int)model->ok, model->ring_share);
+    // (a page lying on a wooden table or held against a skin-coloured wall: that colour is all around the
+    // page, and the hand's colour cannot be told from it)
+    if ((rules & kFingerSkinRegion) && model && model->ok && model->ring_share < 0.4) {
+        // a finger the page mask took for paper: an area of the hand's own colour (sampled outside the page,
+        // so a hand must be in the photo), smooth, coming in over the page border
+        cv::Mat hand = cv::Mat::zeros(h, w, CV_8U);
+        for (int y = 0; y < h; ++y) {
+            const cv::Vec3b* q = ycc.ptr<cv::Vec3b>(y);
+            uint8_t* o = hand.ptr<uint8_t>(y);
+            for (int x = 0; x < w; ++x)
+                if (q[x][1] >= pc[1] + 7 && q[x][2] <= pc[2] - 4 && model->skin(q[x][0], q[x][1], q[x][2])) o[x] = 255;
+        }
+        const cv::Mat k_open = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(border | 1, border | 1));
+        cv::morphologyEx(hand, hand, cv::MORPH_OPEN, k_open);
+        cv::morphologyEx(hand, hand, cv::MORPH_CLOSE, k_open);
+        hand.setTo(0, fill);
+        int m = cv::connectedComponentsWithStats(hand, lab, st, cen, 8);
+        cv::Mat band = cv::Mat::zeros(h, w, CV_8U);
+        cv::rectangle(band, cv::Rect(0, 0, w, h), cv::Scalar(255), 2 * border);
+        for (int i = 1; i < m; ++i) {
+            int x = st.at<int>(i, 0), y = st.at<int>(i, 1), bw = st.at<int>(i, 2), bh = st.at<int>(i, 3), area = st.at<int>(i, 4);
+            if (area < 0.002 * w * h || area > 0.25 * w * h) continue;
+            cv::Mat comp = lab(cv::Rect(x, y, bw, bh)) == i;
+            cv::Rect tb = cv::boundingRect(band(cv::Rect(x, y, bw, bh)) & comp);
+            if (std::max(tb.width, tb.height) < 1.5 * border) continue;   // does not come in over the border
+            int reach = std::min(std::min(x + bw, w - x), std::min(y + bh, h - y));
+            cv::Mat inner;
+            cv::erode(comp, inner, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
+            int n_inner = cv::countNonZero(inner);
+            if (n_inner < 0.2 * area) continue;
+            double edge_frac = (double)cv::countNonZero(edges(cv::Rect(x, y, bw, bh)) & inner) / n_inner;
+            if (std::getenv("FS_DEBUG_FINGERS")) {
+                cv::Scalar cm = cv::mean(ycc(cv::Rect(x, y, bw, bh)), comp);
+                std::fprintf(stderr, "skin region %d,%d %dx%d area %d reach %d edge %.4f dY %.1f dCr %.1f dCb %.1f\n", x, y, bw, bh, area, reach, edge_frac,
+                             cm[0] - pc[0], cm[1] - pc[1], cm[2] - pc[2]);
+            }
+            if (reach < 2 * border || edge_frac > 0.03) continue;
+            accept(x, y, bw, bh, comp);
+        }
+    }
+    if ((rules & kFingerHandColour) && std::bitset<32>((unsigned)sides).count() >= 3) fill.setTo(0);
     int n_fill = cv::countNonZero(fill);
     if (n_fill == 0) return 0;
     // the fringe of the finger (shadow, blurred edge) goes with it
     cv::dilate(fill, fill, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * border + 1, 2 * border + 1)));
-    fill_with_paper(page_bgra, fill, &paper);
+    if (mask_out) *mask_out = fill.clone();
+    fill_finger(page_bgra, fill, &paper);
     return (double)n_fill / (w * h);
 }
 
@@ -692,6 +905,7 @@ PageCorners make_corners(const cv::Mat& photo, const cv::Mat& small, const PageF
         pc.whole_frame = f->whole_frame;
         pc.spread = f->spread;
         pc.net_margin = f->net_margin;
+        pc.area_frac = f->area_frac;
         const FoundPage& fp = f->pages[pc.page_index];
         pc.edge_strength = fp.edge_strength;
         pc.edge_at_limit = fp.edge_at_limit;
@@ -780,7 +994,8 @@ std::vector<PageAssessment> assess_pages(const cv::Mat& photo, const float* seg_
         if (!a.pc.ok) {
             a.reasons.push_back("no page found");
         } else {
-            SurfaceModel m = fit_detected(photo, a.pc, focal_px);
+            a.model = fit_detected(photo, a.pc, focal_px);
+            const SurfaceModel& m = a.model;
             a.fit_median_px = m.ok ? m.median_px / a.pc.scale : -1;
             a.reasons = quality_gate(a.pc, a.fit_median_px, photo.size());
             if (!m.ok) a.reasons.push_back("surface fit failed");
@@ -841,6 +1056,162 @@ cv::Point2d map_at(const GridMap& g, double x, double y) {
     return {bil(g.x), bil(g.y)};
 }
 
+// samples (along, ideal, disp) of a line the user drew near a rule on D (darkness_fast of the page):
+// along the drawn path every 4 px, the darkest column of 3 px within r px across it, kept where it is
+// dark enough and agrees with its neighbours (a running median of the offsets: a letter beside the
+// rule is not followed). Empty if too little of it lies on ink. hz: a horizontal line (along x).
+std::vector<std::array<double, 3>> snap_user_line(const cv::Mat& D, std::vector<cv::Point2d> pts, bool hz, int r) {
+    std::vector<std::array<double, 3>> out;
+    if (pts.size() < 2) return out;
+    auto along = [hz](const cv::Point2d& p) { return hz ? p.x : p.y; };
+    auto across = [hz](const cv::Point2d& p) { return hz ? p.y : p.x; };
+    std::sort(pts.begin(), pts.end(), [&](const cv::Point2d& a, const cv::Point2d& b) { return along(a) < along(b); });
+    const int len = hz ? D.cols : D.rows, wid = hz ? D.rows : D.cols;
+    auto dark = [&](int a, int c) {   // a: along, c: across
+        float s = 0;
+        for (int k = -1; k <= 1; ++k) {
+            int aa = std::min(std::max(a + k, 0), len - 1);
+            s += hz ? D.at<float>(c, aa) : D.at<float>(aa, c);
+        }
+        return s / 3;
+    };
+    std::vector<double> as, cs, off;
+    size_t seg = 0;
+    const int a0 = std::max(0, (int)std::ceil(along(pts.front()))), a1 = std::min(len - 1, (int)std::floor(along(pts.back())));
+    for (int a = a0; a <= a1; a += 4) {
+        while (seg + 2 < pts.size() && along(pts[seg + 1]) < a) ++seg;
+        const cv::Point2d &p = pts[seg], &q = pts[seg + 1];
+        double t = along(q) - along(p) > 1e-6 ? (a - along(p)) / (along(q) - along(p)) : 0;
+        double c0 = across(p) + (across(q) - across(p)) * std::min(1.0, std::max(0.0, t));
+        // the user says a rule is here: it only has to stand out from the band around it (a pale grid
+        // line on a shaded page is ~20 darker than the paper; the detector's faint rules start at 25)
+        int best = -1;
+        float bv = -1e9f;
+        std::vector<float> band;
+        for (int c = std::max(0, (int)std::lround(c0) - r); c <= std::min(wid - 1, (int)std::lround(c0) + r); ++c) {
+            float d = dark(a, c);
+            band.push_back(d);
+            float v = d - 0.15f * std::fabs(c - c0);   // the nearer of two equal rules
+            if (v > bv) { bv = v; best = c; }
+        }
+        if (best < 0) continue;
+        std::nth_element(band.begin(), band.begin() + band.size() / 2, band.end());
+        const float peak = dark(a, best);
+        if (peak < 8.f || peak - band[band.size() / 2] < 6.f) continue;
+        as.push_back(a); cs.push_back(best); off.push_back(best - c0);
+    }
+    const int n = (int)as.size();
+    if (n < 8 || n * 4 < (a1 - a0) / 2) return out;   // less than half of the drawn stretch on ink
+    std::vector<double> keep_a, keep_c;
+    for (int i = 0; i < n; ++i) {
+        std::vector<double> w;
+        for (int k = std::max(0, i - 4); k <= std::min(n - 1, i + 4); ++k) w.push_back(off[k]);
+        std::nth_element(w.begin(), w.begin() + w.size() / 2, w.end());
+        if (std::fabs(off[i] - w[w.size() / 2]) <= 3) { keep_a.push_back(as[i]); keep_c.push_back(cs[i]); }
+    }
+    if (keep_a.size() < 8) return out;
+    std::vector<double> sorted = keep_c;
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    const double ideal = sorted[sorted.size() / 2];
+    for (size_t i = 0; i < keep_a.size(); ++i) out.push_back({keep_a[i], ideal, keep_c[i] - ideal});
+    return out;
+}
+
+// The lines the user drew (PipelineOptions::user_lines), after the line stage: group by group, each
+// snapped to the rule it was drawn along on the page as the warp map so far leaves it (the page the
+// user saw), straightened by a smooth field that holds every line already straight where it is (the
+// stage's lines, the earlier groups), and the field composed into warp4 (stage-1 frame, W x H). A
+// group whose field would move the page by more than 6 % of its long side is left out. Their
+// straightened positions join r.lines (kind 3).
+void apply_user_lines(const cv::Mat& stage1, GridMap& warp4, const std::vector<PipelineOptions::UserLine>& ul, int W, int H, int rot,
+                      PipelineResult& r) {
+    if (ul.empty()) return;
+    const bool swap = rot == cv::ROTATE_90_CLOCKWISE || rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+    const double Wr = swap ? H : W, Hr = swap ? W : H;
+    std::set<int> groups;
+    for (const auto& l : ul) groups.insert(l.group);
+    for (int g : groups) {
+        cv::Mat page = resample_cpu(stage1, warp4);
+        if (page.channels() == 4) cv::cvtColor(page, page, cv::COLOR_BGRA2BGR);
+        cv::Mat D = darkness_fast(page);
+        std::vector<std::array<double, 2>> xy_h, xy_v;   // Fy samples (horizontal lines), Fx samples (vertical)
+        Vec val_h, val_v, w_h, w_v;
+        std::vector<std::array<float, 5>> drawn;
+        const int rad = std::max(10, W / 100);
+        for (const auto& l : ul) {
+            if (l.group != g || l.pts.size() < 2) continue;
+            std::vector<cv::Point2d> pts;
+            double x0 = 1e300, x1 = -1e300, y0 = 1e300, y1 = -1e300;
+            for (const auto& f : l.pts) {
+                cv::Point2d p = unrotate_pt(f.x * Wr, f.y * Hr, W, H, rot);
+                pts.push_back(p);
+                x0 = std::min(x0, p.x); x1 = std::max(x1, p.x); y0 = std::min(y0, p.y); y1 = std::max(y1, p.y);
+            }
+            const bool hz = x1 - x0 >= y1 - y0;
+            auto s = snap_user_line(D, pts, hz, rad);
+            if (s.empty()) continue;
+            // part of the rule was found (a piece the stage straightened, in line with the drawn one): the
+            // drawn line is straightened to that piece's position, so the two join instead of pulling apart
+            double best_ov = 0, ideal = s.front()[1];
+            for (const auto& L : r.lines) {
+                cv::Point2d a = unrotate_pt(L[1] * Wr, L[2] * Hr, W, H, rot), b = unrotate_pt(L[3] * Wr, L[4] * Hr, W, H, rot);
+                if ((std::fabs(b.x - a.x) >= std::fabs(b.y - a.y)) != hz) continue;
+                const double la = std::min(hz ? a.x : a.y, hz ? b.x : b.y), lb = std::max(hz ? a.x : a.y, hz ? b.x : b.y);
+                const double pos = hz ? (a.y + b.y) / 2 : (a.x + b.x) / 2;
+                std::vector<double> near;
+                for (const auto& q : s)
+                    if (q[0] >= la - 3 * rad && q[0] <= lb + 3 * rad) near.push_back(q[1] + q[2]);
+                if (near.empty()) continue;
+                std::nth_element(near.begin(), near.begin() + near.size() / 2, near.end());
+                const double ov = (double)near.size();
+                if (std::fabs(near[near.size() / 2] - pos) < 0.5 * rad && ov > best_ov) { best_ov = ov; ideal = pos; }
+            }
+            for (auto& q : s) { q[2] += q[1] - ideal; q[1] = ideal; }
+            for (const auto& q : s) {
+                if (hz) { xy_h.push_back({q[0], q[1]}); val_h.push_back(q[2]); w_h.push_back(4.0); }
+                else { xy_v.push_back({q[1], q[0]}); val_v.push_back(q[2]); w_v.push_back(4.0); }
+            }
+            const double a = s.front()[0], b = s.back()[0], c = s.front()[1];
+            cv::Point2d e0 = hz ? rotate_pt(a, c, W, H, rot) : rotate_pt(c, a, W, H, rot);
+            cv::Point2d e1 = hz ? rotate_pt(b, c, W, H, rot) : rotate_pt(c, b, W, H, rot);
+            drawn.push_back({3.f, (float)(e0.x / Wr), (float)(e0.y / Hr), (float)(e1.x / Wr), (float)(e1.y / Hr)});
+        }
+        if (drawn.empty()) continue;
+        // the lines already straight hold still: zero across them every 16 px (on the output page,
+        // rotated frame, back to the stage-1 frame)
+        for (const auto& L : r.lines) {
+            cv::Point2d a = unrotate_pt(L[1] * Wr, L[2] * Hr, W, H, rot), b = unrotate_pt(L[3] * Wr, L[4] * Hr, W, H, rot);
+            const bool hz = std::fabs(b.x - a.x) >= std::fabs(b.y - a.y);
+            const double len = cv::norm(b - a);
+            for (double t = 0; t <= len; t += 16) {
+                cv::Point2d p = a + (b - a) * (len > 0 ? t / len : 0.0);
+                if (hz) { xy_h.push_back({p.x, p.y}); val_h.push_back(0); w_h.push_back(1.0); }
+                else { xy_v.push_back({p.x, p.y}); val_v.push_back(0); w_v.push_back(1.0); }
+            }
+        }
+        const int G = 16, gw = W / G + 2, gh = H / G + 2;
+        Field Fy = val_h.empty() || std::all_of(val_h.begin(), val_h.end(), [](double v) { return v == 0; }) ? zeros_field(gw, gh, G)
+                                                                                                              : solve_field_at(xy_h, val_h, &w_h, gw, gh, G);
+        Field Fx = val_v.empty() || std::all_of(val_v.begin(), val_v.end(), [](double v) { return v == 0; }) ? zeros_field(gw, gh, G)
+                                                                                                              : solve_field_at(xy_v, val_v, &w_v, gw, gh, G);
+        double most = 0;
+        for (double v : Fy.v) most = std::max(most, std::fabs(v));
+        for (double v : Fx.v) most = std::max(most, std::fabs(v));
+        if (most > 0.06 * std::max(W, H)) continue;
+        GridMap m = warp4;
+        for (int i = 0; i < m.gh; ++i)
+            for (int j = 0; j < m.gw; ++j) {
+                double x = j * m.stride, y = i * m.stride;
+                cv::Point2d q = map_at(warp4, x + Fx.sample(x, y), y + Fy.sample(x, y));
+                m.x[(size_t)i * m.gw + j] = (float)q.x;
+                m.y[(size_t)i * m.gw + j] = (float)q.y;
+            }
+        warp4 = std::move(m);
+        r.user_lines_used += (int)drawn.size();
+        r.lines.insert(r.lines.end(), drawn.begin(), drawn.end());
+    }
+}
+
 // How straight those rules come out through map m (null: the page as it is): each point's output
 // position (m inverted by fixed-point steps from the point itself; the line stage moves the page
 // by tens of px at most), per line the p95 distance from its straight fit across the line,
@@ -863,6 +1234,126 @@ double straightness_through(const PageTraces& T, const GridMap* m) {
     return T.pts.empty() ? 0.0 : sum / T.pts.size();
 }
 
+// Long straight edges of a page (Canny + Hough at half size: segments of a quarter of the short side
+// or more, within 2 degrees of the axes, away from the outer 25 px), sampled every 8 px: what is
+// already straight on the nets' page, for straight_edges_kept.
+PageTraces straight_edges(const cv::Mat& page) {
+    PageTraces S;
+    cv::Mat g, e;
+    cv::cvtColor(page, g, page.channels() == 4 ? cv::COLOR_BGRA2GRAY : cv::COLOR_BGR2GRAY);
+    cv::resize(g, g, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+    cv::Canny(g, e, 60, 150);
+    std::vector<cv::Vec4i> L;
+    const double len = 0.25 * std::min(g.cols, g.rows);
+    cv::HoughLinesP(e, L, 1, CV_PI / 360, 80, len, 4);
+    for (const auto& l : L) {
+        cv::Point2d a(2.0 * l[0], 2.0 * l[1]), b(2.0 * l[2], 2.0 * l[3]);
+        const double dx = std::fabs(b.x - a.x), dy = std::fabs(b.y - a.y);
+        const bool hz = dx > dy;
+        if ((hz ? dy / dx : dx / dy) > std::tan(2.0 * CV_PI / 180)) continue;
+        if (std::min({a.x, b.x, a.y, b.y}) < 25 || std::max(a.x, b.x) > page.cols - 26 || std::max(a.y, b.y) > page.rows - 26) continue;
+        const int n = (int)(std::hypot(b.x - a.x, b.y - a.y) / 8);
+        std::vector<cv::Point2d> p;
+        for (int i = 0; i <= n; ++i) p.push_back(a + (b - a) * ((double)i / std::max(1, n)));
+        S.pts.push_back(std::move(p));
+        S.hz.push_back(hz);
+    }
+    return S;
+}
+
+// The line stage straightens what it traced, and the guards below measure that; nothing measured
+// what it bends. On an illustration it took the long outlines of the drawing for rules, and making
+// them axis-straight waved the straight frame and bar beside them (a 2-cm S on a magazine page). A
+// candidate must leave every long straight edge of the page within kEdgeBend px of straight (p95
+// distance from its fitted line, after the map, versus before).
+const double kEdgeBend = 3.0;
+
+bool straight_edges_kept(const PageTraces& S, const GridMap& m) {
+    for (size_t l = 0; l < S.pts.size(); ++l) {
+        double before = 0, after = 0;
+        for (int k = 0; k < 2; ++k) {
+            Vec t, c;
+            for (const auto& s : S.pts[l]) {
+                cv::Point2d p = s;
+                if (k == 1)
+                    for (int it = 0; it < 10; ++it) { cv::Point2d q = map_at(m, p.x, p.y); p += s - q; }
+                t.push_back(S.hz[l] ? p.x : p.y); c.push_back(S.hz[l] ? p.y : p.x);
+            }
+            Vec f = polyfit(t, c, 1), d;
+            for (size_t i = 0; i < t.size(); ++i) d.push_back(std::fabs(c[i] - polyval(f, t[i])));
+            std::sort(d.begin(), d.end());
+            (k == 0 ? before : after) = d[(size_t)(0.95 * (d.size() - 1))];
+        }
+        if (after > before + kEdgeBend) return false;
+    }
+    return true;
+}
+
+// Height / width of the rectangle photographed as the quad c (TL, TR, BR, BL, photo px): Zhang and He's
+// rectangle-from-perspective method ("Whiteboard scanning and image enhancement", 2007), principal point
+// at the photo centre. The focal length: focal_px, else measured from the quad when both directions
+// converge enough to tell, else 0.72 x the long side (surface.cpp's default). The camera correction
+// always applies: a sheet tilted one way only is still foreshortened the other way (PageLook.kt
+// measuredPageHw, the same method). -1: degenerate quad.
+double quad_page_hw(const std::array<cv::Point2d, 4>& c, cv::Size photo, double focal_px) {
+    const double u0 = photo.width / 2.0, v0 = photo.height / 2.0, L = std::max(photo.width, photo.height);
+    auto hom = [](const cv::Point2d& p) { return cv::Vec3d(p.x, p.y, 1.0); };
+    const cv::Vec3d m1 = hom(c[0]), m2 = hom(c[1]), m3 = hom(c[3]), m4 = hom(c[2]);
+    const double d2 = m2.cross(m4).dot(m3), d3 = m3.cross(m4).dot(m2);
+    if (std::fabs(d2) < 1e-9 || std::fabs(d3) < 1e-9) return -1;
+    const double k2 = m1.cross(m4).dot(m3) / d2, k3 = m1.cross(m4).dot(m2) / d3;
+    const cv::Vec3d n2 = k2 * m2 - m1, n3 = k3 * m3 - m1;
+    auto converges = [&](const cv::Vec3d& n) { return std::fabs(n[2]) * L / std::max(1e-9, std::hypot(n[0], n[1])) > 0.02; };
+    double f2 = focal_px > 0 ? focal_px * focal_px : 0;
+    if (f2 <= 0 && converges(n2) && converges(n3))
+        f2 = -((n2[0] * n3[0] - (n2[0] * n3[2] + n2[2] * n3[0]) * u0 + n2[2] * n3[2] * u0 * u0) +
+               (n2[1] * n3[1] - (n2[1] * n3[2] + n2[2] * n3[1]) * v0 + n2[2] * n3[2] * v0 * v0)) / (n2[2] * n3[2]);
+    // a quad that barely converges measures the focal length badly (0.29 to 1.78 x the long side on real photos;
+    // phone cameras are about 0.7 - 1.0, 26 mm equivalent: 0.72): outside 0.5 - 2 x, the default
+    if (!(f2 >= 0.25 * L * L && f2 <= 4.0 * L * L) && focal_px <= 0) f2 = (0.72 * L) * (0.72 * L);
+    if (!(f2 > 0)) f2 = (0.72 * L) * (0.72 * L);
+    auto q = [&](const cv::Vec3d& n) {
+        const double x = n[0] - u0 * n[2], y = n[1] - v0 * n[2];
+        return (x * x + y * y) / f2 + n[2] * n[2];
+    };
+    const double a = q(n2), b = q(n3);
+    return a > 0 && b > 0 ? std::sqrt(b / a) : -1;
+}
+
+// Height / width of the paper itself, measured along a flattening map (output page -> photo px): the
+// map's points are first taken through the homography from its corners to a rectangle of the corners'
+// true shape (quad_page_hw: the perspective is removed), then the median length of its columns over
+// that of its rows. Along the map, not only between the corners: a curled sheet is longer than the
+// chord between its corners (a curled magazine page measured 1.25 from its corners, 1.44 along the
+// map; it is A4, 1.41), and the core's page is A4 whatever the paper, so the app takes the paper's own
+// shape from this. A homography map gives exactly the corners' shape. (Before round 17 the lengths were
+// summed in photo px, where a tilt foreshortens one direction.)
+double map_page_hw(const GridMap& m, cv::Size photo, double focal_px) {
+    if (m.gw < 3 || m.gh < 3) return -1;
+    auto P = [&](int i, int j) { const size_t a = (size_t)i * m.gw + j; return cv::Point2d(m.x[a], m.y[a]); };
+    const std::array<cv::Point2d, 4> c = {P(0, 0), P(0, m.gw - 1), P(m.gh - 1, m.gw - 1), P(m.gh - 1, 0)};
+    const double hw0 = quad_page_hw(c, photo, focal_px);
+    if (!(hw0 > 0)) return -1;
+    std::vector<cv::Point2f> src, dst = {{0, 0}, {1, 0}, {1, (float)hw0}, {0, (float)hw0}}, pts, flat;
+    for (const auto& p : c) src.emplace_back((float)p.x, (float)p.y);
+    const cv::Mat Hc = cv::getPerspectiveTransform(src, dst);
+    for (size_t a = 0; a < m.x.size(); ++a) pts.emplace_back(m.x[a], m.y[a]);
+    cv::perspectiveTransform(pts, flat, Hc);
+    Vec rows, cols;
+    for (int i = 0; i < m.gh; ++i) {
+        double s = 0;
+        for (int j = 0; j + 1 < m.gw; ++j) s += cv::norm(flat[(size_t)i * m.gw + j + 1] - flat[(size_t)i * m.gw + j]);
+        rows.push_back(s);
+    }
+    for (int j = 0; j < m.gw; ++j) {
+        double s = 0;
+        for (int i = 0; i + 1 < m.gh; ++i) s += cv::norm(flat[(size_t)(i + 1) * m.gw + j] - flat[(size_t)i * m.gw + j]);
+        cols.push_back(s);
+    }
+    const double w = median(rows);
+    return w > 0 ? median(cols) / w : -1;
+}
+
 // The line stage on a page the nets flattened, with its guards. The page is already flat, so a
 // correction that stretches or squeezes it locally (|det J - 1| p99 above max_line_distortion, or
 // more than max_line_distortion_frac of the cells above 0.2) is a tracing failure (dense staves,
@@ -877,20 +1368,26 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     // the rule net's output is kept for the further unwarp_map runs on the same page (the retry)
     std::vector<float> net_out;
     int net_w = 0, net_h = 0;
+    // progress through the stage (30 - 85): it is one call to the nets' 1 - 3 and can take seconds on a phone
     RuleNetFn net = [&](std::vector<float>& io, int w, int h) {
         if (!net_out.empty() && w == net_w && h == net_h) { io = net_out; return true; }
-        if (!opt.rule_net(io, w, h)) return false;
+        report(opt, 32, "Finding rules and text lines");
+        const bool ok = opt.rule_net(io, w, h);
+        report(opt, 42, "Tracing lines and solving the warp map");
+        if (!ok) return false;
         net_out = io; net_w = w; net_h = h;
         return true;
     };
     const RuleNetFn* netp = opt.rule_net ? &net : nullptr;
     const cv::Mat* ig = ignore.empty() ? nullptr : &ignore;
     WarpDebug w0;
+    w0.keep_traced = opt.faint_lines;   // for the local retry below
     GridMap m0 = unwarp_map(page, &w0, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp);
     // the yardstick for every candidate: the rules the first attempt traced, all of them
     const PageTraces T = page_traces(w0);
     const double s_page = straightness_through(T, nullptr);
     r.line_straightness[0] = s_page;
+    const PageTraces E = straight_edges(page);
     // a candidate is kept if it neither overstretches the page nor leaves those rules less straight
     // than the page as it is (a fallback that drops some lines can bend the rules they were on)
     auto take = [&](WarpDebug& w, GridMap& m) {
@@ -900,9 +1397,11 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         if (opt.max_local_rescale > 0) r.bumps_faded = soften_bumps(m, opt.max_local_rescale, extension_support(w, m.gw, m.gh, m.stride));
         double st = straightness_through(T, &m);
         if (T.pts.size() >= 3 && st > s_page - 0.1) return false;
+        if (!straight_edges_kept(E, m)) { r.edges_bent = true; return false; }
         r.line_straightness[1] = st;
         r.line_distortion = q;
         r.warp = std::move(w);
+        r.warp.traced.reset();
         return true;
     };
     // a second trace-and-solve pass on the page the first one straightened (Marior, ArbDR: run again
@@ -917,9 +1416,14 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         if (r.warp.H.empty() && r.warp.V.empty()) return;
         auto t2 = Clock::now();
         struct Done { PipelineResult& r; Clock::time_point t; ~Done() { r.second_pass_ms = ms_since(t); } } done{r, t2};
+        report(opt, 62, "Second line pass");
         cv::Mat page2 = resample_cpu(page, m);
         if (page2.channels() == 4) cv::cvtColor(page2, page2, cv::COLOR_BGRA2BGR);
-        RuleNetFn net2 = opt.rule_net;   // the page moved: the net runs again
+        RuleNetFn net2 = [&](std::vector<float>& io, int w, int h) {   // the page moved: the net runs again
+            const bool ok = opt.rule_net(io, w, h);
+            report(opt, 70, "Second line pass: tracing");
+            return ok;
+        };
         WarpDebug w;
         GridMap m2 = unwarp_map(page2, &w, nullptr, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges,
                                 opt.rule_net ? &net2 : nullptr);
@@ -947,20 +1451,41 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         // the same lines without those that pass through the overstretched spots (left out whole:
         // dropping only their samples there straightened a rule on one side of a spot and not on
         // the other); the nets' page stays as it is there
+        report(opt, 50, "Tracing lines again, without the overstretched spots");
         cv::Mat spots = distortion_spots(w0, page.cols, page.rows);
         WarpDebug w1;
-        GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots);
+        GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots, &w0);
         if (take(w1, m1)) { r.lines_spots_dropped = true; second_pass(m1); return m1; }
         // the reference lines alone: the faint rules may be what overstretches it (picture edges, a
         // rule traced into text)
+        report(opt, 56, "Tracing the main lines only");
         WarpDebug w2;
         GridMap m2 = unwarp_map(page, &w2, ig, opt.share_rows, false, opt.robust_solve);
         if (take(w2, m2)) { second_pass(m2); return m2; }
     }
     r.warp = std::move(w0);
+    r.warp.traced.reset();
     r.lines_rejected = true;
     r.bumps_faded = 0;
     return identity_grid(page.cols, page.rows);
+}
+
+// Where two grids of the same page put its border: per side (top, right, bottom, left of the page), the share of
+// 64 points along it where the two lie more than gap x the page's size (sqrt of a's outline area) apart
+static void net_edge_gap(const UvGrid& a, const UvGrid& b, double gap, double out[4]) {
+    const std::vector<cv::Point2f> ol = a.outline();
+    const double size = std::sqrt(std::max(1.0, std::abs(cv::contourArea(ol))));
+    const int W = 1001, H = 1001, n = 64;   // page coordinates only: both grids are read at the same page points
+    for (int s = 0; s < 4; ++s) {
+        int far = 0;
+        for (int i = 0; i < n; ++i) {
+            const double t = (i + 0.5) / n * (W - 1);
+            const double x = s == 0 ? t : s == 1 ? W - 1 : s == 2 ? W - 1 - t : 0;
+            const double y = s == 0 ? 0 : s == 1 ? t : s == 2 ? H - 1 : H - 1 - t;
+            far += cv::norm(a.at(x, y, W, H) - b.at(x, y, W, H)) > gap * size;
+        }
+        out[s] = (double)far / n;
+    }
 }
 
 PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
@@ -1013,11 +1538,16 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         nets_fut = std::async(std::launch::async, run_nets);
     }
     report(opt, 2, "Finding the page");
+    // edited corners: the paper mask at the end still comes from a detection (if it agrees with the
+    // user's corners), which needs only the photo: made beside everything else
+    std::future<PageCorners> edited_detection;
+    if (opt.corners_edited)
+        edited_detection = std::async(std::launch::async, [&] { return detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index); });
     Unroll U;
     std::array<cv::Point2d, 4> corners;
     PageCorners pc;
     if (!opt.corners_edited) {
-        pc = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
+        pc = opt.assessed ? opt.assessed->pc : detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
         r.detection = pc;
         if (!pc.ok) {
             give_corners(nullptr);   // the nets that need corners do not run; the future's destructor waits for the rest
@@ -1025,6 +1555,24 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             return r;
         }
         corners = pc.pts;
+        // how far each side of the page finder's outline bows away from the straight line between its corners
+        // (p95 distance / the side's length): measured on the photo, independent of the nets
+        for (int k = 0; k < 4; ++k) {
+            const cv::Point2d a = pc.det.corners[k], b = pc.det.corners[(k + 1) % 4];
+            const double L = cv::norm(b - a);
+            r.side_n[k] = (int)pc.det.side_pts[k].size();
+            if (L < 1 || pc.det.side_pts[k].size() < 5) continue;
+            Vec d;
+            const double aw = photo.cols * std::min(1.0, pc.scale), ah = photo.rows * std::min(1.0, pc.scale);
+            int on_edge = 0;
+            for (const auto& p : pc.det.side_pts[k]) {
+                d.push_back(std::fabs((b - a).cross(p - a)) / L);
+                on_edge += std::min({p.x, p.y, aw - 1 - p.x, ah - 1 - p.y}) < 2.0;
+            }
+            r.side_edge[k] = (double)on_edge / pc.det.side_pts[k].size();
+            std::sort(d.begin(), d.end());
+            r.side_bow[k] = d[(size_t)(0.95 * (d.size() - 1))] / L;
+        }
     } else {
         corners = opt.corners;
     }
@@ -1066,7 +1614,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     if (!opt.corners_edited) {
         t0 = Clock::now();
         report(opt, 8, "Fitting the page surface");
-        r.model = fit_detected(photo, pc, opt.focal_px);
+        r.model = opt.assessed ? opt.assessed->model : fit_detected(photo, pc, opt.focal_px);
         r.ms.emplace_back("surface fit", ms_since(t0));
         r.fit_median_px = r.model.median_px;
         r.fit_p90_px = r.model.p90_px;
@@ -1127,12 +1675,32 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     // outline agrees with the page finder (or with corners set by hand); with two nets, the first is
     // kept unless the second's stage-1 page has far straighter text rows (uv_prefer_margin). The line
     // stage still runs on top.
+    // the stage-1 unroll before the nets, for a net set aside by the border snap below
+    const Unroll U_pre = U;
+    const GeomMode mode_pre = r.mode;
+    const bool fell_back_pre = r.fell_back;
     if (opt.uv_out && !opt.perspective_only) {
         auto t_uv = Clock::now();
         const bool use_mask = !opt.corners_edited && pc.ok && !pc.det.paper.empty();
         const double need = use_mask ? opt.uv_min_agreement : opt.uv_min_agreement_quad;
-        struct Cand { UvGrid g; double agree = 0, consist = -1; int model = 0; bool own = false; };
+        // paper that fills the photo (every corner at a photo corner, and the page finder's paper covers
+        // kFillsPhoto of it): its edges are outside the photo, and a grid that outlines a page inside it has
+        // invented them (the nets learnt pages on a background) - it would crop away the photo's edges with
+        // what is printed there. Such a grid does not define the page. Corners at the photo corners around
+        // less paper are the finder's failure (a sheet half under a box): there the grid's outline is the help.
+        const double kFillsPhoto = 0.9;
+        bool fills_photo = pc.area_frac < 0 || pc.area_frac >= kFillsPhoto;
+        for (const auto& c : corners) {
+            const double tol = 0.02 * std::max(photo.cols, photo.rows);
+            fills_photo &= std::min(c.x, photo.cols - 1 - c.x) < tol && std::min(c.y, photo.rows - 1 - c.y) < tol;
+        }
+        auto grid_broken = [&](const GridValidity& gv) {
+            return (opt.uv_max_folded > 0 && gv.folded > opt.uv_max_folded) ||
+                   (opt.uv_max_collapsed > 0 && gv.collapsed > opt.uv_max_collapsed);
+        };
+        struct Cand { UvGrid g; double agree = 0, agree_mask = -1, consist = -1, paper = -1; int model = 0; bool own = false; };
         std::vector<Cand> ok;
+        UvGrid raw[2];   // each net's grid as it came (edge doubt)
         double best_agree = 0;
         UvGrid pass1;
         if (opt.uv_out_pass1 && !opt.corners_edited) pass1 = uv_grid(opt.uv_out_pass1, opt.uv_crop_pass1);
@@ -1142,18 +1710,34 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             const UvCrop& crop = k == 0 ? opt.uv_crop : opt.uv_crop2;
             Cand c;
             c.g = uv_grid(out, crop);
+            raw[k] = c.g;
             c.model = crop.model;
             // the page finder's mask can miss a coloured band or a dark page its corners still frame
-            c.agree = uv_agreement(c.g, corners, photo.size());
-            if (use_mask) c.agree = std::max(c.agree, uv_agreement(c.g, pc.det.paper, pc.scale));
+            c.agree = r.uv_agree_quad[k] = uv_agreement(c.g, corners, photo.size());
+            if (use_mask) c.agree = std::max(c.agree, c.agree_mask = r.uv_agree_mask[k] = uv_agreement(c.g, pc.det.paper, pc.scale));
+            {
+                const GridValidity gv = uv_grid_validity(c.g, photo.size());
+                r.uv_grid_check[k][0] = gv.folded;
+                r.uv_grid_check[k][1] = gv.collapsed;
+                r.uv_grid_check[k][2] = gv.outside;
+                if (grid_broken(gv)) {
+                    r.uv_grid_rejected[k] = true;
+                    c.g.ok = false;
+                }
+            }
             best_agree = std::max(best_agree, c.agree);
             if (!c.g.ok) continue;
             bool by_finder = c.g.turned == landscape && c.agree >= (c.model == 2 && use_mask ? opt.uv_min_agreement_hr : need);
             if (pass1.ok) c.consist = uv_agreement(c.g, pass1);
-            c.own = !by_finder && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor;
+            // a grid that outlines its own page must outline paper (the page finder's mask): one that reaches into
+            // the background has invented the page (a receipt between coffee cups came out with the cups)
+            if (use_mask) c.paper = r.uv_paper_share[k] = uv_paper_share(c.g, pc.det.paper, pc.scale, photo);
+            c.own = !by_finder && !fills_photo && (opt.uv_hr_own || c.model != 2) && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor &&
+                    (c.paper < 0 || c.paper >= opt.uv_own_min_paper);
             if (by_finder || c.own) ok.push_back(std::move(c));
         }
         r.uv_agreement = best_agree;
+        if (raw[0].ok && raw[1].ok && raw[0].turned == raw[1].turned) net_edge_gap(raw[0], raw[1], opt.edge_gap, r.net_edge_gap);
         // grids that define the page themselves: one page frame for all candidates
         bool any_finder = false;
         for (const auto& c : ok) any_finder |= !c.own;
@@ -1162,17 +1746,23 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         if (!ok.empty()) {
             size_t pick = 0;
             if (ok.size() == 2) {
-                // a half-size stage-1 page of each: text-row angle spread
+                // a half-size stage-1 page of each: text-row angle spread (the pages made here, where the
+                // GPU's context is; the two spreads side by side)
+                cv::Mat half[2];
                 for (size_t k = 0; k < 2; ++k) {
                     Unroll Us = Uh;
                     Us.mode = GeomMode::Neural;
                     Us.uv = ok[k].g;
                     Us.W = W / 2;
                     Us.H = H / 2;
-                    int rows = 0;
-                    r.uv_spread[k] = text_row_spread(remap_unroll(photo, Us, opt.use_gpu), &rows);
-                    if (rows < 5) r.uv_spread[k] = -1;
+                    half[k] = remap_unroll(photo, Us, opt.use_gpu);
                 }
+                int rows[2] = {0, 0};
+                auto spread1 = std::async(std::launch::async, [&] { return text_row_spread(half[1], &rows[1]); });
+                r.uv_spread[0] = text_row_spread(half[0], &rows[0]);
+                r.uv_spread[1] = spread1.get();
+                for (size_t k = 0; k < 2; ++k)
+                    if (rows[k] < 5) r.uv_spread[k] = -1;
                 if (r.uv_spread[0] >= 0 && r.uv_spread[1] >= 0 && r.uv_spread[1] < r.uv_spread[0] - opt.uv_prefer_margin) pick = 1;
             }
             if (ok[pick].own) {
@@ -1183,6 +1773,23 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             U = Uh;
             U.mode = GeomMode::Neural;
             U.uv = std::move(ok[pick].g);
+            // the other net where the chosen one's border misses the paper and the other's fits it (a corner the
+            // chosen net cut off and bent: the coupon's curled strip)
+            if (opt.fuse_miss > 0 && ok.size() == 2 && use_mask && !r.uv_defines_page &&
+                ok[1 - pick].agree_mask >= ok[pick].agree_mask + opt.fuse_min_gain) {
+                FuseStats fst;
+                UvGrid fused = uv_fuse_border(U.uv, ok[1 - pick].g, pc.det.paper, pc.scale, &fst, opt.fuse_miss);
+                r.fuse_runs = fst.runs;
+                r.fuse_worst[0] = fst.worst_a;
+                r.fuse_worst[1] = fst.worst_b;
+                r.fuse_moved_px = fst.moved_px;
+                r.fuse_area = fst.area;
+                if (fst.runs > 0) {
+                    const GridValidity gv = uv_grid_validity(fused, photo.size());
+                    if (gv.folded > 0.001 || grid_broken(gv)) r.fuse_rejected = true;
+                    else U.uv = std::move(fused);
+                }
+            }
             r.uv_agreement = ok[pick].agree;
             r.uv_model = ok[pick].model;
             r.mode = GeomMode::Neural;
@@ -1207,8 +1814,9 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                         double s = text_row_spread(remap_unroll(photo, Us), &rows);
                         return rows < 5 ? -1.0 : s;
                     };
+                    auto spread1 = std::async(std::launch::async, [&] { return spread(fine); });
                     r.uv_zoom_spread[0] = spread(U.uv);
-                    r.uv_zoom_spread[1] = spread(fine);
+                    r.uv_zoom_spread[1] = spread1.get();
                     if (agree >= need && r.uv_zoom_spread[0] >= 0 && r.uv_zoom_spread[1] >= 0 &&
                         r.uv_zoom_spread[1] <= r.uv_zoom_spread[0] + opt.zoom_max_worse) {
                         U.uv = std::move(fine);
@@ -1217,10 +1825,99 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 }
                 r.ms.emplace_back("zoomed flattening pass", ms_since(tz));
             }
+            // how far the grid is from a flat sheet: the homography that best maps its points (photo) to the page,
+            // and the points' distance from it on the page (page px; p50, p95, max)
+            {
+                std::vector<cv::Point2f> ph, pg;
+                const UvGrid& G = U.uv;
+                for (int i = 0; i < G.gh; ++i)
+                    for (int j = 0; j < G.gw; ++j) {
+                        const cv::Point2d& q = G.pts[(size_t)i * G.gw + j];
+                        ph.emplace_back((float)q.x, (float)q.y);
+                        // the page as the net saw it (portrait); turned: x along the photo's long side
+                        const double u = (double)j / (G.gw - 1), v = (double)i / (G.gh - 1);
+                        pg.emplace_back(G.turned ? cv::Point2f((float)(v * (W - 1)), (float)((1 - u) * (H - 1)))
+                                                 : cv::Point2f((float)(u * (W - 1)), (float)(v * (H - 1))));
+                    }
+                cv::Mat Hf = cv::findHomography(ph, pg, 0);
+                if (!Hf.empty()) {
+                    std::vector<cv::Point2f> pr;
+                    cv::perspectiveTransform(ph, pr, Hf);
+                    Vec d;
+                    for (size_t k = 0; k < pr.size(); ++k) d.push_back(cv::norm(pr[k] - pg[k]));
+                    std::sort(d.begin(), d.end());
+                    r.uv_flat_resid[0] = d[d.size() / 2];
+                    r.uv_flat_resid[1] = d[(size_t)(0.95 * (d.size() - 1))];
+                    r.uv_flat_resid[2] = d.back();
+                }
+            }
+            // the border onto the paper's edge (the page finder's mask): where the paper is is measured, not the
+            // net's to decide (it drew a bill's edge bowed into the table, a coupon's curled corner with the table
+            // in it). Not when the grid drew the page itself (the mask was overruled). A net that needs more than
+            // snap_lost x the page's size on most of a side has lost the page: the page before the nets is kept.
+            bool snapped_lost = false;
+            if (opt.snap_border && use_mask && !r.uv_defines_page) {
+                auto tb = Clock::now();
+                BorderSnap bs;
+                UvGrid sg = uv_snap_border(U.uv, pc.det.paper, pc.scale, &bs, opt.snap_search, opt.snap_dead_px, opt.snap_lost);
+                r.snap_px[0] = bs.median_px;
+                r.snap_px[1] = bs.max_px;
+                r.snap_sides = bs.sides_moved;
+                if (bs.sides_lost > 0) {
+                    snapped_lost = true;
+                    U = U_pre;
+                    r.mode = mode_pre;
+                    r.fell_back = fell_back_pre;
+                    r.uv_rejected = true;
+                    r.uv_lost_page = true;
+                } else {
+                    U.uv = std::move(sg);
+                }
+                r.ms.emplace_back("border snap", ms_since(tb));
+            }
+            // the composed grid (fusion, border snap) checked again: a fold made there is not used either
+            if (!snapped_lost && U.mode == GeomMode::Neural && (opt.uv_max_folded > 0 || opt.uv_max_collapsed > 0) &&
+                grid_broken(uv_grid_validity(U.uv, photo.size()))) {
+                snapped_lost = true;
+                U = U_pre;
+                r.mode = mode_pre;
+                r.fell_back = fell_back_pre;
+                r.uv_rejected = true;
+                r.uv_composed_broken = true;
+            }
+            // flat paper: paper bends but does not stretch, so a sheet whose four edges are all straight in the photo
+            // (side_bow, measured on the page finder's outline) is flat; a grid that bends it has invented the curl
+            // (the nets learnt that pages are curled: a dollar bill on a table came out bowed, as much as a curled
+            // magazine page - the grid alone cannot tell them apart). The homography between the corners is stage 1.
+            // Not when the grid drew the page itself (the page finder's outline was overruled).
+            if (opt.flat_edge_bow > 0 && !r.uv_defines_page && !snapped_lost) {
+                bool straight = true;
+                for (double b : r.side_bow) straight &= b >= 0 && b <= opt.flat_edge_bow;
+                if (straight) {
+                    U = Uh;
+                    r.mode = GeomMode::Homography;
+                    r.flat_page = true;
+                }
+            }
         } else {
             r.uv_rejected = true;
         }
         r.ms.emplace_back("flattening net check", ms_since(t_uv));
+    }
+    // the surface model without paper edges to fit (PipelineOptions::surface_min_sides)
+    if (r.mode == GeomMode::Surface && opt.surface_min_sides > 0 && !opt.corners_edited) {
+        int known = 0;
+        bool straight = true;
+        for (int k = 0; k < 4; ++k) {
+            if (r.side_n[k] < 20 || r.side_edge[k] < 0 || r.side_edge[k] > opt.side_edge_max || r.side_bow[k] < 0) continue;
+            ++known;
+            straight &= r.side_bow[k] <= opt.flat_edge_bow;
+        }
+        if (known < opt.surface_min_sides || straight) {
+            U = Uh;
+            r.mode = GeomMode::Homography;
+            r.surface_unfounded = true;
+        }
     }
     t0 = Clock::now();
     report(opt, 20, "Unrolling the page");
@@ -1253,6 +1950,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             o = orient_decide(op, in, opt);
         }
         r.rot = o.rot; r.orient_sh = o.sh; r.orient_sv = o.sv; r.orient_upright = o.upright;
+        r.orient_net_turn = o.net_turn; r.orient_net_margin = o.net_margin; r.orient_net_patches = o.net_patches; r.orient_by_net = o.by_net;
         r.ms.emplace_back("orientation", ms_since(t0));
     }
     t0 = Clock::now();
@@ -1269,6 +1967,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                                opt.rule_net ? &opt.rule_net : nullptr);
         }
         r.lines = fitted_lines(r.warp, W, H, r.rot);
+        apply_user_lines(stage1, warp4, opt.user_lines, W, H, r.rot, r);
     }
     r.rule_net = !r.warp.PH.empty();
     r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_joined = r.warp.net.joined; r.net_kept = r.warp.S2.n_net_kept;
@@ -1280,6 +1979,8 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     t0 = Clock::now();
     report(opt, 85, "Composing the map");
     r.final_map = compose(U, warp4, r.rot, true);
+    // a perspective-only page: the map is a homography, its lengths are the photo's foreshortened ones
+    if (!opt.perspective_only) r.page_hw = map_page_hw(r.final_map, photo.size(), opt.focal_px);
     cv::Mat beyond = beyond_page(warp4, W, H, r.rot);
     r.ms.emplace_back("compose (4-px grid)", ms_since(t0));
     report(opt, 90, "Resampling");
@@ -1289,7 +1990,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     auto shade = [&] {
         auto ts = Clock::now();
         report(opt, 92, "Removing shadows");
-        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side);
+        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side, opt.shade_floor);
         r.shadows_removed |= r.shade_net;
         r.ms.emplace_back("shadow net", ms_since(ts));
     };
@@ -1319,7 +2020,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     // paper mask: from this run's detection, or - when the corners were edited - from a fresh
     // detection if its corners agree with the user's (otherwise the outline is not trusted)
     if (opt.corners_edited) {
-        PageCorners pd = detect_corners(photo, opt.max_analysis_side, opt.seg_logits, opt.page_index);
+        PageCorners pd = edited_detection.get();
         double diag = hypot_xy((double)photo.cols, (double)photo.rows), worst = 0;
         for (int k = 0; k < 4 && pd.ok; ++k) worst = std::max(worst, cv::norm(pd.pts[k] - corners[k]));
         if (pd.ok && worst < 0.03 * diag) pc = pd;
@@ -1339,21 +2040,33 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         if (r.paper.empty()) r.paper = cv::Mat(r.page.size(), CV_8U, cv::Scalar(255));
         r.paper.setTo(0, b);
     }
-    if (opt.erase_fingers && !r.paper.empty()) r.fingers_erased = erase_fingers(r.page, r.paper);
+    if (opt.erase_fingers && !r.paper.empty()) {
+        // the page as it was, for the app's finger brush (add / remove areas, PipelineOptions::keep_unerased)
+        if (opt.keep_unerased) {
+            r.page_unerased = r.page.clone();
+            r.paper_unerased = r.paper.clone();
+        }
+        SkinModel sm;
+        if (opt.finger_rules & (kFingerAdaptiveSkin | kFingerSkinRegion)) sm = skin_model_outside(photo, r.render_map);
+        r.fingers_erased = erase_fingers(r.page, r.paper, &r.finger_mask, opt.finger_rules, &sm);
+        if (r.finger_mask.empty()) r.page_unerased.release(), r.paper_unerased.release();
+        else r.fingers_over_text = finger_over_text(r.page_unerased.empty() ? r.page : r.page_unerased, r.finger_mask, r.paper);
+    }
     // before page: perspective only, same rotation and size (made beside the nets when they kept both)
-    if (!spec.before.empty() && same_homography(Uh, spec.Uh) && r.rot == spec.o.rot) {
+    if (!spec.before.empty() && same_homography(Uh, spec.Uh) && r.rot == spec.o.rot && spec.before.size() == r.page.size()) {
         r.before = spec.before;
         r.before_reused = true;
     } else {
-        GridMap hb = at_render_size(compose(Uh, identity_grid(W, H), r.rot, true), opt);
+        GridMap hb = at_size(compose(Uh, identity_grid(W, H), r.rot, true), r.page.size());
         resample_any(to_bgra(photo), hb, opt.use_gpu, r.before);
     }
     // deformation: page point p -> where it sat on the before page
     {
         const GridMap& g = r.render_map;
         bool swap = r.rot == cv::ROTATE_90_CLOCKWISE || r.rot == cv::ROTATE_90_COUNTERCLOCKWISE;
-        int Wa = swap ? H : W;
-        double k = (double)g.out_w / Wa;
+        int Wa = swap ? H : W, Ha = swap ? W : H;
+        // analysis page px -> output page px (the output may have the paper's own shape: two scales)
+        double kx = (double)g.out_w / Wa, ky = (double)g.out_h / Ha;
         r.disp = GridMap::make(g.out_w, g.out_h, 4);
         const double* m = M.ptr<double>();
         for (int i = 0; i < g.gh; ++i)
@@ -1362,12 +2075,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 double w = X * m[6] + Y * m[7] + m[8];
                 double u = (X * m[0] + Y * m[1] + m[2]) / w, v = (X * m[3] + Y * m[4] + m[5]) / w;
                 cv::Point2d q = rotate_pt(u, v, W, H, r.rot);
-                r.disp.X(i, j) = (float)((q.x + 0.5) * k - 0.5 - 4 * j);
-                r.disp.Y(i, j) = (float)((q.y + 0.5) * k - 0.5 - 4 * i);
+                r.disp.X(i, j) = (float)((q.x + 0.5) * kx - 0.5 - 4 * j);
+                r.disp.Y(i, j) = (float)((q.y + 0.5) * ky - 0.5 - 4 * i);
             }
     }
     r.ms.emplace_back("paper mask + before page", ms_since(t0));
     r.ms.emplace_back("total", ms_since(tall));
+    if (opt.edge_doubt_frac > 0 && r.mode == GeomMode::Neural && !opt.corners_edited)
+        for (double g : r.net_edge_gap) r.edge_doubt |= g >= opt.edge_doubt_frac;
     r.ok = true;
     return r;
 }
@@ -1392,6 +2107,91 @@ void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper) {
     for (int y = 0; y < h; ++y) {
         uint8_t* p = page_bgra.ptr<uint8_t>(y);
         const uint8_t* f = filled.ptr<uint8_t>(y);
+        const uint8_t* a = soft.ptr<uint8_t>(y);
+        uint8_t* pa = paper && !paper->empty() ? paper->ptr<uint8_t>(y) : nullptr;
+        for (int x = 0; x < w; ++x) {
+            if (!a[x]) continue;
+            float t = a[x] / 255.f;
+            for (int k = 0; k < 3; ++k) p[4 * x + k] = (uint8_t)std::lround(p[4 * x + k] * (1 - t) + f[3 * x + k] * t);
+            if (pa) pa[x] = std::max(pa[x], a[x]);
+        }
+    }
+}
+
+namespace {
+// The paper around [mask] (page px), with print taken out: a 1/4-size copy whose dark marks are lifted by a
+// 5x5 max filter, filled into the mask from the paper around it only (normalized convolution at growing
+// scales, so each spot gets its nearest paper).
+cv::Mat paper_behind(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat* paper) {
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    cv::Size ss(std::max(1, w / 4), std::max(1, h / 4));
+    cv::Mat bgr, small, sm, known;
+    cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
+    cv::resize(bgr, small, ss, 0, 0, cv::INTER_AREA);
+    cv::dilate(small, small, cv::Mat::ones(5, 5, CV_8U));   // print out: the paper's own colour
+    cv::resize(mask, sm, ss, 0, 0, cv::INTER_AREA);
+    cv::dilate(sm > 0, sm, cv::Mat::ones(5, 5, CV_8U));
+    known = sm == 0;
+    if (paper && !paper->empty()) {
+        cv::Mat ps;
+        cv::resize(*paper, ps, ss, 0, 0, cv::INTER_AREA);
+        known &= ps > 200;
+    }
+    cv::Mat src, k32, out = cv::Mat::zeros(ss, CV_32FC3), done = known.clone();
+    small.convertTo(src, CV_32FC3);
+    known.convertTo(k32, CV_32F, 1 / 255.0);
+    src.copyTo(out, known);
+    for (double sigma : {2.0, 4.0, 8.0, 16.0, 32.0, 64.0}) {
+        cv::Mat num, den, s3;
+        cv::Mat k3;
+        cv::merge(std::vector<cv::Mat>{k32, k32, k32}, k3);
+        cv::GaussianBlur(src.mul(k3), num, cv::Size(0, 0), sigma);
+        cv::GaussianBlur(k32, den, cv::Size(0, 0), sigma);
+        for (int y = 0; y < ss.height; ++y)
+            for (int x = 0; x < ss.width; ++x)
+                if (!done.at<uint8_t>(y, x) && den.at<float>(y, x) > 0.02f) {
+                    out.at<cv::Vec3f>(y, x) = num.at<cv::Vec3f>(y, x) / den.at<float>(y, x);
+                    done.at<uint8_t>(y, x) = 255;
+                }
+        if (cv::countNonZero(done) == ss.area()) break;
+    }
+    cv::Mat full;
+    cv::resize(out, full, cv::Size(w, h), 0, 0, cv::INTER_LINEAR);
+    full.convertTo(full, CV_8UC3);
+    return full;
+}
+}  // namespace
+
+bool finger_over_text(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat& paper) {
+    if (mask.empty() || cv::countNonZero(mask) == 0) return false;
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    int r = std::max(4, w / 60);
+    cv::Mat ring;
+    cv::dilate(mask, ring, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * r + 1, 2 * r + 1)));
+    ring &= ~mask;
+    if (!paper.empty()) ring &= paper > 200;
+    // away from the page border (the border itself is not text)
+    int b = std::max(4, w / 100);
+    cv::rectangle(ring, cv::Rect(0, 0, w, h), cv::Scalar(0), 2 * b);
+    int n = cv::countNonZero(ring);
+    if (n < 50) return false;
+    cv::Mat gray, bg;
+    cv::cvtColor(page_bgra, gray, cv::COLOR_BGRA2GRAY);
+    cv::dilate(gray, bg, cv::Mat::ones(15, 15, CV_8U));
+    cv::Mat ink = gray < bg - 60;
+    return (double)cv::countNonZero(ink & ring) / n > 0.02;
+}
+
+void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper) {
+    const int w = page_bgra.cols, h = page_bgra.rows;
+    if (mask.empty() || mask.size() != page_bgra.size() || cv::countNonZero(mask) == 0) return;
+    cv::Mat fill = paper_behind(page_bgra, mask, paper);
+    cv::Mat soft;
+    cv::GaussianBlur(mask, soft, cv::Size(0, 0), 1.5);
+    soft = cv::max(soft, mask);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* p = page_bgra.ptr<uint8_t>(y);
+        const uint8_t* f = fill.ptr<uint8_t>(y);
         const uint8_t* a = soft.ptr<uint8_t>(y);
         uint8_t* pa = paper && !paper->empty() ? paper->ptr<uint8_t>(y) : nullptr;
         for (int x = 0; x < w; ++x) {

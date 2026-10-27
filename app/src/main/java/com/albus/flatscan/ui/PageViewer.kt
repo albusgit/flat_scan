@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -62,7 +63,7 @@ class ViewerState {
 private const val MAX_ZOOM = 6f
 private const val DOUBLE_TAP_ZOOM = 2.5f
 
-private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Split, Idle }
+private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Brush, Split, Idle }
 
 /**
  * Maps page pixels to the screen: the page (turned [rotation] clockwise quarter turns) is fitted
@@ -112,10 +113,12 @@ private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int, colorF
 }
 
 /** What the page viewer edits besides zooming: nothing, protected pictures or the unwarp's lines. */
-enum class AreaMode { None, Protect, Lines, Erase }
+enum class AreaMode { None, Protect, Lines, Erase, Fingers }
 
-private val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF))   // ruled, text row, grid
-private val IgnoreColor = Color(0xFFFF6B5E)
+/** Lines the user drew in the line editor (Add line). */
+val DrawnLineColor = Color(0xFFFFE15A)
+internal val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF), DrawnLineColor)   // ruled, text row, grid, drawn
+internal val IgnoreColor = Color(0xFFFF6B5E)
 private val EraseColor = Color(0xFFF2B84B)
 
 /**
@@ -128,7 +131,8 @@ private val EraseColor = Color(0xFFF2B84B)
  * from the bitmap's (PageLook shape): the bitmap is stretched over the page. [colorFilter] (PageLook
  * colours) applies to the cleaned page only. [compare] (0..1, the split across the page): the
  * original on the left of the split, the cleaned page on the right; a one-finger drag moves it
- * ([onCompare]).
+ * ([onCompare]). With [drawStrokes] a one-finger drag is a stroke ([onStroke]) instead of a rectangle:
+ * the finger brush, or a line drawn in [AreaMode.Lines] (shown thin, with the [pendingLines] not yet used).
  */
 @Composable
 fun PageViewer(
@@ -149,6 +153,15 @@ fun PageViewer(
     colorFilter: ColorFilter? = null,
     compare: Float? = null,
     onCompare: (Float) -> Unit = {},
+    // AreaMode.Fingers: the finger mask over the page, the brush radius (page-width fraction), and each
+    // finished one-finger stroke as page fractions x0, y0, x1, y1, ...
+    brushOverlay: Bitmap? = null,
+    brushRadius: Float = 0.02f,
+    onStroke: (List<Float>) -> Unit = {},
+    drawStrokes: Boolean = areaMode == AreaMode.Fingers,
+    pendingLines: List<FloatArray> = emptyList(),
+    // a change of fadeKey (the filter) crossfades the rendering before it into the next one (200 ms)
+    fadeKey: Any? = null,
 ) {
     val protectMode = areaMode != AreaMode.None
     val pageImg = remember(page) { page?.asImageBitmap() }
@@ -166,10 +179,48 @@ fun PageViewer(
             crinkle.snapTo(0f)
         }
     }
+    // the crossfade: the rendering shown before (the other of the page's two render targets, not written while
+    // this one is new) over the new one, fading out
+    var fadeFrom by remember { mutableStateOf<ImageBitmap?>(null) }
+    val fadeOut = remember { Animatable(0f) }
+    val key by rememberUpdatedState(fadeKey)
+    val last = remember { arrayOf<Any?>(null, null) }   // the image last drawn, and its fadeKey
+    LaunchedEffect(pageImg) {
+        val prev = last[0] as ImageBitmap?
+        val changed = last[1] != key
+        last[0] = pageImg
+        last[1] = key
+        if (reduced || prev == null || pageImg == null || prev === pageImg || !changed || prev.width != pageImg.width || prev.height != pageImg.height) {
+            fadeFrom = null
+            return@LaunchedEffect
+        }
+        fadeFrom = prev
+        fadeOut.snapTo(1f)
+        fadeOut.animateTo(0f, tween(200))
+        fadeFrom = null
+    }
+    // a line just found from a sweep (the last of pendingLines) draws itself along its length, with a fading glow
+    val reveal = remember { Animatable(1f) }
+    val revealed = remember { intArrayOf(pendingLines.size) }
+    LaunchedEffect(pendingLines.size) {
+        val grew = pendingLines.size > revealed[0]
+        revealed[0] = pendingLines.size
+        if (grew && !reduced) {
+            reveal.snapTo(0f)
+            reveal.animateTo(1f, tween(420, easing = FastOutSlowInEasing))
+        } else {
+            reveal.snapTo(1f)
+        }
+    }
     var box by remember { mutableStateOf(Size.Zero) }
     // the rectangle being drawn, page pixels
     var drawFrom by remember { mutableStateOf<Offset?>(null) }
     var drawTo by remember { mutableStateOf(Offset.Zero) }
+    // the brush stroke being drawn, page pixels
+    var stroke by remember { mutableStateOf(listOf<Offset>()) }
+    val brushImg = remember(brushOverlay) { brushOverlay?.asImageBitmap() }
+    val strokeDone by rememberUpdatedState(onStroke)
+    val brushing by rememberUpdatedState(drawStrokes)
 
     val geomNow = { PageGeometry(pageWidth, pageHeight, rotation, box, state.scale, state.pan) }
     val geometry by rememberUpdatedState(geomNow)
@@ -250,6 +301,10 @@ fun PageViewer(
                                         splitTo(splitAt(ch.position.x))
                                         Mode.Split
                                     }
+                                    brushing -> {
+                                        stroke = listOf(geometry().toPage(start), geometry().toPage(ch.position))
+                                        Mode.Brush
+                                    }
                                     protecting -> {
                                         drawFrom = geometry().toPage(start)
                                         drawTo = geometry().toPage(ch.position)
@@ -269,6 +324,10 @@ fun PageViewer(
                                 drawTo = geometry().toPage(ch.position)
                                 ch.consume()
                             }
+                            Mode.Brush -> {
+                                stroke = stroke + geometry().toPage(ch.position)
+                                ch.consume()
+                            }
                             Mode.Split -> {
                                 splitTo(splitAt(ch.position.x))
                                 ch.consume()
@@ -280,6 +339,11 @@ fun PageViewer(
                         Mode.Hold -> {
                             holding = false
                             hold(false)
+                        }
+                        Mode.Brush -> {
+                            val g = geometry()
+                            if (g.pw > 0 && g.ph > 0 && stroke.size >= 2) strokeDone(stroke.flatMap { listOf(it.x / g.pw, it.y / g.ph) })
+                            stroke = emptyList()
                         }
                         Mode.Draw -> {
                             val a = drawFrom
@@ -338,9 +402,64 @@ fun PageViewer(
         with(g) {
             inPage {
                 drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null)
+                val f = fadeFrom
+                if (f != null && shown === pageImg && fadeOut.value > 0f) {
+                    drawImage(
+                        f, srcOffset = IntOffset.Zero, srcSize = IntSize(f.width, f.height), dstOffset = IntOffset.Zero, dstSize = IntSize(pageWidth, pageHeight),
+                        alpha = fadeOut.value, filterQuality = FilterQuality.Medium, colorFilter = colorFilter,
+                    )
+                }
                 if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
                 val c = crinkle.value
                 if (holding && c > 0.01f) drawCreases(pageWidth, pageHeight, c, 2.dp.toPx() / g.k)
+                if (areaMode == AreaMode.Fingers) {
+                    brushImg?.let { drawPageImage(it, pageWidth, pageHeight) }
+                    if (stroke.size >= 2) {
+                        val path = androidx.compose.ui.graphics.Path().apply {
+                            moveTo(stroke[0].x, stroke[0].y)
+                            for (q in stroke.drop(1)) lineTo(q.x, q.y)
+                        }
+                        drawPath(path, EraseColor.copy(alpha = 0.55f), style = androidx.compose.ui.graphics.drawscope.Stroke(
+                            width = 2 * brushRadius * pageWidth, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round,
+                        ))
+                    }
+                }
+                if (areaMode == AreaMode.Lines) {
+                    // the lines found from sweeps, not flattened yet (the newest drawing itself in), and the sweep
+                    // being made: a soft wide guide, not a line (the line is found under it)
+                    val lw = 3.dp.toPx() / g.k
+                    val round = Stroke(lw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+                    fun pathOf(pts: List<Offset>, upTo: Float = 1f): androidx.compose.ui.graphics.Path {
+                        val path = androidx.compose.ui.graphics.Path()
+                        if (pts.size < 2) return path
+                        var total = 0f
+                        for (i in 1 until pts.size) total += (pts[i] - pts[i - 1]).getDistance()
+                        var left = total * upTo
+                        path.moveTo(pts[0].x, pts[0].y)
+                        for (i in 1 until pts.size) {
+                            val seg = (pts[i] - pts[i - 1]).getDistance()
+                            if (seg >= left) {
+                                val q = if (seg > 0f) pts[i - 1] + (pts[i] - pts[i - 1]) * (left / seg) else pts[i]
+                                path.lineTo(q.x, q.y)
+                                break
+                            }
+                            path.lineTo(pts[i].x, pts[i].y)
+                            left -= seg
+                        }
+                        return path
+                    }
+                    for ((k, f) in pendingLines.withIndex()) {
+                        val pts = List(f.size / 2) { Offset(f[2 * it] * pageWidth, f[2 * it + 1] * pageHeight) }
+                        val t = if (k == pendingLines.lastIndex) reveal.value else 1f
+                        val path = pathOf(pts, t)
+                        if (t < 1f) drawPath(path, DrawnLineColor.copy(alpha = 0.35f * (1f - t)), style = Stroke(lw * 5f, cap = StrokeCap.Round))
+                        drawPath(path, Color.Black.copy(alpha = 0.45f), style = Stroke(lw * 2.2f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                        drawPath(path, DrawnLineColor, style = round)
+                    }
+                    if (stroke.size >= 2) {
+                        drawPath(pathOf(stroke), Color.White.copy(alpha = 0.35f), style = Stroke(14.dp.toPx() / g.k, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                    }
+                }
                 if (protectMode) {
                     val sw = 2.dp.toPx() / g.k
                     val areaColor = when (areaMode) {
@@ -360,7 +479,7 @@ fun PageViewer(
                                 drawLine(IgnoreColor, a, b, strokeWidth = lw, cap = StrokeCap.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(3 * lw, 2 * lw)))
                             } else {
                                 drawLine(Color.Black.copy(alpha = 0.35f), a, b, strokeWidth = lw * 1.8f, cap = StrokeCap.Round)
-                                drawLine(LineColors[lines[5 * j].toInt().coerceIn(0, 2)], a, b, strokeWidth = lw, cap = StrokeCap.Round)
+                                drawLine(LineColors[lines[5 * j].toInt().coerceIn(0, 3)], a, b, strokeWidth = lw, cap = StrokeCap.Round)
                             }
                             j++
                         }

@@ -15,12 +15,14 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * The shape of the finished page. The core always makes an A4-shaped page (reference parity); the
- * other shapes resize the finished page on export and on screen (page fractions, so protected,
- * erased and ignored areas stay where they are).
+ * The shape of the finished page. Since round 17 the core renders the page at the paper's measured
+ * shape (A4 or US Letter when within 4 % of one: PipelineOptions::render_true_shape; before, always
+ * A4); the shapes resize the finished page on export and on screen when it differs (page fractions,
+ * so protected, erased and ignored areas stay where they are).
  */
 enum class PageShape(val label: String, val caption: String) {
-    AsScanned("A4", "The page as processed: A4 proportions"),
+    Auto("Auto", "A4 or US Letter when the page is close to one, otherwise its own proportions"),
+    AsScanned("A4", "A4 proportions (210 x 297 mm)"),   // the name is stored: pages saved before shapes stay A4
     Measured("As photographed", "The page's own proportions, measured from its corners (receipts, cards, letters)"),
     Letter("US Letter", "8.5 x 11 in"),
     IdCard("ID card", "85.6 x 54 mm (credit card size)"),
@@ -80,11 +82,27 @@ data class PageLook(
         if (w <= 0 || h <= 0) return null
         val portrait = w <= h
         return when (shape) {
-            PageShape.AsScanned -> null
+            PageShape.Auto -> autoHw(w, h)
+            PageShape.AsScanned -> if (portrait) 297f / 210f else 210f / 297f
             PageShape.Measured -> measuredHw.takeIf { it > 0f }
             PageShape.Letter -> if (portrait) 11f / 8.5f else 8.5f / 11f
             PageShape.IdCard -> if (portrait) 85.6f / 54f else 54f / 85.6f
         }?.takeIf { abs(it * w / h - 1f) > 0.005f }
+    }
+
+    // the core's page when the measured shape is within kSnap of it, US Letter when within kSnap of that, else
+    // the measured shape: a cropped page, a coupon or a receipt is not stretched to A4, and the small error of a
+    // measurement from corners does not make an A4 sheet a little off A4. A page from a round-17 core already has
+    // this shape (it snaps the same way), so nothing is resampled; a page from an earlier core is A4 and is
+    // reshaped here
+    private fun autoHw(w: Int, h: Int): Float? {
+        val m = measuredHw.takeIf { it > 0f } ?: return null
+        val letter = if (w <= h) 11f / 8.5f else 8.5f / 11f
+        return when {
+            abs(m * w / h - 1f) < kSnap -> null
+            abs(m / letter - 1f) < kSnap -> letter
+            else -> m
+        }
     }
 
     /**
@@ -103,6 +121,8 @@ data class PageLook(
         .put("measured_hw", measuredHw.toDouble())
 
     companion object {
+        private const val kSnap = 0.04f
+
         fun fromJson(j: JSONObject?): PageLook {
             if (j == null) return PageLook()
             fun f(k: String) = j.optDouble(k, 0.0).toFloat().takeIf { !it.isNaN() } ?: 0f
@@ -170,25 +190,28 @@ fun measuredPageHw(corners: List<Offset>, photoW: Int, photoH: Int, focalPx: Flo
     val k3 = dot(cross(m1, m4), m2) / d3
     val n2 = DoubleArray(3) { k2 * m2[it] - m1[it] }
     val n3 = DoubleArray(3) { k3 * m3[it] - m1[it] }
-    val ratioWh: Double
-    if (abs(n2[2]) < 1e-6 || abs(n3[2]) < 1e-6) {
-        // no perspective along one direction: the plain side lengths
-        ratioWh = sqrt((n2[0] * n2[0] + n2[1] * n2[1]) / (n3[0] * n3[0] + n3[1] * n3[1]))
-    } else {
-        var f2 = focalPx.toDouble().let { it * it }
-        if (f2 <= 0) {
-            f2 = -((n2[0] * n3[0] - (n2[0] * n3[2] + n2[2] * n3[0]) * u0 + n2[2] * n3[2] * u0 * u0) +
-                (n2[1] * n3[1] - (n2[1] * n3[2] + n2[2] * n3[1]) * v0 + n2[2] * n3[2] * v0 * v0)) / (n2[2] * n3[2])
-        }
-        if (f2 <= 0 || f2.isNaN()) return simple.toFloat()
-        // n^T (A^-T A^-1) n with A = [[f, 0, u0], [0, f, v0], [0, 0, 1]]
-        fun q(n: DoubleArray): Double {
-            val x = (n[0] - u0 * n[2])
-            val y = (n[1] - v0 * n[2])
-            return (x * x + y * y) / f2 + n[2] * n[2]
-        }
-        ratioWh = sqrt(q(n2) / q(n3))
+    // the camera correction always applies: a page tilted one way only (no convergence across) still has its
+    // other direction foreshortened (skipping it made an A4 tilted 15 deg 1.62 instead of 1.41). The focal length:
+    // the given one, else from the quad when both directions converge enough to tell, else 0.72 x the long side
+    // (surface.cpp's default; the result depends little on it)
+    val longSide = maxOf(photoW, photoH).toDouble()
+    fun converges(n: DoubleArray) = abs(n[2]) * longSide / maxOf(1e-9, hypot(n[0], n[1])) > 0.02
+    var f2 = focalPx.toDouble().let { it * it }
+    if (f2 <= 0 && converges(n2) && converges(n3)) {
+        f2 = -((n2[0] * n3[0] - (n2[0] * n3[2] + n2[2] * n3[0]) * u0 + n2[2] * n3[2] * u0 * u0) +
+            (n2[1] * n3[1] - (n2[1] * n3[2] + n2[2] * n3[1]) * v0 + n2[2] * n3[2] * v0 * v0)) / (n2[2] * n3[2])
     }
+    // a quad that barely converges measures the focal length badly (0.29 to 1.78 x the long side on real photos;
+    // phone cameras are about 0.7 - 1.0, 26 mm equivalent: 0.72): outside 0.5 - 2 x, the default
+    if (focalPx <= 0f && !(f2 >= 0.25 * longSide * longSide && f2 <= 4.0 * longSide * longSide)) f2 = (0.72 * longSide).let { it * it }
+    if (!(f2 > 0)) f2 = (0.72 * longSide).let { it * it }
+    // n^T (A^-T A^-1) n with A = [[f, 0, u0], [0, f, v0], [0, 0, 1]]
+    fun q(n: DoubleArray): Double {
+        val x = (n[0] - u0 * n[2])
+        val y = (n[1] - v0 * n[2])
+        return (x * x + y * y) / f2 + n[2] * n[2]
+    }
+    val ratioWh = sqrt(q(n2) / q(n3))
     val hw = 1.0 / ratioWh
     // a wild estimate (near-degenerate quad) is worse than the side lengths
     if (hw.isNaN() || hw <= 0 || abs(kotlin.math.ln(hw / simple)) > 0.7) return simple.toFloat()

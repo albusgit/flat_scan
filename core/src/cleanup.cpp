@@ -1,4 +1,5 @@
 #include "cleanup.h"
+#include "board.h"
 
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
@@ -136,6 +137,53 @@ void rel_ab(const cv::Mat& bg4, const cv::Mat& lum, const float* ref, cv::Mat& A
     B = ch[2];
 }
 
+// The candidates are bright only next to their own neighbourhood (a 31 px window of the quarter
+// grid). Inside a large picture that is the picture itself: the light sky of an illustration is its
+// own local maximum, and where the paper is a little blue or grey too (cool light) its colour
+// passed for paper, so the illumination took the sky's brightness and Auto color whitened it, with
+// a halo where the sky darkens. Such a candidate is dimmer than the paper of its part of the page
+// (below kPageBright of the 90th percentile of the candidates in cells of an eighth of the short
+// side, the largest of them within kPageCells cells; a percentile: glare and stickers are small)
+// AND a colour of its own (more than dim_c in a, b from the paper colour; the sky 5-7) AND in a
+// picture: within kPicCells cells of a saturated mid or dark colour area (chroma above kPicC, below
+// kPicLevel of the paper level: the deep blue of the same sky, the ground). A shadow is dim and,
+// under mixed light, tinted too (pink, blue: measured on the shadow sets), but lies on paper, so
+// shadowed paper stays a sample and the filter still evens it out where the shadow net left some.
+const float kPageBright = 0.92f, kDimC = 4.f, kPicC = 12.f, kPicLevel = 0.85f;
+const int kPageCells = 2, kPicCells = 2;
+
+void drop_dim_candidates(const cv::Mat& lum, const cv::Mat& A, const cv::Mat& B, float dim_c, cv::Mat& cand) {
+    const int cs = std::max(8, std::min(lum.rows, lum.cols) / 8);
+    const int gh = (lum.rows + cs - 1) / cs, gw = (lum.cols + cs - 1) / cs;
+    cv::Mat level(gh, gw, CV_32F, cv::Scalar(0.f));
+    std::vector<float> v;
+    for (int gi = 0; gi < gh; ++gi)
+        for (int gj = 0; gj < gw; ++gj) {
+            v.clear();
+            for (int i = gi * cs; i < std::min(lum.rows, (gi + 1) * cs); ++i)
+                for (int j = gj * cs; j < std::min(lum.cols, (gj + 1) * cs); ++j)
+                    if (cand.at<uint8_t>(i, j)) v.push_back(lum.at<float>(i, j));
+            if (v.size() < 16) continue;
+            std::nth_element(v.begin(), v.begin() + v.size() * 9 / 10, v.end());
+            level.at<float>(gi, gj) = v[v.size() * 9 / 10];
+        }
+    cv::dilate(level, level, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2 * kPageCells + 1, 2 * kPageCells + 1)));
+    cv::Mat full;
+    cv::resize(level, full, cv::Size(gw * cs, gh * cs), 0, 0, cv::INTER_LINEAR);
+    // saturated mid / dark areas (opened by a third of a cell: not headline letters or a rule), widened by kPicCells cells
+    cv::Mat pic(lum.size(), CV_8U);
+    for (int i = 0; i < lum.rows; ++i)
+        for (int j = 0; j < lum.cols; ++j)
+            pic.at<uint8_t>(i, j) = hypot_xy(A.at<float>(i, j), B.at<float>(i, j)) > kPicC && lum.at<float>(i, j) < kPicLevel * full.at<float>(i, j) ? 1 : 0;
+    cv::morphologyEx(pic, pic, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(std::max(5, cs / 3) | 1, std::max(5, cs / 3) | 1)));
+    cv::dilate(pic, pic, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(4 * kPicCells * cs + 1, 4 * kPicCells * cs + 1)));
+    for (int i = 0; i < lum.rows; ++i)
+        for (int j = 0; j < lum.cols; ++j)
+            if (cand.at<uint8_t>(i, j) && pic.at<uint8_t>(i, j) && lum.at<float>(i, j) < kPageBright * full.at<float>(i, j) &&
+                hypot_xy(A.at<float>(i, j), B.at<float>(i, j)) > dim_c)
+                cand.at<uint8_t>(i, j) = 0;
+}
+
 // Paper samples, by colour. The old test (chroma max - min < 24 levels, absolute) took every
 // bright, smooth area of low chroma for paper: light yellow / blue / pink boxes, pale photos
 // (whose own brightness then became the illumination, so they were flattened to white), and
@@ -156,7 +204,8 @@ const float kSeedC = 3.f, kStepC = 2.5f, kPathAlpha = 0.1f, kMaxC = 40.f, kEdgeC
 const float kNoiseEdge = 2.5f, kNoiseStep = 1.5f, kNoiseTint = 2.f;   // thresholds >= these x colour noise
 const int kEdgeR = 3;
 
-cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, cv::Mat& A, cv::Mat& B, float& noise) {
+cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand0, cv::Mat& A, cv::Mat& B, float& noise) {
+    cv::Mat cand = cand0.clone();
     const float one[3] = {1.f, 1.f, 1.f};
     rel_ab(bg4, lum, one, A, B);
     float lmax = 1.f;
@@ -210,6 +259,7 @@ cv::Mat paper_mask(const cv::Mat& bg4, const cv::Mat& lum, const cv::Mat& cand, 
             noise = dn[dn.size() * 9 / 10];
         }
     }
+    drop_dim_candidates(lum, A, B, std::max(kDimC, kNoiseTint * noise), cand);
     const float edge_c = std::max(kEdgeC, kNoiseEdge * noise), step_c = std::max(kStepC, kNoiseStep * noise);
     // colour edges: the a, b difference across +-kEdgeR px (4 directions, lightly smoothed
     // first) above edge_c. A ring of them surrounds every coloured area, corners included.
@@ -310,6 +360,8 @@ const char* filter_name(Filter f) {
         case Filter::HighContrast: return "High contrast";
         case Filter::BlackWhite: return "Black & white";
         case Filter::Scan: return "Scan";
+        case Filter::Whiteboard: return "Whiteboard";
+        case Filter::ProjectorDark: return "Dark slide";
     }
     return "?";
 }
@@ -447,6 +499,7 @@ PageParams page_params(const cv::Mat& page, bool use_gpu) {
         for (int i = 0; i < bg4.rows; ++i)
             for (int j = 0; j < bg4.cols; ++j) mask.at<float>(i, j) = lum.at<float>(i, j) >= 0.9f * locmax.at<float>(i, j);
     drop_dark_islands(page, lum, mask);
+    p.samples = mask;
     cv::Mat ill = fill_masked(lum, mask);
     cv::GaussianBlur(ill, p.illum, cv::Size(0, 0), 2.0);
     // white balance from the paper samples of the (ink-free) background
@@ -722,6 +775,7 @@ static inline void scan_px(const Curve& c, const float* v, float l, float tint, 
 }
 
 cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, const Adjust& adj) {
+    if (is_board(f)) return board_filter(img, f == Filter::ProjectorDark, s);
     if (f == Filter::Original && adj.identity()) return img.clone();
     Curve c = filter_curve(f, p.sigma, p.ink);
     AdjustK ak = adjust_constants(adj, c.specks);
@@ -848,6 +902,12 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
     const Filter f = rp.filter;
     const float strength = rp.strength;
     auto t0 = std::chrono::steady_clock::now();
+    if (is_board(f)) {
+        // whiteboard mode: no paper fill (a board has no paper outline), no Solid colors, CPU
+        cv::Mat out = board_filter(page, f == Filter::ProjectorDark, strength);
+        s.ms_filter = ms_since(t0);
+        return out;
+    }
     cv::Mat src = apply_paper(page, paper, p);
     bool sol = rp.solid && f != Filter::BlackWhite;
     // Solid colors in Grayscale: fill in colour, then desaturate

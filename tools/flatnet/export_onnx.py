@@ -17,7 +17,7 @@ from onnx import TensorProto, helper, numpy_helper
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sd_model import UVDocNet  # noqa: E402
 
-ORIG = r'C:\Users\User\Desktop\model_zoo\SyntheticDoc\weights\highres_121x177.ckpt'
+ORIG = os.environ.get('FS_SDHR_CKPT', r'C:\Users\User\Desktop\model_zoo\SyntheticDoc\weights\highres_121x177.ckpt')
 ck0 = torch.load(ORIG, map_location='cpu', weights_only=True)
 dc, mc = ck0['hyper_parameters']['data'], ck0['hyper_parameters'].get('model', {})
 ck = torch.load(sys.argv[2], map_location='cpu', weights_only=True) if len(sys.argv) > 2 else ck0

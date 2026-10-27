@@ -25,31 +25,40 @@ object CrashGuard {
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    /**
-     * [what]: shown in the report; [gpu]: the GPU delegate may run inside. Returns the marker it replaces
-     * (guarded work inside guarded work: the self-test runs Auto's benchmark), for [end] to put back.
-     */
-    fun begin(ctx: Context, what: String, gpu: Boolean): Pair<String, Boolean>? {
-        val p = prefs(ctx)
-        val outer = p.getString("running", null)?.let { it to p.getBoolean("running_gpu", false) }
-        p.edit().putString("running", what).putBoolean("running_gpu", gpu || outer?.second == true).commit()
-        return outer
+    // the guarded work in progress (token -> what, GPU): nested (the self-test runs Auto's benchmark) or side by
+    // side (the crop screen's nets beside processing); the marker names all of it
+    private val active = LinkedHashMap<Long, Pair<String, Boolean>>()
+    private var lastToken = 0L
+
+    /** [what]: shown in the report; [gpu]: the GPU delegate may run inside. Returns the token for [end]. */
+    @Synchronized
+    fun begin(ctx: Context, what: String, gpu: Boolean): Long {
+        val t = ++lastToken
+        active[t] = what to gpu
+        writeMarker(ctx)
+        return t
     }
 
-    fun end(ctx: Context, outer: Pair<String, Boolean>? = null) {
+    @Synchronized
+    fun end(ctx: Context, token: Long) {
+        active.remove(token)
+        writeMarker(ctx)
+    }
+
+    private fun writeMarker(ctx: Context) {
         val e = prefs(ctx).edit()
-        if (outer != null) e.putString("running", outer.first).putBoolean("running_gpu", outer.second)
-        else e.remove("running").remove("running_gpu")
+        if (active.isEmpty()) e.remove("running").remove("running_gpu")
+        else e.putString("running", active.values.joinToString(" + ") { it.first }).putBoolean("running_gpu", active.values.any { it.second })
         e.commit()
     }
 
     /** Runs [block] between [begin] and [end] (also ended when it throws: a Java exception is not a crash). */
     inline fun <T> guard(ctx: Context, what: String, gpu: Boolean, block: () -> T): T {
-        val outer = begin(ctx, what, gpu)
+        val token = begin(ctx, what, gpu)
         try {
             return block()
         } finally {
-            end(ctx, outer)
+            end(ctx, token)
         }
     }
 

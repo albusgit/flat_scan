@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from sd_model import UVDocNet  # noqa: E402
 
-SD_CKPT = r'C:\Users\User\Desktop\model_zoo\SyntheticDoc\weights\highres_121x177.ckpt'
+SD_CKPT = os.environ.get('FS_SDHR_CKPT', r'C:\Users\User\Desktop\model_zoo\SyntheticDoc\weights\highres_121x177.ckpt')
 IN_H, IN_W = 1440, 1024
 GH, GW = 121, 177
 

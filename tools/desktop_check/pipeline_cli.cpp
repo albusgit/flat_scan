@@ -18,7 +18,7 @@
 // GPU stage policy's defaults, FS_GPU_DENSE=1 adds the dense stage); the JSON then has "gpu".
 // FS_RULE_NET=1 | MODEL.onnx: the rule net in the line stage, in-process as the other nets (JSON "nets" has "rulenet");
 // FS_RULE_NET_PY=1 with it: through tools/shadow_net/run_onnx.py and FS_PYTHON instead (Round 10's way).
-// FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
+// FS_USER_LINES: see below (Add line). FS_PERSPECTIVE_ONLY=1: homography only, no warp map. With OUT.jpg, OUT.jpg.lines.jpg shows the fitted lines (red: ruled, green: text, blue: grid).
 // Prints one JSON line: the crop-screen assessment of every page (assess_pages) and the
 // processing result of page 0 (run_photo) without user edits; OUT.jpg = the page (or "-").
 #include <opencv2/imgcodecs.hpp>
@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <fstream>
@@ -40,6 +41,7 @@
 #include "cleanup.h"
 #include "nets.h"
 #include "pipeline.h"
+#include "board.h"
 #ifdef FS_DESKTOP_GPU
 #include "gpu.h"
 #include "resample.h"
@@ -99,18 +101,39 @@ int main(int argc, char** argv) {
     // FS_RULE_NET: "1" the repo's rulenet.onnx, else a model file
     const char* rule_model = std::getenv("FS_RULE_NET");
     const std::string rule_file = rule_model && std::string(rule_model) != "1" ? rule_model : "";
+    // FS_ORIENT_NET: "1" the repo's orientnet.onnx, "0" none, else a model file (default: the repo's, when it is there)
+    const char* orient_env = std::getenv("FS_ORIENT_NET");
+    const std::string orient_file = orient_env && std::string(orient_env) != "1" && std::string(orient_env) != "0" ? orient_env : "";
     auto inference = [&]() -> Inference& {
         if (!inf_store) {
             InferConfig cfg;
             if (!parse_backends(backend_arg, cfg.preference)) std::fprintf(stderr, "unknown backend in \"%s\"; using cpu\n", backend_arg.c_str());
             // FS_SHADE_NET=MODEL.onnx is the CPU ShadeNet model
             std::string shade = shade_model ? shade_model : "";
-            cfg.load = [models, shade, rule_file](const std::string& file) {
+            cfg.load = [models, shade, rule_file, orient_file](const std::string& file) {
                 if (file == "rulenet.onnx" && !rule_file.empty()) return read_file(rule_file);
+                if (file == "orientnet.onnx" && !orient_file.empty()) return read_file(orient_file);
+                if (file == "inpaint.onnx" && std::getenv("FS_INPAINT")) return read_file(std::getenv("FS_INPAINT"));
                 return read_file(file == "shadenet.onnx" && !shade.empty() ? shade : models + "/" + file);
             };
             if (const char* t = std::getenv("FS_ORT_THREADS")) cfg.threads = std::atoi(t);
             if (const char* c = std::getenv("FS_ORT_CACHE")) cfg.cache_dir = c;
+            // FS_NET_CACHE=DIR: every net's outputs stored there per model file (path, size, time) and exact input;
+            // a stored output is used without loading the model (tests that change only what follows the nets)
+            if (const char* nc = std::getenv("FS_NET_CACHE")) {
+                cfg.output_cache_dir = nc;
+                cfg.output_cache_tag = [models, shade, rule_file, orient_file](const std::string& file) {
+                    std::string p = models + "/" + file;
+                    if (file == "rulenet.onnx" && !rule_file.empty()) p = rule_file;
+                    else if (file == "orientnet.onnx" && !orient_file.empty()) p = orient_file;
+                    else if (file == "shadenet.onnx" && !shade.empty()) p = shade;
+                    else if (file == "inpaint.onnx" && std::getenv("FS_INPAINT")) p = std::getenv("FS_INPAINT");
+                    std::error_code ec;
+                    const auto size = std::filesystem::file_size(p, ec);
+                    const auto t = std::filesystem::last_write_time(p, ec);
+                    return p + "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long)t.time_since_epoch().count());
+                };
+            }
             inf_store = Inference::create(cfg);
         }
         return *inf_store;
@@ -146,12 +169,13 @@ int main(int argc, char** argv) {
     const float* logits = lg.empty() ? nullptr : lg.data();
     std::ostringstream f;
     f << "{\"photo\": \"" << argv[1] << "\", \"assess\": [";
+    std::vector<PageAssessment> pages;
     try {
-        auto pages = assess_pages(img, logits, 0);
+        pages = assess_pages(img, logits, 0);
         for (size_t i = 0; i < pages.size(); ++i) {
             const auto& a = pages[i];
             f << (i ? ", " : "") << "{\"ok\": " << (a.pc.ok ? "true" : "false") << ", \"fit_median_px\": " << num(a.fit_median_px)
-              << ", \"reasons\": " << strs(a.reasons) << ", \"whole_frame\": " << (a.pc.whole_frame ? "true" : "false")
+              << ", \"reasons\": " << strs(a.reasons) << ", \"whole_frame\": " << (a.pc.whole_frame ? "true" : "false") << ", \"area_frac\": " << a.pc.area_frac
               << ", \"n_pages\": " << a.pc.n_pages << ", \"corners\": [";
             for (int k = 0; k < 4; ++k) f << (k ? ", " : "") << num(a.pc.pts[k].x) << ", " << num(a.pc.pts[k].y);
             f << "]}";
@@ -162,6 +186,9 @@ int main(int argc, char** argv) {
     }
     PipelineOptions o;
     o.use_gpu = false;
+    // page 0's detection and surface fit from the assessment above, as the app hands the crop screen's to
+    // processing (FS_NO_ASSESSED=1: made again inside run_photo)
+    if (!pages.empty() && pages[0].pc.ok && !std::getenv("FS_NO_ASSESSED")) o.assessed = &pages[0];
 #ifdef FS_DESKTOP_GPU
     const bool gpu_on = std::getenv("FS_GPU") != nullptr;
     if (gpu_on) {
@@ -176,13 +203,15 @@ int main(int argc, char** argv) {
     o.line_stage = std::getenv("FS_NO_LINES") == nullptr;
     o.share_rows = std::getenv("FS_NO_SHARE") == nullptr;
     o.faint_lines = std::getenv("FS_NO_FAINT") == nullptr;
-    o.second_line_pass = std::getenv("FS_NO_SECOND") == nullptr;
+    o.second_line_pass = std::getenv("FS_SECOND") != nullptr;
     o.robust_solve = std::getenv("FS_NO_ROBUST") == nullptr;
     o.colour_edges = std::getenv("FS_NO_EDGES") == nullptr;
     if (const char* md = std::getenv("FS_MAX_DIST")) o.max_line_distortion = std::atof(md), o.max_line_distortion_frac = 1;
     if (std::getenv("FS_NO_SOFTEN")) o.max_local_rescale = 0;
     if (const char* st = std::getenv("FS_SOFTEN_THR")) o.max_local_rescale = std::atof(st);
     o.erase_fingers = std::getenv("FS_NO_FINGERS") == nullptr;
+    o.keep_unerased = std::getenv("FS_INPAINT") != nullptr;
+    if (const char* fr = std::getenv("FS_FINGER_RULES")) o.finger_rules = std::atoi(fr);   // kFinger* bits
     o.shadow_full_strength = std::getenv("FS_SHADE_REF") == nullptr;   // FS_SHADE_REF: the reference strength
     // FS_FRAME_CORNERS=1: the photo's frame is the page, as if set by hand (benchmarks whose photos are
     // cropped to the page, e.g. DocUNet); FS_NO_ORIENT=1: no 0/90/180/270 decision
@@ -192,12 +221,56 @@ int main(int argc, char** argv) {
         o.corners = {cv::Point2d(0, 0), cv::Point2d(img.cols - 1, 0), cv::Point2d(img.cols - 1, img.rows - 1), cv::Point2d(0, img.rows - 1)};
     }
     o.auto_orient = std::getenv("FS_NO_ORIENT") == nullptr;
+    // FS_BOARD=1 (or =dark): whiteboard mode as the app runs it: the board's corners (find_board; the whole
+    // frame when none is reliable), perspective only, no finger erase, no orientation decision; with
+    // FS_RENDER the Whiteboard (Dark slide) filter at 0.7 goes to OUT.jpg.board.jpg
+    const char* board_env = std::getenv("FS_BOARD");
+    BoardQuad board;
+    if (board_env) {
+        const int64 t_board = cv::getTickCount();
+        board = find_board(img);
+        const double board_ms = (cv::getTickCount() - t_board) * 1000.0 / cv::getTickFrequency();
+        o.corners_edited = true;
+        o.corners = board.ok ? board.pts
+                             : std::array<cv::Point2d, 4>{cv::Point2d(1, 1), cv::Point2d(img.cols - 2, 1), cv::Point2d(img.cols - 2, img.rows - 2), cv::Point2d(1, img.rows - 2)};
+        o.perspective_only = true;
+        o.erase_fingers = false;
+        o.auto_orient = false;
+        std::fprintf(stderr, "board: %.1f ms\n", board_ms);
+        std::fprintf(stderr, "board: ok %d method %s confidence %.2f area %.2f dark %d corners %.0f,%.0f %.0f,%.0f %.0f,%.0f %.0f,%.0f\n", board.ok, board.method,
+                     board.confidence, board.area, (int)board_is_dark(img, board), o.corners[0].x, o.corners[0].y, o.corners[1].x, o.corners[1].y,
+                     o.corners[2].x, o.corners[2].y, o.corners[3].x, o.corners[3].y);
+    }
     o.scan_flattened = std::getenv("FS_SCAN_FLAT") != nullptr;   // with FS_SCAN=1: the input was flattened by a net
     o.orient_true_aspect = std::getenv("FS_ORIENT_A4") == nullptr;   // FS_ORIENT_A4=1: decide on the A4-shaped page (round 7)
     // FS_UV_MIN_AGREE=x: the page-outline agreement a net's grid needs (0: always used)
     if (const char* ma = std::getenv("FS_UV_MIN_AGREE")) o.uv_min_agreement = o.uv_min_agreement_quad = std::atof(ma);
     // FS_UV_PREFER=x: the text-row spread margin (deg) by which the second net must beat the first
     if (const char* pm = std::getenv("FS_UV_PREFER")) o.uv_prefer_margin = std::atof(pm);
+    // FS_HR_OWN=0: SyntheticDoc-HR does not define the page itself; FS_GRID_FOLD / FS_GRID_COLL: uv_max_folded /
+    // uv_max_collapsed (round 18 guards)
+    if (const char* ho = std::getenv("FS_HR_OWN")) o.uv_hr_own = std::atoi(ho) != 0;
+    if (const char* gf = std::getenv("FS_GRID_FOLD")) o.uv_max_folded = std::atof(gf);
+    if (const char* gc = std::getenv("FS_GRID_COLL")) o.uv_max_collapsed = std::atof(gc);
+    // FS_EDGE_GAP / FS_EDGE_FRAC: PipelineOptions::edge_gap / edge_doubt_frac
+    if (const char* eg = std::getenv("FS_EDGE_GAP")) o.edge_gap = std::atof(eg);
+    if (const char* ef = std::getenv("FS_EDGE_FRAC")) o.edge_doubt_frac = std::atof(ef);
+    // FS_UV_OWN_PAPER: the paper share a grid needs to define the page itself (0: any, as before round 16)
+    if (const char* op = std::getenv("FS_UV_OWN_PAPER")) o.uv_own_min_paper = std::atof(op);
+    // FS_NO_SNAP: no border snap; FS_SNAP_LOST / FS_SNAP_DEAD: its thresholds
+    if (std::getenv("FS_NO_SNAP")) o.snap_border = false;
+    if (const char* sl = std::getenv("FS_SNAP_LOST")) o.snap_lost = std::atof(sl);
+    if (const char* sd = std::getenv("FS_SNAP_DEAD")) o.snap_dead_px = std::atof(sd);
+    // FS_NO_FLAT: no flat-paper test; FS_FLAT_BOW: its threshold (side bow / side length)
+    if (std::getenv("FS_NO_FLAT")) o.flat_edge_bow = 0;
+    if (const char* fb = std::getenv("FS_FLAT_BOW")) o.flat_edge_bow = std::atof(fb);
+    // FS_TRUE_SHAPE=0: the output page A4-shaped whatever the paper (PipelineOptions::render_true_shape)
+    if (const char* ts = std::getenv("FS_TRUE_SHAPE")) o.render_true_shape = std::atoi(ts) != 0;
+    // FS_FUSE_MISS: PipelineOptions::fuse_miss (0: no border fusion of the two nets)
+    if (const char* fm = std::getenv("FS_FUSE_MISS")) o.fuse_miss = std::atof(fm);
+    if (const char* fg = std::getenv("FS_FUSE_GAIN")) o.fuse_min_gain = std::atof(fg);
+    // FS_SURF_SIDES: PipelineOptions::surface_min_sides (0: the surface model kept whatever its outline)
+    if (const char* ss = std::getenv("FS_SURF_SIDES")) o.surface_min_sides = std::atoi(ss);
     // FS_ZOOM=1: the zoomed second flattening pass (uv_zoom), the repo's ONNX models in-process
     if (std::getenv("FS_ZOOM")) {
         o.zoom_pass = true;
@@ -215,6 +288,7 @@ int main(int argc, char** argv) {
         o.shade_net = shade_net_fn(inference(), &shade_ms);
         o.shade_after_uv = std::getenv("FS_SHADE_AFTER") != nullptr;
         if (const char* ls = std::getenv("FS_SHADE_LS")) o.shade_long_side = std::atoi(ls);
+        if (const char* sf = std::getenv("FS_SHADE_FLOOR")) o.shade_floor = (float)std::atof(sf);   // the map clamp
     }
     // FS_RULE_NET=1 | MODEL.onnx: the rule net (PipelineOptions::rule_net), in-process (nets.cpp
     // rule_net_fn; MODEL.onnx replaces the repo's rulenet.onnx). FS_RULE_NET_PY=1: run by
@@ -248,6 +322,14 @@ int main(int argc, char** argv) {
             };
         }
     }
+    // the orientation net (PipelineOptions::orient_net); FS_ORIENT_MARGIN: its margin
+    {
+        const std::string of = !orient_file.empty() ? orient_file : models + "/orientnet.onnx";
+        std::error_code ec;
+        const bool off = orient_env && std::string(orient_env) == "0";
+        if (!off && std::filesystem::exists(of, ec)) o.orient_net = orient_net_fn(inference());
+        if (const char* om = std::getenv("FS_ORIENT_MARGIN")) o.orient_net_margin = std::atof(om);
+    }
     if (const char* ig = std::getenv("FS_IGNORE")) {
         std::string spec = ig;
         size_t p = 0;
@@ -257,6 +339,23 @@ int main(int argc, char** argv) {
             if (std::sscanf(spec.substr(p, q - p).c_str(), "%f,%f,%f,%f", &a[0], &a[1], &a[2], &a[3]) == 4) o.ignore.push_back(a);
             if (q == std::string::npos) break;
             p = q + 1;
+        }
+    }
+    // FS_USER_LINES="g:x,y x,y ...;g:x,y ..." (output-page fractions): lines drawn in the line editor (Add line)
+    if (const char* ul = std::getenv("FS_USER_LINES")) {
+        std::stringstream ss(ul);
+        std::string item;
+        while (std::getline(ss, item, ';')) {
+            PipelineOptions::UserLine l;
+            size_t c = item.find(':');
+            if (c == std::string::npos) continue;
+            l.group = std::atoi(item.substr(0, c).c_str());
+            std::stringstream ps(item.substr(c + 1));
+            std::string pt;
+            float x, y;
+            while (ps >> pt)
+                if (std::sscanf(pt.c_str(), "%f,%f", &x, &y) == 2) l.pts.emplace_back(x, y);
+            if (l.pts.size() >= 2) o.user_lines.push_back(l);
         }
     }
     // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
@@ -272,6 +371,8 @@ int main(int argc, char** argv) {
         rq.perspective_only = o.perspective_only;
         rq.nets = std::string(flat_nets) == "uv" ? FlatNets::UVDocOnly : std::string(flat_nets) == "hr" ? FlatNets::SynthDocOnly : FlatNets::Both;
         rq.seg_logits = logits;
+        // FS_CROP_CORNERS=1: NetsRequest::crop_from_corners
+        rq.crop_from_corners = std::getenv("FS_CROP_CORNERS") && std::atoi(std::getenv("FS_CROP_CORNERS")) != 0;
         FlatNetsFn fn = flat_nets_fn(img, rq, inference(), &nets);
         if (const char* d = std::getenv("FS_NET_DELAY_MS")) {
             const int delay = std::atoi(d);
@@ -391,11 +492,12 @@ int main(int argc, char** argv) {
       << geom_mode_name(r.mode) << "\", \"fit_median_full_px\": "
       << num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1) << ", \"needs_manual_crop\": " << strs(r.needs_manual_crop)
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
-      << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
-      << ", \"line_distortion\": " << num(r.line_distortion) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false")
+      << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"user_lines_used\": " << r.user_lines_used << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
+      << ", \"line_distortion\": " << num(r.line_distortion) << ", \"page_hw\": " << num(r.page_hw) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"edges_bent\": " << (r.edges_bent ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
+      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_grid_check\": [[" << num(r.uv_grid_check[0][0]) << ", " << num(r.uv_grid_check[0][1]) << ", " << num(r.uv_grid_check[0][2]) << "], [" << num(r.uv_grid_check[1][0]) << ", " << num(r.uv_grid_check[1][1]) << ", " << num(r.uv_grid_check[1][2]) << "]], \"uv_agree_quad\": [" << num(r.uv_agree_quad[0]) << ", " << num(r.uv_agree_quad[1]) << "], \"uv_agree_mask\": [" << num(r.uv_agree_mask[0]) << ", " << num(r.uv_agree_mask[1]) << "]" << ", \"fuse\": [" << r.fuse_runs << ", " << num(r.fuse_worst[0]) << ", " << num(r.fuse_worst[1]) << ", " << num(r.fuse_moved_px) << ", " << num(r.fuse_area) << ", " << (r.fuse_rejected ? 1 : 0) << "]" << ", \"surface_unfounded\": " << (r.surface_unfounded ? "true" : "false") << ", \"side_n\": [" << r.side_n[0] << ", " << r.side_n[1] << ", " << r.side_n[2] << ", " << r.side_n[3] << "], \"side_edge\": [" << num(r.side_edge[0]) << ", " << num(r.side_edge[1]) << ", " << num(r.side_edge[2]) << ", " << num(r.side_edge[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"uv_grid_rejected\": [" << (r.uv_grid_rejected[0] ? 1 : 0) << ", " << (r.uv_grid_rejected[1] ? 1 : 0) << "], \"uv_composed_broken\": " << (r.uv_composed_broken ? "true" : "false") << ", \"net_edge_gap\": [" << num(r.net_edge_gap[0]) << ", " << num(r.net_edge_gap[1]) << ", " << num(r.net_edge_gap[2]) << ", " << num(r.net_edge_gap[3]) << "], \"edge_doubt\": " << (r.edge_doubt ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
-      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": [" << num(r.second_pass[0]) << ", " << num(r.second_pass[1]) << ", " << num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0) << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
+      << ", \"orient_net\": [" << r.orient_net_turn << ", " << num(r.orient_net_margin) << ", " << r.orient_net_patches << ", " << (r.orient_by_net ? 1 : 0) << "]"
+      << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"flat_page\": " << (r.flat_page ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": [" << num(r.second_pass[0]) << ", " << num(r.second_pass[1]) << ", " << num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0) << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
       << ", \"net\": [" << r.warp.net.dropped << ", " << r.warp.net.added << ", " << r.warp.net.joined << ", " << r.warp.S2.n_net_kept << "], \"spots_dropped\": "
       << (r.lines_spots_dropped ? "true" : "false") << ", \"straightness\": [" << num(r.line_straightness[0]) << ", " << num(r.line_straightness[1]) << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
@@ -520,6 +622,27 @@ int main(int argc, char** argv) {
         write_npz(ds, {{"h", NpyArray::f32({h.size() / 3, 3}, h.data())}, {"v", NpyArray::f32({v.size() / 3, 3}, v.data())},
                        {"H", NpyArray::f32({H.size() / 5, 5}, H.data())}, {"V", NpyArray::f32({V.size() / 5, 5}, V.data())}});
     }
+    // FS_DUMP_OUTLINE=P.npz: the page finder's outline in full-resolution photo px: its contour ("contour": n x 2),
+    // the points given to each side ("side0".."side3"), its corners ("corners": 4 x 2, TL TR BR BL) and the
+    // detection's own corners ("det_corners")
+    if (const char* dol = std::getenv("FS_DUMP_OUTLINE"); dol && r.detection.ok) {
+        const PageCorners& pc = r.detection;
+        const double k = 1.0 / std::min(1.0, pc.scale);
+        auto pts = [&](const std::vector<cv::Point2d>& v) {
+            std::vector<float> f;
+            for (const auto& p : v) { f.push_back((float)(p.x * k)); f.push_back((float)(p.y * k)); }
+            return f;
+        };
+        std::vector<cv::Point2d> cont(pc.det.contour.begin(), pc.det.contour.end());
+        std::vector<cv::Point2d> dc(pc.det.corners.begin(), pc.det.corners.end());
+        std::vector<float> c, s[4], d = pts(dc), co = pts(cont);
+        for (const auto& p : pc.pts) { c.push_back((float)p.x); c.push_back((float)p.y); }
+        for (int q = 0; q < 4; ++q) s[q] = pts(pc.det.side_pts[q]);
+        write_npz(dol, {{"contour", NpyArray::f32({co.size() / 2, 2}, co.data())}, {"corners", NpyArray::f32({4, 2}, c.data())},
+                        {"det_corners", NpyArray::f32({4, 2}, d.data())}, {"side0", NpyArray::f32({s[0].size() / 2, 2}, s[0].data())},
+                        {"side1", NpyArray::f32({s[1].size() / 2, 2}, s[1].data())}, {"side2", NpyArray::f32({s[2].size() / 2, 2}, s[2].data())},
+                        {"side3", NpyArray::f32({s[3].size() / 2, 2}, s[3].data())}});
+    }
     // FS_DUMP_MAP=P.npz: the final backward map on its 4-px grid ("x", "y": gh x gw, photo / scan px)
     if (const char* dm = std::getenv("FS_DUMP_MAP"); dm && r.ok) {
         const GridMap& g = r.final_map;
@@ -529,22 +652,78 @@ int main(int argc, char** argv) {
         cv::Mat bgr;
         cv::cvtColor(r.page, bgr, cv::COLOR_BGRA2BGR);
         cv::imwrite(argv[2], bgr, {cv::IMWRITE_JPEG_QUALITY, 85});
+        // FS_INPAINT=MIGAN.onnx: the found fingers painted in by the inpainting net (the app's AI fill) -> OUT.jpg.ai.jpg
+        if (std::getenv("FS_INPAINT") && !r.finger_mask.empty() && !r.page_unerased.empty()) {
+            cv::Mat ai = r.page_unerased.clone();
+            fill_finger(ai, r.finger_mask, nullptr);
+            auto t0 = std::chrono::steady_clock::now();
+            bool ok = inpaint_fill(ai, r.finger_mask, inference(), r.paper_unerased.empty() ? nullptr : &r.paper_unerased);
+            std::fprintf(stderr, "inpaint %s, %.0f ms\n", ok ? "ok" : "FAILED", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            cv::cvtColor(ai, ai, cv::COLOR_BGRA2BGR);
+            cv::imwrite(std::string(argv[2]) + ".ai.jpg", ai, {cv::IMWRITE_JPEG_QUALITY, 90});
+        }
+        // FS_FINGER_OUT=PREFIX: for the finger evaluation (tools/fingers/eval.py), in the PHOTO's frame:
+        // PREFIX_footprint.png (the photo pixels the page shows) and PREFIX_fingers.png (those it filled as a
+        // finger), each page grid cell (4 px) drawn as the quad it comes from
+        if (const char* fo = std::getenv("FS_FINGER_OUT")) {
+            const GridMap& g = r.render_map;
+            cv::Mat foot = cv::Mat::zeros(img.size(), CV_8U), fing = cv::Mat::zeros(img.size(), CV_8U);
+            for (int i = 0; i + 1 < g.gh; ++i)
+                for (int j = 0; j + 1 < g.gw; ++j) {
+                    std::vector<cv::Point> q;
+                    for (auto [di, dj] : {std::pair{0, 0}, {0, 1}, {1, 1}, {1, 0}}) {
+                        int ii = i + di, jj = j + dj;
+                        q.emplace_back((int)std::lround(g.x[(size_t)ii * g.gw + jj]), (int)std::lround(g.y[(size_t)ii * g.gw + jj]));
+                    }
+                    cv::fillConvexPoly(foot, q, cv::Scalar(255));
+                    if (!r.finger_mask.empty()) {
+                        int y0 = i * g.stride, x0 = j * g.stride;
+                        cv::Rect cell(x0, y0, g.stride, g.stride);
+                        cell &= cv::Rect(0, 0, r.finger_mask.cols, r.finger_mask.rows);
+                        if (cell.area() > 0 && cv::countNonZero(r.finger_mask(cell)) * 2 >= cell.area()) cv::fillConvexPoly(fing, q, cv::Scalar(255));
+                    }
+                }
+            cv::imwrite(std::string(fo) + "_footprint.png", foot);
+            cv::imwrite(std::string(fo) + "_fingers.png", fing);
+        }
         // FS_PAGE_PNG=PREFIX: the flattened page and its paper alpha, lossless (tools/filters/)
         if (const char* pg = std::getenv("FS_PAGE_PNG")) {
             cv::imwrite(std::string(pg) + "_page.png", bgr);
             if (!r.paper.empty()) cv::imwrite(std::string(pg) + "_paper.png", r.paper);
         }
-        const cv::Scalar col[3] = {{0, 0, 255}, {0, 160, 0}, {255, 0, 0}};
+        const cv::Scalar col[4] = {{0, 0, 255}, {0, 160, 0}, {255, 0, 0}, {0, 200, 255}};
         for (const auto& l : r.lines)
             cv::line(bgr, cv::Point((int)(l[1] * bgr.cols), (int)(l[2] * bgr.rows)), cv::Point((int)(l[3] * bgr.cols), (int)(l[4] * bgr.rows)),
-                     col[std::min(2, std::max(0, (int)l[0]))], 3);
+                     col[std::min(3, std::max(0, (int)l[0]))], 3);
         for (const auto& a : o.ignore)
             cv::rectangle(bgr, cv::Point((int)(a[0] * bgr.cols), (int)(a[1] * bgr.rows)), cv::Point((int)(a[2] * bgr.cols), (int)(a[3] * bgr.rows)),
                           cv::Scalar(0, 140, 255), 4);
         cv::imwrite(std::string(argv[2]) + ".lines.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 80});
         // FS_RENDER=1: the page as the app shows it by default (Auto color 0.7) -> OUT.jpg.auto.jpg
-        if (std::getenv("FS_RENDER")) {
+        if (std::getenv("FS_RENDER") && board_env) {
             PageParams pp = page_params(r.page, false);
+            RenderParams rp;
+            // as the app: the Dark slide filter when the screen is mostly dark (FS_BOARD=dark forces it)
+            bool dark = std::string(board_env) == "dark" || board_is_dark(img, board);
+            rp.filter = dark ? Filter::ProjectorDark : Filter::Whiteboard;
+            rp.strength = 0.7f;
+            cv::Mat shown = render_page(r.page, r.paper, pp, rp, {}, false);
+            cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);
+            cv::imwrite(std::string(argv[2]) + ".board.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 88});
+        } else if (std::getenv("FS_RENDER")) {
+            PageParams pp = page_params(r.page, false);
+            // FS_DUMP_PARAMS=PREFIX: the filter's quarter-grid estimates as PNGs (illum: paper luminance; tint, pic: 0..1)
+            if (const char* dp = std::getenv("FS_DUMP_PARAMS")) {
+                cv::Mat m;
+                pp.illum.convertTo(m, CV_8U);
+                cv::imwrite(std::string(dp) + "_illum.png", m);
+                pp.tint.convertTo(m, CV_8U, 255.0);
+                cv::imwrite(std::string(dp) + "_tint.png", m);
+                pp.pic.convertTo(m, CV_8U, 255.0);
+                cv::imwrite(std::string(dp) + "_pic.png", m);
+                pp.samples.convertTo(m, CV_8U, 255.0);
+                cv::imwrite(std::string(dp) + "_samples.png", m);
+            }
             cv::Mat shown = render_page(r.page, r.paper, pp, Filter::AutoColor, 0.7f, false, {}, false);
             cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);
             cv::imwrite(std::string(argv[2]) + ".auto.jpg", bgr, {cv::IMWRITE_JPEG_QUALITY, 88});

@@ -2,6 +2,7 @@ package com.albus.flatscan.ui
 
 import android.app.Activity
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -174,8 +175,24 @@ private val Shape = Shapes(
 )
 
 @Composable
-fun FlatScanTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) Dark else Light, typography = Type, shapes = Shape, content = content)
+fun FlatScanTheme(mode: String = com.albus.flatscan.Settings.THEME_SYSTEM, content: @Composable () -> Unit) {
+    val dark = when (mode) {
+        com.albus.flatscan.Settings.THEME_LIGHT -> false
+        com.albus.flatscan.Settings.THEME_DARK -> true
+        else -> isSystemInDarkTheme()
+    }
+    // the status and navigation bar icons follow the chosen theme, not only the phone's (enableEdgeToEdge's default)
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        androidx.compose.runtime.SideEffect {
+            val window = (view.context as? Activity)?.window ?: return@SideEffect
+            WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
+    MaterialTheme(colorScheme = if (dark) Dark else Light, typography = Type, shapes = Shape, content = content)
 }
 
 /**
@@ -200,6 +217,9 @@ fun EditorTheme(content: @Composable () -> Unit) {
         }
     }
     MaterialTheme(colorScheme = EditorScheme, typography = Type, shapes = Shape) {
-        Surface(Modifier.fillMaxSize(), color = Editor.Ground, contentColor = Editor.Text, content = content)
+        // the desk's graph paper on the editor's ground too (graphite lines), under the photo and the page
+        Surface(Modifier.fillMaxSize(), color = Editor.Ground, contentColor = Editor.Text) {
+            Box(Modifier.fillMaxSize().graphPaper(), propagateMinConstraints = true) { content() }
+        }
     }
 }

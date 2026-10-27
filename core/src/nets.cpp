@@ -1,8 +1,10 @@
 #include "nets.h"
 
+#include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <future>
 
 #include "log.h"
 #include "pagefind.h"
@@ -13,6 +15,21 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// NetsRequest::crop_from_corners: corners that outline a found page - inside the photo, 5-120 % of it, and not all
+// four at the photo's corners (the page finder's whole-frame fallback)
+bool corners_found_page(const std::array<cv::Point2d, 4>& c, cv::Size photo) {
+    const double w = photo.width, h = photo.height, tol = 0.02 * std::max(w, h);
+    bool at_corners = true;
+    std::vector<cv::Point2f> q;
+    for (const auto& p : c) {
+        if (std::max(std::max(-p.x, p.x - w), std::max(-p.y, p.y - h)) > tol) return false;
+        at_corners &= std::min(p.x, w - 1 - p.x) < tol && std::min(p.y, h - 1 - p.y) < tol;
+        q.emplace_back((float)p.x, (float)p.y);
+    }
+    const double area = std::fabs(cv::contourArea(q)) / (w * h);
+    return !at_corners && area >= 0.05 && area <= 1.2;
+}
 
 }  // namespace
 
@@ -28,6 +45,8 @@ const char* backend_name(Backend b) {
         case Backend::OpenVINO: return "openvino";
         case Backend::CoreML: return "coreml";
         case Backend::LiteRtGpu: return "gpu";
+        case Backend::LiteRtGpu16: return "gpu16";
+        case Backend::LiteRtCpu16: return "cpu16";
     }
     return "?";
 }
@@ -43,7 +62,7 @@ bool parse_backends(const std::string& s, std::vector<Backend>& out) {
         if (!t.empty()) {
             bool found = false;
             for (Backend b : {Backend::CPU, Backend::XNNPACK, Backend::QNN_HTP, Backend::NNAPI, Backend::CUDA, Backend::TensorRT, Backend::DirectML,
-                              Backend::OpenVINO, Backend::CoreML, Backend::LiteRtGpu})
+                              Backend::OpenVINO, Backend::CoreML, Backend::LiteRtGpu, Backend::LiteRtGpu16, Backend::LiteRtCpu16})
                 if (t == backend_name(b) || (b == Backend::QNN_HTP && t == "qnn_htp") || (b == Backend::DirectML && t == "directml") ||
                     (b == Backend::LiteRtGpu && t == "litert")) {
                     out.push_back(b);
@@ -94,15 +113,15 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
             LOGI("flattening nets: page finder failed: %s", e.what());
         }
     }
-    // one net on one crop; false: no grid (input, net or output size failed)
-    auto run = [&](const char* name, const UvCrop& c, std::vector<float>& grid) {
+    // one net on one crop into nr; false: no grid (input, net or output size failed)
+    auto run_into = [&](const char* name, const UvCrop& c, std::vector<float>& grid, NetRun& nr) {
         auto t0 = Clock::now();
         const NetId id = c.model == 2 ? NetId::SynthDocHR : NetId::UVDoc;
         Inference& inf = c.model == 2 && hr ? *hr : uv_inf;
         const UvSpec& sp = uv_spec(c.model);
-        NetRun nr;
         nr.name = name;
         grid.clear();
+        if (rq.cancel && *rq.cancel) return false;
         try {
             if (c.model == 0 || c.model == 2) {
                 Tensor x{{1, 3, sp.in_h, sp.in_w}, uv_input(photo, c, blank)};
@@ -122,8 +141,13 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
         nr.backend = inf.backend(id);
         nr.ms = inf.last_ms(id);
         nr.total_ms = ms_since(t0);
-        r.runs.push_back(nr);
         return nr.ok;
+    };
+    auto run = [&](const char* name, const UvCrop& c, std::vector<float>& grid) {
+        NetRun nr;
+        const bool ok = run_into(name, c, grid, nr);
+        if (!nr.name.empty()) r.runs.push_back(nr);
+        return ok;
     };
     // automatic corners: a first UVDoc pass on the whole photo finds the page; the nets then run on its
     // outline (a page finder that split a folded page or cut a curled one does not decide what they see)
@@ -135,6 +159,10 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
     }
     // false: no first-pass grid and no page corners (corners_fn found no page)
     auto crop_for = [&](int model, UvCrop& c) {
+        if (rq.crop_from_corners && !rq.corners_edited) {
+            const std::array<cv::Point2d, 4>* q = rq.corners_fn ? rq.corners_fn() : &rq.corners;
+            if (q && corners_found_page(*q, photo.size())) { c = uv_crop(photo.size(), *q, model); return true; }
+        }
         if (!r.grid_pass1.empty()) {
             UvGrid g = uv_grid(r.grid_pass1.data(), r.crop_pass1);
             if (g.ok) { c = uv_crop_on_grid(photo.size(), g, model); return true; }
@@ -146,8 +174,21 @@ NetsResult run_flat_nets(const cv::Mat& photo, const NetsRequest& rq, Inference&
     };
     std::vector<float> uv, sd;
     UvCrop cu, cs;
-    if (rq.nets != FlatNets::SynthDocOnly && crop_for(0, cu)) run("uvdoc", cu, uv);
-    if (rq.nets != FlatNets::UVDocOnly && crop_for(2, cs)) run("synthdoc_hr", cs, sd);
+    const bool want_uv = rq.nets != FlatNets::SynthDocOnly && crop_for(0, cu);
+    const bool want_sd = rq.nets != FlatNets::UVDocOnly && crop_for(2, cs);
+    // the two depend only on their crops (and run on their own Inference): side by side
+    if (want_uv && want_sd) {
+        NetRun nu, ns;
+        auto f = std::async(std::launch::async, [&] { run_into("synthdoc_hr", cs, sd, ns); });
+        run_into("uvdoc", cu, uv, nu);
+        f.get();
+        for (NetRun* n : {&nu, &ns})
+            if (!n->name.empty()) r.runs.push_back(*n);
+    } else if (want_uv) {
+        run("uvdoc", cu, uv);
+    } else if (want_sd) {
+        run("synthdoc_hr", cs, sd);
+    }
     // SyntheticDoc high-res fills the first slot (run_photo keeps it unless UVDoc's rows are far
     // straighter), UVDoc the second; UVDoc alone the first
     if (!sd.empty()) {
@@ -195,6 +236,94 @@ std::function<bool(std::vector<float>&, int, int)> shade_net_fn(Inference& inf, 
     };
 }
 
+bool inpaint_fill(cv::Mat& page_bgra, const cv::Mat& mask, Inference& inf, const cv::Mat* paper, double* ms) {
+    if (mask.empty() || mask.size() != page_bgra.size() || page_bgra.channels() != 4) return false;
+    const int S = 512, W = page_bgra.cols, H = page_bgra.rows;
+    // nearby areas share a crop
+    cv::Mat grown;
+    cv::dilate(mask, grown, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(31, 31)));
+    cv::Mat lbl, stats, cent;
+    const int n = cv::connectedComponentsWithStats(grown, lbl, stats, cent, 8, CV_32S);
+    bool any = false;
+    for (int k = 1; k < n; ++k) {
+        cv::Rect hole(stats.at<int>(k, cv::CC_STAT_LEFT), stats.at<int>(k, cv::CC_STAT_TOP), stats.at<int>(k, cv::CC_STAT_WIDTH), stats.at<int>(k, cv::CC_STAT_HEIGHT));
+        // a square crop twice the hole's size (at least 256 px): the page around it is what the net reads
+        int side = std::min(std::max(W, H), std::max(256, 2 * std::max(hole.width, hole.height)));
+        int cw = std::min(side, W), ch = std::min(side, H);
+        int x0 = std::min(std::max(0, hole.x + hole.width / 2 - cw / 2), W - cw), y0 = std::min(std::max(0, hole.y + hole.height / 2 - ch / 2), H - ch);
+        cv::Rect crop(x0, y0, cw, ch);
+        cv::Mat m = mask(crop) & (lbl(crop) == k);
+        if (cv::countNonZero(m) == 0) continue;
+        cv::Mat rgb, rs, ms_;
+        cv::cvtColor(page_bgra(crop), rgb, cv::COLOR_BGRA2RGB);
+        if (paper && paper->size() == page_bgra.size()) {
+            // beyond the paper: the paper's own colour (its median in the crop, outside the hole)
+            cv::Mat off = (*paper)(crop) < 128, on = ((*paper)(crop) >= 128) & (m == 0);
+            if (cv::countNonZero(off) > 0 && cv::countNonZero(on) > 0) {
+                cv::Vec3b med;
+                for (int q = 0; q < 3; ++q) {
+                    std::vector<uint8_t> v;
+                    for (int y = 0; y < ch; ++y)
+                        for (int xx = 0; xx < cw; ++xx)
+                            if (on.at<uint8_t>(y, xx)) v.push_back(rgb.at<cv::Vec3b>(y, xx)[q]);
+                    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                    med[q] = v[v.size() / 2];
+                }
+                rgb.setTo(cv::Scalar(med[0], med[1], med[2]), off);
+            }
+        }
+        cv::resize(rgb, rs, cv::Size(S, S), 0, 0, cw > S || ch > S ? cv::INTER_AREA : cv::INTER_LINEAR);
+        cv::resize(m, ms_, cv::Size(S, S), 0, 0, cv::INTER_NEAREST);
+        cv::dilate(ms_, ms_, cv::Mat::ones(3, 3, CV_8U));   // no finger edge pixels left as "known"
+        // input (MI-GAN's demo): channel 0 = known - 0.5 (+0.5 page, -0.5 hole), 1-3 = RGB in [-1, 1] times known
+        Tensor x{{1, 4, S, S}, std::vector<float>((size_t)4 * S * S)};
+        float* d = x.data.data();
+        for (int y = 0; y < S; ++y)
+            for (int xx = 0; xx < S; ++xx) {
+                const size_t i = (size_t)y * S + xx;
+                const float known = ms_.at<uint8_t>(y, xx) ? 0.f : 1.f;
+                const cv::Vec3b c = rs.at<cv::Vec3b>(y, xx);
+                d[i] = known - 0.5f;
+                for (int q = 0; q < 3; ++q) d[(size_t)(q + 1) * S * S + i] = (c[q] * (2.f / 255.f) - 1.f) * known;
+            }
+        std::vector<Tensor> out;
+        std::string err;
+        if (!inf.run(NetId::Inpaint, x, out, &err)) {
+            LOGI("inpaint net: %s", err.c_str());
+            return any;
+        }
+        if (ms) *ms += inf.last_ms(NetId::Inpaint);
+        if (out.empty() || out[0].data.size() != (size_t)3 * S * S) return any;
+        cv::Mat res(S, S, CV_8UC3);
+        const float* o = out[0].data.data();
+        for (int y = 0; y < S; ++y)
+            for (int xx = 0; xx < S; ++xx)
+                for (int q = 0; q < 3; ++q) {
+                    float v = (o[(size_t)q * S * S + (size_t)y * S + xx] * 0.5f + 0.5f) * 255.f;
+                    res.at<cv::Vec3b>(y, xx)[2 - q] = (uint8_t)std::min(255.f, std::max(0.f, std::round(v)));   // RGB -> BGR
+                }
+        cv::Mat back;
+        cv::resize(res, back, crop.size(), 0, 0, cv::INTER_LINEAR);
+        // the net's pixels in the hole, feathered over 1 px (MI-GAN's pipeline: 3x3 dilate, 5x5 Gaussian)
+        cv::Mat a;
+        cv::dilate(m, a, cv::Mat::ones(3, 3, CV_8U));
+        cv::GaussianBlur(a, a, cv::Size(5, 5), 1.0);
+        a = cv::max(a, m);
+        for (int y = 0; y < ch; ++y) {
+            uint8_t* p = page_bgra.ptr<uint8_t>(y0 + y) + 4 * x0;
+            const uint8_t* b = back.ptr<uint8_t>(y);
+            const uint8_t* w = a.ptr<uint8_t>(y);
+            for (int xx = 0; xx < cw; ++xx) {
+                if (!w[xx]) continue;
+                const float t = w[xx] / 255.f;
+                for (int q = 0; q < 3; ++q) p[4 * xx + q] = (uint8_t)std::lround(p[4 * xx + q] * (1 - t) + b[3 * xx + q] * t);
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
 RuleNetFn rule_net_fn(Inference& inf, double* ms) {
     return [&inf, ms](std::vector<float>& io, int w, int h) {
         if (w <= 0 || h <= 0 || io.size() != (size_t)3 * w * h) return false;
@@ -208,6 +337,26 @@ RuleNetFn rule_net_fn(Inference& inf, double* ms) {
         if (y.empty() || (y[0].data.size() != (size_t)2 * w * h && y[0].data.size() != (size_t)4 * w * h)) return false;   // rules (+ text lines)
         io = std::move(y[0].data);
         if (ms) *ms += inf.last_ms(NetId::RuleNet);
+        return true;
+    };
+}
+
+OrientNetFn orient_net_fn(Inference& inf, double* ms) {
+    return [&inf, ms](const std::vector<float>& in, int n, std::vector<float>& logits) {
+        // the model takes a fixed batch of 32 patches (tools/orientnet/export.py): fewer are padded with zeros
+        const int B = 32;
+        if (n <= 0 || n > B || in.size() != (size_t)n * 128 * 128) return false;
+        Tensor x{{B, 1, 128, 128}, in};
+        x.data.resize((size_t)B * 128 * 128, 0.f);
+        std::vector<Tensor> y;
+        std::string err;
+        if (!inf.run(NetId::OrientNet, x, y, &err)) {
+            LOGI("orientation net: %s", err.c_str());
+            return false;
+        }
+        if (y.empty() || y[0].data.size() != (size_t)B * 4) return false;
+        logits.assign(y[0].data.begin(), y[0].data.begin() + (size_t)n * 4);
+        if (ms) *ms += inf.last_ms(NetId::OrientNet);
         return true;
     };
 }

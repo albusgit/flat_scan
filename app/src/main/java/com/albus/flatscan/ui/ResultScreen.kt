@@ -50,6 +50,7 @@ import androidx.compose.material.icons.outlined.Compare
 import androidx.compose.material.icons.outlined.DoneAll
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Collections
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.MoreVert
@@ -78,6 +79,18 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
@@ -90,7 +103,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import kotlin.math.PI
 import kotlin.math.sin
+import androidx.compose.material.icons.outlined.TouchApp
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -112,15 +128,50 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material.icons.automirrored.outlined.RotateLeft
+import androidx.compose.material.icons.outlined.Cached
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.PostAdd
+import androidx.compose.material3.Switch
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.albus.flatscan.CaptureMode
 import com.albus.flatscan.FilterKind
 import com.albus.flatscan.ImportSource
 import com.albus.flatscan.ScanViewModel
 import com.albus.flatscan.ScreenMode
 import com.albus.flatscan.Screen
+import com.albus.flatscan.countDrawnLines
+import androidx.compose.material.icons.outlined.Draw
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material.icons.outlined.Restore
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
+import kotlin.math.max
+import kotlin.math.min
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.style.TextOverflow
 import java.util.Locale
 import kotlin.math.roundToInt
 
 private enum class Sheet { None, Save, Share }
+
+/**
+ * The five tools along the bottom, one job each: the page's look (filters), light and colour, cleaning up (marks,
+ * fingers, solid colours, a screen's pixel grid), flattening (the line editor, AreaMode.Lines) and the page itself
+ * (crop, turns, size, document or whiteboard).
+ */
+private enum class ResultTab { Look, Adjust, Clean, Flatten, Page }
+
+/** What the editor panel shows: a tab's tools, or the tool open on the page. */
+private enum class PanelKind { Look, Adjust, Clean, Page, Lines, Fingers, Erase, Protect }
 
 /** A flatten the iron sweeps across the page before it starts ([perspective] as in [ScanViewModel.reflatten]). */
 private class IronRequest(val perspective: Boolean?)
@@ -135,12 +186,25 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     var sheet by remember { mutableStateOf(Sheet.None) }
     var showDetails by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    // the finger brush: Remove (add to the mask) or Keep, and its radius (page-width fraction)
+    var brushAdd by remember { mutableStateOf(true) }
+    var brushRadius by remember { mutableFloatStateOf(0.02f) }
+    // the finger tool's smart select (a tap selects the finger) instead of the brush
+    var smartSelect by remember { mutableStateOf(false) }
+    // the line editor's Add line: a drag draws a line along a rule the unwarp missed
+    var drawingLine by remember { mutableStateOf(false) }
     var tool by remember {
         // back from flattening again in the line editor: show the new lines
         mutableStateOf(if (vm.reopenLines) AreaMode.Lines else AreaMode.None).also { vm.reopenLines = false }
     }
+    var tab by rememberSaveable { mutableStateOf(if (vm.adjustOpen) ResultTab.Adjust else ResultTab.Look) }
     val exporter = rememberExportActions(vm)
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { vm.importUris(it) }
+    // a new page the way this one came in: the camera, or the photo picker
+    val addPage = {
+        if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        else vm.startCamera()
+    }
     // "Flatten again": the iron sweeps across the page, then the processing screen takes over
     var ironing by remember { mutableStateOf<IronRequest?>(null) }
     val sweep = remember { Animatable(0f) }
@@ -171,6 +235,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     val closeTool = {
         if (tool == AreaMode.Lines) vm.revertIgnore()
         tool = AreaMode.None
+        drawingLine = false
     }
     BackHandler(enabled = mode != AreaMode.None) { closeTool() }
 
@@ -180,47 +245,37 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = { if (mode != AreaMode.None) closeTool() else vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            Text(
-                buildAnnotatedString {
-                    if (vm.pages.size > 1 && index >= 0) {
-                        append("Page ${index + 1} ")
-                        withStyle(SpanStyle(color = Editor.Muted, fontWeight = FontWeight.SemiBold)) { append("of ${vm.pages.size}") }
-                    } else {
-                        append("Page")
-                    }
-                },
-                style = MaterialTheme.typography.titleMedium, maxLines = 1,
-                modifier = Modifier.padding(horizontal = 10.dp).weight(1f),
-            )
-            // one tap for an upside-down page: there is no automatic 180-degree turn
-            IconButton(onClick = { vm.rotateResult180() }, enabled = vm.page != null) {
-                Box(
-                    Modifier.size(30.dp).border(1.5.dp, Editor.Inactive, CircleShape).semantics { contentDescription = "Turn 180 degrees" },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("180°", style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.ExtraBold), color = Editor.Inactive)
+            // the page count opens the document's pages (reorder, select, delete, add); two lines, so that undo and
+            // redo fit beside it
+            Column(
+                Modifier.weight(1f).clip(RoundedCornerShape(8.dp))
+                    .clickable(role = Role.Button, onClickLabel = "Show all pages") { vm.open(Screen.Pages) }
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    if (vm.pages.size > 1 && index >= 0) "Page ${index + 1}" else "Page",
+                    style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                if (vm.pages.size > 1 && index >= 0) {
+                    Text(
+                        "of ${vm.pages.size}", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontSize = 12.sp),
+                        color = Editor.Muted, maxLines = 1,
+                    )
                 }
             }
+            // undo / redo of every edit that does not re-run the geometry (filters, adjust, rotate, areas): always
+            // here, dimmed when there is nothing to undo; the area tools have their own undo in their panels
+            val editing = mode == AreaMode.None
+            IconButton(onClick = { vm.undo() }, enabled = editing && vm.history.canUndo, modifier = Modifier.width(40.dp)) {
+                Icon(Icons.AutoMirrored.Outlined.Undo, "Undo")
+            }
+            IconButton(onClick = { vm.redo() }, enabled = editing && vm.history.canRedo, modifier = Modifier.width(40.dp)) {
+                Icon(Icons.AutoMirrored.Outlined.Redo, "Redo")
+            }
+            if (vm.pending.isEmpty()) IconButton(onClick = addPage) { Icon(Icons.Outlined.PostAdd, "Add a page") }
             Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreVert, "More") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    if (vm.spreadPartner != null) {
-                        DropdownMenuItem(
-                            text = { Text("Swap the two book pages") },
-                            leadingIcon = { Icon(Icons.Outlined.SwapHoriz, null) },
-                            onClick = { vm.swapSpread(); menu = false },
-                        )
-                    }
-                    DropdownMenuItem(
-                        text = { Text("Iron (unwarp)") },
-                        leadingIcon = { Icon(PaperIcons.Iron, null) },
-                        trailingIcon = { Checkbox(checked = !vm.perspectiveOnly, onCheckedChange = null) },
-                        enabled = ready && ironing == null,
-                        onClick = {
-                            menu = false
-                            if (vm.perspectiveOnly) iron(false) else vm.reflatten(perspective = true)
-                        },
-                    )
                     DropdownMenuItem(
                         text = { Text("Show wrinkle map") },
                         trailingIcon = { Checkbox(checked = vm.showWrinkles, onCheckedChange = null) },
@@ -235,17 +290,17 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     )
                 }
             }
-            Button(
+            Spacer(Modifier.width(4.dp))
+            // pressed into its ink shadow, as the app's other primary buttons
+            InkPressable(
                 onClick = { sheet = Sheet.Save }, enabled = ready, shape = ChipShape,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Editor.Text, contentColor = Editor.Ground,
-                    disabledContainerColor = Editor.Text.copy(alpha = 0.3f), disabledContentColor = Editor.Ground.copy(alpha = 0.7f),
-                ),
-                contentPadding = PaddingValues(horizontal = 18.dp),
+                container = Editor.Text, contentColor = Editor.Ground, shadow = Color.Black,
                 modifier = Modifier.height(40.dp),
             ) {
-                if (exporter.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Editor.Ground)
-                else Text("Save", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp))
+                Box(Modifier.padding(horizontal = 18.dp), contentAlignment = Alignment.Center) {
+                    if (exporter.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = Editor.Ground)
+                    else Text("Save", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp))
+                }
             }
         }
     }
@@ -257,6 +312,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 areas = when (mode) {
                     AreaMode.Lines -> if (vm.perspectiveOnly) emptyList() else vm.ignore
                     AreaMode.Erase -> vm.erase
+                    AreaMode.Fingers -> emptyList()
                     else -> vm.protect
                 },
                 areaMode = mode, lines = vm.lines, state = viewer,
@@ -270,6 +326,8 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 },
                 onTap = { x, y, line ->
                     when {
+                        mode == AreaMode.Fingers -> if (smartSelect) vm.smartSelectFinger(x, y, brushAdd)
+                        mode == AreaMode.Lines && line >= 0 && vm.lines.getOrNull(5 * line)?.toInt() == 3 -> vm.removeUserLineNear(x, y)
                         mode == AreaMode.Protect -> vm.removeProtectAt(x, y)
                         mode == AreaMode.Erase -> vm.removeEraseAt(x, y)
                         line >= 0 -> vm.toggleLine(line)
@@ -280,24 +338,43 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 colorFilter = colorFilter,
                 compare = if (mode == AreaMode.None) compare else null,
                 onCompare = { compare = it },
+                brushOverlay = if (mode == AreaMode.Fingers) vm.fingerOverlay else null,
+                brushRadius = brushRadius,
+                onStroke = { pts -> if (mode == AreaMode.Lines) vm.traceUserLine(pts) else vm.addFingerStroke(brushAdd, brushRadius, pts) },
+                drawStrokes = (mode == AreaMode.Fingers && !smartSelect) || (mode == AreaMode.Lines && drawingLine),
+                pendingLines = if (mode == AreaMode.Lines) vm.pendingUserLines else emptyList(),
+                fadeKey = p.filter,
             )
             if (mode == AreaMode.None && vm.showHoldHint && vm.page != null && compare == null) {
                 Text(
-                    "Press and hold to see the original",
+                    "Hold to see the original",
                     style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
-                        .background(Editor.Text.copy(alpha = 0.12f), ChipShape)
+                        // dark, as the compare button: a light pill vanished on a white page
+                        .background(Editor.Panel.copy(alpha = 0.88f), ChipShape)
                         .padding(horizontal = 14.dp, vertical = 7.dp),
                 )
             }
-            // undo / redo of every edit that does not re-run the geometry (filters, adjust, rotate, areas)
-            AnimatedVisibility(
-                visible = mode == AreaMode.None && (vm.history.canUndo || vm.history.canRedo),
-                enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopStart),
-            ) {
-                Row(Modifier.padding(4.dp).background(Editor.Panel.copy(alpha = 0.88f), RoundedCornerShape(10.dp))) {
-                    IconButton(onClick = { vm.undo() }, enabled = vm.history.canUndo) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
-                    IconButton(onClick = { vm.redo() }, enabled = vm.history.canRedo) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
+            // the nets disagree on an edge of this page: the corner screen is one tap away
+            if (mode == AreaMode.None && vm.edgeDoubt && vm.page != null && compare == null) {
+                Row(
+                    Modifier.align(Alignment.TopStart).padding(6.dp)
+                        .background(Editor.Panel.copy(alpha = 0.92f), ChipShape)
+                        .clickable(onClickLabel = "Adjust the corners") { vm.recrop() }
+                        .padding(start = 12.dp, end = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Outlined.Crop, null, tint = Editor.Accent, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Check the edges",
+                        style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    IconButton(onClick = { vm.dismissEdgeDoubt() }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Outlined.Close, "Dismiss", tint = Color(0xFFE3E3E0), modifier = Modifier.size(16.dp))
+                    }
                 }
             }
             Row(Modifier.align(Alignment.TopEnd).padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -323,32 +400,52 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
             }
         }
     }
-    val panel: @Composable ColumnScope.() -> Unit = {
-        if (mode == AreaMode.Protect) {
-            ProtectPanel(vm, onDone = { tool = AreaMode.None })
-        } else if (mode == AreaMode.Lines) {
-            LinesPanel(vm, onClose = closeTool, onIron = iron, ironing = ironing != null)
-        } else if (mode == AreaMode.Erase) {
-            ErasePanel(vm, onDone = { tool = AreaMode.None })
-        } else if (vm.adjustOpen) {
-            AdjustPanel(vm)
-        } else {
-            FilterPanel(
-                vm, onProtect = { tool = AreaMode.Protect }, onErase = { tool = AreaMode.Erase },
-                onAddPage = {
-                    if (vm.lastSource == ImportSource.Gallery) pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    else vm.startCamera()
-                },
+    val shownPanel = when (mode) {
+        AreaMode.Protect -> PanelKind.Protect
+        AreaMode.Lines -> PanelKind.Lines
+        AreaMode.Erase -> PanelKind.Erase
+        AreaMode.Fingers -> PanelKind.Fingers
+        else -> when (tab) {
+            ResultTab.Adjust -> PanelKind.Adjust
+            ResultTab.Clean -> PanelKind.Clean
+            ResultTab.Page -> PanelKind.Page
+            else -> PanelKind.Look
+        }
+    }
+    if (mode == AreaMode.Fingers) {
+        LaunchedEffect(Unit) { vm.refreshFingerOverlay() }
+        DisposableEffect(Unit) { onDispose { vm.closeFingerTool() } }
+    }
+    val panelOf: @Composable ColumnScope.(PanelKind) -> Unit = { k ->
+        when (k) {
+            PanelKind.Protect -> ProtectPanel(vm, onDone = { tool = AreaMode.None })
+            PanelKind.Lines -> LinesPanel(vm, onClose = closeTool, onIron = iron, ironing = ironing != null, drawing = drawingLine, onDrawing = { drawingLine = it })
+            PanelKind.Erase -> ErasePanel(vm, onDone = { tool = AreaMode.None })
+            PanelKind.Fingers -> FingerPanel(
+                vm, brushAdd, { brushAdd = it }, brushRadius, { brushRadius = it }, smartSelect, { smartSelect = it }, onDone = { tool = AreaMode.None },
             )
+            PanelKind.Adjust -> AdjustPanel(vm)
+            PanelKind.Clean -> CleanPanel(vm, onErase = { tool = AreaMode.Erase }, onFingers = { tool = AreaMode.Fingers }, onProtect = { tool = AreaMode.Protect })
+            PanelKind.Page -> PagePanel(vm)
+            PanelKind.Look -> FilterPanel(vm)
         }
     }
     val dock: @Composable () -> Unit = {
-        ToolDock(vm, linesOpen = mode == AreaMode.Lines, onLines = { if (mode == AreaMode.Lines) closeTool() else tool = AreaMode.Lines }, onTab = closeTool)
+        ToolDock(if (mode == AreaMode.Lines) ResultTab.Flatten else tab) { t ->
+            if (t == ResultTab.Flatten) {
+                if (mode == AreaMode.Lines) closeTool() else tool = AreaMode.Lines
+            } else {
+                closeTool()
+                tab = t
+                vm.openAdjust(t == ResultTab.Adjust)
+            }
+        }
     }
 
     BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         // landscape phones and tablets: the panel beside the page (below it, the page would get a sliver)
         val wide = maxWidth > maxHeight && maxWidth >= 600.dp
+        val panelCap = maxHeight * 0.5f
         if (wide) {
             Column(Modifier.fillMaxSize()) {
                 topBar()
@@ -359,9 +456,9 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                     }
                     Column(
                         Modifier.width(400.dp).fillMaxHeight().padding(end = 8.dp)
-                            .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)).background(Editor.Panel).navigationBarsPadding(),
+                            .clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding(),
                     ) {
-                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { panel() }
+                        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) { panelOf(shownPanel) }
                         dock()
                     }
                 }
@@ -373,7 +470,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                 if (vm.showWrinkles) WrinkleLegend(vm.overlayMaxPx, vm.overlay != null)
                 // the editor panel: the tool of the selected tab over the tool dock
                 Column(Modifier.fillMaxWidth().clip(Editor.PanelShape).background(Editor.Panel).navigationBarsPadding()) {
-                    panel()
+                    ToolPanel(shownPanel, cap = panelCap, panel = panelOf)
                     dock()
                 }
             }
@@ -381,7 +478,7 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
 
     if (sheet != Sheet.None) {
-        ExportSheet(sheet == Sheet.Share, vm.pages.size, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = Sheet.None })
+        ExportSheet(vm, sheet == Sheet.Share, vm.pages.size, vm.docTitle, onRename = { vm.renameDocument(it) }, onSave = { exporter.save(it) }, onShare = { exporter.share(it) }, onDismiss = { sheet = Sheet.None })
     }
     if (showDetails) {
         AlertDialog(
@@ -393,17 +490,55 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
     }
 }
 
-/** Six tools along the bottom: three tabs (filters, adjust, flatten) and three actions. */
+/**
+ * The editor panel at the height of what it shows, as photo editors do: the page above re-fits as the panel
+ * grows or shrinks (the dock stays put), so a short panel (Look, Clean up) leaves no empty space. A change of tab
+ * or tool fades through (the old controls out in 90 ms, the new ones in, rising 8 dp) while the height follows on a
+ * critically damped spring, which also takes a quick second tap in its stride; a change inside a panel (Levels,
+ * a row that appears) animates its height too. At most [cap], then the panel scrolls. Reduced motion: no animation.
+ */
 @Composable
-private fun ToolDock(vm: ScanViewModel, linesOpen: Boolean, onLines: () -> Unit, onTab: () -> Unit) {
+private fun ToolPanel(shown: PanelKind, cap: Dp, panel: @Composable ColumnScope.(PanelKind) -> Unit) {
+    val reduced = rememberReducedMotion()
+    val rise = with(LocalDensity.current) { 8.dp.roundToPx() }
+    val size = spring<IntSize>(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
+    // with animations off the panel changes outright (AnimatedContent would draw both panels for a frame)
+    if (reduced) {
+        key(shown) {
+            Column(Modifier.fillMaxWidth().heightIn(max = cap).verticalScroll(rememberScrollState())) { panel(shown) }
+        }
+        return
+    }
+    AnimatedContent(
+        shown, label = "tool panel", contentAlignment = Alignment.TopCenter,
+        modifier = Modifier.fillMaxWidth().heightIn(max = cap),
+        transitionSpec = {
+            (fadeIn(tween(200, delayMillis = 70, easing = LinearOutSlowInEasing)) +
+                slideInVertically(tween(260, delayMillis = 70, easing = LinearOutSlowInEasing)) { rise })
+                .togetherWith(fadeOut(tween(90, easing = FastOutLinearInEasing)))
+                .using(SizeTransform(clip = true) { _, _ -> size })
+        },
+    ) { k ->
+        Column(
+            Modifier.fillMaxWidth().animateContentSize(size).verticalScroll(rememberScrollState()),
+        ) { panel(k) }
+    }
+}
+
+/** The five tool tabs along the bottom ([ResultTab]); the pages open from the page count in the top bar. */
+@Composable
+private fun ToolDock(selected: ResultTab, onSelect: (ResultTab) -> Unit) {
     HorizontalDivider(color = Editor.Divider)
-    Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 10.dp)) {
-        DockItem("Filters", Icons.Outlined.Palette, Modifier.weight(1f), selected = !vm.adjustOpen && !linesOpen) { onTab(); vm.openAdjust(false) }
-        DockItem("Adjust", Icons.Outlined.Tune, Modifier.weight(1f), selected = vm.adjustOpen && !linesOpen) { onTab(); vm.openAdjust(true) }
-        DockItem("Flatten", PaperIcons.Iron, Modifier.weight(1f), selected = linesOpen) { onLines() }
-        DockItem("Crop", Icons.Outlined.Crop, Modifier.weight(1f)) { vm.recrop() }
-        DockItem("Rotate", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f)) { vm.rotateResult() }
-        DockItem("Pages", Icons.Outlined.Collections, Modifier.weight(1f), badge = vm.pages.size) { vm.open(Screen.Pages) }
+    Row(Modifier.fillMaxWidth().selectableGroup().padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 10.dp)) {
+        for ((t, label, icon) in listOf(
+            Triple(ResultTab.Look, "Look", Icons.Outlined.Palette),
+            Triple(ResultTab.Adjust, "Adjust", Icons.Outlined.Tune),
+            Triple(ResultTab.Clean, "Clean up", Icons.Outlined.AutoFixHigh),
+            Triple(ResultTab.Flatten, "Flatten", PaperIcons.Iron),
+            Triple(ResultTab.Page, "Page", Icons.Outlined.Description),
+        )) {
+            DockItem(label, icon, Modifier.weight(1f), selected = t == selected) { onSelect(t) }
+        }
     }
 }
 
@@ -412,7 +547,7 @@ private fun ToolDock(vm: ScanViewModel, linesOpen: Boolean, onLines: () -> Unit,
 private fun DockItem(label: String, icon: ImageVector, modifier: Modifier, selected: Boolean? = null, badge: Int = 0, onClick: () -> Unit) {
     val color = if (selected == true) Editor.Accent else Editor.Inactive
     Column(
-        modifier.height(58.dp).clip(RoundedCornerShape(8.dp))
+        modifier.heightIn(min = 58.dp).clip(RoundedCornerShape(8.dp))
             .then(if (selected != null) Modifier.selectable(selected, role = Role.Tab, onClick = onClick) else Modifier.clickable(role = Role.Button, onClick = onClick)),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -440,25 +575,28 @@ private fun EditorChip(
     role: Role = Role.Button,
 ) {
     val shape = ChipShape
+    // dimmed through its colours (as PanelTile)
+    val fg = LocalContentColor.current.let { if (enabled) it else it.copy(alpha = 0.4f) }
+    val edge = (if (selected) Editor.Accent else Editor.Outline).let { if (enabled) it else it.copy(alpha = 0.5f) }
     Row(
         Modifier.minimumInteractiveComponentSize().height(36.dp).clip(shape)
             .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
-            .border(1.dp, if (selected) Editor.Accent else Editor.Outline, shape)
+            .border(1.dp, edge, shape)
             .selectable(selected, enabled = enabled, role = role, onClick = onClick)
-            .alpha(if (enabled) 1f else 0.4f)
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (icon != null) {
-            Icon(icon, null, Modifier.size(16.dp))
+            Icon(icon, null, Modifier.size(16.dp), tint = fg)
             Spacer(Modifier.width(8.dp))
         }
-        Text(text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), maxLines = 1)
+        Text(text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), color = fg, maxLines = 1)
     }
 }
 
+/** Look: the filter and its strength, one live preview per filter; the look on every page; the next imported photo. */
 @Composable
-private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () -> Unit, onAddPage: () -> Unit) {
+private fun FilterPanel(vm: ScanViewModel) {
     val p = vm.params
     val thumbFilter = remember(vm.look) { vm.look.composeFilter() }
     Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -481,7 +619,7 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
     ) {
-        items(FilterKind.entries) { f ->
+        items(FilterKind.forMode(vm.pageMode)) { f ->
             val selected = f == p.filter
             Column(
                 // wide enough for "High contrast" (66 dp cut it to "High")
@@ -490,9 +628,12 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 val ring = RoundedCornerShape(6.dp)
+                // the selection ring moves to the picked filter (160 ms)
+                val ringWidth by animateDpAsState(if (selected) 2.5.dp else 1.dp, tween(160), label = "ring")
+                val ringColor by animateColorAsState(if (selected) Editor.Accent else Editor.Divider, tween(160), label = "ring")
                 Box(
                     Modifier.size(58.dp, 76.dp)
-                        .border(if (selected) 2.5.dp else 1.dp, if (selected) Editor.Accent else Editor.Divider, ring)
+                        .border(ringWidth, ringColor, ring)
                         .padding(3.dp).clip(RoundedCornerShape(3.dp)).background(Editor.Ground),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -507,40 +648,285 @@ private fun FilterPanel(vm: ScanViewModel, onProtect: () -> Unit, onErase: () ->
             }
         }
     }
+    if (vm.pages.size > 1 || vm.pending.isNotEmpty()) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // the next imported photo first: the step most often taken from here
+            if (vm.pending.isNotEmpty()) {
+                EditorChip("Next photo (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
+            }
+            if (vm.pages.size > 1) {
+                // the filter, strength and adjustments of this page on every page of the document
+                EditorChip(
+                    if (vm.applyingAll) "Applying..." else "Use this look on all ${vm.pages.size} pages", onClick = { vm.applyToAllPages() },
+                    icon = Icons.Outlined.DoneAll, enabled = !vm.applyingAll && vm.page != null,
+                )
+            }
+        }
+    } else {
+        Spacer(Modifier.height(14.dp))
+    }
+}
+
+/** A row of the Clean up panel that opens a tool: icon, what it does, its state and a chevron. */
+@Composable
+private fun CleanRow(icon: ImageVector, title: String, caption: String, value: String, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 10.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        Modifier.fillMaxWidth().heightIn(min = 58.dp).clickable(role = Role.Button, onClick = onClick).padding(horizontal = 18.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        val solidOk = p.filter != FilterKind.BlackWhite
-        EditorChip(
-            "Solid colors", onClick = { vm.setSolid(!p.solid) }, icon = Icons.Outlined.GridView,
-            selected = p.solid && solidOk, enabled = solidOk, role = Role.Switch,
-        )
-        if (p.solid && solidOk) {
-            val n = vm.protect.size / 4
-            EditorChip(if (n > 0) "Protected pictures ($n)" else "Protect a picture", onClick = onProtect, icon = Icons.Outlined.Shield)
+        CleanIcon(icon)
+        // the state beside the title, so the caption keeps the row's width
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f, fill = false))
+                if (value.isNotEmpty()) Text(value, style = MaterialTheme.typography.labelMedium, color = Editor.Accent, maxLines = 1, modifier = Modifier.padding(start = 8.dp))
+            }
+            Text(caption, style = MaterialTheme.typography.bodySmall, color = Editor.Muted)
         }
+        Icon(Icons.Outlined.ChevronRight, null, tint = Editor.Muted)
+    }
+}
+
+@Composable
+private fun CleanIcon(icon: ImageVector) {
+    Box(Modifier.padding(end = 12.dp).size(34.dp).border(1.dp, Editor.Outline, CircleShape), contentAlignment = Alignment.Center) {
+        Icon(icon, null, tint = Editor.Accent, modifier = Modifier.size(18.dp))
+    }
+}
+
+/**
+ * A segmented choice of the editor panel ([options]: value to label): a track with the chosen option as a solid pill
+ * filling its cell. [wide]: the track takes the width it is given, the options sharing it equally.
+ */
+@Composable
+private fun <T> EditorSegments(
+    label: String, options: List<Pair<T, String>>, selected: T, modifier: Modifier = Modifier, wide: Boolean = false, onPick: (T) -> Unit,
+) {
+    Row(
+        modifier.height(40.dp).clip(ChipShape).background(Editor.Raised).border(1.dp, Editor.Outline, ChipShape).padding(3.dp)
+            .selectableGroup().semantics { contentDescription = label },
+    ) {
+        for ((v, text) in options) {
+            val on = v == selected
+            val fill by animateColorAsState(if (on) Editor.Accent else Color.Transparent, label = "segment")
+            Box(
+                (if (wide) Modifier.weight(1f) else Modifier).fillMaxHeight().clip(SegmentShape).background(fill)
+                    .selectable(on, role = Role.RadioButton) { onPick(v) }.padding(horizontal = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = if (on) FontWeight.ExtraBold else FontWeight.Medium),
+                    color = if (on) Editor.Ground else Editor.Text, maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/** A segment inside the [ChipShape] track (3 dp in): its corners follow the track's. */
+private val SegmentShape = RoundedCornerShape(5.dp)
+
+/** Clean up: marks erased, fingers at the edges, shaded cells made one colour, a screen photo's pixel grid. */
+@Composable
+private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> Unit, onProtect: () -> Unit) {
+    val p = vm.params
+    Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 10.dp)) {
         val ne = vm.erase.size / 4
-        EditorChip(if (ne > 0) "Erased ($ne)" else "Erase", onClick = onErase, icon = Icons.Outlined.AutoFixHigh)
-        // photo of a monitor / laptop / phone: descreen (moire, pixel grid) before the filter. Auto finds only clear
-        // cases (docs/results/r11/filters.md), so a tap cycles Auto -> On -> Off
-        EditorChip(
-            "Screen photo: ${p.screen.label}",
-            onClick = { vm.setScreen(when (p.screen) { ScreenMode.Auto -> ScreenMode.On; ScreenMode.On -> ScreenMode.Off; ScreenMode.Off -> ScreenMode.Auto }) },
-            icon = Icons.Outlined.Monitor, selected = p.screen == ScreenMode.On,
+        CleanRow(
+            Icons.Outlined.AutoFixHigh, "Erase marks", "Stains, stamps, punch holes: drag a box over them.",
+            if (ne == 0) "" else if (ne == 1) "1 area" else "$ne areas", onErase,
         )
-        if (vm.pages.size > 1) {
-            // the filter, strength and adjustments of this page on every page of the document
-            EditorChip(
-                if (vm.applyingAll) "Applying..." else "Apply to all ${vm.pages.size} pages", onClick = { vm.applyToAllPages() },
-                icon = Icons.Outlined.DoneAll, enabled = !vm.applyingAll && vm.page != null,
+        if (vm.pageMode == CaptureMode.Document) {
+            CleanRow(
+                Icons.Outlined.TouchApp, "Fingers at the edges", "Removed by themselves; paint to fix what was missed.",
+                if (!vm.fingersAuto) "Off" else if (vm.fingerStrokes.isNotEmpty()) "Edited" else "Automatic", onFingers,
             )
         }
-        if (vm.pending.isNotEmpty()) {
-            EditorChip("Next page (${vm.nextPendingIndex} of ${vm.pendingTotal})", onClick = { vm.nextPage() }, icon = Icons.AutoMirrored.Filled.ArrowForward, selected = true)
-        } else {
-            EditorChip("Add page", onClick = onAddPage, icon = Icons.Outlined.Add)
+        val solidOk = p.filter != FilterKind.BlackWhite
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 58.dp)
+                .toggleable(p.solid && solidOk, enabled = solidOk, role = Role.Switch) { vm.setSolid(it) }
+                .alpha(if (solidOk) 1f else 0.5f).padding(horizontal = 18.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CleanIcon(Icons.Outlined.GridView)
+            Column(Modifier.weight(1f)) {
+                Text("Solid colours", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    if (solidOk) "Shaded table cells become one flat colour." else "Not with B&W: the page is already two colours.",
+                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                )
+            }
+            Switch(checked = p.solid && solidOk, onCheckedChange = null, enabled = solidOk)
+        }
+        if (p.solid && solidOk) {
+            val n = vm.protect.size / 4
+            CleanRow(
+                Icons.Outlined.Shield, "Protect pictures", "Photos, logos and drawings in a box keep their colours.",
+                if (n == 0) "" else if (n == 1) "1 box" else "$n boxes", onProtect,
+            )
+        }
+        // a photo of a monitor, laptop or phone: descreen (moire, pixel grid) before the filter; Auto finds only clear
+        // cases (docs/results/r11/filters.md)
+        Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CleanIcon(Icons.Outlined.Monitor)
+                Column(Modifier.weight(1f)) {
+                    Text("Photo of a screen", style = MaterialTheme.typography.titleSmall)
+                    Text("Removes the pixel grid and moiré.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted)
+                }
+            }
+            // under the text, at the text's width: the label keeps the row and the choice gets its own line
+            EditorSegments(
+                "Photo of a screen", listOf(ScreenMode.Auto to "Auto", ScreenMode.On to "On", ScreenMode.Off to "Off"), p.screen,
+                Modifier.padding(start = 46.dp, top = 8.dp).fillMaxWidth(), wide = true,
+            ) { vm.setScreen(it) }
+        }
+    }
+}
+
+/**
+ * A tool tile of the editor panels (the Page panel's page actions, the Flatten panel's line tools): an icon over its
+ * name; [selected] (a tool that stays on) fills it with a tint of the accent, a disabled one dims.
+ */
+@Composable
+private fun PanelTile(
+    label: String,
+    icon: ImageVector,
+    modifier: Modifier,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    role: Role = Role.Button,
+    onClick: () -> Unit,
+) {
+    // dimmed through its colours, not a layer's alpha: the outline under a layer whose alpha changed was not drawn again
+    val fg = (if (selected) Editor.Accent else LocalContentColor.current).let { if (enabled) it else it.copy(alpha = 0.4f) }
+    val edge = (if (selected) Editor.Accent else Editor.Outline).let { if (enabled) it else it.copy(alpha = 0.5f) }
+    Column(
+        modifier.heightIn(min = 64.dp).clip(ChipShape)
+            .background(if (selected) Editor.Accent.copy(alpha = 0.18f) else Color.Transparent)
+            .border(1.dp, edge, ChipShape)
+            .selectable(selected, enabled = enabled, role = role, onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(icon, null, Modifier.size(20.dp), tint = fg)
+        Spacer(Modifier.height(5.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = TextAlign.Center, color = fg)
+    }
+}
+
+/** Page: crop and turns, the page's size, document or whiteboard processing, the two pages of a book spread. */
+@Composable
+private fun PagePanel(vm: ScanViewModel) {
+    val l = vm.look
+    Column(
+        Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PanelTile("Crop", Icons.Outlined.Crop, Modifier.weight(1f).fillMaxHeight()) { vm.recrop() }
+            PanelTile("Rotate left", Icons.AutoMirrored.Outlined.RotateLeft, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResultLeft() }
+            PanelTile("Rotate right", Icons.AutoMirrored.Outlined.RotateRight, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult() }
+            // there is no automatic 180-degree turn: one tap for an upside-down page
+            PanelTile("Turn 180°", Icons.Outlined.Cached, Modifier.weight(1f).fillMaxHeight()) { vm.rotateResult180() }
+        }
+        Column {
+            Text("PAGE SIZE", style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono), color = Editor.Muted, modifier = Modifier.padding(bottom = 6.dp))
+            ShapeChooser(l) { vm.updateLook(l.copy(shape = it)) }
+        }
+        if (vm.pageMode == CaptureMode.Document) {
+            // shadows of the hand and the phone divided out of the page (core: the shading map, the shadow net)
+            Row(
+                Modifier.fillMaxWidth().clip(ChipShape).toggleable(vm.removeShadows, role = Role.Switch) { vm.setRemoveShadows(it) }.padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                    Text("Remove shadows", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        if (vm.removeShadows) "Hand and phone shadows are lifted off the page." else "The page keeps the light it was photographed in.",
+                        style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                    )
+                }
+                Switch(checked = vm.removeShadows, onCheckedChange = null)
+            }
+        }
+        Column {
+            Text("This page is a", style = MaterialTheme.typography.titleSmall)
+            // document or whiteboard processing for this page (processed again from its photo)
+            EditorSegments(
+                "Kind of page", listOf(CaptureMode.Document to "Document", CaptureMode.Whiteboard to "Whiteboard"), vm.pageMode,
+                Modifier.padding(top = 8.dp).fillMaxWidth(), wide = true,
+            ) { if (it != vm.pageMode) vm.setPageMode(it) }
+            Text("Changing these processes the page again.", style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 4.dp))
+        }
+        if (vm.spreadPartner != null) {
+            EditorChip("Swap the two book pages", onClick = { vm.swapSpread() }, icon = Icons.Outlined.SwapHoriz)
+        }
+    }
+}
+
+/**
+ * Fingers: the automatic finger removal (on / off) and a brush that adds areas to it (filled with the paper
+ * around them) or takes areas out (the photo comes back there). The mask is shown in orange; strokes are
+ * saved with the page.
+ */
+@Composable
+private fun FingerPanel(
+    vm: ScanViewModel, add: Boolean, onAdd: (Boolean) -> Unit, radius: Float, onRadius: (Float) -> Unit,
+    smart: Boolean, onSmart: (Boolean) -> Unit, onDone: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.TouchApp, null, tint = Editor.Accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("Fingers", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
+            Text(if (vm.fingerShare <= 0f) "none removed" else "%.1f%% of the page".format(100 * vm.fingerShare), style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+        }
+        Text(
+            (if (smart) "Tap a finger the app missed: it is found and filled with the paper around it."
+            else "Orange is filled with the paper around it. Paint over a finger the app missed.") +
+                " Switch to Keep to bring back what it took by mistake." +
+                if (vm.fingersOverText) " Text ran under a finger: what it hid can't be brought back." else "",
+            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
+        )
+        FlowRow(
+            Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            EditorSegments("Tool", listOf(true to "Smart select", false to "Brush"), smart, onPick = onSmart)
+            EditorSegments("Remove or keep", listOf(true to "Remove", false to "Keep"), add, onPick = onAdd)
+            EditorChip(if (vm.fingersAuto) "Automatic: on" else "Automatic: off", onClick = { vm.setFingersAutoOn(!vm.fingersAuto) }, selected = vm.fingersAuto)
+        }
+        // how a removed finger is filled: the paper around it, or the inpainting net (content-aware, on the phone)
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                Text("Fill with", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    if (vm.fingerFill == 1) "AI: continues what is around it, on the phone. Takes a few seconds." else "The plain paper around it.",
+                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                )
+            }
+            EditorSegments("Fill with", listOf(0 to "Paper", 1 to "AI"), vm.fingerFill) { vm.chooseFingerFill(it) }
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp).alpha(if (smart) 0.4f else 1f), verticalAlignment = Alignment.CenterVertically) {
+            Text("Brush size", style = MaterialTheme.typography.labelLarge, color = Editor.Muted)
+            Slider(
+                value = radius, onValueChange = onRadius, valueRange = 0.005f..0.06f, enabled = !smart, colors = editorSliderColors(),
+                modifier = Modifier.weight(1f).padding(horizontal = 10.dp).semantics { contentDescription = "Brush size" },
+            )
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            EditorChip("Undo", onClick = { vm.undoFingerStroke() }, enabled = vm.fingerStrokes.isNotEmpty())
+            EditorChip("Clear", onClick = { vm.clearFingerStrokes() }, enabled = vm.fingerStrokes.isNotEmpty())
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = onDone, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
+                contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
+            ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
         }
     }
 }
@@ -606,53 +992,104 @@ private fun ProtectPanel(vm: ScanViewModel, onDone: () -> Unit) {
  * (perspective correction only).
  */
 @Composable
-private fun LinesPanel(vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?) -> Unit, ironing: Boolean) {
-    val n = vm.ignore.size / 4
-    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(PaperIcons.Iron, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
-            Spacer(Modifier.width(10.dp))
-            Text("Flatten", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold), modifier = Modifier.weight(1f))
-            EditorChip(
-                if (vm.perspectiveOnly) "Iron off" else "Iron on", role = Role.Switch, selected = !vm.perspectiveOnly,
-                icon = if (vm.perspectiveOnly) PaperIcons.IronLifted else PaperIcons.Iron, enabled = !ironing,
-                onClick = { if (vm.perspectiveOnly) onIron(false) else vm.reflatten(perspective = true) },
-            )
+private fun LinesPanel(
+    vm: ScanViewModel, onClose: () -> Unit, onIron: (Boolean?) -> Unit, ironing: Boolean, drawing: Boolean, onDrawing: (Boolean) -> Unit,
+) {
+    val ignoredBoxes = vm.ignore.size / 4
+    val drawn = countDrawnLines(vm.userLines)
+    val ironOn = !vm.perspectiveOnly
+    // the page's lines by kind (ruled, text row, table, drawn and flattened) and those ignored (their middle in a box)
+    val ignore = vm.ignore.toList()
+    val counts = remember(vm.lines, ignore) {
+        val c = IntArray(5)
+        val l = vm.lines
+        var i = 0
+        while (5 * i + 4 < l.size) {
+            val mx = (l[5 * i + 1] + l[5 * i + 3]) / 2
+            val my = (l[5 * i + 2] + l[5 * i + 4]) / 2
+            if (inAreas(ignore, mx, my)) c[4]++ else c[l[5 * i].toInt().coerceIn(0, 3)]++
+            i++
         }
-        Text(
-            when {
-                vm.perspectiveOnly -> "The iron is lifted: only the perspective is corrected. Turn it on to straighten curved lines."
-                vm.lines.isEmpty() -> "No lines were found on this page: only its outline flattens it."
-                else -> "Tap a line that should stay as it is (a logo, a drawing, a second sheet), or drag a box over an area. Then iron again."
-            },
-            style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 6.dp),
-        )
-        if (!vm.perspectiveOnly && vm.lines.isNotEmpty()) {
-            Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                LegendDot(Color(0xFF8FB0FF), "Ruled lines")
-                LegendDot(Color(0xFF5BD18B), "Text rows")
-                LegendDot(Color(0xFFFF6B5E), "Ignored")
+        c
+    }
+    val used = counts[0] + counts[1] + counts[2] + counts[3]
+    Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 16.dp)) {
+        // what the tab does and how it stands, the iron as a switch (as Remove shadows)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(if (ironOn) PaperIcons.Iron else PaperIcons.IronLifted, null, tint = Editor.Accent, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Flatten", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold))
+                Text(
+                    when {
+                        !ironOn -> "Iron lifted: perspective only"
+                        used == 0 -> "No lines found on this page"
+                        used == 1 -> "1 line guides the iron"
+                        else -> "$used lines guide the iron"
+                    },
+                    style = MaterialTheme.typography.bodySmall, color = Editor.Muted,
+                )
+            }
+            Row(
+                Modifier.clip(ChipShape).toggleable(ironOn, enabled = !ironing, role = Role.Switch) { on ->
+                    if (on) onIron(false) else vm.reflatten(perspective = true)
+                }.padding(start = 10.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Iron", style = MaterialTheme.typography.labelLarge, color = Editor.Inactive, modifier = Modifier.padding(end = 10.dp))
+                Switch(checked = ironOn, onCheckedChange = null, enabled = !ironing)
             }
         }
-        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            EditorChip("Use all lines", onClick = { vm.clearIgnore() }, enabled = n > 0 && !vm.perspectiveOnly)
-            Spacer(Modifier.weight(1f))
-            if (vm.ignoreChanged) {
-                TextButton(onClick = onClose, enabled = !ironing) { Text("Cancel") }
-                Button(
-                    onClick = { onIron(null) }, enabled = !ironing, shape = ChipShape,
-                    colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
-                    contentPadding = PaddingValues(start = 14.dp, end = 18.dp), modifier = Modifier.height(40.dp),
+        if (ironOn) {
+            // the key to the colours on the page, with how many of each
+            if (used + counts[4] + drawn > 0) {
+                FlowRow(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (counts[0] > 0) LegendDot(LineColors[0], "Ruled", counts[0])
+                    if (counts[1] > 0) LegendDot(LineColors[1], "Text rows", counts[1])
+                    if (counts[2] > 0) LegendDot(LineColors[2], "Table", counts[2])
+                    if (drawn > 0) LegendDot(DrawnLineColor, "Drawn", drawn)
+                    if (counts[4] > 0) LegendDot(IgnoreColor, "Ignored", counts[4])
+                }
+            }
+            // one line for the tool in use
+            Text(
+                when {
+                    drawing -> "Sweep roughly along a printed line the iron missed: the line is found and followed. Tap a yellow line to remove it."
+                    used == 0 -> "Add a line along a printed rule, or the page's outline alone flattens it."
+                    else -> "Tap a line to leave it out (a logo, a second sheet), or drag a box over an area."
+                },
+                style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 10.dp),
+            )
+            // the line tools, always in place (dimmed when there is nothing for them to do)
+            Row(Modifier.padding(top = 12.dp).height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PanelTile(
+                    "Add line", Icons.Outlined.Draw, Modifier.weight(1f).fillMaxHeight(), selected = drawing, enabled = !ironing, role = Role.Switch,
+                ) { onDrawing(!drawing) }
+                PanelTile("Undo", Icons.AutoMirrored.Outlined.Undo, Modifier.weight(1f).fillMaxHeight(), enabled = vm.lineUndoSteps > 0 && !ironing) { vm.undoLineEdit() }
+                PanelTile("Use all lines", Icons.Outlined.Restore, Modifier.weight(1f).fillMaxHeight(), enabled = ignoredBoxes > 0 && !ironing) { vm.clearIgnore() }
+            }
+        } else {
+            Text(
+                "Only the perspective is corrected. Turn the iron on to straighten curved lines.",
+                style = MaterialTheme.typography.bodySmall, color = Editor.Muted, modifier = Modifier.padding(top = 10.dp),
+            )
+        }
+        // leave, or flatten with the edits (as the crop screen's Cancel and Flatten page): "Flatten again" comes in with
+        // the first edit, and until then there is only Done (a dimmed accent button read as half-enabled)
+        Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            SecondaryPill(
+                onClick = onClose, enabled = !ironing, container = Editor.Raised, border = Editor.Outline,
+                modifier = Modifier.weight(1f).height(48.dp),
+            ) { PillText(if (vm.lineEditsChanged) "Cancel" else "Done") }
+            if (ironOn && (vm.lineEditsChanged || ironing)) {
+                PrimaryPill(
+                    onClick = { onIron(null) }, enabled = !ironing, container = Editor.Accent, content = Editor.Ground,
+                    modifier = Modifier.weight(1.6f).height(48.dp),
                 ) {
                     Icon(PaperIcons.Iron, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Flatten again", style = MaterialTheme.typography.titleSmall)
+                    PillText("Flatten again")
                 }
-            } else {
-                Button(
-                    onClick = onClose, shape = ChipShape, colors = ButtonDefaults.buttonColors(containerColor = Editor.Accent, contentColor = Editor.Ground),
-                    contentPadding = PaddingValues(horizontal = 22.dp), modifier = Modifier.height(40.dp),
-                ) { Text("Done", style = MaterialTheme.typography.titleSmall) }
             }
         }
     }
@@ -672,11 +1109,13 @@ private fun IronSweep(t: Float, modifier: Modifier) {
 }
 
 @Composable
-private fun LegendDot(color: Color, label: String) {
+private fun LegendDot(color: Color, label: String, count: Int) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(width = 14.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(color))
         Spacer(Modifier.width(6.dp))
         Text(label, style = MaterialTheme.typography.labelMedium, color = Editor.Inactive)
+        Spacer(Modifier.width(4.dp))
+        Text("$count", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono), color = Editor.Muted)
     }
 }
 

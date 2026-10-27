@@ -17,7 +17,21 @@ enum class FilterKind(val id: Int, val label: String) {
     Grayscale(3, "Grayscale"),
     HighContrast(4, "High contrast"),
     BlackWhite(5, "B&W"),
+    Whiteboard(7, "Whiteboard"),         // whiteboard mode: board white, marker colours kept and boosted (core/src/board.cpp)
+    ProjectorDark(8, "Dark slide"),      // whiteboard mode: a projected slide with a dark background
+    ;
+
+    companion object {
+        /** The filters offered for a page of [mode]. */
+        fun forMode(mode: CaptureMode): List<FilterKind> = when (mode) {
+            CaptureMode.Document -> listOf(Original, Scan, Lighten, AutoColor, Grayscale, HighContrast, BlackWhite)
+            CaptureMode.Whiteboard -> listOf(Whiteboard, ProjectorDark, Original, AutoColor)
+        }
+    }
 }
+
+/** What is being scanned: a document (the full pipeline) or a whiteboard / projector screen (perspective only, its own cleanup). */
+enum class CaptureMode(val label: String) { Document("Document"), Whiteboard("Whiteboard") }
 
 /**
  * Everything the user can change on the result screen; switching any of these never re-runs
@@ -51,6 +65,9 @@ object NativeLib {
         System.loadLibrary("flatscan")
     }
 
+    /** A one-channel JPEG of [bitmap] (ARGB_8888) at [quality] (export, grayscale pages); null on failure. */
+    @JvmStatic external fun encodeGrayJpeg(bitmap: Bitmap, quality: Int): ByteArray?
+
     /** Which backend the heavy image passes use, with the GLES driver string. */
     @JvmStatic external fun gpuInfo(): String
 
@@ -81,6 +98,29 @@ object NativeLib {
      */
     @JvmStatic external fun pageFinder(photo: Bitmap, timing: Array<String?>?): FloatArray?
 
+    /** Makes the page finder's session ahead of [pageFinder]'s first photo (one run on a blank input; off the main thread). */
+    @JvmStatic external fun prewarmFinder()
+
+    /**
+     * Camera guidance (ui/CameraGuide.kt): one camera analysis frame, RGBA_8888 rows of [rowStride] bytes in the
+     * direct buffer [frame], turned upright by [rotation] (ImageInfo.rotationDegrees). [findPage]: the page finder
+     * at 256 on its own 2-thread CPU session and the detection's quad step (no edge snapping); off: luma and
+     * sharpness only. -> [found, x0, y0 .. x3, y3 (TL TR BR BL, upright frame px), upright width, height, paper
+     * share, luma 0..1, glare (share of the page's pixels blown out), sharpness (Laplacian variance), ms]
+     * ([PreviewFrame.from]), or null.
+     */
+    @JvmStatic external fun previewPage(frame: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int, rotation: Int, findPage: Boolean): FloatArray?
+
+    /**
+     * The app's GPU sessions made ahead of the first page: one run on a blank input of every net and shape its
+     * group runs on the GPU (the rule net portrait and landscape), so the GPU compiles and tunes there. -> one line
+     * per net: setup ms and backend.
+     */
+    @JvmStatic external fun prewarmGpu(listener: ProgressListener?): String
+
+    /** Debug: the LiteRT GPU's exhaustive work-group tuning instead of the fast one (the default), from the next sessions. */
+    @JvmStatic external fun setGpuTuning(exhaustive: Boolean)
+
     /**
      * Page detection for the crop screen. logits: the page-finder net's output for this photo
      * (float[2 * 256 * 256]) or null for the colour-threshold detector. JSON: ok, error, pages
@@ -102,14 +142,50 @@ object NativeLib {
      * 0 both (the straighter page wins), 1 UVDoc only, 2 SyntheticDoc high-res only. shadows: the shadow
      * net on the flattened page. rules: the rule net (rulenet.onnx, Settings > Table rules) in the line
      * refinement, on the CPU. The nets run on [configureNets]' backends; their timings and backends
-     * are in [info]'s "accel".
+     * are in [info]'s "accel". removeShadows: false leaves the page's shadows (neither the shading map
+     * nor the shadow net). userLines: the line editor's drawn lines, [group, n, x0, y0, ...] repeated as
+     * output-page fractions (PageMeta.userLines), straightened after the line stage.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
-        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, listener: ProgressListener?,
+        flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, board: Boolean, removeShadows: Boolean, userLines: FloatArray?,
+        listener: ProgressListener?,
     ): Long
+
+    /**
+     * The flattening nets for [photo] with automatic corners, ahead of [process] (the crop screen: they depend
+     * only on the photo, [logits], [pageIndex] and [flatNets] there). Registers them and returns; [runPrecompute]
+     * runs them. From here on a [process] of the same photo with those inputs and unedited corners takes their
+     * grids instead of running the nets, also while they still run (the same page, sooner); anything else
+     * cancels them. Replaces an earlier call's.
+     */
+    @JvmStatic external fun precomputeNets(photo: Bitmap, logits: FloatArray?, pageIndex: Int, flatNets: Int)
+
+    /** Runs [precomputeNets]' nets on the calling thread (off the main thread); returns when they are done or cancelled. */
+    @JvmStatic external fun runPrecompute()
+
+    /** Cancels [precomputeNets]' nets (those not yet started do not run). */
+    @JvmStatic external fun cancelPrecompute()
+
+    /**
+     * The finger tool's smart select: the outline of the area around page point ([x], [y], fractions) that
+     * belongs with it (a finger, a thumb), page fractions [x0, y0, x1, y1, ...]; empty if none was found.
+     */
+    @JvmStatic external fun fingerSelect(handle: Long, x: Float, y: Float): FloatArray
+
+    /**
+     * The line editor's Add line: the printed line a rough [stroke] (page fractions x0, y0, x1, y1, ...) was drawn
+     * along, followed along its length (page fractions, every 4 px); empty if there is no line under most of it.
+     */
+    @JvmStatic external fun findLine(handle: Long, stroke: FloatArray): FloatArray
+
+    /**
+     * Whiteboard mode: the board or screen in [photo] (core/src/board.cpp): [x0, y0 .. x3, y3 (TL, TR, BR,
+     * BL), confidence, area share, dark (1: a dark slide)], or null when no reliable quadrilateral is found.
+     */
+    @JvmStatic external fun detectBoard(photo: Bitmap): FloatArray?
 
     /**
      * JSON: ok, error, mode, fell_back, fit_median_px, rot, gpu_resample, legend_px (wrinkle
@@ -152,7 +228,13 @@ object NativeLib {
      * Erase tool: the page as processed with every rectangle (page fractions [x0, y0, x1, y1, ...])
      * filled with the paper around it; an empty array restores the page. Re-render afterwards.
      */
-    @JvmStatic external fun setErase(handle: Long, rects: FloatArray): Boolean
+    @JvmStatic external fun setEdits(handle: Long, rects: FloatArray, fingersAuto: Boolean, strokes: FloatArray, fill: Int): Boolean
+
+    /**
+     * The finger brush's view: [out] (ARGB) filled with the mask a render with these settings fills, translucent
+     * orange on transparent. Returns the share of the page in the mask.
+     */
+    @JvmStatic external fun fingerOverlay(handle: Long, fingersAuto: Boolean, strokes: FloatArray, out: Bitmap): Float
 
     /**
      * The lines the warp map was fitted to: [kind, x0, y0, x1, y1, ...], ends as page fractions;

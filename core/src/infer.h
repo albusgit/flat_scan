@@ -15,16 +15,35 @@
 #include <vector>
 
 namespace fs {
-enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet };
-enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu };
+enum class NetId { PageFinder, UVDoc, SynthDocHR, ShadeNet, RuleNet, Inpaint, OrientNet };
+// LiteRtGpu16 / LiteRtCpu16: the LiteRT GPU with precision loss allowed (fp16), LiteRT's CPU (XNNPACK) forced to
+// fp16 arithmetic; Auto's benchmark candidates when asked for (lossy: its tolerances decide), never the CPU fallback.
+enum class Backend { CPU, XNNPACK, QNN_HTP, NNAPI, CUDA, TensorRT, DirectML, OpenVINO, CoreML, LiteRtGpu, LiteRtGpu16, LiteRtCpu16 };
+// A model file in place (Android: an uncompressed asset of the APK, AAsset_getBuffer), valid while keep lives.
+struct ModelView {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    std::shared_ptr<const void> keep;
+};
 struct InferConfig {
     std::function<std::vector<uint8_t>(const std::string& file)> load;  // model bytes (Android: AAssetManager)
+    // optional: the LiteRT backends read the model files in place instead of a copy on the heap (not ShadeNet's
+    // and the rule net's, which are rewritten per input shape); no data: load instead
+    std::function<ModelView(const std::string& file)> map;
     std::vector<Backend> preference;   // tried in order per net; CPU is always appended last
     std::string cache_dir;             // compiled-model cache (QNN context binaries, LiteRT GPU kernels)
     bool fp16 = true;                  // accelerators only; CPU stays fp32
     int threads = 0;                   // 0: ORT default; LiteRT CPU: min(cores, 4)
     std::string qnn_dir;               // folder of libQnnHtp.so (Android: the qnn_htp asset pack); empty: the library path
     std::string litert_dir;            // folder of libtensorflowlite_jni.so + libtensorflowlite_gpu_jni.so; empty: by name (Android: the APK's lib/)
+    // LiteRT GPU: exhaustive work-group tuning (every size timed per kernel: minutes for the rule net and SyntheticDoc
+    // high-res at their shapes on a phone) instead of the fast one (one size by formula); a debug switch, to measure
+    bool gpu_exhaustive_tuning = false;
+    // Desktop tests: a folder where every run's outputs are stored under a hash of the net's CPU model
+    // (output_cache_tag(file): e.g. its path, size and time) and its exact input; a stored output is returned
+    // without loading the model. Empty (the app): off.
+    std::string output_cache_dir;
+    std::function<std::string(const std::string& file)> output_cache_tag;
 };
 struct Tensor { std::vector<int64_t> shape; std::vector<float> data; };
 class Inference {

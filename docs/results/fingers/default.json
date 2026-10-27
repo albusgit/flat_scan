@@ -1,0 +1,590 @@
+{
+ "summary": {
+  "label": "default",
+  "env": [],
+  "finger_photos": 32,
+  "finger_photos_with_finger_on_page": 32,
+  "mean_iou": 0.13575207555270655,
+  "pooled_iou": 0.16749423465650543,
+  "detected": 11,
+  "control_photos": 46,
+  "control_fp_rate": 0.06521739130434782,
+  "control_mean_filled": 0.0008230950793996166,
+  "errors": []
+ },
+ "rows": [
+  {
+   "photo": "fingers_01.jpg",
+   "set": "fingers",
+   "gt_share": 0.006473344983575871,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 14317
+  },
+  {
+   "photo": "fingers_02.jpg",
+   "set": "fingers",
+   "gt_share": 0.08607330865125966,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 47613
+  },
+  {
+   "photo": "fingers_03.jpg",
+   "set": "fingers",
+   "gt_share": 0.0,
+   "pred_share": 0.0,
+   "iou": null,
+   "inter": 0,
+   "union": 0
+  },
+  {
+   "photo": "fingers_04.jpg",
+   "set": "fingers",
+   "gt_share": 0.05777852078798507,
+   "pred_share": 0.11316936311136283,
+   "iou": 0.2640902516146394,
+   "inter": 62807,
+   "union": 237824
+  },
+  {
+   "photo": "fingers_05.jpg",
+   "set": "fingers",
+   "gt_share": 0.053290823654321404,
+   "pred_share": 0.026999019473570026,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 132489
+  },
+  {
+   "photo": "fingers_06.jpg",
+   "set": "fingers",
+   "gt_share": 0.03984172741127004,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 21699
+  },
+  {
+   "photo": "fingers_07.jpg",
+   "set": "fingers",
+   "gt_share": 0.10484435487284342,
+   "pred_share": 0.12396586584011904,
+   "iou": 0.7286401259393179,
+   "inter": 59245,
+   "union": 81309
+  },
+  {
+   "photo": "fingers_08.jpg",
+   "set": "fingers",
+   "gt_share": 0.0340335008025291,
+   "pred_share": 0.03278009310033877,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 19190
+  },
+  {
+   "photo": "fingers_09.jpg",
+   "set": "fingers",
+   "gt_share": 0.1860017415893407,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 99324
+  },
+  {
+   "photo": "fingers_10.jpg",
+   "set": "fingers",
+   "gt_share": 0.19656351205469594,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 74290
+  },
+  {
+   "photo": "fingers_11.jpg",
+   "set": "fingers",
+   "gt_share": 0.08480373887505777,
+   "pred_share": 0.033839204520043534,
+   "iou": 0.3404608310454599,
+   "inter": 40427,
+   "union": 118742
+  },
+  {
+   "photo": "fingers_12.jpg",
+   "set": "fingers",
+   "gt_share": 0.44897878471143254,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 79467
+  },
+  {
+   "photo": "fingers_13.jpg",
+   "set": "fingers",
+   "gt_share": 0.011409883971370185,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 3311
+  },
+  {
+   "photo": "fingers_14.jpg",
+   "set": "fingers",
+   "gt_share": 0.04709105944598269,
+   "pred_share": 0.022663035205154263,
+   "iou": 0.4368220338983051,
+   "inter": 10309,
+   "union": 23600
+  },
+  {
+   "photo": "fingers_15.jpg",
+   "set": "fingers",
+   "gt_share": 0.10307277209464837,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 164610
+  },
+  {
+   "photo": "fingers_16.jpg",
+   "set": "fingers",
+   "gt_share": 0.019776173920818794,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 42907
+  },
+  {
+   "photo": "fingers_17.jpg",
+   "set": "fingers",
+   "gt_share": 0.011304831671593234,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 13267
+  },
+  {
+   "photo": "fingers_18.jpg",
+   "set": "fingers",
+   "gt_share": 0.007332763746603107,
+   "pred_share": 0.008799316495923729,
+   "iou": 0.6803437759911284,
+   "inter": 2454,
+   "union": 3607
+  },
+  {
+   "photo": "fingers_19.jpg",
+   "set": "fingers",
+   "gt_share": 0.02582752228793362,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 1463
+  },
+  {
+   "photo": "fingers_20.jpg",
+   "set": "fingers",
+   "gt_share": 0.0026949719130165074,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 1173
+  },
+  {
+   "photo": "fingers_21.jpg",
+   "set": "fingers",
+   "gt_share": 0.06695100672999696,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 108783
+  },
+  {
+   "photo": "fingers_22.jpg",
+   "set": "fingers",
+   "gt_share": 0.2208278720912254,
+   "pred_share": 0.21630156768386408,
+   "iou": 0.5606173761513568,
+   "inter": 155388,
+   "union": 277173
+  },
+  {
+   "photo": "fingers_23.jpg",
+   "set": "fingers",
+   "gt_share": 0.028649932658593277,
+   "pred_share": 0.03848831328245316,
+   "iou": 0.41162589240373987,
+   "inter": 13780,
+   "union": 33477
+  },
+  {
+   "photo": "fingers_24.jpg",
+   "set": "fingers",
+   "gt_share": 0.028601985978202103,
+   "pred_share": 0.042174708174655,
+   "iou": 0.6765343970886696,
+   "inter": 9667,
+   "union": 14289
+  },
+  {
+   "photo": "fingers_25.jpg",
+   "set": "fingers",
+   "gt_share": 0.08310946033522423,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 29111
+  },
+  {
+   "photo": "fingers_26.jpg",
+   "set": "fingers",
+   "gt_share": 0.048890599846013856,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 23749
+  },
+  {
+   "photo": "fingers_27.jpg",
+   "set": "fingers",
+   "gt_share": 0.07662275109788921,
+   "pred_share": 0.02568069131605043,
+   "iou": 0.24493173355399256,
+   "inter": 3552,
+   "union": 14502
+  },
+  {
+   "photo": "fingers_28.jpg",
+   "set": "fingers",
+   "gt_share": 0.06570191689666906,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 20853
+  },
+  {
+   "photo": "fingers_29.jpg",
+   "set": "fingers",
+   "gt_share": 0.007966626670759272,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 571
+  },
+  {
+   "photo": "fingers_30.jpg",
+   "set": "fingers",
+   "gt_share": 0.01488980935484998,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 19178
+  },
+  {
+   "photo": "fingers_31.jpg",
+   "set": "fingers",
+   "gt_share": 0.04162243245867037,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 66455
+  },
+  {
+   "photo": "fingers_32.jpg",
+   "set": "fingers",
+   "gt_share": 0.14223165540724003,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 280246
+  },
+  {
+   "photo": "fingers_33.jpg",
+   "set": "fingers",
+   "gt_share": 0.03648643465013946,
+   "pred_share": 0.0,
+   "iou": 0.0,
+   "inter": 0,
+   "union": 66583
+  },
+  {
+   "photo": "control_01.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_02.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_03.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_05.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_06.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_07.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_08.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_09.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_10.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_11.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_12.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_13.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_14.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_15.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_16.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_17.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_18.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_19.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_20.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_21.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_22.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_23.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_24.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_25.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_26.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_27.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_28.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_29.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_30.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_31.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_32.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_33.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_34.jpg",
+   "set": "control",
+   "pred_share": 0.010832464452853385,
+   "false_positive": true
+  },
+  {
+   "photo": "control_35.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_36.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_37.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_38.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_39.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_40.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_41.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_42.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_43.jpg",
+   "set": "control",
+   "pred_share": 0.003261849113835017,
+   "false_positive": true
+  },
+  {
+   "photo": "control_44.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_45.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_46.jpg",
+   "set": "control",
+   "pred_share": 0.0,
+   "false_positive": false
+  },
+  {
+   "photo": "control_47.jpg",
+   "set": "control",
+   "pred_share": 0.023768060085693963,
+   "false_positive": true
+  }
+ ]
+}

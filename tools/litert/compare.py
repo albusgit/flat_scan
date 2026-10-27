@@ -5,8 +5,9 @@
       TFLITE_DIR default app/src/main/litert/models (tools/litert/convert.py)
       --seg DIR: the page finder's inputs NAME_seg_in.npz (tools/desktop_check pagefind_cli input PHOTO OUT.npz;
                  default: INPUTS_DIR); compared on pagefinder.tflite
-      --pages NPZ: tools/litert/shade_inputs.py's real pages at 512 x W, W = 32..512; compared on shadenet.tflite (the
-                 any-size CPU ShadeNet) at every width, after resize_tensor_input as the app's loader does
+      --pages NPZ: tools/litert/shade_inputs.py's real pages at 512 x W, W = 32..512; compared on shadenet_any.tflite
+                 (the any-size ShadeNet, which convert.py --work DIR leaves in DIR: copy it to TFLITE_DIR) at every width;
+                 the app's rewrite of shadenet.tflite gives its output bit for bit (tools/litert/check_resize.py)
       NAME: only these photos (default: every photo in INPUTS_DIR)
   python tools/litert/compare.py raw INPUTS_DIR RAW_DIR NAME ...
       writes RAW_DIR/NAME_TAG.in.f32 (the net input, float32 NHWC bytes) for tools/litert/gpu_check.sh
@@ -44,8 +45,8 @@ TFLITE_DIR = os.path.join(REPO, 'app', 'src', 'main', 'litert', 'models')
 NETS = [('uv_p1', '_p1_in.npz', 'uvdoc.onnx', 'uvdoc_static.tflite'),
         ('uv_rc0', '_rc0_in.npz', 'uvdoc.onnx', 'uvdoc_static.tflite'),
         ('sdhr_rc2', '_rc2_in.npz', 'syntheticdoc_hr.onnx', 'syntheticdoc_hr_static.tflite'),
-        ('shade', '_shade_in.npz', 'shadenet.onnx', 'shadenet_512x352.tflite'),
-        ('shade_any', '_shade_in.npz', 'shadenet.onnx', 'shadenet.tflite'),
+        ('shade', '_shade_in.npz', 'shadenet.onnx', 'shadenet.tflite'),
+        ('shade_any', '_shade_in.npz', 'shadenet.onnx', 'shadenet_any.tflite'),
         ('finder', '_seg_in.npz', 'pagefinder.onnx', 'pagefinder.tflite')]
 TOL = {'px': (0.25, 1.0), 'levels': (0.5, 2.0), 'logits': (0.01, 0.1)}   # (p99, max)
 FLIP_TOL = 1e-4   # share of page finder decisions that may flip

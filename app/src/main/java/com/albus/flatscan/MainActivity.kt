@@ -8,6 +8,16 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -17,14 +27,21 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
 import com.albus.flatscan.ui.CameraScreen
+import com.albus.flatscan.ui.graphPaper
+import com.albus.flatscan.ui.rememberReducedMotion
 import com.albus.flatscan.ui.CropScreen
 import com.albus.flatscan.ui.FlatScanTheme
 import com.albus.flatscan.ui.HomeScreen
 import com.albus.flatscan.ui.MessageHost
 import com.albus.flatscan.ui.PagesScreen
+import com.albus.flatscan.ui.LicensesScreen
 import com.albus.flatscan.ui.ProcessingScreen
 import com.albus.flatscan.ui.ResultScreen
+import com.albus.flatscan.ui.AdvancedSettingsScreen
 import com.albus.flatscan.ui.SettingsScreen
+import com.albus.flatscan.ui.StorageScreen
+import com.albus.flatscan.ui.TrashScreen
+import com.albus.flatscan.ui.SyncScreen
 
 class MainActivity : ComponentActivity() {
     private val vm: ScanViewModel by viewModels()
@@ -33,9 +50,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            FlatScanTheme {
+            FlatScanTheme(vm.themeMode) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    App(vm)
+                    Box(Modifier.fillMaxSize().graphPaper()) { App(vm) }
                 }
             }
         }
@@ -56,14 +73,34 @@ class MainActivity : ComponentActivity() {
      * (comma-separated names). `--ez selftest true` instead: the self-test (one run), its report written to
      * files/batch_out/selftest_report.txt (external files). `--es bench gpu`: Auto's benchmark with those
      * candidates even where the GPU is unavailable (the emulator: the CPU fallback), its report in
-     * files/batch_out/bench_report.txt. `--es open_test SET`: the photos of files/batch/SET imported as pages,
+     * files/batch_out/bench_report.txt (`--es bench gpu,gpu16,cpu16`: the fp16 backends too, measured only: Auto's stored
+     * choice is not replaced). `--ei threads N` with any of these: the CPU nets on N threads. `--es open_test SET`: the photos of files/batch/SET imported as pages,
      * then each stored page opened in turn, the times in files/batch_out/open_report.txt (ScanViewModel.runOpenTest).
+     * `--es ocrPackBase URL`: the text recognition pack from URL instead of the GitHub release (a local server
+     * through `adb reverse`; empty: the release again), with any other extra. `--es ocr_test PHOTO`: the pack
+     * downloaded if needed and files/batch/PHOTO recognised, report in files/batch_out/ocr_test.txt.
      */
     private fun startBatch(i: Intent?) {
         if (i == null || applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        i.getStringExtra("ocrPackBase")?.let { com.albus.flatscan.output.OcrPack.setDebugBase(this, it) }
+        i.getStringExtra("ocr_test")?.let { photo ->
+            vm.runOcrTest(photo, java.io.File(getExternalFilesDir(null), "batch_out/ocr_test.txt"))
+            return
+        }
         if (i.getBooleanExtra("selftest", false)) {
             vm.runSelfTest(1, java.io.File(getExternalFilesDir(null), "batch_out/selftest_report.txt"))
             vm.open(Screen.Settings)
+            return
+        }
+        // `--ez no_ahead true` with any extra: the flattening nets do not start ahead of processing (A/B checks)
+        if (i.hasExtra("no_ahead")) vm.netsAheadOff = i.getBooleanExtra("no_ahead", false)
+        // `--ei threads N` with any extra: the CPU nets on N threads (0: the default) from the next net configuration
+        if (i.hasExtra("threads")) vm.netThreads = i.getIntExtra("threads", 0)
+        // `--ez gpu_exhaustive true` with any extra: the LiteRT GPU tunes its kernels exhaustively (to time the trade-off)
+        if (i.hasExtra("gpu_exhaustive")) NativeLib.setGpuTuning(i.getBooleanExtra("gpu_exhaustive", false))
+        // `--ez gpu_warm true`: the GPU sessions' setup ms per net into files/batch_out/gpu_warm.txt (ScanViewModel.debugWarmGpu)
+        if (i.getBooleanExtra("gpu_warm", false)) {
+            vm.debugWarmGpu(java.io.File(getExternalFilesDir(null), "batch_out/gpu_warm.txt"))
             return
         }
         i.getStringExtra("open_test")?.let { set ->
@@ -91,6 +128,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** How deep a screen sits under Home: a deeper screen slides in from the right. */
+private fun depth(s: Screen) = when (s) {
+    Screen.Home -> 0
+    Screen.Settings, Screen.Trash, Screen.Pages, Screen.Camera -> 1
+    Screen.Licenses, Screen.Sync, Screen.Advanced, Screen.Storage, Screen.Crop -> 2
+    Screen.Processing -> 3
+    Screen.Result -> 4
+}
+
 @Composable
 private fun App(vm: ScanViewModel) {
     BackHandler(enabled = vm.screen != Screen.Home && vm.screen != Screen.Processing) { vm.back() }
@@ -101,16 +147,44 @@ private fun App(vm: ScanViewModel) {
         view.keepScreenOn = busy
         onDispose { view.keepScreenOn = false }
     }
+    val reduced = rememberReducedMotion()
     Box(Modifier.fillMaxSize()) {
-        when (vm.screen) {
-            Screen.Home -> HomeScreen(vm)
-            Screen.Camera -> CameraScreen(vm)
-            Screen.Crop -> CropScreen(vm)
-            Screen.Processing -> ProcessingScreen(vm)
-            Screen.Result -> ResultScreen(vm)
-            Screen.Pages -> PagesScreen(vm)
-            Screen.Settings -> SettingsScreen(vm)
-        }
+        // with animations off the screen changes outright: AnimatedContent, even with no transition, draws the old
+        // and the new screen over each other for a frame
+        if (reduced) ScreenContent(vm, vm.screen)
+        // screens slide like sheets: deeper screens come in from the right, going back slides them out; the
+        // flattened page grows into the result
+        else AnimatedContent(
+            vm.screen,
+            transitionSpec = {
+                val fwd = depth(targetState) >= depth(initialState)
+                when {
+                    initialState == Screen.Processing && targetState == Screen.Result ->
+                        (fadeIn(tween(280, 60)) + scaleIn(tween(360, easing = FastOutSlowInEasing), initialScale = 0.94f)) togetherWith fadeOut(tween(200))
+                    else -> (slideInHorizontally(tween(320, easing = FastOutSlowInEasing)) { w -> if (fwd) w / 3 else -w / 3 } + fadeIn(tween(240))) togetherWith
+                        (slideOutHorizontally(tween(320, easing = FastOutSlowInEasing)) { w -> if (fwd) -w / 6 else w / 3 } + fadeOut(tween(200)))
+                }.using(SizeTransform(clip = false))
+            },
+            label = "screen",
+        ) { screen -> ScreenContent(vm, screen) }
         MessageHost(vm)
+    }
+}
+
+@Composable
+private fun ScreenContent(vm: ScanViewModel, screen: Screen) {
+    when (screen) {
+        Screen.Home -> HomeScreen(vm)
+        Screen.Camera -> CameraScreen(vm)
+        Screen.Crop -> CropScreen(vm)
+        Screen.Processing -> ProcessingScreen(vm)
+        Screen.Result -> ResultScreen(vm)
+        Screen.Pages -> PagesScreen(vm)
+        Screen.Settings -> SettingsScreen(vm)
+        Screen.Licenses -> LicensesScreen(vm)
+        Screen.Trash -> TrashScreen(vm)
+        Screen.Sync -> SyncScreen(vm)
+        Screen.Advanced -> AdvancedSettingsScreen(vm)
+        Screen.Storage -> StorageScreen(vm)
     }
 }

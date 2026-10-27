@@ -3,7 +3,7 @@
 //   litert_check LIB_DIR MODEL_DIR NET [--runs N] [--input FILE] [--cache DIR] [--tol T]
 // LIB_DIR: libtensorflowlite_jni.so + libtensorflowlite_gpu_jni.so (InferConfig::litert_dir).
 // MODEL_DIR: the GPU model and the CPU's ONNX, as the app's loader finds them: uvdoc_static.tflite +
-// uvdoc.onnx, syntheticdoc_hr_static.tflite + syntheticdoc_hr.onnx, shadenet_512x352.tflite + shadenet.onnx.
+// uvdoc.onnx, syntheticdoc_hr_static.tflite + syntheticdoc_hr.onnx, shadenet.tflite (512 x 352) + shadenet.onnx.
 // NET: uvdoc (input 1x3x712x488), synthdoc_hr (1x3x1440x1024), shadenet (1x3x512x352).
 // FILE: the NCHW float32 input, raw little-endian (default: a fixed pseudo-random image in [0, 1]).
 // Prints the backend each side ran on, the first (session set-up included) and the median run time, and
@@ -36,6 +36,7 @@ static const char* name(Backend b) {
     switch (b) {
         case Backend::CPU: return "cpu";
         case Backend::LiteRtGpu: return "gpu";
+        case Backend::LiteRtGpu16: return "gpu16";
         default: return "other";
     }
 }

@@ -31,6 +31,319 @@ It has **not been run on a phone**. Round 4 ran an x86_64 build on the Android 1
   - Export as a multi-page PDF, one JPG per page into a folder, or share them all.
 - **Orientation (round 4):** sideways pages are turned upright (90°); there is **no automatic 180° turn**. A **Turn 180°** button sits on the page for upside-down results (the dock's Rotate still turns 90°). The Auto-rotate setting turns the sideways turn off.
 
+## Better finger detection (Phase 1, feature 5)
+
+**Result screen › Fingers** shows what was filled, in orange over the page. From there:
+- **Remove** brush: paint over a finger the app missed.
+- **Keep** brush: paint where the app took too much.
+- **Automatic: on/off**: switches the automatic detection on or off.
+- **Undo** and **Clear**, plus a brush-size slider.
+
+Strokes are stored with the page, in page coordinates, and are re-applied when the page is re-processed.
+
+A filled area takes the paper around it, not a flat colour. The fill uses a local paper estimate (a
+max-filter, then a normalised-convolution fill). Text is never invented: if text ran under the finger, the
+area gets a thin dashed grey outline, and the panel says so.
+
+### What changed in detection (`core/src/pipeline.cpp`, `erase_fingers`)
+
+The old test only looked at holes in the page mask. A hole is an area at the page border that the
+segmentation net did not count as paper. On the test photos the net usually counts the finger as paper, so
+nothing was found (5 of 32 photos). Two rules are now on by default (`PipelineOptions::finger_rules`):
+
+- **`kFingerSkinRegion`** catches fingers the page mask took for paper. It samples the hand's own colour
+  outside the page (`skin_model_outside`, a Cr/Cb Gaussian) and looks for areas of that colour on the
+  page. Such an area must be smooth (no ink inside), come in over the page border and reach into the page.
+  The rule runs only if a hand-coloured area exists outside the page. It does not run if that colour covers
+  40 % or more of a band around the page: then it is a table or a wall, not a hand.
+- **`kFingerHandColour`** applies to every candidate. On average, the candidate must be clearly redder and
+  less blue than the paper (Cr ≥ +10, Cb ≤ −10). Each candidate's entry side is the side it runs along
+  furthest. If candidates come in from three or four sides, nothing is filled: that is a box's flaps, a
+  table or a coloured frame, not hands.
+
+### Measured (`tools/fingers/eval.py`; app settings: nets, rule net, shadow net)
+
+Test photos:
+- 33 finger photos with hand-drawn masks (`testdata/fingers`, one has no finger on the detected page).
+- 46 control photos with skin-like colours but no hands (`testdata/control`): orange or beige paper,
+  printed faces, wood, kraft, cardboard.
+
+All are from Wikimedia Commons; licences are in the manifests. The IoU is taken inside the page's
+footprint. A control photo counts as a false positive when more than 0.05 % of its page is filled.
+
+| rules | mean IoU (32) | pooled IoU | photos with a detection | control false positives | control area filled |
+|---|---|---|---|---|---|
+| **before** (holes only) | 0.077 | 0.047 | 5 | 6 / 46 (13.0 %) | 0.72 % |
+| + contact (candidate along the border) | 0.077 | 0.047 | 5 | 6 / 47* (12.8 %) | 0.71 % |
+| + finger width 2–16 % | 0.012 | 0.001 | 1 | 2 / 46 (4.3 %) | 0.03 % |
+| + skin regions | 0.127 | 0.167 | 11 | 7 / 46 (15.2 %) | 1.20 % |
+| + skin regions + width | 0.064 | 0.131 | 8 | 3 / 46 (6.5 %) | 0.51 % |
+| colour + sides only | 0.064 | 0.046 | 4 | 3 / 46 (6.5 %) | 0.08 % |
+| **skin regions + colour + sides (default)** | **0.136** | **0.167** | **11** | **3 / 46 (6.5 %)** | **0.08 %** |
+
+\* That run still included `control_04`, later dropped: its Commons title did not match what the photo shows.
+
+The default meets the plan's bar: IoU above the baseline (mean 0.077 → 0.136, pooled 0.047 → 0.167), and a
+false-positive rate below it (13.0 % → 6.5 %). The rules were picked by looking at these same photos, so the
+numbers are optimistic. There is no held-out set.
+
+The absolute IoU is still low: 21 of 32 finger photos get nothing. Many of them are stock photos where the
+page is a small part of the frame, or the hand sits on a dark book cover. A typical scanner photo, with the
+page filling the frame and fingers at its edge, is the easier case, but this set does not measure it
+separately. The brush exists for the misses.
+
+**Document path:** with the finger erase off, the flattened and rendered pages are byte-identical to the
+previous build on all 79 photos. With it on (`doc_identity.py --fingers`), 40 of the 46 control photos are identical. The 6 that differ are exactly the
+old build's 6 false positives: the new build leaves 3 of them untouched, and fills the other 3 with the new
+paper fill.
+
+Tests:
+- `tools/desktop_check/finger_test.cpp`: fill with the paper colour; no text invented inside; filled area
+  marked as paper; outline only when text ran under the finger; text-under detection.
+- `PageMetaTest`: brush strokes and the automatic on/off survive save and load.
+
+**Not verified on a phone:** the brush (touch accuracy, speed of re-applying strokes on a large page),
+and detection on photos taken by a phone user rather than stock photos.
+
+## Whiteboard mode (Phase 1, feature 4)
+
+A **Document / Whiteboard** switch on the camera screen and on Home sets what the next scans are; the result
+screen has a **Whiteboard** chip that switches one page after the fact (it is re-processed from its original).
+In whiteboard mode:
+
+- **Corners:** `find_board` (`core/src/board.cpp`) looks for the board or the lit screen, not a page. It
+  combines three candidate sources: the largest bright region, closed outlines, and quads built from long
+  straight Hough lines. For a board wider than the photo, the photo's own edges stand in for the missing
+  sides; those sides do not count as edge support, and at least two real sides are needed. Each candidate
+  is scored on edge support, area, real sides, and how much brighter its inside is than the rest of the
+  photo. If nothing is reliable, the whole frame is used. Corners stay editable as for a page.
+- **Processing:** perspective only. No unwarp nets, line stage, orientation guess, shadow net or finger
+  erase. A board is flat, and those stages are tuned for paper.
+- **Filters:** **Whiteboard** whitens the board: a tile-wise background estimate that skips tiles with
+  strokes or coloured areas (sticky notes, magnets), then normalisation, white-point blend, and a
+  saturation boost on strokes only. **Dark slide** is chosen automatically when the screen's median
+  brightness is below 70 (light text on a dark slide); it keeps the dark background and lifts the content.
+  Original and Auto colour are also offered.
+
+### Measured (`tools/board/sheet.py`, `docs/results/whiteboard/`)
+
+Test photos: 17 whiteboards and 14 projector screens from Wikimedia Commons (`testdata/whiteboard`,
+`testdata/projector`; licences in `testdata/MANIFEST_extra.json`). I labelled the board / screen corners by
+hand (`testdata/board_corners.json`, about ±2 % of the photo). Two photos have no single board to find and
+are not scored: a wall-sized board, and a slide projected on a wall.
+
+Corner IoU with the labels:
+
+| | whiteboards (16) | projector screens (13) |
+|---|---|---|
+| whole frame (what Document mode's page finder falls back to on these photos) | 0.71 mean; IoU ≥ 0.8 on 6; < 0.5 on 3 | 0.27 mean; ≥ 0.8 on 0; < 0.5 on 12 |
+| `find_board`, first version (edge support × area only) | 0.83; ≥ 0.8 on 12; < 0.5 on 1 | 0.44; ≥ 0.8 on 1; < 0.5 on 8 |
+| `find_board`, final (+ brightness against the surroundings; small quads allowed when they stand out by ≥ 40 levels) | **0.86; ≥ 0.8 on 12; < 0.5 on 0** | **0.67; ≥ 0.8 on 5; < 0.5 on 2** |
+
+The final weights came from a small sweep (11 settings) on the same photos, so the numbers are optimistic.
+There is no held-out set. A texture ("calm inside") term did not help and was dropped.
+
+Most projector photos are wide room shots of a presentation, taken by event photographers, not a phone
+user framing a slide. The two misses below 0.5 are projector_01 (a screen at a steep angle under a tent
+roof) and projector_08 (a small screen behind people). The before / after sheets
+(`docs/results/whiteboard/sheet_*.jpg`) show every photo: the corners used, and the result with the
+Whiteboard or Dark slide filter at strength 0.7.
+
+**Document path unchanged:** `tools/board/doc_identity.py` runs every photo through the build before this
+feature and the build after. It uses the app settings (nets, rule net, shadow net) with the finger erase
+off, because feature 5 changes that on purpose. It then compares the flattened page (lossless PNG), the
+rendered page and the JSON byte for byte. Result: **79 of 79 photos identical** (46 control, 33 finger).
+The repo has no runnable document benchmark (`docs/AUDIT.md` §3), so this identity check stands in for it.
+
+Tests: `tools/desktop_check/board_test.cpp` (13 checks on synthetic photos: a board on a wall and a lit
+screen in a dark room found with corners within 2 % of the diagonal; no quad found in a noisy scene; the board
+white on its dim and lit sides; red and blue markers keep their colour and gain saturation; a sticky note keeps
+its colour; a dark slide stays dark and even with bright text) and `PageMetaTest` (a page's mode and finger
+edits survive save/load; files from before load with defaults; the mode is part of the page geometry, so
+switching it re-processes; the filters offered in each mode).
+
+**Not verified on a phone:** the mode switch, corner detection speed on a phone CPU (desktop, one core: median 21 ms,
+max 71 ms over the 31 photos, at 640 px), and how the filter looks on a phone screen.
+
+## Better output (Phase 1, feature 3)
+
+Export sheet (Save / Share): **format** PDF, JPEG per page, PNG per page, or PDF + JPEG; **colour**,
+**grayscale** or **black & white**; **size** Small / Balanced / High with the size the export will have;
+**searchable text**; paper **A4 / Letter / the page's own shape** (content centred, margins none / small /
+normal); **file name template** (`{title} {date} {time} {pages} {n}`, a choice of date formats; shared with
+sync); **always ask where to save** (system picker) or a **default export folder** (Storage Access
+Framework, remembered). Code: `Exporter.kt`, `output/` (`PdfWriter`, `Bilevel`, `Ocr`, `OcrLayout`).
+
+- **Own PDF writer** (`output/PdfWriter.kt`, PDF 1.7, no Android dependency): JPEG pages passed through as
+  DCT, black and white pages as 1-bit **CCITT G4** (or Flate), an invisible **OCR text layer** (render mode
+  3) in a glyph-less CID font (`resources/flatscan/glyphless.ttf`, built by
+  `tools/pdf_check/make_glyphless_font.py`) with a ToUnicode map, and metadata: Title (Unicode), Creator,
+  Producer, CreationDate, ModDate, /Lang. Android's `PdfDocument` (used before) can do none of these.
+- **OCR:** Tesseract 5 (Tesseract4Android 4.8.0, JitPack, Apache-2.0) with the `heb` + `eng` tessdata_fast
+  models (ML Kit has no Hebrew), downloaded on first use since the size work: see *App size* below. It runs on the finished page (`out.jpg`: rotation and
+  page shape applied), which is exactly the image the PDF places, so the text layer lines up with it by
+  construction. Results are cached per page (`ocr.json`, keyed by the page image) and the text goes to the
+  database (`pages.ocr_text`, schema v3) for the **history search**. Settings › *Recognise text after
+  scanning* (on) recognises a document's pages in the background when it is finished (WorkManager).
+- **Hebrew in the text layer:** right-to-left lines are written in visual order (each Hebrew word's letters
+  reversed, Latin and digits kept), as word processors store Hebrew; OCR lines that run across table
+  columns are split at the gaps. Measured with three PDF engines (`tools/pdf_check/check.py`, report in
+  `docs/results/output/pdf_check.txt`): search finds 119 / 119 Hebrew and 191 / 191 English words in poppler
+  (Evince, Okular), PDFium (Chrome, Edge, Android) and pdf.js (Firefox); writing the logical order instead,
+  0 / 119 in all three. Where a search highlight lands vs the word in the image: Hebrew median 0.50 pt, p95
+  1.99 pt; English median 1.15 pt, p95 2.05 pt (1 pt = 0.35 mm).
+- **Black and white:** Bradley's adaptive threshold, then CCITT G4 (decoded by libtiff to identical pixels;
+  poppler renders the G4 and the Flate page identically). As pictures: 1-bit PNG.
+- **Sizes** (`OutputTest`, the two test pages, image bytes): colour / black and white = 5.8x (Small),
+  12.5x (Balanced), 17.2x (High): the plan's 3x is met. Grayscale is a one-channel JPEG (native, OpenCV) but
+  barely smaller than colour on document pages (4-5 % measured with PIL; pages are nearly neutral already).
+  High colour passes the finished page through without re-encoding.
+- **Estimate:** the pages are encoded with the chosen options and the PDF is written to a byte counter, so
+  the shown size is the size of the file (`theEstimateIsTheExactPdfSize`); OCR text is left out of it.
+- **App size:** debug APK 101.8 -> 124.8 MB with features 1-3 and 6; OCR is 12.6 MB of it uncompressed
+  (libtesseract, libleptonica, libjpeg, libpng 7.5 MB; traineddata 5.1 MB).
+
+Tests: `PdfWriterTest` (writes the sample PDFs, xref offsets, metadata strings, grapheme reversal with
+niqqud, placement), `OutputTest` (presets, never enlarging, 1-bit PNG, the B&W size target, the exact
+estimate), `LibraryMigrationTest` (v2 -> v3, v1 -> v3); `tools/pdf_check/check.py` (qpdf structure, search
+in three engines, highlight positions, rendering in poppler and PDFium within 1.3 grey levels of the page
+image, Hebrew title through pdf.js, G4 through libtiff). Samples: `docs/results/output/sample_*.pdf`.
+
+Not verified on a phone: Tesseract4Android itself (its native code cannot run in JVM tests: the OCR text
+used in the tests comes from desktop Tesseract 5.3.4 with the distribution's heb / eng models; the phone uses
+tessdata_fast), OCR speed and memory, the export sheet, saving to SAF folders, the native grayscale encoder.
+
+## Sync to your own server (Phase 1, feature 6)
+
+Upload-only, free, no account and no FlatScan cloud (`sync/`). Settings › *Sync to your server*:
+
+- **Targets:** WebDAV (Nextcloud, ownCloud, Synology, most NAS boxes; the folder URL, user, password),
+  paperless-ngx (`POST /api/documents/post_document/`, `Authorization: Token`; title, created date, the
+  document's tags plus fixed ones, created when missing, and a correspondent), or a folder picked with the
+  Storage Access Framework (Syncthing, cloud-folder and SMB apps; no network code). SFTP is not done.
+- **What is uploaded:** the document as PDF (the current exporter), named by the file name template
+  (`{date}_{title}` by default; `{title} {date} {time} {pages}`, a choice of date formats; shared with
+  export). A taken name gets " (2)", " (3)"...; nothing is overwritten.
+- **Queue:** WorkManager, one unique job per document, exponential backoff from 30 s, up to 10 attempts;
+  options *Only on Wi-Fi* (unmetered network) and *Only while charging*. *Upload automatically* queues a
+  document when you go back from it after scanning or editing it (only if it changed since its last
+  upload); otherwise upload by hand (history: long press › Upload; pages screen ⋮ › Upload now).
+- **Status in the history:** waiting / uploading / uploaded / failed with the reason (e.g. "the server
+  refused the credentials (HTTP 401)"). Wrong settings or credentials fail at once; network trouble is
+  retried ("Will retry: ...").
+- **Exactly once:** the PDF is written once per document version and reused by retries (same bytes). WebDAV
+  and the folder reserve the file name in the database *before* the first byte; a retry uploads to that
+  same name (replacing its own partial file) or, if the earlier upload arrived and only the answer was lost,
+  finds it complete and stops. paperless: the file's MD5 is recorded first; a retry asks paperless for a
+  document with that checksum (and the recorded task) before uploading again, and paperless refuses a
+  duplicate file anyway.
+- **Security:** password / token and pinned certificates in EncryptedSharedPreferences (AES-256, key in
+  the Android Keystore); never logged (no HTTP logging; only headers carry them). HTTPS by default (an
+  address without a scheme gets `https://`). A self-signed certificate is accepted only after the user
+  trusts it on first use: Test connection shows its SHA-256 fingerprint and subject. Plain `http://` works
+  only when typed, with a warning (`res/xml/network_security_config.xml` allows cleartext for that).
+- **Test connection does a real authenticated upload and delete:** WebDAV puts a small file, reads it back
+  and deletes it; paperless uploads a tiny PDF, waits for its consumption and deletes the document (it stays
+  in paperless's own trash until emptied); the folder creates and deletes a file. A ping is not enough.
+- **New permission: `INTERNET`** (used only by sync, only when a server is set up). Database version 2
+  (`sync_remote`, `uploaded_at`, `uploaded_modified`), with its migration.
+
+**Integration tests against real servers** (`tools/sync_it/run.sh`): wsgidav (WebDAV over HTTPS with a
+self-signed certificate, basic auth) and paperless-ngx 2.18 + redis in Docker. Needs python3 with
+`wsgidav cheroot`, openssl, Docker with compose. The script starts both, gets a paperless token, runs
+`SyncIntegrationTest` and stops them (`KEEP=1` leaves them running). Measured here, all 10 pass:
+
+| Test | What it shows |
+|---|---|
+| webdavTestConnectionUploadsAndDeletes | real upload, read back, delete; folder empty after |
+| webdavWrongPasswordFailsTheTestAsAuth | the test fails with an authentication error, not a "works" |
+| webdavNeverOverwritesAndAddsASuffix | an existing `..._Bill.pdf` is kept, the upload becomes `..._Bill (2).pdf` |
+| webdavOfflineMidUploadThenOnlineUploadsExactlyOnce | a proxy cuts the connection after 200 KB of a 512 KB upload; the retry completes; one file, identical bytes |
+| webdavAnswerLostThenRetryDoesNotUploadTwice | the PUT arrives but its answer is dropped; the retry finds it complete; one file |
+| paperlessTestConnectionUploadsAndDeletes | upload, consumption, delete |
+| paperlessWrongTokenFailsAsAuth | authentication error |
+| paperlessUploadSendsTitleDateTagsAndCorrespondent | title, created date, 2 tags, correspondent on the stored document |
+| paperlessOfflineMidUploadThenOnlineUploadsExactlyOnce | cut after 200 KB, retry: exactly one document with that title |
+| paperlessAnswerLostThenRetryKeepsOneDocument | answer lost, retry: exactly one document |
+
+Without the servers these tests are skipped. JVM tests that always run: `SyncWorkerTest` (a cut upload is
+retried with status "pending" and its reserved name, then stored once and marked uploaded; wrong
+credentials fail at once with the reason; the last attempt gives up; Wi-Fi / charging constraints and one
+queued job per document), `LibraryMigrationTest` (v1 -> v2 keeps the data), `FileNameTemplateTest`.
+
+Not verified on a phone: the settings screen, the certificate dialog, the Keystore, the SAF folder target
+(no test runs it), WorkManager rescheduling on a real network change (the retry itself is tested, the
+"phone offline" is simulated by the proxy), Nextcloud / Synology specifically (wsgidav stands in).
+
+## Page editor (Phase 1, feature 2)
+
+The pages screen is the document's page editor (`ui/PagesScreen.kt`, `ui/PageGrid.kt`, `PageEditing.kt`):
+
+- **Drag and drop:** hold a page and drag; the order changes live and the drop is one undo step. Held near
+  the top or bottom edge, the grid scrolls by itself (faster closer to the edge), so a page can be carried
+  through a long document.
+- **Select pages** (⋮ › Select pages; All / None): rotate, duplicate, move (to the start, to the end, to
+  another document or a new one), delete. One page: split the document from it.
+- **Per page (…):** rotate, duplicate, insert pages before it (camera, photos, PDF pages), move to another
+  document, split from here, delete.
+- **Reverse page order** in one action (⋮).
+- **Insert anywhere:** new pages from the camera, photos or a **PDF** go before the chosen page. PDF pages
+  are rendered at 200 dpi (`renderPdfPages`, Android `PdfRenderer`), kept as their own original (PNG) and
+  processed perspective-only from the full page (no page finding).
+- **Undo / redo for the whole session** (top bar): order, delete, insert, duplicate, rotate, split and
+  moves between documents. Deleted pages keep their files until the session ends (leaving the document),
+  so undo can bring them back; then pages no document refers to are deleted.
+- Rotating a page that is not open re-renders it from its stored session (no quality loss); without a
+  session its `out.jpg` is turned.
+
+Tests: `PageEditingTest` (move one / a block, reverse, insert at any position, delete, duplicate, rotate,
+split, move to another document, undo / redo across a session, no-op edits not recorded);
+`PageGridDragTest` (Robolectric + Compose UI test, real pointer input on the grid the screen uses):
+page 5 dragged to position 1 in a 20-page document, and a page held at the bottom edge carried past the
+pages visible at the start (this one fails with the edge scrolling disabled; the first one does not,
+because the grid keeps its first visible item in place and so follows a dragged first item by itself).
+
+Not verified on a phone: the screen itself (dialogs, menus, PDF picker), drag smoothness, PDF import,
+rotation of stored pages. Known: dragging the first visible page makes the grid follow it (Compose keeps
+the first visible item in place), which can look like a jump.
+
+## Scan history (Phase 1, feature 1)
+
+Every scan is a document that can be reopened, edited and exported again later.
+
+- **Storage:** page folders moved from the cache to app-private storage, `filesDir/pages/<page id>/`:
+  `original.<ext>` (the photo **byte for byte** as captured or imported), `meta.json` (the processing
+  parameters: corners, crop rotation, filter, look, rotation, protect / erase / ignore areas, unwarp),
+  `out.jpg` (rendered page, the export source), `thumb.jpg` (480 px) and `session/` (the processed page).
+  Documents and page order are in a Room database, `library.db` (`data/LibraryDb.kt`): documents (title,
+  created and modified dates, tags, sync status and error, trash date) and pages (document, position,
+  created date, original dropped). Schemas are exported to `app/schemas/`.
+- **Non-destructive editing:** a new scan and a later re-edit both decode the stored original with the
+  same code (`loadPhotoFile`), so a re-crop on an old scan starts from the same pixels as the first scan
+  (before, re-edits started from a q95 re-encode of the decoded photo). Filter and look edits re-render
+  from the stored session.
+- **Home = history:** Scan / Import start a new document; the list shows documents newest first with
+  thumbnail, page count, date and sync state. Search matches every word in the title or tags (and the
+  recognised text once OCR exists). Long press selects: rename (one), delete (any number).
+- **Trash:** deleted documents stay 30 days (restore, delete forever, empty); older ones are purged at
+  start-up.
+- **Settings › Storage:** space used (all, originals), and removing the original photos of documents
+  not changed for 30 / 90 / 365 days. Such pages keep their processed page (filters, rotation and export
+  still work) but cannot be re-cropped; only pages with a stored session lose their original.
+- **Upgrade:** the single document of earlier versions (`cacheDir/document`) is imported once as the
+  first document (its pages keep their `source.jpg`, a re-encode, since the original was never kept).
+- `android:supportsRtl="true"` is set: layouts now mirror in Hebrew and Arabic locales.
+
+Tests (JVM, Robolectric with native graphics; `./gradlew testDebugUnitTest`): `LibraryTest` (ordering,
+moving pages between documents, rename and tags, 30-day trash and purge, delete forever, dropping
+originals, legacy import, the database surviving a close and reopen as after a process kill),
+`LibraryMigrationTest` (schema v1 from `app/schemas`), `DecodeParityTest` (fresh scan and re-edit decode
+identical pixels, EXIF turn included; the old re-encode did not), `HistorySearchTest` (English, Hebrew,
+tags, recognised text).
+
+Not verified on a phone: the history and trash screens, process death in the real app (tested at the
+database level), storage numbers, the mirrored layout in a Hebrew locale.
+
 ## Round 4: robustness on real photos
 
 What changed (brief: `E:/fs_datasets/round4/README_FOR_APP_AGENT.md`; reference: its `code/` and `seg/`):
@@ -118,12 +431,12 @@ Contact sheets and per-page measurements were made on the 34 pages and on synthe
 
 Research notes (model survey with licences, verified vs inferred) are in `C:\Users\User\Desktop\model_zoo\`: `dewarping_survey.md`, `enhancement_survey.md` and `occluder_survey.md`.
 
-**Models in the app** (`assets/models/`, ONNX Runtime; fp16 weights with fp32 compute; the outputs match PyTorch to 1e-4 for UVDoc and 4e-4 for the SyntheticDoc grid):
+**Models in the app** (`assets/models/`; ONNX Runtime when this was written, `.tflite` on LiteRT 1.4.0 since Round 11; fp16 weights with fp32 compute; the outputs match PyTorch to 1e-4 for UVDoc and 4e-4 for the SyntheticDoc grid):
 
 | Model | Paper | Licence | File | Input → output |
 |---|---|---|---|---|
 | UVDoc | Verhoeven et al., SIGGRAPH Asia 2023 | MIT (code and weights in the repo) | `uvdoc.onnx`, 15.8 MB | 488×712 RGB → 45×31 backward grid |
-| SyntheticDoc high-res | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages, 2× input) | code MIT; **the weights file states no licence**, so confirm with the authors before a release | `syntheticdoc_hr.onnx`, 17 MB | 1024×1440 RGB → 121×177 grid (its shading map is not used) |
+| SyntheticDoc high-res | Woortmann, Magne, Sorkine-Hornung, ECCV 2026 (same net, retrained on 1M simulated pages, 2× input) | code and weights MIT (authors' repo); training data: SyntheticDoc dataset, CC BY 4.0 (https://doi.org/10.3929/ethz-c-000801994). Cleared for release; attribution in the app's licences screen. | `syntheticdoc_hr.onnx`, 17 MB | 1024×1440 RGB → 121×177 grid (its shading map is not used) |
 | ShadeNet (ours) | trained here, `tools/shadow_net/` | ours | `shadenet.onnx`, 1 MB | flattened page at 512 px → its shading map |
 
 **Pipeline** (`core/src/uvdoc.{h,cpp}`, `run_photo`):
@@ -378,7 +691,11 @@ Page 3 is unchanged to the eye.
 - **Second pass** (`second_line_pass`): the line stage runs again on its own output and its map is
   composed with the first. It is kept only if it passes the guard, straightens the rules it traced
   by more than 0.1 px, and leaves the first pass's rules no less straight. The idea comes from
-  Marior and ArbDR (run again on your own output, stop on a score).
+  Marior and ArbDR (run again on your own output, stop on a score). Off by default since the
+  text-line net (`FS_SECOND=1` on the desktop turns it on): on the 34 real photos it ran on 24 and was
+  kept on 2, and without it straightness is the same (row deviation p90 6.4997 → 6.4952 px, angle
+  spread 1.4977 → 1.5000°) and the warp map takes 24 % less time. On the S24 FE it was 1.6 s of a
+  5.4 s page.
 - **Wavy rules found as pieces:**
   - an extension stops where it meets another found piece of the same rule;
   - `share_ideals` gives one height to pieces whose traces run on the same ink (median gap ≤ 2 px
@@ -510,6 +827,28 @@ redo, a compare split view, apply to all pages, export options (paper size, marg
 reorder, the camera torch and a gallery button, processing progress, a landscape layout. Defaults give
 byte-identical pages; every feature was driven on the emulator without a crash.
 
+## App size: one file per net, text recognition as a download, the self-test in debug builds
+
+- **One file per net.** The rule net shipped three times (any size for the CPU, 1152 x 800 and 800 x 1152 for the
+  GPU) and ShadeNet twice (any size, 512 x 352). Now each ships once at a fixed size (`rulenet.tflite` 1152 x 800,
+  `shadenet.tflite` 512 x 352) and the loader rewrites it in memory for each page (`core/src/tflite_shape.cpp`: the
+  input's size and the resizes' constant output sizes; the interpreter derives every other shape), on the CPU and
+  for the GPU delegate (allocated before delegating). `tools/litert/check_resize.py` compares the rewrite with the
+  converter's own files: bit for bit at the 9 rule-net and 6 ShadeNet sizes checked, with and without XNNPACK, and
+  with the former 800 x 1152 GPU copy. Not run on a phone GPU.
+- **Text recognition is a download** (`output/OcrPack.kt`, Gradle task `ocrPacks`): Tesseract4Android's native
+  libraries and the heb + eng models are a 5.6 MB zip per ABI (12.6 MB unpacked), fetched from the GitHub release
+  `ocr-pack-1` when text recognition is first wanted (Settings, the export sheet's searchable text), checked against
+  the SHA-256 the APK carries (`assets/ocr_pack.json`), unpacked to `no_backup/ocr_pack/` and loaded by a class
+  loader whose library path is the pack (Tesseract4Android's Java classes stay in the APK). The zip is
+  reproducible (two builds, the same SHA-256). Emulator (x86_64, the pack from a local server): downloaded,
+  checked, unpacked, 391 words of the English test page in 3.7 s.
+- **The self-test's photo and reference** (4.1 MB) are in `src/debug/assets` only; release builds have no self-test.
+  Auto's GPU benchmark runs on a lossy copy of the photo (`assets/bench/photo1.webp`, 0.5 MB): it compares each
+  backend with the CPU on the same input.
+- Sizes (clean builds, arm64-v8a): debug APK 99.6 -> 86.9 MB; release APK 64.5 MB (Round 11: 67.1 MB).
+  Emulator batch (3 real photos, CPU, shadow net on): 3 / 3 processed, rule net and ShadeNet from their one file.
+
 ## Paper redesign: a new logo, Recursive, paper colours, the iron
 
 The layouts and flows are unchanged; the look moves from rounded and modern to printer paper on a graph-paper desk.
@@ -537,6 +876,12 @@ The layouts and flows are unchanged; the look moves from rounded and modern to p
   file lands on a paper airplane in the message; holding for the original briefly crinkles the page; the crop
   outline is dashed with square highlighter handles and its warning sits on a sticky note; the camera shows a
   tumbling paper ball while it takes the photo; the self-test report is printed on a torn receipt.
+- **Screens of the Phase 1 features** (merged after the redesign): the history home has the logo, the
+  highlighter headline and the crumpled ball while it is empty, the pressable scan card and the index-card
+  import; documents and trashed documents are paper sheets with the stacked-sheet thumbnail and their counts in
+  mono; the page editor's cards have 4 dp corners and mono page numbers, deleted pages (one or a selection)
+  crumple away, and an empty document shows the iron; Sync and Settings > Sync / Storage use the mono section
+  labels and ruled dividers; the Document / Whiteboard switch has crisp corners.
 - **Not changed:** the wrinkle map keeps its TURBO colours (they are made in the core, `overlay.cpp`, and the
   legend has to match them).
 
@@ -731,6 +1076,33 @@ tools/run_acceptance.sh   fs_cli app_ref out_ref fixtures out                 # 
 ```
 
 The raw output of those runs is in `docs/results/`.
+
+### Licences
+
+Third-party components in the release APK. **Settings > About > Open-source licences** shows the same list with
+the full texts (`assets/licenses/`; the list is `ui/Licenses.kt`).
+
+| Component | Version | Licence |
+|---|---|---|
+| UVDoc model (Verhoeven, Magne, Sorkine-Hornung, SIGGRAPH Asia 2023) | authors' weights | MIT, (c) 2023 Tanguy MAGNE |
+| SyntheticDoc high-res model (Woortmann, Magne, Sorkine-Hornung, ECCV 2026) | authors' weights | MIT, (c) 2026 Tanguy MAGNE |
+| SyntheticDoc dataset (same authors, ETH Zurich): training data of that model, not in the APK | 2026, DOI 10.3929/ethz-c-000801994 | CC BY 4.0 |
+| LiteRT (runtime and GPU delegate) | 1.4.0 | Apache-2.0 (its LICENSE also carries a Caffe BSD notice) |
+| OpenCV (the slim static build, `tools/opencv_min`) | 4.11.0 | Apache-2.0 |
+| in OpenCV: oneTBB / libjpeg-turbo / libpng / Carotene HAL / KleidiCV HAL / cpufeatures | 2021.11.0 / 3.0.3 / 1.6.43 / 0.0.1 / 0.3.0 / - | Apache-2.0 / IJG + BSD-3-Clause + zlib / libpng v2 / BSD-3-Clause / Apache-2.0 / Apache-2.0 |
+| AndroidX (Compose, Material3, Activity, Lifecycle, Core, CameraX, ExifInterface), Kotlin stdlib | `app/build.gradle.kts`; Kotlin 2.1.21 | Apache-2.0 |
+| Tesseract OCR (Tesseract4Android, JitPack) | 4.8.0 (Tesseract 5) | Apache-2.0 |
+| in Tesseract4Android: Leptonica / libjpeg / libpng (its own .so files) | from its build | BSD-2-Clause style / IJG / libpng: **texts not yet in `assets/licenses/`** |
+| Tesseract models `eng`, `heb` (in the downloaded text recognition pack; source `app/ocr/tessdata`) | tessdata_fast | Apache-2.0 |
+| OkHttp, Okio | 4.12.0 | Apache-2.0 |
+| AndroidX Room, WorkManager, Security-crypto (with Google Tink) | 2.7.2, 2.10.5, 1.1.0 | Apache-2.0 |
+| LLVM libc++ (NDK r27c) | LLVM 18 | Apache-2.0 with LLVM Exceptions |
+| Recursive font | 1.085 | SIL OFL 1.1 |
+| Page finder (`pagefinder.tflite`) | - | **origin and licence not yet documented: must be resolved before release** |
+
+Not listed: our own nets (ShadeNet, rule net). zlib is Android's system library (not in the APK). An APK built
+without the slim OpenCV (the Maven AAR's `libopencv_java4.so`) also carries libwebp, libtiff, OpenJPEG, OpenEXR,
+protobuf, ADE and ittnotify, which this list does not cover.
 
 ## Architecture
 

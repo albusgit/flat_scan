@@ -5,6 +5,7 @@
 #include <opencv2/core.hpp>
 #include <array>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,10 @@ struct WarpDebug {
     NetLineStats net;
     std::vector<std::pair<std::string, double>> ms;   // stage timings
     int cg_iters[6] = {0, 0, 0, 0, 0, 0};
+    // keep_traced (set by the caller): unwarp_map keeps this state as it stood before drop_lines applies
+    // (the global stage, the lines and the first traces) in traced, for a retry (resume below)
+    bool keep_traced = false;
+    std::shared_ptr<const WarpDebug> traced;
 };
 
 // warpmap.unwarp_image(src) -> backward map on the 4-px grid of src (mx4, my4).
@@ -99,9 +104,12 @@ struct WarpDebug {
 // non-zero pixel is left out whole (the line stage's local retry, neural_line_stage).
 // rule_net (app, with faint): which found lines are rules, which rules were missed, how far a
 // rule runs and whether a bent trace is a rule (see net_lines in warpmap.cpp); null: no net.
+// resume (app): an earlier call's WarpDebug with traced (keep_traced) on the same src with the same
+// ignore, share_rows, faint, robust, edges and rule-net output: that call's global stage and traces are
+// taken instead of computed again, and only this call's drop_lines and the solves run (the same map).
 GridMap unwarp_map(const cv::Mat& src_bgr, WarpDebug* dbg = nullptr, const cv::Mat* ignore = nullptr, bool share_rows = false,
                    bool faint = false, bool robust = false, bool edges = false, const RuleNetFn* rule_net = nullptr,
-                   const cv::Mat* drop_lines = nullptr);
+                   const cv::Mat* drop_lines = nullptr, const WarpDebug* resume = nullptr);
 
 // The relative-residual tolerance of the warp map's conjugate-gradient field solves
 // (docs/results/accel/cg_rtol.txt). Default 1e-6: ~20 % less warp-map time than the reference's 1e-8,
@@ -116,6 +124,10 @@ double warp_cg_rtol();
 bool text_net_rows_enabled();
 
 // Building blocks exposed for the stage tests.
+// warpmap.solve: values at the (straightened) positions xy, a smooth field on a G-px grid (gw x gh);
+// weights optional; warm: a start for the solver; iters: its iterations (optional)
+Field solve_field_at(const std::vector<std::array<double, 2>>& xy, const Vec& values, const Vec* weights, int gw, int gh, int G);
+Field zeros_field(int gw, int gh, int g);
 cv::Mat darkness_fast(const cv::Mat& bgr);
 void get_lines(const cv::Mat& D, Lines& H, Lines& V, bool faint = false, const cv::Mat* PH = nullptr, const cv::Mat* PV = nullptr,
                NetLineStats* stats = nullptr);
