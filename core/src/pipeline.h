@@ -86,8 +86,26 @@ struct PipelineOptions {
     UvCrop uv_crop;                   // photo; null: not run
     const float* uv_out2 = nullptr;   // a second net's grid (e.g. UVDoc next to SyntheticDoc) for uv_crop2: both
     UvCrop uv_crop2;                  // are tried, the straighter stage-1 page wins (see uv_prefer_margin)
-    double uv_prefer_margin = 3.0;    // the second net is chosen only if its text-row angle spread is lower by this (deg)
-                                      // (DocUNet: UVDoc's straighter rows mostly came with uneven stretch; 0.3 lost 0.45 LD)
+    double uv_prefer_margin = 1.0;    // the second net is chosen only if its text-row angle spread is lower by this (deg)
+                                      // (DocUNet: UVDoc's straighter rows mostly came with uneven stretch; 0.3 lost 0.45 LD.
+                                      // Round 18, fine-tuned SD-HR: 3 -> 1 straightened a long-ruled table it bent,
+                                      // dir300 +0.004 MS-SSIM, DocReal -0.003 with the 36k checkpoint)
+    // SyntheticDoc-HR (model 2) may outline its own page against the page finder (uv_min_consistency with pass 1).
+    // Off: only the page finder, the user's corners or UVDoc define the page (round 18: the fine-tuned SD-HR framed a
+    // whole cluttered scene, and pass 1, which also gives its crop, is no independent check)
+    bool uv_hr_own = true;
+    // a grid with more than this share of folded-over triangles / collapsed cells (uv_grid_validity) is not used,
+    // and a composed grid (after fusion and the border snap) that breaks it falls back to the page before the nets.
+    // 0: off. (Round 17 logs: no chosen grid folds on 121 + dir300; collapsed share of chosen grids <= 0.009 there,
+    // up to 0.024 on DocReal)
+    double uv_max_folded = 0;
+    double uv_max_collapsed = 0;
+    // Edge doubt (round 18): where the two nets (SyntheticDoc-HR and UVDoc) both drew the page and their borders lie
+    // more than edge_gap x the page's size apart along at least edge_doubt_frac of one side, nobody knows where that
+    // edge is (a strip of desk, a cut corner): PipelineResult::edge_doubt asks the app to have the corners checked.
+    // edge_doubt_frac 0: off.
+    double edge_gap = 0.015;
+    double edge_doubt_frac = 0.3;
     // flat paper (round 16): a net can invent a curl on a flat sheet (a dollar bill on a table came out bowed). When
     // every side of the page finder's outline is straight (side_bow at most flat_edge_bow: the bill 0.010, a curled
     // magazine page 0.15, a cookbook 0.06 - 0.09, a curled coupon strip 0.056), the homography replaces the grid
@@ -176,6 +194,10 @@ struct PipelineOptions {
     bool reference_orient = false;    // ungated decision, exactly the reference (parity tests)
     int out_w = 1600;                 // analysis page width (portrait; landscape swaps) - the reference's
     int render_w = 0;                 // output page width (portrait) if different from out_w; 0 = same
+    bool render_true_shape = true;    // the output page at the paper's measured shape (page_hw; A4 / US Letter when
+                                      // within true_shape_snap of one), same pixel count; off = A4 (reference parity).
+                                      // The analysis page and final_map stay A4 either way
+    double true_shape_snap = 0.04;    // = the app's PageLook kSnap
     bool use_gpu = true;
     double surface_fallback_px = 3.0; // outline residual median above this -> homography
     int max_analysis_side = 2400;     // detection / fit run on a copy no larger than this (reference inputs: 2212-2300 px)
@@ -227,6 +249,12 @@ struct PipelineResult {
     double uv_agreement = -1;         // UVDoc outline vs the page (IoU); -1: UVDoc not run
     double uv_consistency = -1;       // ... vs the first pass's outline (-1: no first pass)
     double uv_grid_check[2][3] = {{-1, -1, -1}, {-1, -1, -1}};   // each net's grid: folded, collapsed, outside (uv_grid_validity)
+    bool uv_grid_rejected[2] = {false, false};   // ... set aside by uv_max_folded / uv_max_collapsed
+    bool uv_composed_broken = false;             // the composed grid broke them: the page before the nets was kept
+    // the two nets' borders: per side (top, right, bottom, left of the page) the share of its points where they lie
+    // more than PipelineOptions::edge_gap x the page's size apart (-1: not both nets)
+    double net_edge_gap[4] = {-1, -1, -1, -1};
+    bool edge_doubt = false;   // a neural page whose edge the nets disagree on (net_edge_gap >= edge_doubt_frac)
     double uv_agree_quad[2] = {-1, -1}, uv_agree_mask[2] = {-1, -1};   // each net's outline against the corners, the mask (IoU)
     double uv_paper_share[2] = {-1, -1};   // share of each net's page that the page finder's mask calls paper (-1: not measured)
     double snap_px[2] = {-1, -1};     // border snap: median / max displacement (photo px; -1: not run)

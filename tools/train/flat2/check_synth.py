@@ -7,9 +7,11 @@ import sys
 
 import cv2
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import synth  # noqa: E402
+from run2_core import endpoint_resize  # noqa: E402
 
 
 def border(g):
@@ -17,8 +19,8 @@ def border(g):
 
 
 def unwarp(img, g, oh, ow):
-    gx = cv2.resize(g[0], (ow, oh), interpolation=cv2.INTER_LINEAR)
-    gy = cv2.resize(g[1], (ow, oh), interpolation=cv2.INTER_LINEAR)
+    """the grid's end points on the page's corner pixels, as the app reads it (uvdoc.cpp UvGrid::at)"""
+    gx, gy = endpoint_resize(torch.from_numpy(np.ascontiguousarray(g, np.float32)), (oh, ow)).numpy()
     return cv2.remap(img, gx, gy, cv2.INTER_LINEAR)
 
 
@@ -43,7 +45,11 @@ def main():
         tp = np.stack([(t[0] + 1) / 2 * (x.shape[1] - 1), (t[1] + 1) / 2 * (x.shape[0] - 1)])
         cv2.polylines(x, [border(tp).astype(np.int32)], True, (0, 200, 0), 3)
         # the net page as the app unwarps it from x
-        netpage = unwarp(x, tp.astype(np.float32), 600 if not turned else int(600 / hw), int(600 / max(hw, 1e-3)) if turned else 600)
+        # (a turned page is portrait as the net sees it: 600 high, 600 x hw wide; turned back for the sheet)
+        if turned:
+            netpage = cv2.rotate(unwarp(x, tp.astype(np.float32), 600, max(1, int(600 * hw))), cv2.ROTATE_90_COUNTERCLOCKWISE)
+        else:
+            netpage = unwarp(x, tp.astype(np.float32), max(1, int(600 * hw)), 600)
         H = 500
         f = lambda im: cv2.resize(im, (max(1, int(im.shape[1] * H / im.shape[0])), H), interpolation=cv2.INTER_AREA)
         r = np.hstack([f(ph), np.zeros((H, 6, 3), np.uint8), f(flat), np.zeros((H, 6, 3), np.uint8), f(x),

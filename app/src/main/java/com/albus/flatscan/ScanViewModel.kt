@@ -2290,7 +2290,9 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         fingerStrokes = geom.fingerStrokes.toList()
         fingerFill = geom.fingerFill
         fingerOverlay = null
-        fingersOverText = runCatching { JSONObject(withContext(nativeCtx) { NativeLib.info(h) }).optBoolean("fingers_over_text") }.getOrDefault(false)
+        val pageInfo = runCatching { JSONObject(withContext(nativeCtx) { NativeLib.info(h) }) }.getOrNull()
+        fingersOverText = pageInfo?.optBoolean("fingers_over_text") ?: false
+        edgeDoubt = pageInfo?.optBoolean("edge_doubt") ?: false
         if (geom.hasEdits) {
             val rects = erase.toFloatArray()
             val fa = fingersAuto
@@ -2566,6 +2568,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 else -> "Geometry: $mode"
             },
         )
+        if (info.optBoolean("edge_doubt")) sb.append("\nEdges: the two flattening nets disagree on where an edge is (check the corners)")
         if (info.has("rot")) sb.append("\nOrientation: ").append(
             when (info.optInt("rot")) { 0 -> "turned 90 degrees clockwise"; 2 -> "turned 90 degrees counter-clockwise"; 1 -> "turned 180 degrees"; else -> "as photographed" },
         )
@@ -2821,6 +2824,17 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** Text ran under a removed finger on this page (its area is outlined in the page). */
     var fingersOverText by mutableStateOf(false)
         private set
+
+    /**
+     * The two flattening nets disagree on where an edge of this page is (core PipelineResult::edge_doubt): a strip of
+     * the table may show, or a corner may be cut. The result screen offers the corner screen; dismissed per page.
+     */
+    var edgeDoubt by mutableStateOf(false)
+        private set
+
+    fun dismissEdgeDoubt() {
+        edgeDoubt = false
+    }
 
     /** Refreshes the brush overlay (the finger tool is open). */
     fun refreshFingerOverlay() {

@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'flatnet'))
 sys.path.insert(0, os.path.join(HERE, '..', 'flat'))
 import fast  # noqa: E402
 import common as C  # noqa: E402  (tools/flatnet: SD-HR model, BM-only forward)
+from run2_core import bm_forward, endpoint_resize  # noqa: E402
 
 cv2.setNumThreads(1)
 GH, GW = C.GH, C.GW
@@ -78,13 +79,15 @@ def app_crop(img, grid, rng, margin=(0.02, 0.10), jitter=0.02):
     bx1, by1 = min(W, int(math.ceil(x1 + m)) + 1), min(H, int(math.ceil(y1 + m)) + 1)
     turned = np.linalg.norm(c[1] - c[0]) > np.linalg.norm(c[3] - c[0])
     crop = img[by0:by1, bx0:bx1]
+    if min(crop.shape[:2]) < 16:
+        raise ValueError('app_crop: an empty crop')
     t = (turned_grid(grid) if turned else grid) - np.array([bx0, by0], np.float32)[:, None, None]
     cw, ch = bx1 - bx0, by1 - by0
     if turned:
         crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
         t = np.stack([(ch - 1) - t[1], t[0]])
         cw, ch = ch, cw
-    x = cv2.resize(crop, (IN_W, IN_H), interpolation=cv2.INTER_AREA if cw > IN_W else cv2.INTER_LINEAR)
+    x = cv2.resize(crop, (IN_W, IN_H), interpolation=cv2.INTER_AREA)   # as uv_input and synth.app_input
     return cv2.cvtColor(x, cv2.COLOR_BGR2RGB), np.stack([t[0] / (cw - 1) * 2 - 1, t[1] / (ch - 1) * 2 - 1]).astype(np.float32), turned
 
 
@@ -93,15 +96,10 @@ class Mixed(Dataset):
     kind id, is_anchor)"""
     KINDS = ['flat', 'nearflat', 'curl', 'corner', 'fold', 'fold2', 'curl_corner', 'wave_curl', 'uvdoc', 'anchor']
 
-    def __init__(self, synth_dirs, uvdoc, anchor, mix, length, held=False, seed=0):
-        self.synth = []
-        for d in synth_dirs:
-            for line in open(os.path.join(d, 'index.jsonl')):
-                r = json.loads(line)
-                r['root'] = d
-                self.synth.append(r)
-        # held-out: every 50th synthetic sample (by id) never trains
-        self.synth = [r for r in self.synth if (int(r['id'].split('_')[0]) % 50 == 7) == held]
+    def __init__(self, synth_dirs, uvdoc, anchor, mix, length, held=False, seed=0, all_ids=False):
+        self.synth_dirs, self.all_ids = synth_dirs, all_ids
+        self.held = held
+        self.reload()
         self.uv_items, self.uv_grids = [], None
         if uvdoc:
             items = json.load(open(os.path.join(uvdoc, 'index.json')))
@@ -118,14 +116,34 @@ class Mixed(Dataset):
         w = {'synth': mix[0] if self.synth else 0, 'uvdoc': mix[1] if self.uv_items else 0, 'anchor': mix[2] if self.anchor else 0}
         tot = sum(w.values())
         self.p = {k: v / tot for k, v in w.items()}
-        self.length, self.held, self.seed, self.epoch = length, held, seed, 0
+        self.length, self.seed, self.epoch = length, seed, 0
+
+    def reload(self):
+        """(re-)read the synthetic index: make_data.py may still be adding samples while the GPU trains"""
+        self.synth = []
+        for d in self.synth_dirs:
+            if not os.path.exists(os.path.join(d, 'index.jsonl')):   # a folder still being generated
+                continue
+            for line in open(os.path.join(d, 'index.jsonl')):
+                r = json.loads(line)
+                r['root'] = d
+                self.synth.append(r)
+        # held-out: every 50th shard never trains (all_ids: a folder that is all held-out)
+        if not self.all_ids:
+            self.synth = [r for r in self.synth if (int(r['id'].split('_')[0]) % 50 == 7) == self.held]
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, i):
+        forced = None
+        if isinstance(i, (tuple, list)):   # (source, id) from run2_core.BalancedBatches
+            forced, i = i
+        if getattr(self, 'live_reload', 0) and time.time() - getattr(self, '_loaded', 0) > self.live_reload:
+            self.reload()   # in each worker: samples make_data.py has written since (its index is replaced whole)
+            self._loaded = time.time()
         rng = np.random.default_rng((self.seed, self.epoch, i, int(self.held)))
-        src = rng.choice(list(self.p), p=list(self.p.values()))
+        src = forced if forced is not None else rng.choice(list(self.p), p=list(self.p.values()))
         if self.held:   # deterministic: walk the held synthetic set
             src = 'synth'
         if src == 'synth':
@@ -139,7 +157,7 @@ class Mixed(Dataset):
             k, it = self.uv_items[rng.integers(len(self.uv_items))]
             img = cv2.imread(os.path.join(self.uv_root, it['img']))
             g = np.asarray(self.uv_grids[k], np.float32)                     # 2 x 89 x 61 photo px (rows = t)
-            g = np.stack([cv2.resize(g[c], (GW, GH), interpolation=cv2.INTER_LINEAR) for c in range(2)])
+            g = endpoint_resize(torch.from_numpy(g.copy()), (GH, GW)).numpy()
             x, t, _ = app_crop(img, g, rng)
             kind, anchor = self.KINDS.index('uvdoc'), 0
         else:
@@ -239,13 +257,11 @@ class RealVal:
             ch, cw = crop.shape[:2]
             x = cv2.cvtColor(cv2.resize(crop, (IN_W, IN_H), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
             xt = torch.from_numpy(x).permute(2, 0, 1)[None].to(dev).float() / 127.5 - 1
-            with fast.bf16():
-                g = C.bm_only_forward(net, xt)[0].float().cpu().numpy()
+            g = bm_forward(net, xt)[0].cpu().numpy()
             # net grid -> crop px -> the page as the net saw it, turned back
             gx, gy = (g[0] + 1) / 2 * (cw - 1), (g[1] + 1) / 2 * (ch - 1)
             oh, ow = (ref.shape[1], ref.shape[0]) if turned else ref.shape[:2]
-            mx = cv2.resize(gx.astype(np.float32), (ow, oh), interpolation=cv2.INTER_LINEAR)
-            my = cv2.resize(gy.astype(np.float32), (ow, oh), interpolation=cv2.INTER_LINEAR)
+            mx, my = endpoint_resize(torch.from_numpy(np.stack([gx, gy]).astype(np.float32)), (oh, ow)).numpy()   # as UvGrid::at
             page = cv2.remap(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), mx, my, cv2.INTER_LINEAR)
             if turned:
                 page = cv2.rotate(page, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -262,8 +278,7 @@ def synth_eval(net, loader, dev):
     acc = {}
     for x, t, kind, _ in loader:
         x = x.to(dev).float() / 127.5 - 1
-        with fast.bf16():
-            p = C.bm_only_forward(net, x).float()
+        p = bm_forward(net, x)
         l1, ld, _, _, _ = losses(p, t.to(dev), None, None)
         for k, a, b in zip(kind.tolist(), l1.tolist(), ld.tolist()):
             n = Mixed.KINDS[k]
@@ -294,17 +309,21 @@ def main():
     ap.add_argument('--tol', type=float, default=0.03, help='a synthetic kind may get this much worse (relative)')
     ap.add_argument('--workers', type=int, default=max(1, os.cpu_count() - 2))
     ap.add_argument('--no_compile', action='store_true')
+    ap.add_argument('--held', default='', help='a folder of held-out synthetic samples (else every 50th shard of --synth)')
+    ap.add_argument('--epoch_len', type=int, default=4000, help='samples per epoch: the synthetic index is re-read each epoch')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = fast.setup(0)
     w = [float(v) for v in a.w.split(',')]
     mix = [float(v) for v in a.mix.split(',')]
     sdirs = a.synth.split(',')
-    tr = Mixed(sdirs, a.uvdoc, a.anchor, mix, a.steps * a.bs // 20 + a.bs)
-    va = Mixed(sdirs, '', '', [1, 0, 0], 0, held=True)
+    tr = Mixed(sdirs, a.uvdoc, a.anchor, mix, a.epoch_len)
+    va = Mixed([a.held] if a.held else sdirs, '', '', [1, 0, 0], 0, held=True, all_ids=bool(a.held))
     va.length = min(len(va.synth), 800)
     print(f'train: synth {len(tr.synth)}, uvdoc {len(tr.uv_items)}, anchor {len(tr.anchor)}; mix {tr.p}; held synth {va.length}', flush=True)
-    tl = DataLoader(tr, batch_size=a.bs, shuffle=True, num_workers=a.workers, drop_last=True, pin_memory=True, persistent_workers=True)
+    # workers are made afresh every epoch (not persistent): they get the epoch number (the draws differ every
+    # epoch) and the re-read synthetic index
+    tl = DataLoader(tr, batch_size=a.bs, shuffle=True, num_workers=a.workers, drop_last=True, pin_memory=True)
     vl = DataLoader(va, batch_size=a.bs, shuffle=False, num_workers=min(4, a.workers))
     net = C.load_sdhr(a.init, dev)
     teacher = C.load_sdhr(a.init, dev).eval() if tr.anchor else None
@@ -328,6 +347,9 @@ def main():
     while step < a.steps:
         tr.epoch = ep
         ep += 1
+        if ep > 1:
+            tr.reload()
+            print(f'epoch {ep}: synth {len(tr.synth)}', flush=True)
         net.train()
         for m in net.modules():
             if isinstance(m, torch.nn.BatchNorm2d):

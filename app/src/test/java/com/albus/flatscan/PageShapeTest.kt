@@ -51,6 +51,25 @@ class PageShapeTest {
         assertEquals(PageShape.AsScanned, PageLook.fromJson(JSONObject()).shape)
     }
 
+    // round 17: the core renders the paper's own shape (same pixel count), so Auto changes nothing there
+    @Test
+    fun aCorePageAlreadyAtItsShapeIsNotResampled() {
+        val cw = 1442
+        val ch = 2524   // a coupon measured 1.75
+        assertNull(auto(1.75f).targetHw(cw, ch))
+        assertEquals(cw to ch, auto(1.75f).outputSize(cw, ch))
+        // a core page snapped to Letter
+        assertNull(auto(1.27f).targetHw(1673, 2165))
+    }
+
+    @Test
+    fun theA4ChoiceMakesAnyCorePageA4() {
+        val a4 = PageLook(shape = PageShape.AsScanned, measuredHw = 1.75f)
+        assertEquals(297f / 210f, a4.targetHw(1442, 2524)!!, 1e-6f)
+        assertNull(a4.targetHw(w, h))
+        assertEquals(210f / 297f, a4.targetHw(2524, 1442)!!, 1e-6f)
+    }
+
     // the corners (TL, TR, BR, BL) of a w x h mm sheet 900 mm from a camera of focal f (px), turned by `tilt`
     // about the photo's x axis (towards / away), `turn` about its y axis and `spin` in its plane, rounded to float
     private fun photographed(w: Double, h: Double, tilt: Double, turn: Double, spin: Double = 0.0): List<Offset> {

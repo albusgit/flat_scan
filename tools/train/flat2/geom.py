@@ -26,32 +26,38 @@ import torch
 
 # ---------------------------------------------------------------- shapes
 
-def bend(P, s_dir, c, R, phi, keep_side=-1):
-    """Bend the points P (N x 3, sheet still flat where this bend acts: z of the bent part is added) round a cylinder.
-    s_dir: unit 2-vector in the sheet plane, the bend's normal; c: the line's offset (points with d = P.s_dir - c > 0
-    bend); R: radius; phi: the largest angle (beyond the arc d > R phi the sheet goes on straight, tangent).
-    Isometric for a flat sheet: arc length along s_dir is kept."""
-    n = np.array([s_dir[0], s_dir[1], 0.0])
-    d = P[:, :2] @ np.asarray(s_dir) - c
+def bend(P, s_dir, c, R, phi, M=None):
+    """Bend the sheet round a cylinder. P: N x 3 points as the earlier bends left them; M: N x 2 the same points on
+    the flat sheet (material coordinates; None: P is still flat). s_dir: unit 2-vector in the sheet plane, the bend's
+    normal; c: the line's offset (material points with d = M.s_dir - c > 0 bend); R: radius; phi: the largest angle
+    (beyond the arc d > R phi the sheet goes on straight, tangent).
+    Each bent point moves with its material point's frame on the cylinder (the arc's point at d, turned by d / R):
+    what an earlier bend did to it (its offset from where it lay flat) turns with it. So a bend whose arc lies on
+    flat sheet carries everything beyond it rigidly, and bends applied outermost first stay isometric (round 18: the
+    two folds of fold2 were applied innermost first, and stretched the paper by up to 16%)."""
+    n2 = np.asarray(s_dir, np.float64)
+    if M is None:
+        M = P[:, :2]
+    d = M @ n2 - c
     out = P.copy()
     m = d > 0
     dd = d[m]
-    arc = np.minimum(dd, R * phi)
+    qn = P[m, :2] @ n2 - c            # where the point lies along the normal now
+    off_n, off_z = qn - dd, P[m, 2]   # its offset from its flat place, in the bend's (along n, up z) plane
+    a = np.minimum(dd, R * phi) / R
     rest = np.maximum(dd - R * phi, 0)
-    # in the bend's (along n, up z) plane: the arc, then the tangent line
-    a = arc / R
-    along = R * np.sin(a) + rest * np.cos(phi)
-    up = R * (1 - np.cos(a)) + rest * np.sin(phi)
-    out[m, 0] += (along - dd) * n[0]
-    out[m, 1] += (along - dd) * n[1]
-    out[m, 2] += up
+    ca, sa = np.cos(a), np.sin(a)
+    along = R * sa + ca * (rest + off_n) - sa * off_z
+    up = R * (1 - ca) + sa * (rest + off_n) + ca * off_z
+    out[m, :2] += (along - qn)[:, None] * n2[None]
+    out[m, 2] = up
     return out
 
 
-def fold(P, s_dir, c, angle, round_r=0.004):
+def fold(P, s_dir, c, angle, round_r=0.004, M=None):
     """A fold: the part beyond the line turned up by |angle| (rad) about it, with a small rounding radius (paper
     lies on a table: a fold lifts one side; which side is the line's normal's choice)."""
-    return bend(P, s_dir, c, max(round_r, 1e-4), abs(angle))
+    return bend(P, s_dir, c, max(round_r, 1e-4), abs(angle), M)
 
 
 def wave(P, rng, amp):
@@ -76,7 +82,7 @@ def random_shape(rng, H, kind=None):
     L = max(1.0, H)
     steps = []   # (op, args) applied in order
 
-    def line_through_corner():
+    def line_through_corner(with_flap=False):
         # a line cutting two adjacent sides near a corner: its normal points at the corner
         cx, cy = int(rng.integers(0, 2)), int(rng.integers(0, 2))
         corner = np.array([cx * 1.0, cy * H])
@@ -88,6 +94,8 @@ def random_shape(rng, H, kind=None):
         n = np.array([-t[1], t[0]]) / np.linalg.norm(t)
         if (corner - p1) @ n < 0:
             n = -n
+        if with_flap:
+            return n, float(p1 @ n), np.array([corner, p1, p2])
         return n, float(p1 @ n)
 
     def random_line(edge_frac=(0.15, 0.85)):
@@ -113,17 +121,24 @@ def random_shape(rng, H, kind=None):
         steps.append(('wave', wave_params(rng.uniform(0.002, 0.012) * L)))
     elif kind in ('curl', 'wave_curl'):
         n, c = axis_line(0.1, 0.7)
-        steps.append(('bend', (n, c, rng.uniform(0.15, 1.2) * L, rng.uniform(0.3, 1.6))))
-        if kind == 'wave_curl':
+        if kind == 'wave_curl':   # the ripple first: the curl then carries it, along the paper's normal
             steps.append(('wave', wave_params(rng.uniform(0.002, 0.008) * L)))
+        steps.append(('bend', (n, c, rng.uniform(0.15, 1.2) * L, rng.uniform(0.3, 1.6))))
     elif kind == 'corner':
         n, c = line_through_corner()
         steps.append(('bend', (n, c, rng.uniform(0.03, 0.4) * min(1.0, H), rng.uniform(0.3, 2.2))))
     elif kind == 'curl_corner':
+        # the lifted corner on the curl's flat part (a corner inside the curl would have to bend with it), bent
+        # first: the curl then leaves it alone
         n, c = axis_line(0.3, 0.8)
-        steps.append(('bend', (n, c, rng.uniform(0.4, 1.5) * L, rng.uniform(0.2, 0.8))))
-        n2, c2 = line_through_corner()
+        for _ in range(50):
+            n2, c2, flap = line_through_corner(with_flap=True)
+            if (flap @ n - c).max() <= 0:
+                break
+        else:
+            raise ValueError('curl_corner: no corner on the flat side')
         steps.append(('bend', (n2, c2, rng.uniform(0.05, 0.3) * min(1.0, H), rng.uniform(0.3, 1.5))))
+        steps.append(('bend', (n, c, rng.uniform(0.4, 1.5) * L, rng.uniform(0.2, 0.8))))
     elif kind == 'fold':
         n, c = random_line()
         steps.append(('fold', (n, c, rng.uniform(0.1, 0.9))))
@@ -131,17 +146,19 @@ def random_shape(rng, H, kind=None):
         ax = int(rng.integers(0, 2))
         n = np.array([1.0, 0.0]) if ax == 0 else np.array([0.0, 1.0])
         ext = 1.0 if ax == 0 else H
-        steps.append(('fold', (n, ext / 3, rng.uniform(0.1, 0.6))))
+        # the outer fold first: the inner one then turns it with the rest of its side
         steps.append(('fold', (n, 2 * ext / 3, rng.uniform(0.1, 0.6))))
+        steps.append(('fold', (n, ext / 3, rng.uniform(0.1, 0.6))))
     elif kind != 'flat':
         raise ValueError(kind)
 
     def f(P):
+        M = P[:, :2].copy()   # the flat sheet: every bend is placed on it
         for op, args in steps:
             if op == 'bend':
-                P = bend(P, *args)
+                P = bend(P, *args, M=M)
             elif op == 'fold':
-                P = fold(P, *args)
+                P = fold(P, *args, M=M)
             else:
                 comps, amp = args
                 z = np.zeros(len(P))
@@ -163,6 +180,20 @@ def sheet(H, nu, nv):
     a, b, c, d = idx[:-1, :-1].ravel(), idx[:-1, 1:].ravel(), idx[1:, 1:].ravel(), idx[1:, :-1].ravel()
     F = np.concatenate([np.stack([a, b, c], 1), np.stack([a, c, d], 1)])
     return P, np.stack([S, T], -1), F
+
+
+def mesh_points(P, s, t):
+    """points of the deformed mesh P (nv x nu x 3, sheet() order) at page coordinates s, t (arrays in [0, 1]): on
+    the mesh's own triangles (sheet()'s faces a-b-c and a-c-d), so a grid made from them is the surface the photo
+    was rendered from (not the analytic shape between the mesh's vertices: they differ at folds)"""
+    nv, nu = P.shape[:2]
+    x, y = np.asarray(s, np.float64) * (nu - 1), np.asarray(t, np.float64) * (nv - 1)
+    c0 = np.clip(np.floor(x).astype(int), 0, nu - 2)
+    r0 = np.clip(np.floor(y).astype(int), 0, nv - 2)
+    fx, fy = (x - c0)[..., None], (y - r0)[..., None]
+    a, b, c, d = P[r0, c0], P[r0, c0 + 1], P[r0 + 1, c0 + 1], P[r0 + 1, c0]
+    upper = fx >= fy   # triangle a-b-c
+    return np.where(upper, a + fx * (b - a) + fy * (c - b), a + fy * (d - a) + fx * (c - d))
 
 
 # ---------------------------------------------------------------- camera
@@ -223,7 +254,10 @@ def rasterise(V2, z, F, uv, size, device='cpu', max_box=24):
     lo = torch.floor(torch.minimum(torch.minimum(A, B), C)).long()
     hi = torch.ceil(torch.maximum(torch.maximum(A, B), C)).long()
     span = (hi - lo).clamp(min=0)
-    keep = (span[:, 0] < max_box) & (span[:, 1] < max_box) & (hi[:, 0] >= 0) & (hi[:, 1] >= 0) & (lo[:, 0] < W) & (lo[:, 1] < H)
+    seen = (hi[:, 0] >= 0) & (hi[:, 1] >= 0) & (lo[:, 0] < W) & (lo[:, 1] < H)
+    if (seen & ((span[:, 0] >= max_box) | (span[:, 1] >= max_box))).any():
+        raise ValueError('a visible face is larger than max_box: use a finer mesh')   # was dropped (a hole)
+    keep = (span[:, 0] < max_box) & (span[:, 1] < max_box) & seen
     fi = torch.nonzero(keep).squeeze(1)
     zbuf = torch.full((H * W,), float('inf'), device=device)
     best = torch.full((H * W,), -1, dtype=torch.long, device=device)
@@ -237,7 +271,7 @@ def rasterise(V2, z, F, uv, size, device='cpu', max_box=24):
         px = lo[chunk, 0:1] + ox[None]           # faces x k*k
         py = lo[chunk, 1:2] + oy[None]
         inb = (px <= hi[chunk, 0:1]) & (py <= hi[chunk, 1:2]) & (px >= 0) & (py >= 0) & (px < W) & (py < H)
-        qx, qy = px.float() + 0.5, py.float() + 0.5
+        qx, qy = px.float(), py.float()   # pixel centres at integer coordinates, as Camera.project and cv2.remap
         a, b, c = A[chunk], B[chunk], C[chunk]
         den = (b[:, 1] - c[:, 1]) * (a[:, 0] - c[:, 0]) + (c[:, 0] - b[:, 0]) * (a[:, 1] - c[:, 1])
         den = torch.where(den.abs() < 1e-12, torch.full_like(den, 1e-12), den)
@@ -247,13 +281,21 @@ def rasterise(V2, z, F, uv, size, device='cpu', max_box=24):
         e = -1e-4
         inside = inb & (w0 >= e) & (w1 >= e) & (w2 >= e)
         f3 = F_[chunk]
-        zz = w0 * z[f3[:, 0:1]] + w1 * z[f3[:, 1:2]] + w2 * z[f3[:, 2:3]]
+        # perspective-correct: 1 / depth is linear in the photo, page coordinates / depth too
+        iz0, iz1, iz2 = w0 / z[f3[:, 0:1]], w1 / z[f3[:, 1:2]], w2 / z[f3[:, 2:3]]
+        iz = (iz0 + iz1 + iz2).clamp_min(1e-12)
+        zz = 1 / iz
         pix = (py * W + px)[inside]
         zv = zz[inside]
         zbuf.scatter_reduce_(0, pix, zv, reduce='amin')
-        records.append((pix, zv, chunk[:, None].expand_as(px)[inside], w0[inside], w1[inside], w2[inside]))
-    for pix, zv, face, w0, w1, w2 in records:
+        records.append((pix, zv, chunk[:, None].expand_as(px)[inside], (iz0 / iz)[inside], (iz1 / iz)[inside], (iz2 / iz)[inside]))
+    # one face per pixel where faces tie on an edge (the lowest index), not whichever write lands last
+    chosen = torch.full((H * W,), len(F_), dtype=torch.long, device=device)
+    for pix, zv, face, *_ in records:
         win = zv <= zbuf[pix] + 1e-7
+        chosen.scatter_reduce_(0, pix[win], face[win], reduce='amin')
+    for pix, zv, face, w0, w1, w2 in records:
+        win = face == chosen[pix]
         p, f3 = pix[win], F_[face[win]]
         st[p] = w0[win, None] * uv[f3[:, 0]] + w1[win, None] * uv[f3[:, 1]] + w2[win, None] * uv[f3[:, 2]]
         best[p] = face[win]

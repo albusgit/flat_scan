@@ -50,6 +50,7 @@ import androidx.compose.material.icons.outlined.Compare
 import androidx.compose.material.icons.outlined.DoneAll
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Collections
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.MoreVert
@@ -354,6 +355,27 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
                         .background(Editor.Panel.copy(alpha = 0.88f), ChipShape)
                         .padding(horizontal = 14.dp, vertical = 7.dp),
                 )
+            }
+            // the nets disagree on an edge of this page: the corner screen is one tap away
+            if (mode == AreaMode.None && vm.edgeDoubt && vm.page != null && compare == null) {
+                Row(
+                    Modifier.align(Alignment.TopStart).padding(6.dp)
+                        .background(Editor.Panel.copy(alpha = 0.92f), ChipShape)
+                        .clickable(onClickLabel = "Adjust the corners") { vm.recrop() }
+                        .padding(start = 12.dp, end = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Outlined.Crop, null, tint = Editor.Accent, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Check the edges",
+                        style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold), color = Color(0xFFE3E3E0),
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    IconButton(onClick = { vm.dismissEdgeDoubt() }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Outlined.Close, "Dismiss", tint = Color(0xFFE3E3E0), modifier = Modifier.size(16.dp))
+                    }
+                }
             }
             Row(Modifier.align(Alignment.TopEnd).padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (vm.rendering) {

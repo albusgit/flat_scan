@@ -37,7 +37,9 @@ def main():
         for line in open(a.exclude):
             b = os.path.splitext(os.path.basename(line.strip()))[0]
             skip.add(b[len('commons_'):] if b.startswith('commons_') else b)
-    sess = ort.InferenceSession(ONNX, providers=['CPUExecutionProvider'])
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 2   # runs beside the data generator
+    sess = ort.InferenceSession(ONNX, so, providers=['CPUExecutionProvider'])
     os.makedirs(a.out, exist_ok=True)
     n = 0
     with open(os.path.join(a.out, 'index.jsonl'), 'w') as f:

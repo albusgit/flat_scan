@@ -4,6 +4,27 @@ A brief for anyone planning the next steps toward CamScanner's quality. All numb
 build of the app's pipeline (`tools/desktop_check/pipeline_cli`). A change ships only after its changed pages were
 looked at side by side and better clearly outnumbered worse. Round 16's brief is at commit 9bf7dc5.
 
+## Round 18 (2026-10-27): the fine-tuned SD-HR ships
+Trained on a rented RTX 5090 (vast.ai, about $2.20) with `tools/train/flat2/train_run2.py` and `tools/train/vast/run_sdhr2.sh`:
+run 2 (12k steps, 20k new synthetic samples + UVDoc + 718 curated anchor photos), then pass 2 (15k more steps, 20k
+more samples). Generator fixes from an outside review: pixel centres, perspective-correct raster, stacked bends
+isometric, no dark rim at the paper's edge, pale desks, clutter, shadows on the table, tables / forms / ruled paper,
+float32 targets, UVDoc pass-1 crops. Trainer: float32 coordinate head (bf16 had made most of the derivative loss
+rounding), fixed source counts per batch, the original net as teacher, resumable checkpoints.
+
+| Full app pipeline, MS-SSIM | dir300 | DocReal |
+|---|---|---|
+| Shipped before (original SD-HR) | 0.500 | 0.475 |
+| Run 1 (36k, round 17) | 0.532 | 0.526 |
+| **Pass 2 (shipped now)** | **0.551** | **0.524** |
+
+Held-out synthetic grid error (L1 x 1000): original 41.0, run 2 16.6, pass 2 14.2.
+121 photos vs the old app, every changed page viewed: 3 better, 5 worse; with `uv_prefer_margin` 3 -> 1 (now the
+default) page3's bent table is fixed (4 worse left: the coupon's curled corner, two background strips, one mild skew).
+New: `edge_doubt` (the two nets' borders disagree along a side by > 1.5 % of the page) shows "Check the edges" on
+the result, one tap to the corner screen. Not yet calibrated on the photo sets. Still to measure: each app check
+alone with pass 2, the coupon fusion rule (`fuse_min_gain`), the full LiteRT parity run (3 photos checked).
+
 ## Pipeline (photo -> page)
 `core/src/pipeline.cpp` `run_photo`, in order:
 1. **Page finder:** a segmentation net plus a contour give 4 corners, a paper mask and outline points per side.

@@ -226,15 +226,35 @@ cv::Mat to_bgra(const cv::Mat& m) {
     return o;
 }
 
+// The output page's size for a map g of the A4 analysis page: render_w wide (portrait) or the analysis size, and
+// with render_true_shape at the paper's own height / width hw (the map's frame): A4 when hw is within
+// true_shape_snap of it, US Letter when within that of Letter, else hw; the same number of pixels. A receipt or a
+// bill is then not drawn A4-shaped (before round 17 only the app's Auto shape fixed that, by resampling again).
+cv::Size render_size(const GridMap& g, const PipelineOptions& opt, double hw) {
+    const bool portrait = g.out_w <= g.out_h;
+    int w = g.out_w, h = g.out_h;
+    if (opt.render_w > 0 && opt.render_w != opt.out_w) {
+        int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
+        w = portrait ? opt.render_w : long_side;
+        h = portrait ? long_side : opt.render_w;
+    }
+    if (!opt.render_true_shape || !(hw > 0)) return {w, h};
+    const double a4 = (double)h / w, letter = portrait ? 11.0 / 8.5 : 8.5 / 11.0;
+    if (std::fabs(hw / a4 - 1) < opt.true_shape_snap) return {w, h};
+    if (std::fabs(hw / letter - 1) < opt.true_shape_snap) hw = letter;
+    hw = std::min(8.0, std::max(0.125, hw));
+    const int nw = std::max(16, (int)std::lround(std::sqrt((double)w * h / hw)));
+    return {nw, std::max(16, (int)std::lround(nw * hw))};
+}
+
+GridMap at_size(const GridMap& g, cv::Size s) {
+    return s.width == g.out_w && s.height == g.out_h ? g : rescale_grid(g, s.width, s.height);
+}
+
 void final_resample(const cv::Mat& photo, PipelineResult& r, const PipelineOptions& opt) {
     auto t0 = Clock::now();
     cv::Mat src = to_bgra(photo);
-    r.render_map = r.final_map;
-    if (opt.render_w > 0 && opt.render_w != opt.out_w) {
-        bool portrait = r.final_map.out_w <= r.final_map.out_h;
-        int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
-        r.render_map = rescale_grid(r.final_map, portrait ? opt.render_w : long_side, portrait ? long_side : opt.render_w);
-    }
+    r.render_map = at_size(r.final_map, render_size(r.final_map, opt, r.page_hw));
     r.gpu_resample = opt.use_gpu && Gpu::instance().resample(src, r.render_map, r.page);
     if (!r.gpu_resample) r.page = resample_cpu(src, r.render_map);
     r.ms.emplace_back(r.gpu_resample ? "final resample (GPU)" : "final resample (CPU)", ms_since(t0));
@@ -268,11 +288,9 @@ GridMap identity_grid(int W, int H) {
     return g;
 }
 
-GridMap at_render_size(const GridMap& g, const PipelineOptions& opt) {
-    if (opt.render_w <= 0 || opt.render_w == opt.out_w) return g;
-    bool portrait = g.out_w <= g.out_h;
-    int long_side = (int)std::lround(opt.render_w * 297.0 / 210.0);
-    return rescale_grid(g, portrait ? opt.render_w : long_side, portrait ? long_side : opt.render_w);
+// the before page (perspective only) at the size of the output page, hw as render_size
+GridMap at_render_size(const GridMap& g, const PipelineOptions& opt, double hw = -1) {
+    return at_size(g, render_size(g, opt, hw));
 }
 
 void resample_any(const cv::Mat& src_bgra, const GridMap& g, bool gpu, cv::Mat& out) {
@@ -1452,6 +1470,24 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     return identity_grid(page.cols, page.rows);
 }
 
+// Where two grids of the same page put its border: per side (top, right, bottom, left of the page), the share of
+// 64 points along it where the two lie more than gap x the page's size (sqrt of a's outline area) apart
+static void net_edge_gap(const UvGrid& a, const UvGrid& b, double gap, double out[4]) {
+    const std::vector<cv::Point2f> ol = a.outline();
+    const double size = std::sqrt(std::max(1.0, std::abs(cv::contourArea(ol))));
+    const int W = 1001, H = 1001, n = 64;   // page coordinates only: both grids are read at the same page points
+    for (int s = 0; s < 4; ++s) {
+        int far = 0;
+        for (int i = 0; i < n; ++i) {
+            const double t = (i + 0.5) / n * (W - 1);
+            const double x = s == 0 ? t : s == 1 ? W - 1 : s == 2 ? W - 1 - t : 0;
+            const double y = s == 0 ? 0 : s == 1 ? t : s == 2 ? H - 1 : H - 1 - t;
+            far += cv::norm(a.at(x, y, W, H) - b.at(x, y, W, H)) > gap * size;
+        }
+        out[s] = (double)far / n;
+    }
+}
+
 PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     GpuStageScope gpu_stages(opt_in.use_gpu);   // the global stage's remap (warpmap.cpp)
     PipelineResult r;
@@ -1658,8 +1694,13 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             const double tol = 0.02 * std::max(photo.cols, photo.rows);
             fills_photo &= std::min(c.x, photo.cols - 1 - c.x) < tol && std::min(c.y, photo.rows - 1 - c.y) < tol;
         }
+        auto grid_broken = [&](const GridValidity& gv) {
+            return (opt.uv_max_folded > 0 && gv.folded > opt.uv_max_folded) ||
+                   (opt.uv_max_collapsed > 0 && gv.collapsed > opt.uv_max_collapsed);
+        };
         struct Cand { UvGrid g; double agree = 0, agree_mask = -1, consist = -1, paper = -1; int model = 0; bool own = false; };
         std::vector<Cand> ok;
+        UvGrid raw[2];   // each net's grid as it came (edge doubt)
         double best_agree = 0;
         UvGrid pass1;
         if (opt.uv_out_pass1 && !opt.corners_edited) pass1 = uv_grid(opt.uv_out_pass1, opt.uv_crop_pass1);
@@ -1669,6 +1710,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             const UvCrop& crop = k == 0 ? opt.uv_crop : opt.uv_crop2;
             Cand c;
             c.g = uv_grid(out, crop);
+            raw[k] = c.g;
             c.model = crop.model;
             // the page finder's mask can miss a coloured band or a dark page its corners still frame
             c.agree = r.uv_agree_quad[k] = uv_agreement(c.g, corners, photo.size());
@@ -1678,6 +1720,10 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 r.uv_grid_check[k][0] = gv.folded;
                 r.uv_grid_check[k][1] = gv.collapsed;
                 r.uv_grid_check[k][2] = gv.outside;
+                if (grid_broken(gv)) {
+                    r.uv_grid_rejected[k] = true;
+                    c.g.ok = false;
+                }
             }
             best_agree = std::max(best_agree, c.agree);
             if (!c.g.ok) continue;
@@ -1686,11 +1732,12 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             // a grid that outlines its own page must outline paper (the page finder's mask): one that reaches into
             // the background has invented the page (a receipt between coffee cups came out with the cups)
             if (use_mask) c.paper = r.uv_paper_share[k] = uv_paper_share(c.g, pc.det.paper, pc.scale, photo);
-            c.own = !by_finder && !fills_photo && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor &&
+            c.own = !by_finder && !fills_photo && (opt.uv_hr_own || c.model != 2) && c.consist >= opt.uv_min_consistency && c.agree >= opt.uv_consistent_floor &&
                     (c.paper < 0 || c.paper >= opt.uv_own_min_paper);
             if (by_finder || c.own) ok.push_back(std::move(c));
         }
         r.uv_agreement = best_agree;
+        if (raw[0].ok && raw[1].ok && raw[0].turned == raw[1].turned) net_edge_gap(raw[0], raw[1], opt.edge_gap, r.net_edge_gap);
         // grids that define the page themselves: one page frame for all candidates
         bool any_finder = false;
         for (const auto& c : ok) any_finder |= !c.own;
@@ -1739,7 +1786,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 r.fuse_area = fst.area;
                 if (fst.runs > 0) {
                     const GridValidity gv = uv_grid_validity(fused, photo.size());
-                    if (gv.folded > 0.001) r.fuse_rejected = true;
+                    if (gv.folded > 0.001 || grid_broken(gv)) r.fuse_rejected = true;
                     else U.uv = std::move(fused);
                 }
             }
@@ -1827,6 +1874,16 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                     U.uv = std::move(sg);
                 }
                 r.ms.emplace_back("border snap", ms_since(tb));
+            }
+            // the composed grid (fusion, border snap) checked again: a fold made there is not used either
+            if (!snapped_lost && U.mode == GeomMode::Neural && (opt.uv_max_folded > 0 || opt.uv_max_collapsed > 0) &&
+                grid_broken(uv_grid_validity(U.uv, photo.size()))) {
+                snapped_lost = true;
+                U = U_pre;
+                r.mode = mode_pre;
+                r.fell_back = fell_back_pre;
+                r.uv_rejected = true;
+                r.uv_composed_broken = true;
             }
             // flat paper: paper bends but does not stretch, so a sheet whose four edges are all straight in the photo
             // (side_bow, measured on the page finder's outline) is flat; a grid that bends it has invented the curl
@@ -1996,19 +2053,20 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
         else r.fingers_over_text = finger_over_text(r.page_unerased.empty() ? r.page : r.page_unerased, r.finger_mask, r.paper);
     }
     // before page: perspective only, same rotation and size (made beside the nets when they kept both)
-    if (!spec.before.empty() && same_homography(Uh, spec.Uh) && r.rot == spec.o.rot) {
+    if (!spec.before.empty() && same_homography(Uh, spec.Uh) && r.rot == spec.o.rot && spec.before.size() == r.page.size()) {
         r.before = spec.before;
         r.before_reused = true;
     } else {
-        GridMap hb = at_render_size(compose(Uh, identity_grid(W, H), r.rot, true), opt);
+        GridMap hb = at_size(compose(Uh, identity_grid(W, H), r.rot, true), r.page.size());
         resample_any(to_bgra(photo), hb, opt.use_gpu, r.before);
     }
     // deformation: page point p -> where it sat on the before page
     {
         const GridMap& g = r.render_map;
         bool swap = r.rot == cv::ROTATE_90_CLOCKWISE || r.rot == cv::ROTATE_90_COUNTERCLOCKWISE;
-        int Wa = swap ? H : W;
-        double k = (double)g.out_w / Wa;
+        int Wa = swap ? H : W, Ha = swap ? W : H;
+        // analysis page px -> output page px (the output may have the paper's own shape: two scales)
+        double kx = (double)g.out_w / Wa, ky = (double)g.out_h / Ha;
         r.disp = GridMap::make(g.out_w, g.out_h, 4);
         const double* m = M.ptr<double>();
         for (int i = 0; i < g.gh; ++i)
@@ -2017,12 +2075,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 double w = X * m[6] + Y * m[7] + m[8];
                 double u = (X * m[0] + Y * m[1] + m[2]) / w, v = (X * m[3] + Y * m[4] + m[5]) / w;
                 cv::Point2d q = rotate_pt(u, v, W, H, r.rot);
-                r.disp.X(i, j) = (float)((q.x + 0.5) * k - 0.5 - 4 * j);
-                r.disp.Y(i, j) = (float)((q.y + 0.5) * k - 0.5 - 4 * i);
+                r.disp.X(i, j) = (float)((q.x + 0.5) * kx - 0.5 - 4 * j);
+                r.disp.Y(i, j) = (float)((q.y + 0.5) * ky - 0.5 - 4 * i);
             }
     }
     r.ms.emplace_back("paper mask + before page", ms_since(t0));
     r.ms.emplace_back("total", ms_since(tall));
+    if (opt.edge_doubt_frac > 0 && r.mode == GeomMode::Neural && !opt.corners_edited)
+        for (double g : r.net_edge_gap) r.edge_doubt |= g >= opt.edge_doubt_frac;
     r.ok = true;
     return r;
 }

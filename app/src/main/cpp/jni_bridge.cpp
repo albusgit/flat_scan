@@ -1209,6 +1209,8 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_info(JNIEnv* env, jc
       << ", \"fingers_erased\": " << json_num(r.fingers_erased) << ", \"fingers_over_text\": " << (r.fingers_over_text ? "true" : "false") << ", \"user_lines_used\": " << r.user_lines_used << ", \"uv_model\": " << r.uv_model
       << ", \"uv_spread\": [" << json_num(r.uv_spread[0]) << ", " << json_num(r.uv_spread[1]) << "]"
       << ", \"flat_page\": " << (r.flat_page ? "true" : "false")
+      << ", \"edge_doubt\": " << (r.edge_doubt ? "true" : "false") << ", \"net_edge_gap\": [" << json_num(r.net_edge_gap[0]) << ", "
+      << json_num(r.net_edge_gap[1]) << ", " << json_num(r.net_edge_gap[2]) << ", " << json_num(r.net_edge_gap[3]) << "]"
       << ", \"shadows_removed\": " << (r.shadows_removed ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false")
       << ", \"screen\": {\"detected\": " << (s->screen.screen ? "true" : "false") << ", \"score\": " << json_num(s->screen.score)
       << ", \"threshold\": " << json_num(kScreenThreshold) << "}"

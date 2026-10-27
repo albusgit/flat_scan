@@ -15,13 +15,14 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * The shape of the finished page. The core always makes an A4-shaped page (reference parity); the
- * other shapes resize the finished page on export and on screen (page fractions, so protected,
- * erased and ignored areas stay where they are).
+ * The shape of the finished page. Since round 17 the core renders the page at the paper's measured
+ * shape (A4 or US Letter when within 4 % of one: PipelineOptions::render_true_shape; before, always
+ * A4); the shapes resize the finished page on export and on screen when it differs (page fractions,
+ * so protected, erased and ignored areas stay where they are).
  */
 enum class PageShape(val label: String, val caption: String) {
     Auto("Auto", "A4 or US Letter when the page is close to one, otherwise its own proportions"),
-    AsScanned("A4", "The page as processed: A4 proportions"),
+    AsScanned("A4", "A4 proportions (210 x 297 mm)"),   // the name is stored: pages saved before shapes stay A4
     Measured("As photographed", "The page's own proportions, measured from its corners (receipts, cards, letters)"),
     Letter("US Letter", "8.5 x 11 in"),
     IdCard("ID card", "85.6 x 54 mm (credit card size)"),
@@ -82,16 +83,18 @@ data class PageLook(
         val portrait = w <= h
         return when (shape) {
             PageShape.Auto -> autoHw(w, h)
-            PageShape.AsScanned -> null
+            PageShape.AsScanned -> if (portrait) 297f / 210f else 210f / 297f
             PageShape.Measured -> measuredHw.takeIf { it > 0f }
             PageShape.Letter -> if (portrait) 11f / 8.5f else 8.5f / 11f
             PageShape.IdCard -> if (portrait) 85.6f / 54f else 54f / 85.6f
         }?.takeIf { abs(it * w / h - 1f) > 0.005f }
     }
 
-    // the core's A4 page when the measured shape is within kSnap of it, US Letter when within kSnap of that,
-    // else the measured shape: a cropped page, a coupon or a receipt is not stretched to A4, and the small
-    // error of a measurement from corners does not make an A4 sheet a little off A4
+    // the core's page when the measured shape is within kSnap of it, US Letter when within kSnap of that, else
+    // the measured shape: a cropped page, a coupon or a receipt is not stretched to A4, and the small error of a
+    // measurement from corners does not make an A4 sheet a little off A4. A page from a round-17 core already has
+    // this shape (it snaps the same way), so nothing is resampled; a page from an earlier core is A4 and is
+    // reshaped here
     private fun autoHw(w: Int, h: Int): Float? {
         val m = measuredHw.takeIf { it > 0f } ?: return null
         val letter = if (w <= h) 11f / 8.5f else 8.5f / 11f
