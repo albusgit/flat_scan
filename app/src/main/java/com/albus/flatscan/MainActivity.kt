@@ -30,6 +30,7 @@ import com.albus.flatscan.ui.CameraScreen
 import com.albus.flatscan.ui.graphPaper
 import com.albus.flatscan.ui.rememberReducedMotion
 import com.albus.flatscan.ui.CropScreen
+import com.albus.flatscan.ui.DepthScreen
 import com.albus.flatscan.ui.FlatScanTheme
 import com.albus.flatscan.ui.HomeScreen
 import com.albus.flatscan.ui.MessageHost
@@ -133,7 +134,7 @@ private fun depth(s: Screen) = when (s) {
     Screen.Home -> 0
     Screen.Settings, Screen.Trash, Screen.Pages, Screen.Camera -> 1
     Screen.Licenses, Screen.Sync, Screen.Advanced, Screen.Storage, Screen.Crop -> 2
-    Screen.Processing -> 3
+    Screen.Processing, Screen.Depth -> 3
     Screen.Result -> 4
 }
 
@@ -186,5 +187,6 @@ private fun ScreenContent(vm: ScanViewModel, screen: Screen) {
         Screen.Sync -> SyncScreen(vm)
         Screen.Advanced -> AdvancedSettingsScreen(vm)
         Screen.Storage -> StorageScreen(vm)
+        Screen.Depth -> DepthScreen(vm)
     }
 }

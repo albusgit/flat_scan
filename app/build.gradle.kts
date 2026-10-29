@@ -303,4 +303,6 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.4.2")
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")
+    // the depth test (Settings > Advanced > Depth capture); optional: the app installs and runs without ARCore
+    implementation("com.google.ar:core:1.48.0")
 }

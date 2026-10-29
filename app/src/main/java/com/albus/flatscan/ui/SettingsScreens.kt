@@ -192,6 +192,11 @@ fun AdvancedSettingsScreen(vm: ScanViewModel) {
             modifier = Modifier.fillMaxWidth().padding(top = 26.dp).height(48.dp),
             shape = MaterialTheme.shapes.small,
         ) { Text("Restore the defaults") }
+        SettingsGroup("Experiments") {
+            NavRow("Depth capture", "ARCore's depth over the camera: how flat it measures a page, and frames saved to share. Needs Google Play Services for AR.") {
+                vm.open(Screen.Depth)
+            }
+        }
         TechnicalDetails(vm)
     }
     if (confirmReset) {

@@ -124,11 +124,15 @@ static Problem make_problem(char axis, int n_obs, int n_edge, const std::array<s
 }
 
 SurfaceModel fit_surface(const std::array<std::vector<cv::Point2d>, 4>& side_pts, const std::array<cv::Point2d, 4>& corners,
-                         int w, int h, bool landscape, double focal_px, int threads) {
+                         int w, int h, bool landscape, double focal_px, int threads, double page_hw) {
     SurfaceModel best;
     double f = focal_px > 0 ? focal_px : 0.72 * std::max(h, w);
     double cx = w / 2.0, cy = h / 2.0;
     double W = landscape ? 297.0 : 210.0, H = landscape ? 210.0 : 297.0;
+    if (page_hw > 0) {
+        W = page_hw >= 1 ? 210.0 : 210.0 / page_hw;
+        H = page_hw >= 1 ? 210.0 * page_hw : 210.0;
+    }
     cv::Mat K = (cv::Mat_<double>(3, 3) << f, 0, cx, 0, f, cy, 0, 0, 1);
     std::vector<cv::Point3d> obj = {{0, 0, 0}, {W, 0, 0}, {W, H, 0}, {0, H, 0}};
     std::vector<cv::Point2d> img(corners.begin(), corners.end());

@@ -284,7 +284,8 @@ def sample(rng, pages, kind=None, size=None):
     grid_t = g3.reshape(GH, GW, 2).transpose(2, 0, 1).astype(np.float32)
     # grid_z: the sheet's height off the table at each grid point (page widths): where it is lifted (a curled corner)
     return dict(photo=img, grid=grid, grid_turned=grid_t, grid_z=gP[:, 2].reshape(GH, GW).astype(np.float32), kind=kind,
-                aspect=aname, hw=hw, visible=float(mask.mean()), cut=bool(cut), mask=mask)
+                aspect=aname, hw=hw, visible=float(mask.mean()), cut=bool(cut), mask=mask,
+                P=P, cam=cam)   # P, cam: the bent sheet and the camera (the true map at any density: geom.mesh_points + cam.project)
 
 
 def app_input(sm, rng, size=(1024, 1440), margin=(0.02, 0.10), jitter=0.02, corners=None):

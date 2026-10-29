@@ -1114,6 +1114,8 @@ std::vector<std::array<float, 5>> fitted_lines(const WarpDebug& d, int W, int H,
 
 }  // namespace
 
+double quad_page_hw(const std::array<cv::Point2d, 4>& c, cv::Size photo, double focal_px);
+
 namespace {
 
 // the analysis copy the corner fit and the surface fit run on
@@ -1172,13 +1174,23 @@ PageCorners make_corners(const cv::Mat& photo, const cv::Mat& small, const PageF
     return pc;
 }
 
+// The surface model is fitted as an A4 sheet; a sheet whose corners measure (quad_page_hw) its long side at
+// kSurfaceFreeAspect x its short side or more is fitted with that shape instead: a receipt fitted as A4 came
+// out bent and tilted to reach its ends, half its length (1.5 - 1.8 for 3.3 - 4.9) with lines repeated.
+// The corners' chord is the shortest a curled sheet can be, so a long one is still fitted at least that long.
+// Measured at the fit's own focal length, not one measured from the quad: that took a tilted card (1.46) for a
+// strip (2.44 at 1.76 x the long side, 1.37 at 0.72), while a strip's shape hardly depends on it (4.81 - 4.90).
+constexpr double kSurfaceFreeAspect = 1.8;
+
 SurfaceModel fit_detected(const cv::Mat& photo, const PageCorners& pc, double focal_px) {
     const Detection& D = pc.det;
     double f_low = focal_px > 0 ? focal_px * pc.scale : 0;
     int sw = (int)std::lround(photo.cols * pc.scale), sh = (int)std::lround(photo.rows * pc.scale);
     if (pc.scale >= 1.0) { sw = photo.cols; sh = photo.rows; }
     int threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-    return fit_surface(D.side_pts, D.corners, sw, sh, D.landscape, f_low, threads);
+    double hw = quad_page_hw(D.corners, cv::Size(sw, sh), f_low > 0 ? f_low : 0.72 * std::max(sw, sh));
+    if (!(hw > 0 && std::max(hw, 1 / hw) >= kSurfaceFreeAspect)) hw = -1;
+    return fit_surface(D.side_pts, D.corners, sw, sh, D.landscape, f_low, threads, hw);
 }
 
 std::string fmt0(const char* f, double v) {

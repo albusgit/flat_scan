@@ -38,7 +38,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Licenses, Trash, Sync, Advanced, Storage }
+enum class Screen { Home, Camera, Crop, Processing, Result, Pages, Settings, Licenses, Trash, Sync, Advanced, Storage, Depth }
 
 enum class ImportSource { Camera, Gallery }
 
@@ -968,6 +968,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             Screen.Trash -> Screen.Home
             Screen.Sync -> Screen.Settings
             Screen.Advanced -> Screen.Settings
+            Screen.Depth -> Screen.Advanced
             Screen.Storage -> Screen.Settings
             else -> {
                 batch = false

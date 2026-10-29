@@ -28,9 +28,10 @@ struct SurfaceModel {
 };
 
 // surface.fit(side_pts, corners, img_shape, landscape, f=None)
-// focal_px <= 0 selects the reference default 0.72 * max(image side).
+// focal_px <= 0 selects the reference default 0.72 * max(image side). page_hw > 0: the sheet's height / width
+// (the corners' frame) instead of A4's, the short side kept at 210 mm.
 SurfaceModel fit_surface(const std::array<std::vector<cv::Point2d>, 4>& side_pts,
                          const std::array<cv::Point2d, 4>& corners, int img_w, int img_h, bool landscape,
-                         double focal_px = 0, int threads = 4);
+                         double focal_px = 0, int threads = 4, double page_hw = -1);
 
 }  // namespace fs
