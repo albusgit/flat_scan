@@ -28,8 +28,11 @@ const char* backend_name(Backend b);
 bool parse_backends(const std::string& s, std::vector<Backend>& out);
 
 // The page finder's logits for the whole photo (2 x 256 x 256); false: net unavailable (the
-// caller uses the colour-threshold finder).
+// caller uses the colour-threshold finder). Runs the round-4 model or v2 (pagefind.h), whichever the model
+// files hold (found on the first run).
 bool page_finder_logits(const cv::Mat& photo_bgr, Inference& inf, std::vector<float>& logits);
+// the page finder model's input side: 384 (v2, or not yet known), 256 (round 4)
+int page_finder_input_side();
 
 // Settings > flattening nets
 enum class FlatNets { Both = 0, UVDocOnly = 1, SynthDocOnly = 2 };

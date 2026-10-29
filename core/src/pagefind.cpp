@@ -114,6 +114,40 @@ std::vector<float> seg_input(const cv::Mat& bgr) {
     return out;
 }
 
+std::vector<float> seg2_input(const cv::Mat& bgr, SegLetterbox* lb) {
+    const int H = bgr.rows, W = bgr.cols;
+    const double s = (double)SEG2_SIZE / std::max(W, H);
+    const int w = std::max(1, py_round(W * s)), h = std::max(1, py_round(H * s));
+    const int x0 = (SEG2_SIZE - w) / 2, y0 = (SEG2_SIZE - h) / 2;
+    cv::Mat x(SEG2_SIZE, SEG2_SIZE, CV_8UC3, cv::Scalar(104, 116, 124));   // net.PAD_BGR: the ImageNet mean
+    cv::Mat r;
+    cv::resize(bgr, r, cv::Size(w, h), 0, 0, cv::INTER_AREA);
+    r.copyTo(x(cv::Rect(x0, y0, w, h)));
+    if (lb) *lb = SegLetterbox{s, x0, y0, w, h};
+    std::vector<float> out(SEG2_INPUT_LEN);
+    const int plane = SEG2_SIZE * SEG2_SIZE;
+    for (int y = 0; y < SEG2_SIZE; ++y) {
+        const uint8_t* q = x.ptr<uint8_t>(y);
+        for (int xx = 0; xx < SEG2_SIZE; ++xx)
+            for (int c = 0; c < 3; ++c) {          // RGB plane c <- BGR channel 2 - c
+                float v = (float)q[3 * xx + 2 - c] / 255.f;
+                out[(size_t)c * plane + y * SEG2_SIZE + xx] = (v - MEAN[c]) / STD[c];
+            }
+    }
+    return out;
+}
+
+std::vector<float> seg2_to_seg(const float* out, const SegLetterbox& lb) {
+    std::vector<float> lg(SEG_OUTPUT_LEN);
+    const size_t plane2 = (size_t)SEG2_SIZE * SEG2_SIZE, plane = (size_t)SEG_SIZE * SEG_SIZE;
+    for (int c = 0; c < 2; ++c) {   // paper, gutter (the edge channel is not read downstream yet)
+        cv::Mat l(SEG2_SIZE, SEG2_SIZE, CV_32F, const_cast<float*>(out) + c * plane2);
+        cv::Mat dst(SEG_SIZE, SEG_SIZE, CV_32F, lg.data() + c * plane);
+        cv::resize(l(cv::Rect(lb.x0, lb.y0, lb.w, lb.h)), dst, dst.size(), 0, 0, cv::INTER_LINEAR);
+    }
+    return lg;
+}
+
 std::vector<cv::Point2d> resample_closed(const std::vector<cv::Point2d>& c, double step) {
     std::vector<cv::Point2d> out;
     size_t n = c.size();

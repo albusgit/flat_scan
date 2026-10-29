@@ -4,6 +4,29 @@ A brief for anyone planning the next steps toward CamScanner's quality. All numb
 build of the app's pipeline (`tools/desktop_check/pipeline_cli`). A change ships only after its changed pages were
 looked at side by side and better clearly outnumbered worse. Round 16's brief is at commit 9bf7dc5.
 
+## Round 19 (2026-10-29): pictures keep their shape under the line stage
+The poster (`dewarpnet__13_2`): the line stage straightened the bottles' cap edges, label bands and curved logo text,
+pinching them (local area vs the nets' page, p1 / p99, bottle region: 0.872 / 1.108). Leaving their lines out is
+not enough: the smooth solve still bends an area with no lines to follow the lines beside it.
+- **Shape lock (ships, `PipelineOptions::lock_shapes`):** where the user paints Keep as is, the line stage's map
+  becomes one rigid motion fitted to the paper just around the area, blended back over 6 % of the page's shorter
+  side; the page outline is left out (moving it let the finger fill take the poster's orange edge for a hand).
+  Poster: 0.982 / 1.037 with the paint alone, **0.994 / 1.005** with the lock. No paint: all 34 photos
+  byte-identical. `tools/desktop_check/lock_test`.
+- **Automatic picture masks (off):** the block mask (`picture_guard`, spread 18) + lock passed on the poster
+  (0.989 / 1.027, p5 / p95 0.995 / 1.008) but locked 43 % of it and, on the 34, made 3 pages worse (shaded text
+  pages taken for pictures) and 1 better. An outside review's stricter mask (`picture_mode` 2: colour that neither
+  shading nor one ink on one paper explains, text rows and thin rules vetoed) fired on 4 pages, never on text, but
+  missed the bottles (smooth colour) and the Penitentes drawing. An automatic version needs a trained picture output.
+- **Creases (tried, not kept):** the poster's blue / orange panel boundary stays ~5 px off straight (p90; nets alone
+  6). Robust (reweighted) thin-plate smoothness broke the map into blobs on mis-traced lines and tripped the
+  distortion guard; relaxing smoothness only along folds that >= 3 lines' kinks line up on found folds on 5 of 34
+  pages and changed nothing measurable. The poster's boundary bends at several soft places, not one fold.
+- The arched "FAST, POWERFUL" headline is printed so (CamScanner keeps it too); the line stage leaves it alone.
+- Models: the round-19 overnight page finder v2 (`tools/train/pagefind2`) and SD-HR pass 3 replace round 18's (backup:
+  `E:/fs_train/r19_app/models_r18`). The app pipeline with them, 2026-10-29: dir300 MS-SSIM 0.574 / LD 19.84,
+  DocReal 0.539 / 21.16. The retrained rule / text-line net (r19, product negatives) missed its gate and is not shipped.
+
 ## Round 18 (2026-10-27): the fine-tuned SD-HR ships
 Trained on a rented RTX 5090 (vast.ai, about $2.20) with `tools/train/flat2/train_run2.py` and `tools/train/vast/run_sdhr2.sh`:
 run 2 (12k steps, 20k new synthetic samples + UVDoc + 718 curated anchor photos), then pass 2 (15k more steps, 20k
@@ -67,7 +90,7 @@ The core renders every page A4-shaped. Its true shape is measured (`map_page_hw`
 | Best of these per photo (oracle) | 0.532 |
 | Gradient-boosted selector on the pipeline's own JSON signals, 5-fold CV grouped by document | 0.497, and never below the default on any set |
 
-UVDoc wins on dir300 and DocReal; SD-HR wins on WarpDoc. These sets are research-licensed, so the shipped selector must be trained on licence-clean labels. Plan: inv3d real (MIT), plus synthetic photos with exact flat pages.
+UVDoc wins on dir300 and DocReal; SD-HR wins on WarpDoc. These sets are research-licensed, so the shipped selector must be trained on licence-clean labels. Plan: synthetic photos with exact flat pages plus licence-clean real photos (SmartDoc, Mendeley, cleared Roboflow sets; round 19). Inv3D real is CC BY-NC-SA 4.0 (KIT RADAR record), not MIT: evaluation only.
 
 ## Training (`docs/TRAINING_PLAN.md`)
 - **Exact-ground-truth generator** (`tools/train/flat2`):

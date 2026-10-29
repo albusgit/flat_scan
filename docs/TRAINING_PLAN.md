@@ -22,7 +22,7 @@ perspective page. So picking among them costs nothing at runtime.
 
 1. **Labels from licence-clean data only.** The validation sets above are research-licensed or unlicensed, so the
    shipped selector must not be trained on them; they stay its test.
-   - inv3d real (MIT): 360 photos with flat documents.
+   - inv3d real: 360 photos with flat documents. CC BY-NC-SA 4.0 (not MIT, checked 2026-10-27): evaluation only.
    - Synthetic full photos with exact flat pages: `flat2/synth.py` already renders them; add a "write the whole photo
      + the flat page" mode.
    - Run each photo 3 ways with `ft.sh` and score with `gtscore.py`.

@@ -169,7 +169,7 @@ private fun ToolChip(t: AdjustTool, selected: Boolean, changed: Boolean, onClick
 
 /** A -1..1 slider with 0 in the middle; the value reads -100..+100, and a tap on it goes back to 0. */
 @Composable
-private fun Bipolar(label: String, value: Float, caption: String, onChange: (Float) -> Unit) {
+internal fun Bipolar(label: String, value: Float, caption: String, onChange: (Float) -> Unit) {
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))

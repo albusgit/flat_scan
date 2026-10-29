@@ -9,12 +9,17 @@
 
 namespace fs {
 
-UvCrop uv_crop(cv::Size photo, const std::array<cv::Point2d, 4>& c, int model) {
+UvCrop uv_crop(cv::Size photo, const std::array<cv::Point2d, 4>& c, int model, bool pad) {
     double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
     for (const auto& p : c) { x0 = std::min(x0, p.x); y0 = std::min(y0, p.y); x1 = std::max(x1, p.x); y1 = std::max(y1, p.y); }
     double m = 0.06 * std::max(x1 - x0, y1 - y0);
-    int bx0 = std::max(0, (int)std::floor(x0 - m)), by0 = std::max(0, (int)std::floor(y0 - m));
-    int bx1 = std::min(photo.width, (int)std::ceil(x1 + m) + 1), by1 = std::min(photo.height, (int)std::ceil(y1 + m) + 1);
+    int bx0 = (int)std::floor(x0 - m), by0 = (int)std::floor(y0 - m), bx1 = (int)std::ceil(x1 + m) + 1, by1 = (int)std::ceil(y1 + m) + 1;
+    if (!pad) {
+        bx0 = std::max(0, bx0);
+        by0 = std::max(0, by0);
+        bx1 = std::min(photo.width, bx1);
+        by1 = std::min(photo.height, by1);
+    }
     UvCrop u;
     u.box = cv::Rect(bx0, by0, std::max(1, bx1 - bx0), std::max(1, by1 - by0));
     // the same rule as run_photo's landscape flag: top edge longer than left edge
@@ -27,9 +32,14 @@ std::vector<float> uv_input(const cv::Mat& photo, const UvCrop& c, const cv::Mat
     const UvSpec& sp = uv_spec(c.model);
     cv::Rect box = c.box & cv::Rect(0, 0, photo.cols, photo.rows);
     cv::Mat crop = photo(box), turned, small, rgb;
+    if (box != c.box) {   // a padded crop: the photo inside its box, kUvPadColour where the box reaches past it
+        cv::Mat padded(c.box.size(), photo.type(), kUvPadColour);
+        crop.copyTo(padded(box - c.box.tl()));
+        crop = padded;
+    }
     if (!blank.empty() && blank.size() == photo.size()) {
-        cv::Mat hide;
-        cv::dilate(blank(box) > 0, hide, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(15, 15)));
+        cv::Mat hide = cv::Mat::zeros(c.box.size(), CV_8U), hide_in = hide(box - c.box.tl());
+        cv::dilate(blank(box) > 0, hide_in, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(15, 15)));
         if (cv::countNonZero(hide) > 0) {
             // the background colour: the crop's border ring outside the hidden page
             cv::Mat ring = cv::Mat::zeros(crop.size(), CV_8U);

@@ -260,7 +260,8 @@ def sample(rng, pages, kind=None, size=None):
         img = cv2.imdecode(b, cv2.IMREAD_COLOR)
     # ground truth: the page grid on the rendered mesh, through the same camera
     gs, gt = np.meshgrid(np.linspace(0, 1, GW), np.linspace(0, 1, GH))
-    g2, _ = cam.project(geom.mesh_points(P, gs, gt).reshape(-1, 3))
+    gP = geom.mesh_points(P, gs, gt).reshape(-1, 3)
+    g2, _ = cam.project(gP)
     grid = g2.reshape(GH, GW, 2).transpose(2, 0, 1).astype(np.float32)
     gx, gy = np.round(g2[:, 0]).astype(int), np.round(g2[:, 1]).astype(int)
     inside = (gx >= 0) & (gy >= 0) & (gx < W) & (gy < H)
@@ -281,7 +282,9 @@ def sample(rng, pages, kind=None, size=None):
     si, tj = np.meshgrid(np.linspace(0, 1, GH), 1 - np.linspace(0, 1, GW), indexing='ij')
     g3, _ = cam.project(geom.mesh_points(P, si, tj).reshape(-1, 3))
     grid_t = g3.reshape(GH, GW, 2).transpose(2, 0, 1).astype(np.float32)
-    return dict(photo=img, grid=grid, grid_turned=grid_t, kind=kind, aspect=aname, hw=hw, visible=float(mask.mean()), cut=bool(cut))
+    # grid_z: the sheet's height off the table at each grid point (page widths): where it is lifted (a curled corner)
+    return dict(photo=img, grid=grid, grid_turned=grid_t, grid_z=gP[:, 2].reshape(GH, GW).astype(np.float32), kind=kind,
+                aspect=aname, hw=hw, visible=float(mask.mean()), cut=bool(cut), mask=mask)
 
 
 def app_input(sm, rng, size=(1024, 1440), margin=(0.02, 0.10), jitter=0.02, corners=None):

@@ -67,6 +67,9 @@ struct WarpDebug {
     std::vector<std::array<double, 3>> EH, EV;     // app: colour-area boundaries traced as lines (colour_edges)
     Lines E_lines;                                 // their extents, stage-1 frame: [pos, start, end, width, length], horizontal first
     int n_edges_h = 0, n_edge_bowed = 0;
+    std::vector<std::array<double, 3>> DH, DV;     // app: dashed rules (dashed_lines), as the text rows' samples
+    Lines D_lines;                                 // their extents: [ideal, start, end, thickness, length], horizontal first
+    int n_dash_h = 0, n_dash_v = 0;
     int n_downweighted = 0;                        // robust solve: samples left at < half weight (last pass)
     std::vector<std::array<double, 4>> G_lines;   // global-stage grid lines: [horizontal (1/0), straightened
                                                   // position, start, end] (stage-1 frame)

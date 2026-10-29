@@ -5,7 +5,9 @@ outputs untrained there: weight 0).
 Environment: TN_HOURS (training time budget, default 7.5: the learning rate follows a cosine over it), TN_ITERS (an
 iteration cap, default 400000), TN_CH (widths, default 12,24,32,48,64,96), TN_TEXT_P (share of text samples, 0.65),
 TN_BATCH (16), TN_CROP (384), TN_SMALL_FRAC (0.75) / TN_SMALL_CROP (256) / TN_SMALL_BATCH (32): progressive resizing, TN_COMPILE (1), TN_LR (2e-3), TN_WORKERS (12), TN_VAL (validation every N its, 3000), TN_MEM (GPU
-memory fraction, 0.85). Loss, augmentation, EMA and checkpoints as tools/rule_net/train2.py (picture edges count as
+memory fraction, 0.85), TN_INIT (a best.pt / last.pt to fine-tune from), TN_VAL_PROD (a pool of pages with product shots
+and drawings, synth_products.py: it counts in the mean F1 that picks best.pt; with TN_INIT the start is validated
+too, as it 0). Loss, augmentation, EMA and checkpoints as tools/rule_net/train2.py (picture edges count as
 rules: RN_EDGE pos); a transposed sample swaps h and v of both pairs. OUT_DIR: best.pt (best mean F1 over the
 validation pools' labelled channels), last.pt, log.jsonl. Keeps Windows awake while it runs."""
 import json, math, os, sys, time
@@ -39,6 +41,30 @@ def load(prefix):
     return X, Y, E
 
 
+class Rows:
+    """one .npy pool read a sample at a time with plain file reads, not a memory map: a map's pages stay in every data
+    worker's working set (round 19: 4 workers over 75 GB of pools took free RAM to 0.2 GB with 10 GB committed, and the
+    watchdog stopped the run), a read's go to the file cache, which Windows gives back"""
+    def __init__(self, path):
+        a = np.load(path, mmap_mode='r')
+        self.path, self.shape, self.dtype, self.off = path, a.shape, a.dtype, a.offset
+        self.count = int(np.prod(a.shape[1:]))
+        self.f = None
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, i):
+        if self.f is None:
+            self.f = open(self.path, 'rb')
+        self.f.seek(self.off + int(i) * self.count * self.dtype.itemsize)
+        return np.fromfile(self.f, self.dtype, self.count).reshape(self.shape[1:])
+
+
+def load_rows(prefix):
+    return Rows(prefix + '_img.npy'), Rows(prefix + '_mask.npy'), Rows(prefix + '_edge.npy') if os.path.exists(prefix + '_edge.npy') else None
+
+
 def targets(y, e):
     """y uint8 2 or 4 x h x w, e edge bits or None -> target 4 x h x w, weight 4 x h x w (text weight 0 for rule pools)"""
     t = np.zeros((4,) + y.shape[1:], np.float32)
@@ -62,7 +88,7 @@ class Data(torch.utils.data.IterableDataset):
         C = self.crop
         info = torch.utils.data.get_worker_info()
         rs = np.random.default_rng((info.id if info else 0) * 7919 + int(time.time()) % 100000)
-        groups = [[load(p) for p in tpools], [load(p) for p in rpools]]
+        groups = [[load_rows(p) for p in tpools], [load_rows(p) for p in rpools]]
         while True:
             g = groups[0] if (rs.random() < TEXT_P or not groups[1]) else groups[1]
             X, Y, E = g[rs.integers(0, len(g))]
@@ -70,10 +96,10 @@ class Data(torch.utils.data.IterableDataset):
             sc = rs.uniform(0.8, 1.25) if rs.random() < 0.5 else 1.0
             cs = min(S, int(math.ceil(C / sc)))
             y0, x0 = rs.integers(0, S - cs + 1, 2)
-            x = np.asarray(X[i, y0:y0 + cs, x0:x0 + cs])
+            x = X[i][y0:y0 + cs, x0:x0 + cs]
             if not x.any():
                 continue
-            t, w = targets(np.asarray(Y[i, :, y0:y0 + cs, x0:x0 + cs]), np.asarray(E[i, y0:y0 + cs, x0:x0 + cs]) if E is not None else None)
+            t, w = targets(Y[i][:, y0:y0 + cs, x0:x0 + cs], E[i][y0:y0 + cs, x0:x0 + cs] if E is not None else None)
             if cs != C:
                 x = cv2.resize(x, (C, C), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
                 t = np.stack([cv2.resize(q, (C, C), interpolation=cv2.INTER_LINEAR) for q in t])
@@ -166,7 +192,13 @@ def train(fast):
     torch.cuda.set_per_process_memory_fraction(float(os.environ.get('TN_MEM', 0.85)))
     torch.backends.cudnn.benchmark = True
     VAL = {'text': val_set(vtext), 'rules': val_set(vrule)}
+    if os.environ.get('TN_VAL_PROD'):
+        VAL['products'] = val_set(os.environ['TN_VAL_PROD'])
     net = RuleNet(CH, 4).cuda()
+    # TN_INIT: a best.pt / last.pt to fine-tune from (its EMA weights; round 19: the shipped net, run1/best.pt)
+    if os.environ.get('TN_INIT'):
+        net.load_state_dict(torch.load(os.environ['TN_INIT'], map_location='cuda', weights_only=False)['state'])
+        print('init from', os.environ['TN_INIT'], flush=True)
     ema = RuleNet(CH, 4).cuda(); ema.load_state_dict(net.state_dict()); ema.eval()
     for p in ema.parameters(): p.requires_grad_(False)
     print(f'{sum(p.numel() for p in net.parameters()) / 1e6:.3f} M params, ch {CH}, {HOURS} h', flush=True)
@@ -208,6 +240,11 @@ def train(fast):
     ema_f = [es[k] for k in es if es[k].dtype.is_floating_point]; net_f = [ns[k] for k in es if es[k].dtype.is_floating_point]
     ema_i = [(es[k], ns[k]) for k in es if not es[k].dtype.is_floating_point]
     logf = open(os.path.join(out, 'log.jsonl'), 'a')
+    if os.environ.get('TN_INIT') and best < 0:   # the start, on the same validation (the shipped net's own scores)
+        r = validate(ema, VAL)
+        score = float(np.mean([v for vs in r.values() for v in vs]))
+        print(f'  it 0 (init) val {json.dumps(r)} mean {score:.4f}', flush=True)
+        logf.write(json.dumps({'it': 0, 'val': r, 'score': score, 'init': os.environ['TN_INIT']}) + '\n'); logf.flush()
     while True:
         if phase == 'small' and time.time() - t0 >= small_frac * budget:
             del dl

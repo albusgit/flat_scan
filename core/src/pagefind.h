@@ -17,6 +17,20 @@ constexpr int PAGEFIND_WORK = 1000;                // pagefind.WORK (long side o
 // / 255, ImageNet mean / std; NCHW float32 (1 x 3 x 256 x 256).
 std::vector<float> seg_input(const cv::Mat& bgr);
 
+// Page finder v2 (round 19, tools/train/pagefind2/net.py): the photo letterboxed into 384 x 384 (long side
+// scaled to 384, INTER_AREA, centred, padded with the ImageNet mean), 3 outputs: paper, gutter, paper edge.
+// Its output is turned into the round-4 layout above (paper and gutter logits of the whole photo squashed to
+// 256 x 256), which everything downstream reads.
+constexpr int SEG2_SIZE = 384;
+constexpr int SEG2_INPUT_LEN = 3 * SEG2_SIZE * SEG2_SIZE;
+constexpr int SEG2_OUTPUT_LEN = 3 * SEG2_SIZE * SEG2_SIZE;
+struct SegLetterbox { double scale = 1; int x0 = 0, y0 = 0, w = 0, h = 0; };   // the photo inside the 384 x 384 input
+
+// net.to_input: NCHW float32 (1 x 3 x 384 x 384); lb = where the photo went
+std::vector<float> seg2_input(const cv::Mat& bgr, SegLetterbox* lb);
+// the v2 output (3 x 384 x 384 logits) -> the round-4 layout (2 x 256 x 256: the photo's box resized, bilinear)
+std::vector<float> seg2_to_seg(const float* out, const SegLetterbox& lb);
+
 struct RefineInfo {
     std::vector<double> offset, strength;   // per outline point
     double edge_norm = 0, at_limit = 0;

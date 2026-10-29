@@ -74,5 +74,16 @@ class PageMetaTest {
     fun filtersOfferedPerMode() {
         assertFalse(FilterKind.Whiteboard in FilterKind.forMode(CaptureMode.Document))
         assertEquals(FilterKind.Whiteboard, FilterKind.forMode(CaptureMode.Whiteboard).first())
+        // a screen keeps its colours: no filter that whitens the page
+        val screen = FilterKind.forMode(CaptureMode.Screen)
+        assertEquals(FilterKind.AutoColor, screen.first())
+        assertFalse(FilterKind.Scan in screen || FilterKind.BlackWhite in screen || FilterKind.Whiteboard in screen)
+    }
+
+    @Test
+    fun screenModeRoundTripsAndIsPartOfTheGeometry() {
+        val m = meta().copy(mode = CaptureMode.Screen, perspectiveOnly = true)
+        assertEquals(CaptureMode.Screen, PageMeta.fromJson(JSONObject(m.toJson().toString())).mode)
+        assertTrue(m.geometryKey(1600, true, true) != meta().copy(mode = CaptureMode.Whiteboard, perspectiveOnly = true).geometryKey(1600, true, true))
     }
 }

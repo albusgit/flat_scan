@@ -1,0 +1,316 @@
+{
+ "id_detections": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/iddetection/id_detections",
+  "match": "exact"
+ },
+ "document_segmentation_tzzh7": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/freddiews/document-segmentation-tzzh7",
+  "match": "exact"
+ },
+ "filtered_document_segmentation": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/freddiews/filtered-document-segmentation",
+  "match": "exact"
+ },
+ "card_corner": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/khanh-tran/card-corner",
+  "match": "likely"
+ },
+ "card_4_class": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/khanh-tran/card-4-class",
+  "match": "exact"
+ },
+ "document_segmentation_v2_gt86h": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/lung-x8el1/document-segmentation-v2-gt86h",
+  "match": "exact"
+ },
+ "document_segmentation_v2": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/lung-x8el1/document-segmentation-v2-gt86h",
+  "match": "likely"
+ },
+ "dccc_vn_instseg": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/bach-khoa-university-op163/dccc_vn_instseg",
+  "match": "exact"
+ },
+ "doc_scanner": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/doc-scan/doc-scanner",
+  "match": "likely"
+ },
+ "sdf_n0tlb": {
+  "use": "eval",
+  "licence": "none shown",
+  "url": "https://universe.roboflow.com/sc-8qaqk/sdf-n0tlb",
+  "match": "exact"
+ },
+ "business_cards_n3hbf": {
+  "use": "eval",
+  "licence": "none shown",
+  "url": "https://universe.roboflow.com/sc-8qaqk/business-cards-n3hbf",
+  "match": "exact"
+ },
+ "test1_2kpgu": {
+  "use": "eval",
+  "licence": "Public Domain (as labelled by re-uploader)",
+  "url": "https://universe.roboflow.com/indra-dt1vq/is-test1-w504r-2kpgu",
+  "match": "likely"
+ },
+ "_2kpgu": {
+  "use": "eval",
+  "licence": "Public Domain (as labelled by re-uploader)",
+  "url": "https://universe.roboflow.com/indra-dt1vq/is-test1-w504r-2kpgu",
+  "match": "likely"
+ },
+ "more2": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/more-doc/more2",
+  "match": "exact"
+ },
+ "book_page_segmentation_tecgp": {
+  "use": "eval",
+  "licence": "unknown",
+  "url": "",
+  "match": "not found"
+ },
+ "bill_segmentation": {
+  "use": "eval",
+  "licence": "unknown",
+  "url": "",
+  "match": "not found"
+ },
+ "bill_segmentation_image_project": {
+  "use": "eval",
+  "licence": "none shown",
+  "url": "https://universe.roboflow.com/labeling-e7pmr/bill-segmentation-image-project",
+  "match": "exact"
+ },
+ "ktp_sim_passport_segmentation": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/visual-intelligence-studio-2/ktp-sim-passport-segmentation",
+  "match": "exact"
+ },
+ "receipt_detection": {
+  "use": "eval",
+  "licence": "unknown",
+  "url": "",
+  "match": "not found"
+ },
+ "receipt_detection_9exb2": {
+  "use": "eval",
+  "licence": "unknown",
+  "url": "",
+  "match": "not found"
+ },
+ "idcard_jj": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/jj-ks6fe/idcard-g2wbl",
+  "match": "guessed"
+ },
+ "paper_unochapeco": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/unochapeco/paper-s9top",
+  "match": "guessed (strong)"
+ },
+ "paper_s9top": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/unochapeco/paper-s9top",
+  "match": "exact"
+ },
+ "cs_invoice": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/public-workspace-8btg0/cs-invoice-100",
+  "match": "likely"
+ },
+ "bienban": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/thai-nguyenquy/bienban",
+  "match": "exact"
+ },
+ "idcard_g2wbl": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/jj-ks6fe/idcard-g2wbl",
+  "match": "exact"
+ },
+ "idcard_final_polygon": {
+  "use": "train",
+  "licence": "Public Domain",
+  "url": "https://universe.roboflow.com/realfinal-bbkda/idcard_final_polygon",
+  "match": "exact"
+ },
+ "book_book_reader": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/pagethought/book_reader",
+  "match": "likely"
+ },
+ "documents_segmentation": {
+  "use": "train",
+  "licence": "MIT",
+  "url": "https://universe.roboflow.com/greendata/documents-segmentation",
+  "match": "likely"
+ },
+ "seg_paper": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/ghtkkkk/seg_paper",
+  "match": "exact"
+ },
+ "is_unochapeco_paper_s9top": {
+  "use": "train",
+  "licence": "Public Domain (re-upload); original unochapeco/paper-s9top is CC BY 4.0",
+  "url": "https://universe.roboflow.com/indra-dt1vq/is-unochapeco-paper-s9top",
+  "match": "exact"
+ },
+ "is_unochapeco_paper": {
+  "use": "train",
+  "licence": "Public Domain (re-upload); original CC BY 4.0",
+  "url": "https://universe.roboflow.com/indra-dt1vq/is-unochapeco-paper-s9top",
+  "match": "likely"
+ },
+ "segrec": {
+  "use": "train",
+  "licence": "Public Domain",
+  "url": "https://universe.roboflow.com/myworkspace-cvgyw/segrec",
+  "match": "exact"
+ },
+ "receipts_train": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/receipts-el7un/receipts_train",
+  "match": "exact"
+ },
+ "book_book_cmjt2": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/project-iorgd/book-cmjt2",
+  "match": "exact"
+ },
+ "receipt_segmentation_z4vqo": {
+  "use": "train",
+  "licence": "MIT",
+  "url": "https://universe.roboflow.com/occam/receipt-segmentation-z4vqo",
+  "match": "exact"
+ },
+ "receipts_coolstuff": {
+  "use": "train",
+  "licence": "MIT",
+  "url": "https://universe.roboflow.com/coolstuff-gl6ym/receipts-segmentation",
+  "match": "guessed"
+ },
+ "receipts_segmentation": {
+  "use": "train",
+  "licence": "MIT",
+  "url": "https://universe.roboflow.com/coolstuff-gl6ym/receipts-segmentation",
+  "match": "likely"
+ },
+ "receipt_occam": {
+  "use": "train",
+  "licence": "MIT",
+  "url": "https://universe.roboflow.com/occam/receipt-segmentation-z4vqo",
+  "match": "guessed"
+ },
+ "id_card_skew": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/help-6gn8b/id-card-skew",
+  "match": "exact"
+ },
+ "idcard_hghx0": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/text-message/idcard-hghx0",
+  "match": "exact"
+ },
+ "segmentation_hnf8e": {
+  "use": "eval",
+  "licence": "unknown",
+  "url": "",
+  "match": "not found"
+ },
+ "document_segmentation_j6olp": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/maulvi-zm/document-segmentation-j6olp",
+  "match": "exact"
+ },
+ "segment_passport_mefxx": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/passport-4nsxp/segment-passport-mefxx",
+  "match": "exact"
+ },
+ "segment_passport": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/passport-4nsxp/segment-passport-mefxx",
+  "match": "likely"
+ },
+ "documento_nlsft": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/superspace/documento-nlsft",
+  "match": "exact"
+ },
+ "documento": {
+  "use": "train",
+  "licence": "Public Domain",
+  "url": "https://universe.roboflow.com/moises-valera/documento",
+  "match": "likely"
+ },
+ "doc_rida": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/rida-zvrxk/doc-oszd8",
+  "match": "guessed"
+ },
+ "doc_oszd8": {
+  "use": "train",
+  "licence": "CC BY 4.0",
+  "url": "https://universe.roboflow.com/rida-zvrxk/doc-oszd8",
+  "match": "exact"
+ },
+ "midv500": {
+  "use": "eval",
+  "licence": "research use"
+ },
+ "midv2019": {
+  "use": "eval",
+  "licence": "research use"
+ },
+ "smartdoc": {
+  "use": "eval",
+  "licence": "duplicate of our own SmartDoc release"
+ },
+ "negative_coco": {
+  "use": "eval",
+  "licence": "COCO photos: Flickr licences, some non-commercial; ids lost in renaming"
+ },
+ "negative_coco_train": {
+  "use": "eval",
+  "licence": "same"
+ }
+}

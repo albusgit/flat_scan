@@ -627,6 +627,8 @@ void main() {
     }
     if (uGray != 0) t = vec3(luma(t));
     float se = uKind == 4 ? 1.0 : uStrength;   // scan applies the strength inside its curve
+    // paper the curve made white is white at any strength (cleanup.cpp kPaperWhite0)
+    if (uKind != 0 && uKind != 4 && se < 1.0) se += (1.0 - se) * smoothstep(0.96, 1.0, min(t.r, min(t.g, t.b)));
     vec3 o = clamp(q + se * (t * 255.0 - q), 0.0, 255.0);
     uvec3 ou = uvec3(roundEven(o));
     px[r * uOut.x + x] = ou.r | (ou.g << 8) | (ou.b << 16) | (255u << 24);

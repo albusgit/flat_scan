@@ -18,6 +18,8 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -33,6 +35,12 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.asAndroidColorFilter
+import androidx.compose.ui.graphics.asAndroidBitmap
+import com.albus.flatscan.PageTransform
+import com.albus.flatscan.pagePxMatrix
 import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -42,6 +50,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.toSize
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sin
@@ -63,7 +72,7 @@ class ViewerState {
 private const val MAX_ZOOM = 6f
 private const val DOUBLE_TAP_ZOOM = 2.5f
 
-private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Brush, Split, Idle }
+private enum class Mode { Pending, Hold, Zoom, Pan, Draw, Brush, Split, Swipe, Corner, Idle }
 
 /**
  * Maps page pixels to the screen: the page (turned [rotation] clockwise quarter turns) is fitted
@@ -88,6 +97,18 @@ private class PageGeometry(val pw: Int, val ph: Int, val rotation: Int, val box:
         return u + Offset(pw / 2f, ph / 2f)
     }
 
+    /** The inverse of [toPage]: page pixels to the screen. */
+    fun toScreen(p: Offset): Offset {
+        val u = p - Offset(pw / 2f, ph / 2f)
+        val v = when (rotation) {
+            1 -> Offset(-u.y, u.x)
+            2 -> Offset(-u.x, -u.y)
+            3 -> Offset(u.y, -u.x)
+            else -> u
+        }
+        return v * k + center + pan
+    }
+
     fun clampPan(p: Offset, s: Float): Offset {
         val mx = max(0f, (rw * base * s - box.width) / 2)
         val my = max(0f, (rh * base * s - box.height) / 2)
@@ -104,12 +125,33 @@ private class PageGeometry(val pw: Int, val ph: Int, val rotation: Int, val box:
     }
 }
 
-/** Draws [image] stretched over the page rectangle (page pixel coordinates). */
-private fun DrawScope.drawPageImage(image: ImageBitmap, pw: Int, ph: Int, colorFilter: ColorFilter? = null) {
-    drawImage(
-        image, srcOffset = IntOffset.Zero, srcSize = IntSize(image.width, image.height),
-        dstOffset = IntOffset.Zero, dstSize = IntSize(pw, ph), filterQuality = FilterQuality.Medium, colorFilter = colorFilter,
-    )
+/**
+ * Draws [image] stretched over the page rectangle (page pixel coordinates); with [transform] (PageTransform.matrix)
+ * through the page's perspective, on [paper] where it bares the page.
+ */
+private fun DrawScope.drawPageImage(
+    image: ImageBitmap, pw: Int, ph: Int, colorFilter: ColorFilter? = null, transform: DoubleArray? = null, paper: Color = Color.White,
+    alpha: Float = 1f,
+) {
+    if (transform == null) {
+        drawImage(
+            image, srcOffset = IntOffset.Zero, srcSize = IntSize(image.width, image.height),
+            dstOffset = IntOffset.Zero, dstSize = IntSize(pw, ph), alpha = alpha, filterQuality = FilterQuality.Medium, colorFilter = colorFilter,
+        )
+        return
+    }
+    clipRect(0f, 0f, pw.toFloat(), ph.toFloat()) {
+        drawRect(paper, size = Size(pw.toFloat(), ph.toFloat()), alpha = alpha, colorFilter = colorFilter)
+        drawIntoCanvas { c ->
+            val m = android.graphics.Matrix()
+            m.setScale(pw.toFloat() / image.width, ph.toFloat() / image.height)
+            m.postConcat(pagePxMatrix(transform, pw.toFloat(), ph.toFloat()))
+            val p = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+            p.alpha = (alpha * 255).toInt().coerceIn(0, 255)
+            p.colorFilter = colorFilter?.asAndroidColorFilter()
+            c.nativeCanvas.drawBitmap(image.asAndroidBitmap(), m, p)
+        }
+    }
 }
 
 /** What the page viewer edits besides zooming: nothing, protected pictures or the unwarp's lines. */
@@ -120,6 +162,44 @@ val DrawnLineColor = Color(0xFFFFE15A)
 internal val LineColors = listOf(Color(0xFF8FB0FF), Color(0xFF5BD18B), Color(0xFFC79BFF), DrawnLineColor)   // ruled, text row, grid, drawn
 internal val IgnoreColor = Color(0xFFFF6B5E)
 private val EraseColor = Color(0xFFF2B84B)
+/** The line brush: Straighten paint (Keep as is is drawn in [IgnoreColor]: the lines there are left out). */
+internal val StraightenColor = Color(0xFF5FD3F3)
+
+/**
+ * The page point ([x], [y]: fractions) lies under a line-brush stroke of [mode] (0 Straighten, 1 Keep as is) of
+ * [paint] (PageMeta.linePaint layout). [hw]: the page's height / width (a stroke's radius is a fraction of its width).
+ */
+internal fun inLinePaint(paint: List<Float>, mode: Int, x: Float, y: Float, hw: Float): Boolean {
+    var i = 0
+    while (i + 3 <= paint.size) {
+        val n = paint[i + 2].toInt()
+        if (i + 3 + 2 * n > paint.size) break
+        if (paint[i].toInt() == mode) {
+            val r = paint[i + 1]
+            val q = Offset(x, y * hw)
+            for (k in 0 until n) {
+                val a = Offset(paint[i + 3 + 2 * k], paint[i + 4 + 2 * k] * hw)
+                val b = if (k + 1 < n) Offset(paint[i + 5 + 2 * k], paint[i + 6 + 2 * k] * hw) else a
+                if (segmentDistance(q, a, b) <= r) return true
+            }
+        }
+        i += 3 + 2 * n
+    }
+    return false
+}
+
+/** A line with its middle at ([x], [y]) is left out by the line brush: under Keep as is, or outside every Straighten stroke. */
+internal fun leftOutByPaint(paint: List<Float>, x: Float, y: Float, hw: Float): Boolean {
+    if (paint.isEmpty()) return false
+    if (inLinePaint(paint, 1, x, y, hw)) return true
+    var i = 0
+    var straighten = false
+    while (i + 3 <= paint.size) {
+        if (paint[i].toInt() == 0) straighten = true
+        i += 3 + 2 * paint[i + 2].toInt()
+    }
+    return straighten && !inLinePaint(paint, 0, x, y, hw)
+}
 
 /**
  * The result page with pinch zoom / pan (double tap toggles 1x / 2.5x), press and hold for the
@@ -160,6 +240,25 @@ fun PageViewer(
     onStroke: (List<Float>) -> Unit = {},
     drawStrokes: Boolean = areaMode == AreaMode.Fingers,
     pendingLines: List<FloatArray> = emptyList(),
+    // AreaMode.Lines: the line brush's strokes (PageMeta.linePaint layout), the brush in use (-1 none, 0 Straighten,
+    // 1 Keep as is: a stroke is drawn [brushRadius] wide) and the page's own height / width (the core's, unstretched)
+    linePaint: List<Float> = emptyList(),
+    lineBrush: Int = -1,
+    paintHw: Float = 1f,
+    // the page's perspective (PageTransform.matrix of the shown page, null: none), the paper colour it bares, and a
+    // grid over the page while a perspective slider moves
+    transform: DoubleArray? = null,
+    paper: Color = Color.White,
+    grid: Boolean = false,
+    // a one-finger swipe across the unzoomed page (no tool open, not comparing): +1 the next page (to the left), -1
+    // the one before; null: no swiping
+    onSwipe: ((Int) -> Unit)? = null,
+    // Perspective > Guided: the guides as drawn on the page shown ([x0, y0, x1, y1] fractions each; null: not guiding)
+    guides: List<FloatArray>? = null,
+    // Perspective > Corners: the 4 corners (TL, TR, BR, BL page fractions) being dragged onto the page's own, and each
+    // move of one (null: not editing corners)
+    cornerQuad: List<Float>? = null,
+    onCornerQuad: (List<Float>) -> Unit = {},
     // a change of fadeKey (the filter) crossfades the rendering before it into the next one (200 ms)
     fadeKey: Any? = null,
 ) {
@@ -221,6 +320,12 @@ fun PageViewer(
     val brushImg = remember(brushOverlay) { brushOverlay?.asImageBitmap() }
     val strokeDone by rememberUpdatedState(onStroke)
     val brushing by rememberUpdatedState(drawStrokes)
+    val swipeTo by rememberUpdatedState(onSwipe)
+    val cornersNow by rememberUpdatedState(cornerQuad)
+    val cornerMoved by rememberUpdatedState(onCornerQuad)
+    // the page following a swipe across it (screen px), back to rest when it ends
+    val swipeDx = remember { Animatable(0f) }
+    val swipeScope = rememberCoroutineScope()
 
     val geomNow = { PageGeometry(pageWidth, pageHeight, rotation, box, state.scale, state.pan) }
     val geometry by rememberUpdatedState(geomNow)
@@ -265,6 +370,8 @@ fun PageViewer(
                     val slop = viewConfiguration.touchSlop
                     var lastTime = down.uptimeMillis
                     var mode = Mode.Pending
+                    var lastPos = start
+                    var corner = -1
                     while (true) {
                         val ev: PointerEvent? = if (mode == Mode.Pending && !protecting && !comparing) {
                             val remaining = longPress - (lastTime - down.uptimeMillis)
@@ -294,9 +401,20 @@ fun PageViewer(
                             continue
                         }
                         val ch = pressed[0]
+                        lastPos = ch.position
                         when (mode) {
                             Mode.Pending -> if ((ch.position - start).getDistance() > slop) {
+                                // the corner editor: the corner under the finger (44 dp), if any
+                                cornersNow?.let { q ->
+                                    val g = geometry()
+                                    var bestD = 44.dp.toPx()
+                                    for (i in 0 until 4) {
+                                        val d = (g.toScreen(Offset(q[2 * i] * g.pw, q[2 * i + 1] * g.ph)) - start).getDistance()
+                                        if (d < bestD) { bestD = d; corner = i }
+                                    }
+                                }
                                 mode = when {
+                                    corner >= 0 -> Mode.Corner
                                     comparing -> {
                                         splitTo(splitAt(ch.position.x))
                                         Mode.Split
@@ -311,7 +429,24 @@ fun PageViewer(
                                         Mode.Draw
                                     }
                                     state.scale > 1.01f -> Mode.Pan
+                                    swipeTo != null -> Mode.Swipe
                                     else -> Mode.Idle
+                                }
+                                ch.consume()
+                            }
+                            Mode.Swipe -> {
+                                swipeScope.launch { swipeDx.snapTo(ch.position.x - start.x) }
+                                ch.consume()
+                            }
+                            Mode.Corner -> {
+                                val q = cornersNow
+                                val g = geometry()
+                                if (q != null && g.pw > 0 && g.ph > 0) {
+                                    val p = g.toPage(ch.position)
+                                    cornerMoved(q.toMutableList().also {
+                                        it[2 * corner] = PageTransform.clampCorner(p.x / g.pw)
+                                        it[2 * corner + 1] = PageTransform.clampCorner(p.y / g.ph)
+                                    })
                                 }
                                 ch.consume()
                             }
@@ -339,6 +474,13 @@ fun PageViewer(
                         Mode.Hold -> {
                             holding = false
                             hold(false)
+                        }
+                        Mode.Swipe -> {
+                            // far enough and mostly across: the next page (to the left) or the one before
+                            val d = lastPos - start
+                            val far = abs(d.x) > 64.dp.toPx() && abs(d.x) > 1.5f * abs(d.y)
+                            if (far) swipeTo?.invoke(if (d.x < 0) 1 else -1)
+                            swipeScope.launch { swipeDx.animateTo(0f, tween(180)) }
                         }
                         Mode.Brush -> {
                             val g = geometry()
@@ -385,12 +527,12 @@ fun PageViewer(
                 }
             },
     ) {
-        val g = PageGeometry(pageWidth, pageHeight, rotation, size, state.scale, state.pan)
+        val g = PageGeometry(pageWidth, pageHeight, rotation, size, state.scale, state.pan + Offset(swipeDx.value, 0f))
         val shown = if (holding && beforeImg != null) beforeImg else pageImg
         if (shown == null || pageWidth == 0 || pageHeight == 0) return@Canvas
         // a soft shadow under the page lifts it off the dark ground
         val pageSize = Size(g.rw * g.k, g.rh * g.k)
-        val pageTl = g.center + state.pan - Offset(pageSize.width / 2, pageSize.height / 2)
+        val pageTl = g.center + g.pan - Offset(pageSize.width / 2, pageSize.height / 2)
         val blur = 18.dp.toPx()
         for (i in 1..6) {
             val grow = blur * i / 6f
@@ -401,15 +543,49 @@ fun PageViewer(
         }
         with(g) {
             inPage {
-                drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null)
+                val pageT = if (shown === pageImg) transform else null
+                drawPageImage(shown, pageWidth, pageHeight, if (shown === pageImg) colorFilter else null, pageT, paper)
                 val f = fadeFrom
                 if (f != null && shown === pageImg && fadeOut.value > 0f) {
-                    drawImage(
-                        f, srcOffset = IntOffset.Zero, srcSize = IntSize(f.width, f.height), dstOffset = IntOffset.Zero, dstSize = IntSize(pageWidth, pageHeight),
-                        alpha = fadeOut.value, filterQuality = FilterQuality.Medium, colorFilter = colorFilter,
-                    )
+                    drawPageImage(f, pageWidth, pageHeight, colorFilter, pageT, paper, alpha = fadeOut.value)
                 }
-                if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight)
+                if (!holding && overlayImg != null) drawPageImage(overlayImg, pageWidth, pageHeight, transform = pageT, paper = Color.Transparent)
+                if (grid) {
+                    // thirds and their halves, as Lightroom's Transform grid: mid grey, seen on white paper and on dark print
+                    val gw = 1.dp.toPx() / g.k
+                    val gc = Color(0xFF8A8A8A).copy(alpha = 0.75f)
+                    for (k in 1 until 6) {
+                        drawLine(gc, Offset(pageWidth * k / 6f, 0f), Offset(pageWidth * k / 6f, pageHeight.toFloat()), gw)
+                        drawLine(gc, Offset(0f, pageHeight * k / 6f), Offset(pageWidth.toFloat(), pageHeight * k / 6f), gw)
+                    }
+                }
+                // Perspective > Guided: the guides, and the one being drawn (straight, its first point to its last)
+                guides?.let { gl ->
+                    val lw = 2.5.dp.toPx() / g.k
+                    for (f in gl) {
+                        val a = Offset(f[0] * pageWidth, f[1] * pageHeight)
+                        val b = Offset(f[2] * pageWidth, f[3] * pageHeight)
+                        drawLine(Color.Black.copy(alpha = 0.45f), a, b, strokeWidth = lw * 2.2f, cap = StrokeCap.Round)
+                        drawLine(DrawnLineColor, a, b, strokeWidth = lw, cap = StrokeCap.Round)
+                    }
+                    if (stroke.size >= 2) drawLine(Color.White.copy(alpha = 0.85f), stroke.first(), stroke.last(), strokeWidth = lw, cap = StrokeCap.Round)
+                }
+                // Perspective > Corners: the outline being dragged onto the page's corners, and its handles
+                cornerQuad?.let { q ->
+                    val pts = List(4) { Offset(q[2 * it] * pageWidth, q[2 * it + 1] * pageHeight) }
+                    val lw = 2.dp.toPx() / g.k
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(pts[0].x, pts[0].y)
+                        for (p in pts.drop(1)) lineTo(p.x, p.y)
+                        close()
+                    }
+                    drawPath(path, Color.Black.copy(alpha = 0.45f), style = Stroke(lw * 2.4f))
+                    drawPath(path, outline, style = Stroke(lw))
+                    for (p in pts) {
+                        drawCircle(Color.White, radius = 11.dp.toPx() / g.k, center = p)
+                        drawCircle(outline, radius = 11.dp.toPx() / g.k, center = p, style = Stroke(lw * 1.5f))
+                    }
+                }
                 val c = crinkle.value
                 if (holding && c > 0.01f) drawCreases(pageWidth, pageHeight, c, 2.dp.toPx() / g.k)
                 if (areaMode == AreaMode.Fingers) {
@@ -425,6 +601,22 @@ fun PageViewer(
                     }
                 }
                 if (areaMode == AreaMode.Lines) {
+                    // the line brush's strokes under everything else, tinted
+                    val wide = { w: Float -> Stroke(w, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round) }
+                    var s = 0
+                    while (s + 3 <= linePaint.size) {
+                        val n = linePaint[s + 2].toInt()
+                        if (s + 3 + 2 * n > linePaint.size) break
+                        val path = androidx.compose.ui.graphics.Path()
+                        for (k in 0 until n) {
+                            val q = Offset(linePaint[s + 3 + 2 * k] * pageWidth, linePaint[s + 4 + 2 * k] * pageHeight)
+                            if (k == 0) path.moveTo(q.x, q.y) else path.lineTo(q.x, q.y)
+                        }
+                        if (n == 1) path.lineTo(linePaint[s + 3] * pageWidth + 0.01f, linePaint[s + 4] * pageHeight)
+                        val color = if (linePaint[s].toInt() == 0) StraightenColor else IgnoreColor
+                        drawPath(path, color.copy(alpha = 0.3f), style = wide(2 * linePaint[s + 1] * pageWidth))
+                        s += 3 + 2 * n
+                    }
                     // the lines found from sweeps, not flattened yet (the newest drawing itself in), and the sweep
                     // being made: a soft wide guide, not a line (the line is found under it)
                     val lw = 3.dp.toPx() / g.k
@@ -457,7 +649,11 @@ fun PageViewer(
                         drawPath(path, DrawnLineColor, style = round)
                     }
                     if (stroke.size >= 2) {
-                        drawPath(pathOf(stroke), Color.White.copy(alpha = 0.35f), style = Stroke(14.dp.toPx() / g.k, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                        if (lineBrush >= 0) {
+                            drawPath(pathOf(stroke), (if (lineBrush == 0) StraightenColor else IgnoreColor).copy(alpha = 0.5f), style = wide(2 * brushRadius * pageWidth))
+                        } else {
+                            drawPath(pathOf(stroke), Color.White.copy(alpha = 0.35f), style = wide(14.dp.toPx() / g.k))
+                        }
                     }
                 }
                 if (protectMode) {
@@ -475,7 +671,7 @@ fun PageViewer(
                             val a = Offset(lines[5 * j + 1] * pageWidth, lines[5 * j + 2] * pageHeight)
                             val b = Offset(lines[5 * j + 3] * pageWidth, lines[5 * j + 4] * pageHeight)
                             val mid = Offset((lines[5 * j + 1] + lines[5 * j + 3]) / 2, (lines[5 * j + 2] + lines[5 * j + 4]) / 2)
-                            if (inAreas(areas, mid.x, mid.y)) {
+                            if (inAreas(areas, mid.x, mid.y) || leftOutByPaint(linePaint, mid.x, mid.y, paintHw)) {
                                 drawLine(IgnoreColor, a, b, strokeWidth = lw, cap = StrokeCap.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(3 * lw, 2 * lw)))
                             } else {
                                 drawLine(Color.Black.copy(alpha = 0.35f), a, b, strokeWidth = lw * 1.8f, cap = StrokeCap.Round)

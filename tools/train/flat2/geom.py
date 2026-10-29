@@ -55,9 +55,12 @@ def bend(P, s_dir, c, R, phi, M=None):
 
 
 def fold(P, s_dir, c, angle, round_r=0.004, M=None):
-    """A fold: the part beyond the line turned up by |angle| (rad) about it, with a small rounding radius (paper
-    lies on a table: a fold lifts one side; which side is the line's normal's choice)."""
-    return bend(P, s_dir, c, max(round_r, 1e-4), abs(angle), M)
+    """A fold: the part beyond the line turned up by angle (rad) about it, with a small rounding radius (which side
+    is the line's normal's choice). angle < 0: a valley fold (turned down: the mountain fold of the mirrored sheet)."""
+    if angle >= 0:
+        return bend(P, s_dir, c, max(round_r, 1e-4), angle, M)
+    Q = P * np.array([1.0, 1.0, -1.0])
+    return bend(Q, s_dir, c, max(round_r, 1e-4), -angle, M) * np.array([1.0, 1.0, -1.0])
 
 
 def wave(P, rng, amp):
@@ -76,8 +79,96 @@ def wave(P, rng, amp):
 def random_shape(rng, H, kind=None):
     """kind (or a random one) -> (name, f) with f(P) the deformation of flat sheet points P (N x 3). Every random
     choice is made here, once: f is a fixed shape (it is called for the render mesh and the ground-truth grids)."""
-    kinds = ['flat', 'nearflat', 'curl', 'corner', 'fold', 'fold2', 'curl_corner', 'wave_curl']
-    w = [0.16, 0.14, 0.18, 0.16, 0.12, 0.06, 0.10, 0.08]
+    kind, steps = random_steps(rng, H, kind)
+
+    def f(P):
+        M = P[:, :2].copy()   # the flat sheet: every bend is placed on it
+        for op, args in steps:
+            if op == 'bend':
+                P = bend(P, *args, M=M)
+            elif op == 'fold':
+                P = fold(P, *args[:3], *(args[3:] or ()), M=M)
+            else:
+                comps, amp = args
+                z = np.zeros(len(P))
+                for k, th, ph, a in comps:
+                    z += np.sin(k * (P[:, 0] * math.cos(th) + P[:, 1] * math.sin(th)) + ph) * a
+                P = P.copy()
+                P[:, 2] += amp * z / 3
+        return P
+    return kind, f
+
+
+KINDS = ['flat', 'nearflat', 'curl', 'corner', 'fold', 'fold2', 'curl_corner', 'wave_curl']
+KIND_W = [0.16, 0.14, 0.18, 0.16, 0.12, 0.06, 0.10, 0.08]
+# round 19 (tools/train/gpugen): sharp folds up to ~150 deg, crumples (3-5 creases, mountain and valley), dog-ears
+KINDS_R19 = KINDS + ['fold_sharp', 'crumple', 'dogear', 'combo']
+KIND_W_R19 = [0.11, 0.10, 0.13, 0.10, 0.08, 0.05, 0.07, 0.06, 0.07, 0.07, 0.05, 0.11]
+COMBO_PARTS = ['curl', 'corner', 'fold', 'fold_sharp', 'crumple', 'nearflat', 'dogear']
+
+
+def _chord(n, c, H, k=9):
+    """points of the line {p . n = c} inside the sheet [0, 1] x [0, H] (empty: the line misses it)"""
+    t = np.array([-n[1], n[0]])
+    p0 = n * c
+    ts = np.linspace(-4 * max(1, H), 4 * max(1, H), 4001)
+    q = p0[None] + ts[:, None] * t[None]
+    inside = (q[:, 0] >= 0) & (q[:, 0] <= 1) & (q[:, 1] >= 0) & (q[:, 1] <= H)
+    if not inside.any():
+        return np.zeros((0, 2))
+    q = q[inside]
+    return q[np.linspace(0, len(q) - 1, k).astype(int)]
+
+
+def _arc(st):
+    """the arc length of a bend / fold (beyond it the sheet goes on straight)"""
+    a = st[1]
+    if st[0] == 'bend':
+        return a[2] * a[3]
+    return (a[3] if len(a) > 3 else 0.004) * abs(a[2])
+
+
+def combine_steps(parts, H):
+    """steps of several shapes on one sheet -> one isometric order, or None. A bend turns the material beyond its
+    line; two lines crossing inside the sheet (or each lying beyond the other: both would turn the strip between)
+    have no isometric order and are refused. Lines whose beyond regions nest go outermost first; ripples first."""
+    waves = [st for st in parts if st[0] == 'wave']
+    lines = [st for st in parts if st[0] != 'wave']
+    ch = [_chord(np.asarray(st[1][0], float), st[1][1], H) for st in lines]
+    before = {i: set() for i in range(len(lines))}   # j in before[i]: j must come before i
+    for i in range(len(lines)):
+        for j in range(i + 1, len(lines)):
+            ni, ci = np.asarray(lines[i][1][0], float), lines[i][1][1]
+            nj, cj = np.asarray(lines[j][1][0], float), lines[j][1][1]
+            if len(ch[i]) == 0 or len(ch[j]) == 0:
+                continue
+            si, sj = ch[j] @ ni - ci, ch[i] @ nj - cj        # j's chord seen from i's line, and i's from j's
+            if (si.min() < -1e-6 and si.max() > 1e-6) or (sj.min() < -1e-6 and sj.max() > 1e-6):
+                return None                                  # they cross inside the sheet
+            j_beyond_i, i_beyond_j = si.mean() > 0, sj.mean() > 0
+            if j_beyond_i and i_beyond_j:
+                return None
+            # a line carried round another's arc would bend with it (only its straight part carries rigidly)
+            if (j_beyond_i and si.min() <= _arc(lines[i]) + 0.01) or (i_beyond_j and sj.min() <= _arc(lines[j]) + 0.01):
+                return None
+            if j_beyond_i:
+                before[i].add(j)                             # j lies in i's turned part: j is outer, goes first
+            elif i_beyond_j:
+                before[j].add(i)
+    order, left = [], set(range(len(lines)))
+    while left:
+        ready = [i for i in left if not (before[i] & left)]
+        if not ready:
+            return None
+        order.append(ready[0]); left.remove(ready[0])
+    return waves + [lines[i] for i in order]
+
+
+def random_steps(rng, H, kind=None, kinds=None, weights=None):
+    """random_shape's choices: (kind, steps), steps = [(op, args)] applied in order: ('bend', (n, c, R, phi)),
+    ('fold', (n, c, angle[, round_r])), ('wave', ([(k, th, ph, a)], amp)). Also read by tools/train/gpugen (the same
+    shapes on the GPU, with kinds=KINDS_R19)."""
+    kinds, w = (kinds, weights) if kinds else (KINDS, KIND_W)
     kind = kind or str(rng.choice(kinds, p=np.array(w) / sum(w)))
     L = max(1.0, H)
     steps = []   # (op, args) applied in order
@@ -149,25 +240,49 @@ def random_shape(rng, H, kind=None):
         # the outer fold first: the inner one then turns it with the rest of its side
         steps.append(('fold', (n, 2 * ext / 3, rng.uniform(0.1, 0.6))))
         steps.append(('fold', (n, ext / 3, rng.uniform(0.1, 0.6))))
+    elif kind == 'combo':
+        # 2-3 shapes on one sheet (a curled page with a crease, a folded letter with a lifted corner ...)
+        for _ in range(30):
+            subs = list(rng.choice(COMBO_PARTS, int(rng.integers(2, 4)), replace=False))
+            parts = []
+            for sub in subs:
+                parts += random_steps(rng, H, kind=str(sub))[1]
+            steps = combine_steps(parts, H)
+            if steps is not None:
+                kind = 'combo_' + '+'.join(subs)
+                break
+        else:
+            return random_steps(rng, H, kind='curl')
+    elif kind == 'fold_sharp':
+        n, c = random_line((0.2, 0.8))
+        steps.append(('fold', (n, c, rng.uniform(0.9, 2.6), rng.uniform(0.002, 0.01))))
+    elif kind == 'crumple':
+        # parallel creases across the sheet (creases crossing inside the sheet would tear this model: measured up to
+        # 2.4x stretch with +-12 deg between them), at least 6 % of the sheet apart, outermost first
+        th = rng.uniform(0, math.pi)
+        n = np.array([math.cos(th), math.sin(th)])
+        proj = np.array([[0, 0], [1, 0], [0, H], [1, H]]) @ n
+        lo, hi = proj.min(), proj.max()
+        k = int(rng.integers(3, 6))
+        cs = np.sort(rng.uniform(lo + 0.1 * (hi - lo), hi - 0.1 * (hi - lo), k))
+        if len(cs) > 1 and np.diff(cs).min() < 0.06 * (hi - lo):
+            cs = np.linspace(cs[0], cs[-1], k) if cs[-1] - cs[0] > 0.06 * (hi - lo) * (k - 1) else cs[:1]
+        for c in cs[::-1]:
+            steps.append(('fold', (n, float(c), rng.choice([-1, 1]) * rng.uniform(0.08, 0.5), rng.uniform(0.002, 0.02))))
+    elif kind == 'dogear':
+        cx, cy = int(rng.integers(0, 2)), int(rng.integers(0, 2))
+        corner = np.array([cx * 1.0, cy * H])
+        a = rng.uniform(0.06, 0.3) * min(1.0, H)
+        p1 = corner + np.array([(1 - 2 * cx) * a, 0])
+        p2 = corner + np.array([0, (1 - 2 * cy) * a * rng.uniform(0.7, 1.4)])
+        t = p2 - p1
+        n = np.array([-t[1], t[0]]) / np.linalg.norm(t)
+        if (corner - p1) @ n < 0:
+            n = -n
+        steps.append(('fold', (n, float(p1 @ n), rng.uniform(2.6, 3.1), rng.uniform(0.002, 0.006))))
     elif kind != 'flat':
         raise ValueError(kind)
-
-    def f(P):
-        M = P[:, :2].copy()   # the flat sheet: every bend is placed on it
-        for op, args in steps:
-            if op == 'bend':
-                P = bend(P, *args, M=M)
-            elif op == 'fold':
-                P = fold(P, *args, M=M)
-            else:
-                comps, amp = args
-                z = np.zeros(len(P))
-                for k, th, ph, a in comps:
-                    z += np.sin(k * (P[:, 0] * math.cos(th) + P[:, 1] * math.sin(th)) + ph) * a
-                P = P.copy()
-                P[:, 2] += amp * z / 3
-        return P
-    return kind, f
+    return kind, steps
 
 
 def sheet(H, nu, nv):
@@ -258,16 +373,22 @@ def rasterise(V2, z, F, uv, size, device='cpu', max_box=24):
     if (seen & ((span[:, 0] >= max_box) | (span[:, 1] >= max_box))).any():
         raise ValueError('a visible face is larger than max_box: use a finer mesh')   # was dropped (a hole)
     keep = (span[:, 0] < max_box) & (span[:, 1] < max_box) & seen
-    fi = torch.nonzero(keep).squeeze(1)
     zbuf = torch.full((H * W,), float('inf'), device=device)
     best = torch.full((H * W,), -1, dtype=torch.long, device=device)
     st = torch.full((H * W, 2), float('nan'), device=device)
-    # pixels per face: the box's grid, in chunks of faces
-    k = max_box
-    oy, ox = torch.meshgrid(torch.arange(k, device=device), torch.arange(k, device=device), indexing='ij')
-    ox, oy = ox.reshape(-1), oy.reshape(-1)
+    # pixels per face: a box's grid, in chunks of faces; faces grouped by their box's size (one box sized for the
+    # largest face tested ~10x the pixels needed: most faces are ~8 px). Same pixels and ties: the reductions are minima
+    need = span.max(1).values + 1
+    chunks = []
+    for k in sorted({b for b in (4, 8, 12, 16, 24, 32, 48) if b < max_box} | {max_box}):
+        fi = torch.nonzero(keep & (need <= k)).squeeze(1)
+        keep = keep & (need > k)
+        if len(fi):
+            chunks += [(k, c) for c in torch.split(fi, max(1, 4_000_000 // (k * k)))]
     records = []
-    for chunk in torch.split(fi, max(1, 4_000_000 // (k * k))):
+    for k, chunk in chunks:
+        oy, ox = torch.meshgrid(torch.arange(k, device=device), torch.arange(k, device=device), indexing='ij')
+        ox, oy = ox.reshape(-1), oy.reshape(-1)
         px = lo[chunk, 0:1] + ox[None]           # faces x k*k
         py = lo[chunk, 1:2] + oy[None]
         inb = (px <= hi[chunk, 0:1]) & (py <= hi[chunk, 1:2]) & (px >= 0) & (py >= 0) & (px < W) & (py < H)

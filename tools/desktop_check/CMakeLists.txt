@@ -130,3 +130,9 @@ add_executable(tflite_shape_cli tflite_shape_cli.cpp)
 target_link_libraries(tflite_shape_cli PRIVATE core_nogpu)
 add_executable(finger_test finger_test.cpp)
 target_link_libraries(finger_test PRIVATE core_nogpu)
+# Upright for the finished page (core/src/upright.cpp) on synthetic pages
+add_executable(upright_test upright_test.cpp)
+target_link_libraries(upright_test PRIVATE core_nogpu)
+# the shape lock (core/src/pipeline.cpp lock_shapes) on synthetic maps
+add_executable(lock_test lock_test.cpp)
+target_link_libraries(lock_test PRIVATE core_nogpu)

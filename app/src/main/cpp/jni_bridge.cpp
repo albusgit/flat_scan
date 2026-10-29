@@ -29,6 +29,7 @@
 #include "cleanup.h"
 #include "screen.h"
 #include "linefind.h"
+#include "upright.h"
 #include "gpu.h"
 #include "infer.h"
 #include "log.h"
@@ -903,7 +904,7 @@ JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_pageFinder(JNIEn
     if (!ok) return nullptr;
     if (timing && env->GetArrayLength(timing) >= 1) {
         std::string e = net_entry(true, g->inf->last_ms(NetId::PageFinder), ms_since(t0), first, g->inf->backend(NetId::PageFinder),
-                                  shape_str({1, 3, SEG_SIZE, SEG_SIZE}));
+                                  shape_str({1, 3, page_finder_input_side(), page_finder_input_side()}));
         jstring js = env->NewStringUTF(e.c_str());
         env->SetObjectArrayElement(timing, 0, js);
         env->DeleteLocalRef(js);
@@ -918,7 +919,8 @@ JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_pageFinder(JNIEn
 JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_prewarmFinder(JNIEnv*, jclass) {
     auto g = group(g_finder);
     if (!g->first_use(NetId::PageFinder)) return;
-    Tensor x{{1, 3, SEG_SIZE, SEG_SIZE}, std::vector<float>((size_t)SEG_INPUT_LEN, 0.f)};
+    const int side = page_finder_input_side();   // v2's 384 until the model is known to be round 4's
+    Tensor x{{1, 3, side, side}, std::vector<float>((size_t)3 * side * side, 0.f)};
     std::vector<Tensor> y;
     std::string err;
     if (!g->inf->run(NetId::PageFinder, x, y, &err)) LOGI("page finder warm-up: %s", err.c_str());
@@ -1011,7 +1013,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint render_w, jboolean use_gpu, jfloatArray logits,
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jboolean flatten, jint flat_nets, jboolean shadows, jboolean rules,
-                                                                  jboolean board, jboolean remove_shadows, jfloatArray user_lines, jobject listener) {
+                                                                  jboolean board, jboolean remove_shadows, jfloatArray user_lines,
+                                                                  jboolean auto_lines, jfloatArray line_paint, jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -1063,6 +1066,25 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
             for (size_t k = 0; k < np; ++k) l.pts.emplace_back(v[i + 2 * k], v[i + 2 * k + 1]);
             i += 2 * np;
             if (l.pts.size() >= 2) o.user_lines.push_back(std::move(l));
+        }
+    }
+    // the line brush: [mode, radius, n, x0, y0, ... x(n-1), y(n-1)] repeated, output-page fractions (PageMeta.linePaint)
+    o.auto_lines = auto_lines;
+    if (line_paint) {
+        jsize n = env->GetArrayLength(line_paint);
+        std::vector<float> v(n);
+        if (n) env->GetFloatArrayRegion(line_paint, 0, n, v.data());
+        size_t i = 0;
+        while (i + 3 <= v.size()) {
+            PipelineOptions::LinePaint s;
+            s.mode = (int)std::lround(v[i]);
+            s.radius = v[i + 1];
+            size_t np = (size_t)std::max(0.f, v[i + 2]);
+            i += 3;
+            if (i + 2 * np > v.size()) break;
+            for (size_t k = 0; k < np; ++k) s.pts.emplace_back(v[i + 2 * k], v[i + 2 * k + 1]);
+            i += 2 * np;
+            if (!s.pts.empty()) o.line_paint.push_back(std::move(s));
         }
     }
     // the page's Remove shadows switch: off, neither the shading map nor the shadow net
@@ -1124,6 +1146,10 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         } else {
             o.flat_nets = flat_nets_fn(bgr, rq, *flat_g->inf, &nets, hr_g->inf.get());
         }
+        // run_photo's own net call: SD-HR on a page that fills the photo, with a grey margin (full_frame_net)
+        o.uv_net = [flat_g, hr_g](int model, std::vector<float>& io) {
+            return uv_net_fn(model == 2 && hr_g && hr_g->inf ? *hr_g->inf : *flat_g->inf)(model, io);
+        };
     }
     // the shadow net, after SyntheticDoc's grid (as with the Kotlin ShadeNet)
     NetCall shade;
@@ -1461,6 +1487,34 @@ JNIEXPORT jfloat JNICALL Java_com_albus_flatscan_NativeLib_fingerOverlay(JNIEnv*
 // (a tap on blank paper).
 // The line editor's Add line: the printed line a rough stroke (page fractions x0, y0, x1, y1, ...) was drawn along
 // on this page (core/src/linefind.h), as page fractions along it; empty if there is none under most of the stroke.
+// Page > Perspective's Upright (core/src/upright.h): the Transform sliders [rotate, vertical, horizontal] that make the
+// page's lines (mode 0 Level .. 3 Auto) or the user's guides (mode 4 Guided: [x0, y0, x1, y1, ...] page fractions)
+// level and plumb on the page as shown (height / width hw); empty when there is nothing to go by
+JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_upright(JNIEnv* env, jclass, jlong h, jint mode, jfloatArray guides, jfloat hw) {
+    std::vector<float> out;
+    Session* s = session(h);
+    if (s && s->result.ok && mode >= 0 && mode <= 4) {
+        try {
+            std::vector<UprightLine> lines;
+            if (mode == (int)UprightMode::Guided) {
+                std::vector<float> v(guides ? (size_t)env->GetArrayLength(guides) : 0);
+                if (!v.empty()) env->GetFloatArrayRegion(guides, 0, (jsize)v.size(), v.data());
+                for (size_t i = 0; i + 3 < v.size(); i += 4) lines.push_back({v[i], v[i + 1], v[i + 2], v[i + 3], 1.0});
+            } else {
+                const PipelineResult& r = s->result;
+                lines = upright_lines(!r.page_unerased.empty() ? r.page_unerased : (!s->page_orig.empty() ? s->page_orig : r.page));
+            }
+            double sl[3] = {0, 0, 0};
+            if (upright_solve(lines, (UprightMode)mode, hw, sl)) out = {(float)sl[0], (float)sl[1], (float)sl[2]};
+        } catch (const std::exception& e) {
+            LOGI("upright failed: %s", e.what());
+        }
+    }
+    jfloatArray a = env->NewFloatArray((jsize)out.size());
+    if (!out.empty()) env->SetFloatArrayRegion(a, 0, (jsize)out.size(), out.data());
+    return a;
+}
+
 JNIEXPORT jfloatArray JNICALL Java_com_albus_flatscan_NativeLib_findLine(JNIEnv* env, jclass, jlong h, jfloatArray stroke) {
     std::vector<float> out;
     Session* s = session(h);
@@ -2049,6 +2103,9 @@ JNIEXPORT jstring JNICALL Java_com_albus_flatscan_NativeLib_batchPhoto(JNIEnv* e
         NetsResult nets;
         auto flat_g = group(g_flat), hr_g = group(g_hr);
         o.flat_nets = flat_nets_fn(img, rq, *flat_g->inf, &nets, hr_g->inf.get());
+        o.uv_net = [flat_g, hr_g](int model, std::vector<float>& io) {
+            return uv_net_fn(model == 2 && hr_g && hr_g->inf ? *hr_g->inf : *flat_g->inf)(model, io);
+        };
         PipelineResult r;
         auto t_run = Clock::now();
         try {

@@ -42,6 +42,7 @@ data class PageLook(
     val warmth: Float = 0f,
     val shape: PageShape = PageShape.AsScanned,
     val measuredHw: Float = 0f,
+    val transform: PageTransform = PageTransform(),   // the page's perspective (Page > Perspective), after the shape
 ) {
     val colorIdentity: Boolean get() = brightness == 0f && contrast == 0f && saturation == 0f && warmth == 0f
 
@@ -119,6 +120,7 @@ data class PageLook(
     fun toJson(): JSONObject = JSONObject().put("brightness", brightness.toDouble()).put("contrast", contrast.toDouble())
         .put("saturation", saturation.toDouble()).put("warmth", warmth.toDouble()).put("shape", shape.name)
         .put("measured_hw", measuredHw.toDouble())
+        .apply { if (transform != PageTransform()) put("transform", transform.toJson()) }
 
     companion object {
         private const val kSnap = 0.04f
@@ -131,32 +133,63 @@ data class PageLook(
                 saturation = f("saturation").coerceIn(-1f, 1f), warmth = f("warmth").coerceIn(-1f, 1f),
                 shape = PageShape.entries.firstOrNull { it.name == j.optString("shape") } ?: PageShape.AsScanned,
                 measuredHw = f("measured_hw").coerceIn(0f, 8f),
+                transform = PageTransform.fromJson(j.optJSONObject("transform")),
             )
         }
     }
 }
 
 /**
- * The finished page for export and thumbnails: the core's render [src] with [look] (shape, colour)
+ * The finished page for export and thumbnails: the core's render [src] with [look] (shape, perspective, colour)
  * turned [rotation] clockwise quarter turns. At the default look this is exactly [rotatedCopy].
  */
 fun finishPage(src: Bitmap, rotation: Int, look: PageLook): Bitmap {
     val cm = look.colorMatrix()
     val (w, h) = look.outputSize(src.width, src.height)
-    if (cm == null && w == src.width && h == src.height) return src.rotatedCopy(rotation)
+    val t = look.transform.matrix(h.toFloat() / w)
+    if (cm == null && t == null && w == src.width && h == src.height) return src.rotatedCopy(rotation)
     val q = ((rotation % 4) + 4) % 4
     val outW = if (q % 2 == 0) w else h
     val outH = if (q % 2 == 0) h else w
     val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
     val m = Matrix()
     m.postScale(w.toFloat() / src.width, h.toFloat() / src.height)
+    if (t != null) m.postConcat(pagePxMatrix(t, w.toFloat(), h.toFloat()))
     m.postTranslate(-w / 2f, -h / 2f)
     m.postRotate(90f * q)
     m.postTranslate(outW / 2f, outH / 2f)
     val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
     if (cm != null) paint.colorFilter = ColorMatrixColorFilter(cm)
-    Canvas(out).drawBitmap(src, m, paint)
+    val canvas = Canvas(out)
+    // a perspective change can bare a corner of the page: the paper's colour there, as the core fills beyond the page
+    if (t != null) canvas.drawRect(0f, 0f, outW.toFloat(), outH.toFloat(), Paint(paint).apply { color = paperColor(src) })
+    canvas.drawBitmap(src, m, paint)
     return out
+}
+
+/** [t] (PageTransform.matrix: page fractions to page fractions) as a matrix on a page of [w] x [h] px. */
+fun pagePxMatrix(t: DoubleArray, w: Float, h: Float): Matrix {
+    val d = doubleArrayOf(w.toDouble(), 0.0, 0.0, 0.0, h.toDouble(), 0.0, 0.0, 0.0, 1.0)
+    val dInv = doubleArrayOf(1.0 / w, 0.0, 0.0, 0.0, 1.0 / h, 0.0, 0.0, 0.0, 1.0)
+    val p = PageTransform.mul(d, PageTransform.mul(t, dInv))
+    return Matrix().apply { setValues(FloatArray(9) { p[it].toFloat() }) }
+}
+
+/** The page's paper colour: the median of 64 points along each side, 2 % in from its edges. */
+fun paperColor(b: Bitmap): Int {
+    if (b.width < 4 || b.height < 4) return android.graphics.Color.WHITE
+    val r = ArrayList<Int>(); val g = ArrayList<Int>(); val bl = ArrayList<Int>()
+    val ix = (b.width * 0.02f).toInt().coerceAtLeast(1)
+    val iy = (b.height * 0.02f).toInt().coerceAtLeast(1)
+    for (k in 0 until 64) {
+        val fx = ix + (b.width - 1 - 2 * ix) * k / 63
+        val fy = iy + (b.height - 1 - 2 * iy) * k / 63
+        for (c in intArrayOf(b.getPixel(fx, iy), b.getPixel(fx, b.height - 1 - iy), b.getPixel(ix, fy), b.getPixel(b.width - 1 - ix, fy))) {
+            r += android.graphics.Color.red(c); g += android.graphics.Color.green(c); bl += android.graphics.Color.blue(c)
+        }
+    }
+    fun med(v: ArrayList<Int>) = v.sorted()[v.size / 2]
+    return android.graphics.Color.rgb(med(r), med(g), med(bl))
 }
 
 /**

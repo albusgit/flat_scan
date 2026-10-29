@@ -352,6 +352,226 @@ cv::Mat ignore_mask(const std::vector<std::array<float, 4>>& rects, int W, int H
     return m;
 }
 
+// the user's line brush strokes of one mode (PipelineOptions::LinePaint) as a mask on the stage-1 page: drawn in
+// the output frame the user painted on, then turned back; empty if there are none
+cv::Mat paint_mask(const std::vector<PipelineOptions::LinePaint>& strokes, int mode, int W, int H, int rot) {
+    bool swap = rot == cv::ROTATE_90_CLOCKWISE || rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+    int Wr = swap ? H : W, Hr = swap ? W : H;
+    cv::Mat m;
+    for (const auto& s : strokes) {
+        if (s.mode != mode || s.pts.empty()) continue;
+        if (m.empty()) m = cv::Mat::zeros(Hr, Wr, CV_8U);
+        std::vector<cv::Point> p;
+        for (const auto& q : s.pts) p.emplace_back((int)std::lround(q.x * Wr), (int)std::lround(q.y * Hr));
+        const int rad = std::max(1, (int)std::lround(s.radius * Wr));
+        for (const auto& q : p) cv::circle(m, q, rad, 255, -1);
+        if (p.size() > 1) cv::polylines(m, p, false, 255, 2 * rad);
+    }
+    if (!m.empty() && rot >= 0)
+        cv::rotate(m, m, rot == cv::ROTATE_90_CLOCKWISE ? cv::ROTATE_90_COUNTERCLOCKWISE
+                         : rot == cv::ROTATE_90_COUNTERCLOCKWISE ? cv::ROTATE_90_CLOCKWISE : cv::ROTATE_180);
+    return m;
+}
+
+// Photos and drawings on a page (PipelineOptions::picture_guard): CV_8U of the page's size, 255 on them; empty if none.
+// On the page at half size with its text strokes taken out (a 7-px median there), per 16-px block (32 px of the page):
+// the colour spread (the root of the summed Lab variances, 8-bit Lab) above spread and the share of paper (within 30
+// of the page's paper lightness, chroma below 14) below paper make a picture block, unless the text-line net's text
+// maps (TH / TV, page size, may be empty) average above veto there (veto > 0). The blocks are closed and opened by one
+// block, pieces under 2 % of the page dropped, and the rest widened by 8 px.
+cv::Mat picture_mask(const cv::Mat& page, const cv::Mat& TH, const cv::Mat& TV, double spread, double paper, double veto) {
+    if (page.empty()) return cv::Mat();
+    cv::Mat bgr = page;
+    if (bgr.channels() == 4) cv::cvtColor(bgr, bgr, cv::COLOR_BGRA2BGR);
+    cv::Mat half, lab;
+    cv::resize(bgr, half, cv::Size((bgr.cols + 1) / 2, (bgr.rows + 1) / 2), 0, 0, cv::INTER_AREA);
+    cv::medianBlur(half, half, 7);
+    cv::cvtColor(half, lab, cv::COLOR_BGR2Lab);
+    // the paper's lightness: the 90th percentile of the grey pixels' L
+    std::vector<uint8_t> greyL;
+    for (int y = 0; y < lab.rows; y += 2)
+        for (int x = 0; x < lab.cols; x += 2) {
+            const cv::Vec3b v = lab.at<cv::Vec3b>(y, x);
+            if (std::hypot(v[1] - 128.0, v[2] - 128.0) < 14) greyL.push_back(v[0]);
+        }
+    if (greyL.size() < 100) return cv::Mat();
+    std::nth_element(greyL.begin(), greyL.begin() + greyL.size() * 9 / 10, greyL.end());
+    const double Lp = greyL[greyL.size() * 9 / 10];
+    const int B = 16, gw = (lab.cols + B - 1) / B, gh = (lab.rows + B - 1) / B;
+    cv::Mat blocks = cv::Mat::zeros(gh, gw, CV_8U);
+    for (int by = 0; by < gh; ++by)
+        for (int bx = 0; bx < gw; ++bx) {
+            const cv::Rect R = cv::Rect(bx * B, by * B, B, B) & cv::Rect(0, 0, lab.cols, lab.rows);
+            cv::Scalar mean, sd;
+            cv::meanStdDev(lab(R), mean, sd);
+            const double s = std::sqrt(sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]);
+            if (s <= spread) continue;
+            int np = 0;
+            for (int y = R.y; y < R.y + R.height; ++y)
+                for (int x = R.x; x < R.x + R.width; ++x) {
+                    const cv::Vec3b v = lab.at<cv::Vec3b>(y, x);
+                    np += std::fabs(v[0] - Lp) < 30 && std::hypot(v[1] - 128.0, v[2] - 128.0) < 14;
+                }
+            if (np >= paper * R.area()) continue;
+            if (veto > 0 && (!TH.empty() || !TV.empty())) {
+                const cv::Rect P = cv::Rect(R.x * 2, R.y * 2, R.width * 2, R.height * 2) & cv::Rect(0, 0, page.cols, page.rows);
+                double t = 0;
+                if (!TH.empty()) t = std::max(t, cv::mean(TH(P))[0]);
+                if (!TV.empty()) t = std::max(t, cv::mean(TV(P))[0]);
+                if (t > veto) continue;
+            }
+            blocks.at<uint8_t>(by, bx) = 255;
+        }
+    cv::morphologyEx(blocks, blocks, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+    cv::morphologyEx(blocks, blocks, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
+    cv::Mat lab_c, st, cen;
+    const int n = cv::connectedComponentsWithStats(blocks, lab_c, st, cen, 8, CV_32S);
+    bool any = false;
+    for (int i = 1; i < n; ++i) {
+        if (st.at<int>(i, cv::CC_STAT_AREA) < 0.02 * gw * gh) blocks.setTo(0, lab_c == i);
+        else any = true;
+    }
+    if (!any) return cv::Mat();
+    cv::Mat m;
+    cv::resize(blocks, m, cv::Size(gw * B * 2, gh * B * 2), 0, 0, cv::INTER_NEAREST);
+    m = m(cv::Rect(0, 0, page.cols, page.rows)).clone();
+    cv::dilate(m, m, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(17, 17)));
+    return m;
+}
+
+// Photographed objects on a page, a stricter test (PipelineOptions::picture_mode 2): colour that neither shading nor
+// one ink on one paper explains. On the page at a 400-px short side (3x3 median, 8-bit Lab), per 16-px block: an
+// affine plane taken out of L, a and b each (shading), then the distance e of each pixel's colour from the block's
+// main colour axis (one ink on one paper, a two-colour panel). q, the share of the block's pixels with e > 5 outside
+// the veto areas: >= 0.30 a seed, >= 0.15 support. Support closed by one block; blocks >= 20 % veto cleared; pieces
+// with >= 2 seeds, >= 4 blocks and >= 2 blocks each way kept, widened by 8 page px, the veto areas taken out again.
+// Veto areas: the text-line net's rows (TH / TV > 0.35, joined along the row over 7 px, >= 60 px long and >= 4x as
+// long as tall; their boxes widened across the row by half their height) and thin rules (PH / PV > 0.5, >= 100 px
+// long, median thickness <= 3 px; widened by 2 px) - not every rule: a bottle's edges are rules to the net too.
+// PH / PV / TH / TV: the net's maps, page size (any may be empty). CV_8U page size, 255 there; empty if none.
+cv::Mat picture_mask_strict(const cv::Mat& page, const cv::Mat& PH, const cv::Mat& PV, const cv::Mat& TH, const cv::Mat& TV) {
+    if (page.empty()) return cv::Mat();
+    cv::Mat bgr = page;
+    if (bgr.channels() == 4) cv::cvtColor(bgr, bgr, cv::COLOR_BGRA2BGR);
+    const double sc = 400.0 / std::min(bgr.cols, bgr.rows);
+    const cv::Size ws((int)std::lround(bgr.cols * sc), (int)std::lround(bgr.rows * sc));
+    cv::Mat small, lab;
+    cv::resize(bgr, small, ws, 0, 0, cv::INTER_AREA);
+    cv::medianBlur(small, small, 3);
+    cv::cvtColor(small, lab, cv::COLOR_BGR2Lab);
+    cv::Mat veto = cv::Mat::zeros(ws, CV_8U);
+    // text rows (hz: along x) on the working image; vertical ones transposed
+    auto rows_veto = [&](const cv::Mat& P, bool hz) {
+        if (P.empty()) return;
+        cv::Mat q;
+        cv::resize(P, q, ws, 0, 0, cv::INTER_LINEAR);
+        if (!hz) q = q.t();
+        cv::Mat b = q > 0.35f, lb, st, cen;
+        cv::morphologyEx(b, b, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 1)));
+        const int n = cv::connectedComponentsWithStats(b, lb, st, cen, 8, CV_32S);
+        cv::Mat v = cv::Mat::zeros(b.size(), CV_8U);
+        for (int i = 1; i < n; ++i) {
+            const int x = st.at<int>(i, 0), y = st.at<int>(i, 1), w = st.at<int>(i, 2), h = st.at<int>(i, 3);
+            if (w < 60 || w < 4 * h) continue;
+            const int e = (h + 1) / 2;
+            v(cv::Rect(x, y - e, w, h + 2 * e) & cv::Rect(0, 0, v.cols, v.rows)).setTo(255);
+        }
+        veto |= hz ? v : cv::Mat(v.t());
+    };
+    // thin rules
+    auto rules_veto = [&](const cv::Mat& P, bool hz) {
+        if (P.empty()) return;
+        cv::Mat q;
+        cv::resize(P, q, ws, 0, 0, cv::INTER_LINEAR);
+        if (!hz) q = q.t();
+        cv::Mat b = q > 0.5f, lb, st, cen;
+        const int n = cv::connectedComponentsWithStats(b, lb, st, cen, 8, CV_32S);
+        cv::Mat v = cv::Mat::zeros(b.size(), CV_8U);
+        for (int i = 1; i < n; ++i) {
+            const int x = st.at<int>(i, 0), y = st.at<int>(i, 1), w = st.at<int>(i, 2), h = st.at<int>(i, 3);
+            if (w < 100) continue;
+            std::vector<int> th;
+            for (int c = x; c < x + w; ++c) {
+                int k = 0;
+                for (int r = y; r < y + h; ++r) k += lb.at<int>(r, c) == i;
+                if (k) th.push_back(k);
+            }
+            std::nth_element(th.begin(), th.begin() + th.size() / 2, th.end());
+            if (th[th.size() / 2] > 3) continue;
+            v.setTo(255, lb == i);
+        }
+        cv::dilate(v, v, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5)));
+        veto |= hz ? v : cv::Mat(v.t());
+    };
+    rows_veto(TH, true);
+    rows_veto(TV, false);
+    rules_veto(PH, true);
+    rules_veto(PV, false);
+    const int B = 16, gw = ws.width / B, gh = ws.height / B;
+    if (gw < 2 || gh < 2) return cv::Mat();
+    cv::Mat seed = cv::Mat::zeros(gh, gw, CV_8U), sup = seed.clone(), vetoed = seed.clone();
+    std::vector<std::array<double, 3>> res(B * B);
+    for (int by = 0; by < gh; ++by)
+        for (int bx = 0; bx < gw; ++bx) {
+            const cv::Rect R(bx * B, by * B, B, B);
+            if (cv::countNonZero(veto(R)) >= 0.2 * B * B) vetoed.at<uint8_t>(by, bx) = 255;
+            // each channel's affine plane (x, y centred: the mean and two slopes), taken out
+            for (int k = 0; k < 3; ++k) {
+                double m = 0, sx = 0, sy = 0;
+                for (int y = 0; y < B; ++y)
+                    for (int x = 0; x < B; ++x) {
+                        const double v = lab.at<cv::Vec3b>(R.y + y, R.x + x)[k];
+                        m += v; sx += v * (x - 7.5); sy += v * (y - 7.5);
+                    }
+                const double suu = B * 340.0;   // the sum of (x - 7.5)^2 over the block
+                m /= B * B; sx /= suu; sy /= suu;
+                for (int y = 0; y < B; ++y)
+                    for (int x = 0; x < B; ++x)
+                        res[y * B + x][k] = lab.at<cv::Vec3b>(R.y + y, R.x + x)[k] - m - sx * (x - 7.5) - sy * (y - 7.5);
+            }
+            cv::Mat C = cv::Mat::zeros(3, 3, CV_64F);
+            for (const auto& r : res)
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) C.at<double>(a, b) += r[a] * r[b];
+            cv::Mat ev, evec;
+            cv::eigen(C, ev, evec);
+            const double ax = evec.at<double>(0, 0), ay = evec.at<double>(0, 1), az = evec.at<double>(0, 2);
+            int hit = 0;
+            for (int y = 0; y < B; ++y)
+                for (int x = 0; x < B; ++x) {
+                    if (veto.at<uint8_t>(R.y + y, R.x + x)) continue;
+                    const auto& r = res[y * B + x];
+                    const double t = r[0] * ax + r[1] * ay + r[2] * az;
+                    hit += r[0] * r[0] + r[1] * r[1] + r[2] * r[2] - t * t > 25;
+                }
+            const double q = hit / double(B * B);
+            if (q >= 0.30) seed.at<uint8_t>(by, bx) = 255;
+            if (q >= 0.15) sup.at<uint8_t>(by, bx) = 255;
+        }
+    cv::morphologyEx(sup, sup, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+    sup.setTo(0, vetoed);
+    seed.setTo(0, vetoed);
+    cv::Mat lb, st, cen;
+    const int n = cv::connectedComponentsWithStats(sup, lb, st, cen, 8, CV_32S);
+    cv::Mat blocks = cv::Mat::zeros(gh, gw, CV_8U);
+    bool any = false;
+    for (int i = 1; i < n; ++i) {
+        if (st.at<int>(i, cv::CC_STAT_AREA) < 4 || st.at<int>(i, cv::CC_STAT_WIDTH) < 2 || st.at<int>(i, cv::CC_STAT_HEIGHT) < 2) continue;
+        const cv::Mat piece = lb == i;
+        if (cv::countNonZero(seed & piece) < 2) continue;
+        blocks.setTo(255, piece);
+        any = true;
+    }
+    if (!any) return cv::Mat();
+    cv::Mat full = cv::Mat::zeros(ws, CV_8U), m, vp;
+    cv::resize(blocks, full(cv::Rect(0, 0, gw * B, gh * B)), cv::Size(gw * B, gh * B), 0, 0, cv::INTER_NEAREST);
+    cv::resize(full, m, bgr.size(), 0, 0, cv::INTER_NEAREST);
+    cv::dilate(m, m, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(17, 17)));
+    cv::resize(veto, vp, bgr.size(), 0, 0, cv::INTER_NEAREST);
+    m.setTo(0, vp);
+    return cv::countNonZero(m) ? m : cv::Mat();
+}
+
 // The shadow net on the flattened page (PipelineOptions::shade_net): the page at long_side,
 // portrait (landscape pages turned for the net and back), its shading map bilinearly back at page
 // size, the page divided by it: brighten only, by at most 1 / floor (PipelineOptions::shade_floor; the map
@@ -687,7 +907,14 @@ double text_row_spread(const cv::Mat& page_bgr, int* rows_out) {
 
 // local area change of the warp map's line stage, |det(I + dF) - 1| per grid cell (the outer 2
 // cells left out): its 99th percentile; frac = the share of cells above 0.2
-double local_distortion(const WarpDebug& d, double* frac) {
+// a field cell within band x the page's shorter side (w x h px) of the page's border (PipelineOptions::edge_stretch_band)
+bool in_edge_band(const Field& F, int i, int j, int w, int h, double band) {
+    if (band <= 0) return false;
+    const double b = band * std::min(w, h), x = (j + 0.5) * F.g, y = (i + 0.5) * F.g;
+    return x < b || y < b || x > w - b || y > h - b;
+}
+
+double local_distortion(const WarpDebug& d, double* frac, int w, int h, double band, double allow) {
     const Field &Fx = d.Fx, &Fy = d.Fy;
     std::vector<double> v;
     for (int i = 2; i + 3 < Fx.gh; ++i)
@@ -695,7 +922,8 @@ double local_distortion(const WarpDebug& d, double* frac) {
             auto V = [&](const Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
             double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
             double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
-            v.push_back(std::fabs((1 + xx) * (1 + yy) - xy * yx - 1));
+            const double q = std::fabs((1 + xx) * (1 + yy) - xy * yx - 1);
+            v.push_back(in_edge_band(Fx, i, j, w, h, band) ? std::max(0.0, q - allow) : q);   // the edge band: allow more
         }
     *frac = 0;
     if (v.empty()) return 0;
@@ -709,7 +937,7 @@ double local_distortion(const WarpDebug& d, double* frac) {
 
 // the spots where the line stage overstretches the page (|det J - 1| > 0.2 per field cell, the outer
 // 2 cells left out as in local_distortion), widened by 24 px: CV_8U, w x h, 255 there
-cv::Mat distortion_spots(const WarpDebug& d, int w, int h) {
+cv::Mat distortion_spots(const WarpDebug& d, int w, int h, double band, double allow) {
     const Field &Fx = d.Fx, &Fy = d.Fy;
     cv::Mat m = cv::Mat::zeros(h, w, CV_8U);
     for (int i = 2; i + 3 < Fx.gh; ++i)
@@ -717,7 +945,7 @@ cv::Mat distortion_spots(const WarpDebug& d, int w, int h) {
             auto V = [&](const Field& F, int a, int b) { return F.v[(size_t)a * F.gw + b]; };
             double xx = (V(Fx, i, j + 1) - V(Fx, i, j)) / Fx.g, xy = (V(Fx, i + 1, j) - V(Fx, i, j)) / Fx.g;
             double yx = (V(Fy, i, j + 1) - V(Fy, i, j)) / Fy.g, yy = (V(Fy, i + 1, j) - V(Fy, i, j)) / Fy.g;
-            if (std::fabs((1 + xx) * (1 + yy) - xy * yx - 1) > 0.2)
+            if (std::fabs((1 + xx) * (1 + yy) - xy * yx - 1) > 0.2 + (in_edge_band(Fx, i, j, w, h, band) ? allow : 0.0))
                 cv::rectangle(m, cv::Rect(j * Fx.g, i * Fx.g, Fx.g, Fx.g), 255, -1);
         }
     cv::dilate(m, m, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(49, 49)));
@@ -859,6 +1087,11 @@ std::vector<std::array<float, 5>> fitted_lines(const WarpDebug& d, int W, int H,
         const auto& L = d.E_lines[i];
         if ((int)i < d.n_edges_h) add(2, L[1], L[0], L[2], L[0]);
         else add(2, L[0], L[1], L[0], L[2]);
+    }
+    for (size_t i = 0; i < d.D_lines.size(); ++i) {   // dashed rules, drawn as ruled lines
+        const auto& L = d.D_lines[i];
+        if ((int)i < d.n_dash_h) add(0, L[1], L[0], L[2], L[0]);
+        else add(0, L[0], L[1], L[0], L[2]);
     }
     // text rows: consecutive samples of one row share its ideal position
     for (size_t i = 0; i < d.T.size();) {
@@ -1379,7 +1612,17 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         return true;
     };
     const RuleNetFn* netp = opt.rule_net ? &net : nullptr;
-    const cv::Mat* ig = ignore.empty() ? nullptr : &ignore;
+    // the pictures on the page give no lines (the net's text maps, for the veto, are the ones the line stage takes)
+    cv::Mat ig_all = ignore;
+    if (opt.picture_guard) {
+        cv::Mat PH, PV, TH, TV;
+        if (netp) rule_probs(page, net, PH, PV, &TH, &TV);
+        r.picture_mask = opt.picture_mode == 2 ? picture_mask_strict(page, PH, PV, TH, TV)
+                                               : picture_mask(page, TH, TV, opt.picture_spread, opt.picture_paper, opt.picture_text_veto);
+        r.picture_share = r.picture_mask.empty() ? 0 : cv::countNonZero(r.picture_mask) / (double)r.picture_mask.total();
+        if (!r.picture_mask.empty()) ig_all = ignore.empty() ? r.picture_mask : cv::Mat(ignore | r.picture_mask);
+    }
+    const cv::Mat* ig = ig_all.empty() ? nullptr : &ig_all;
     WarpDebug w0;
     w0.keep_traced = opt.faint_lines;   // for the local retry below
     GridMap m0 = unwarp_map(page, &w0, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp);
@@ -1391,7 +1634,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     // a candidate is kept if it neither overstretches the page nor leaves those rules less straight
     // than the page as it is (a fallback that drops some lines can bend the rules they were on)
     auto take = [&](WarpDebug& w, GridMap& m) {
-        double f = 0, q = local_distortion(w, &f);
+        double f = 0, q = local_distortion(w, &f, page.cols, page.rows, opt.edge_stretch_band, opt.edge_stretch_allow);
         if (r.line_distortion < 0) r.line_distortion = q;
         if (q > opt.max_line_distortion || f > opt.max_line_distortion_frac) return false;
         if (opt.max_local_rescale > 0) r.bumps_faded = soften_bumps(m, opt.max_local_rescale, extension_support(w, m.gw, m.gh, m.stride));
@@ -1427,7 +1670,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         WarpDebug w;
         GridMap m2 = unwarp_map(page2, &w, nullptr, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges,
                                 opt.rule_net ? &net2 : nullptr);
-        double f = 0, q = local_distortion(w, &f);
+        double f = 0, q = local_distortion(w, &f, page2.cols, page2.rows, opt.edge_stretch_band, opt.edge_stretch_allow);
         r.second_pass[0] = q;
         if (q > opt.max_line_distortion || f > opt.max_line_distortion_frac) return;
         const PageTraces T2 = page_traces(w);
@@ -1452,7 +1695,7 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
         // dropping only their samples there straightened a rule on one side of a spot and not on
         // the other); the nets' page stays as it is there
         report(opt, 50, "Tracing lines again, without the overstretched spots");
-        cv::Mat spots = distortion_spots(w0, page.cols, page.rows);
+        cv::Mat spots = distortion_spots(w0, page.cols, page.rows, opt.edge_stretch_band, opt.edge_stretch_allow);
         WarpDebug w1;
         GridMap m1 = unwarp_map(page, &w1, ig, opt.share_rows, opt.faint_lines, opt.robust_solve, opt.colour_edges, netp, &spots, &w0);
         if (take(w1, m1)) { r.lines_spots_dropped = true; second_pass(m1); return m1; }
@@ -1468,6 +1711,71 @@ GridMap neural_line_stage(const cv::Mat& page, const cv::Mat& ignore, const Pipe
     r.lines_rejected = true;
     r.bumps_faded = 0;
     return identity_grid(page.cols, page.rows);
+}
+
+// The shape lock (PipelineOptions::lock_shapes) on the line stage's map m (output -> page, 4-px grid, the stage-1
+// page's frame): in each piece of lock (CV_8U, page size, 255 there) the map becomes one rigid motion (rotation and
+// shift, least squares), fitted to the map on a ring around the piece - the paper beside it, so the piece goes along
+// with the page around it - or to the piece itself where that ring is off the grid; around the piece the map blends
+// back to the line stage's over band px (smoothstep of the distance). The page's outline is not held: it fades back
+// to the line stage's map within the ring of the grid's border (moved, it let the finger fill take the poster's orange
+// edge beside a locked bottle for a hand). Returns the share of the grid held rigid.
+double lock_shapes(GridMap& m, const cv::Mat& lock, double band) {
+    cv::Mat out(m.gh, m.gw, CV_8U, cv::Scalar(255));   // 0 on the locked nodes (distanceTransform measures to zeros)
+    auto on = [&](double x, double y) {
+        return lock.at<uint8_t>(std::clamp((int)std::lround(y), 0, lock.rows - 1), std::clamp((int)std::lround(x), 0, lock.cols - 1)) != 0;
+    };
+    int n_in = 0;
+    for (int i = 0; i < m.gh; ++i)
+        for (int j = 0; j < m.gw; ++j)
+            if (on(m.stride * j, m.stride * i) || on(m.X(i, j), m.Y(i, j))) { out.at<uint8_t>(i, j) = 0; ++n_in; }
+    if (n_in == 0) return 0;
+    cv::Mat dist, lab;
+    cv::distanceTransform(out, dist, lab, cv::DIST_L2, cv::DIST_MASK_PRECISE, cv::DIST_LABEL_CCOMP);
+    const double bn = std::max(2.0, band / m.stride), ring = std::max(2.0, 0.25 * bn);   // in grid steps
+    double maxl = 0;
+    cv::minMaxLoc(lab, nullptr, &maxl);
+    const int nl = (int)maxl + 1;
+    std::vector<std::vector<std::array<double, 4>>> rim(nl), in(nl);   // (output x, y, page x, y) per piece
+    for (int i = 0; i < m.gh; ++i)
+        for (int j = 0; j < m.gw; ++j) {
+            const float d = dist.at<float>(i, j);
+            const int l = lab.at<int>(i, j);
+            if (d == 0) in[l].push_back({(double)m.stride * j, (double)m.stride * i, m.X(i, j), m.Y(i, j)});
+            else if (d <= ring) rim[l].push_back({(double)m.stride * j, (double)m.stride * i, m.X(i, j), m.Y(i, j)});
+        }
+    std::vector<std::array<double, 6>> fit(nl);   // cos, sin, output centre, page centre: q = R (p - pc) + qc
+    std::vector<char> ok(nl, 0);
+    for (int l = 0; l < nl; ++l) {
+        const auto& pq = rim[l].size() >= 12 ? rim[l] : in[l];
+        if (in[l].empty() || pq.size() < 4) continue;
+        double pcx = 0, pcy = 0, qcx = 0, qcy = 0;
+        for (const auto& v : pq) { pcx += v[0]; pcy += v[1]; qcx += v[2]; qcy += v[3]; }
+        const double n = (double)pq.size();
+        pcx /= n; pcy /= n; qcx /= n; qcy /= n;
+        double dot = 0, crs = 0;
+        for (const auto& v : pq) {
+            const double ax = v[0] - pcx, ay = v[1] - pcy, bx = v[2] - qcx, by = v[3] - qcy;
+            dot += ax * bx + ay * by; crs += ax * by - ay * bx;
+        }
+        const double th = std::atan2(crs, dot);
+        fit[l] = {std::cos(th), std::sin(th), pcx, pcy, qcx, qcy};
+        ok[l] = 1;
+    }
+    for (int i = 0; i < m.gh; ++i)
+        for (int j = 0; j < m.gw; ++j) {
+            const double d = dist.at<float>(i, j);
+            const int l = lab.at<int>(i, j);
+            if (!ok[l] || d >= bn) continue;
+            const auto& f = fit[l];
+            const double t = d / bn, e = std::min(1.0, std::min({i, j, m.gh - 1 - i, m.gw - 1 - j}) / ring);
+            const double w = (1 - t * t * (3 - 2 * t)) * e * e * (3 - 2 * e);   // the page's outline keeps the line stage's
+            const double ax = m.stride * j - f[2], ay = m.stride * i - f[3];
+            const double sx = f[4] + f[0] * ax - f[1] * ay, sy = f[5] + f[1] * ax + f[0] * ay;
+            m.X(i, j) = (float)(w * sx + (1 - w) * m.X(i, j));
+            m.Y(i, j) = (float)(w * sy + (1 - w) * m.Y(i, j));
+        }
+    return n_in / (double)(m.gw * m.gh);
 }
 
 // Where two grids of the same page put its border: per side (top, right, bottom, left of the page), the share of
@@ -1736,7 +2044,45 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                     (c.paper < 0 || c.paper >= opt.uv_own_min_paper);
             if (by_finder || c.own) ok.push_back(std::move(c));
         }
-        r.uv_agreement = best_agree;
+        // a page that fills the photo: the nets saw no margin round it (the photo ends inside the paper), drew its
+        // edges inside the photo and agreed with the frame nowhere - the page was only perspective-corrected.
+        // SD-HR once more on the whole photo with a grey margin past its edges (it learnt pages on a background):
+        // used as any finder's grid is, when its outline agrees with the frame (PipelineOptions::full_frame_net)
+        if (ok.empty() && fills_photo && opt.full_frame_net && opt.uv_net && !opt.corners_edited) {
+            auto tf = Clock::now();
+            const double w1 = photo.cols - 1.0, h1 = photo.rows - 1.0;
+            const std::array<cv::Point2d, 4> frame = {cv::Point2d(0, 0), cv::Point2d(w1, 0), cv::Point2d(w1, h1), cv::Point2d(0, h1)};
+            const UvCrop fc = uv_crop(photo.size(), frame, 2, true);
+            std::vector<float> io = uv_input(photo, fc);
+            if (opt.uv_net(2, io)) {
+                Cand c;
+                c.g = uv_grid(io.data(), fc);
+                c.model = 2;
+                c.agree = uv_agreement(c.g, corners, photo.size());
+                if (use_mask) c.agree = std::max(c.agree, c.agree_mask = uv_agreement(c.g, pc.det.paper, pc.scale));
+                r.uv_full_frame_agree = c.agree;
+                if (c.g.ok && !grid_broken(uv_grid_validity(c.g, photo.size())) && c.g.turned == landscape &&
+                    c.agree >= (use_mask ? opt.uv_min_agreement_hr : need)) {
+                    // the grid has to straighten the text rows the homography leaves bent (full_frame_min_gain)
+                    Unroll Us = Uh;
+                    Us.W = W / 2;
+                    Us.H = H / 2;
+                    int rows[2] = {0, 0};
+                    const double sh = text_row_spread(remap_unroll(photo, Us, opt.use_gpu), &rows[0]);
+                    Us.mode = GeomMode::Neural;
+                    Us.uv = c.g;
+                    const double sg = text_row_spread(remap_unroll(photo, Us, opt.use_gpu), &rows[1]);
+                    r.uv_full_frame_spread[0] = rows[0] >= 5 ? sh : -1;
+                    r.uv_full_frame_spread[1] = rows[1] >= 5 ? sg : -1;
+                    if (rows[0] >= 5 && rows[1] >= 5 && sg <= sh - opt.full_frame_min_gain) {
+                        ok.push_back(std::move(c));
+                        r.uv_full_frame = true;
+                    }
+                }
+            }
+            r.ms.emplace_back("full-frame flattening pass", ms_since(tf));
+        }
+        r.uv_agreement = std::max(best_agree, r.uv_full_frame_agree);
         if (raw[0].ok && raw[1].ok && raw[0].turned == raw[1].turned) net_edge_gap(raw[0], raw[1], opt.edge_gap, r.net_edge_gap);
         // grids that define the page themselves: one page frame for all candidates
         bool any_finder = false;
@@ -1892,7 +2238,14 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
             // Not when the grid drew the page itself (the page finder's outline was overruled).
             if (opt.flat_edge_bow > 0 && !r.uv_defines_page && !snapped_lost) {
                 bool straight = true;
-                for (double b : r.side_bow) straight &= b >= 0 && b <= opt.flat_edge_bow;
+                int sides = 0;
+                for (int k = 0; k < 4; ++k) {
+                    // a side on the photo's own edge is straight because the photo is (flat_min_sides)
+                    if (opt.flat_min_sides > 0 && (r.side_edge[k] < 0 || r.side_edge[k] >= opt.flat_frame_side)) continue;
+                    straight &= r.side_bow[k] >= 0 && r.side_bow[k] <= opt.flat_edge_bow;
+                    ++sides;
+                }
+                straight &= sides >= std::max(1, opt.flat_min_sides);
                 if (straight) {
                     U = Uh;
                     r.mode = GeomMode::Homography;
@@ -1956,10 +2309,16 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     t0 = Clock::now();
     report(opt, 30, "Tracing lines and solving the warp map");
     GridMap warp4;
-    if (opt.perspective_only || !opt.line_stage) {
+    // the line brush: Keep as is joins the ignore areas, and with any Straighten paint everything outside it does
+    const cv::Mat keep = paint_mask(opt.line_paint, 1, W, H, r.rot), only = paint_mask(opt.line_paint, 0, W, H, r.rot);
+    cv::Mat painted_out = keep;
+    if (!only.empty()) painted_out = keep.empty() ? cv::Mat(~only) : cv::Mat(keep | ~only);
+    r.lines_painted = !only.empty();
+    if (opt.perspective_only || !opt.line_stage || (!opt.auto_lines && only.empty())) {
         warp4 = identity_grid(W, H);
     } else {
         cv::Mat ignore = ignore_mask(opt.ignore, W, H, r.rot);
+        if (!painted_out.empty()) ignore = ignore.empty() ? painted_out : cv::Mat(ignore | painted_out);
         if (r.mode == GeomMode::Neural) {
             warp4 = neural_line_stage(stage1, ignore, opt, r);
         } else {
@@ -1967,8 +2326,25 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                                opt.rule_net ? &opt.rule_net : nullptr);
         }
         r.lines = fitted_lines(r.warp, W, H, r.rot);
-        apply_user_lines(stage1, warp4, opt.user_lines, W, H, r.rot, r);
+        // the lines the paint left out are not shown as used (the ignore areas' are: the line editor marks them)
+        if (!painted_out.empty()) {
+            const bool swap = r.rot == cv::ROTATE_90_CLOCKWISE || r.rot == cv::ROTATE_90_COUNTERCLOCKWISE;
+            const double Wr = swap ? H : W, Hr = swap ? W : H;
+            r.lines.erase(std::remove_if(r.lines.begin(), r.lines.end(), [&](const std::array<float, 5>& l) {
+                              cv::Point2d p = unrotate_pt((l[1] + l[3]) / 2 * Wr, (l[2] + l[4]) / 2 * Hr, W, H, r.rot);
+                              int x = std::clamp((int)std::lround(p.x), 0, W - 1), y = std::clamp((int)std::lround(p.y), 0, H - 1);
+                              return painted_out.at<uint8_t>(y, x) != 0;
+                          }), r.lines.end());
+        }
     }
+    // Keep as is (and the pictures picture_guard found) hold their shape: only a rigid motion with the page around them
+    if (opt.lock_shapes && !opt.perspective_only) {
+        cv::Mat lock = keep;
+        if (!r.picture_mask.empty()) lock = lock.empty() ? r.picture_mask : cv::Mat(lock | r.picture_mask);
+        if (!lock.empty()) r.shape_locked = lock_shapes(warp4, lock, opt.lock_band * std::min(W, H));
+    }
+    // the lines the user drew straighten the page as the user saw it, with or without the line stage
+    if (!opt.perspective_only) apply_user_lines(stage1, warp4, opt.user_lines, W, H, r.rot, r);
     r.rule_net = !r.warp.PH.empty();
     r.net_dropped = r.warp.net.dropped; r.net_added = r.warp.net.added; r.net_joined = r.warp.net.joined; r.net_kept = r.warp.S2.n_net_kept;
     r.stage1 = stage1;

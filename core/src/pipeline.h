@@ -111,6 +111,20 @@ struct PipelineOptions {
     // magazine page 0.15, a cookbook 0.06 - 0.09, a curled coupon strip 0.056), the homography replaces the grid
     // (0: off)
     double flat_edge_bow = 0.012;
+    // ... judged on the sides that are the paper's own edge (side_edge <= side_edge_max): with fewer than
+    // flat_min_sides of them the paper is not called flat (a page that fills the photo has only the photo's straight
+    // edges, which say nothing about its curl). 0: every side counts, the photo's edge too (before round 19)
+    int flat_min_sides = 2;
+    double flat_frame_side = 0.9;   // ... a side is the photo's edge from this share of its points on it (side_edge)
+    // a page that fills the photo, where neither net's grid agreed with the frame (they learnt pages on a background
+    // and drew its edges inside the photo): SD-HR once more on the whole photo with a grey margin past its edges
+    // (uv_crop pad), through uv_net; its grid is used when it agrees with the frame as any grid must
+    // (PipelineResult::uv_full_frame). Off, or no uv_net: the homography, as before round 19.
+    bool full_frame_net = true;
+    // ... and only when its half-size page's text rows are straighter than the homography's by this (text-row angle
+    // spread, deg; both pages with >= 5 rows): a flat form filling the photo is right as the homography has it,
+    // and the net's grid only bends it (round 19: the wagering form's ruled box came out wavy)
+    double full_frame_min_gain = 0.5;
     // both nets accepted: where the chosen grid's border misses the paper by more than fuse_miss x the page's size
     // and the other's fits it, the other grid is blended in around there (uv_fuse_border). 0: off.
     double fuse_miss = 0.015;
@@ -161,6 +175,8 @@ struct PipelineOptions {
     FlatNetsFn flat_nets;
     bool overlap_nets = true;
     bool line_stage = true;           // the warp map (line refinement) on top of stage 1
+    bool auto_lines = true;           // ... straightens every printed line it finds; off: only the lines in the user's
+                                      // Straighten paint (line_paint) and the lines the user drew (user_lines)
     bool share_rows = true;           // UVDoc pages: pieces of one ruled line share one ideal (warpmap)
     bool robust_solve = true;         // IRLS in the warp map: samples the field does not follow lose weight (warpmap)
     bool colour_edges = true;         // neural pages: long straight boundaries between colour areas are lines too (warpmap colour_edges)
@@ -175,6 +191,31 @@ struct PipelineOptions {
                                       // 0.15 also faded real crease corrections, 0.5 left part of a bump)
     double max_line_distortion = 0.2;        // UVDoc pages: line refinement kept only below these
     double max_line_distortion_frac = 0.01;  // (local area change p99, share of cells above 0.2)
+    // ... with edge_stretch_allow more allowed near the border: a cell within edge_stretch_band x the page's shorter
+    // side of it counts its local area change less that much in both (and in the overstretched spots the retry drops
+    // lines through) - it never counts more than before. A page curls at its edges and
+    // corners, where the nets leave it compressed and straightening its lines needs a real stretch: the coupon's
+    // curled corner (its dashed border, header and title rows) was dropped as "overstretched" (round 19). Inside,
+    // where the nets have flattened it, a stretch is a tracing failure (music staves, a rule traced into text).
+    // 0: the whole page measured (before round 19).
+    double edge_stretch_band = 0.1;
+    double edge_stretch_allow = 0.6;
+    // Neural pages: photos and drawings printed on the page (product shots, illustrations) give the line stage no lines
+    // (their edges and the text on them are curved by what they show, not by the paper): picture_mask in pipeline.cpp,
+    // its areas joined to the ignore areas. Blocks of 32 px whose colour spread (with the text strokes taken out) is
+    // above picture_spread and whose share of paper is below picture_paper; the text-line net vetoes blocks it marks as
+    // text more than picture_text_veto (mean probability; 0: no veto). Off until measured (round 19: the poster's
+    // bottles were bent to straighten their caps and label bands).
+    bool picture_guard = false;
+    double picture_spread = 18, picture_paper = 0.5, picture_text_veto = 0;
+    int picture_mode = 1;             // 2: picture_mask_strict (colour that neither shading nor one ink on one paper explains)
+    // The shape lock: where the user painted Keep as is (and where picture_guard found pictures) the line stage may move
+    // the page only rigidly - a rotation and a shift, fitted to the correction just around the area (the paper there),
+    // blended into the rest over lock_band x the page's shorter side. Leaving the lines there out (the ignore path) is
+    // not enough: the smooth solve still bends an area with no lines in it to follow the lines beside it (round 19, the
+    // poster's bottles with Keep as is over them: local area -1.2 % / +2.5 % of the nets' page).
+    bool lock_shapes = true;
+    double lock_band = 0.06;
     const float* seg_logits = nullptr;   // page-finder net output for this photo (2 x 256 x 256);
                                          // null: colour-threshold paper_mask (the feature flag is off)
     int page_index = 0;               // book spread: which page of the photo (0 = the larger one)
@@ -208,6 +249,12 @@ struct PipelineOptions {
     // groups before it made; each is straightened in turn after the line stage (apply_user_lines).
     struct UserLine { int group = 0; std::vector<cv::Point2f> pts; };
     std::vector<UserLine> user_lines;
+    // app: the line brush (the Flatten tab's paint): strokes as fractions of the output page (rotated frame) as the user
+    // saw it, radius a fraction of that page's width. Straighten (mode 0): when any is painted, the line stage uses only
+    // the lines there, auto_lines or not. Keep as is (mode 1): the lines there are left out (as the ignore areas), so a
+    // picture (a product photo, a drawing) moves with the paper around it and is not bent to straighten its edges.
+    struct LinePaint { int mode = 0; float radius = 0.02f; std::vector<cv::Point2f> pts; };
+    std::vector<LinePaint> line_paint;
     std::function<void(int, const char*)> progress;   // percent, stage name
     // The shadow net (ShadeNet, tools/shadow_net): called with the flattened page at shade_long_side
     // (portrait; planar BGR in [0, 1], 3 x h x w, sides multiples of 32), it replaces the buffer with
@@ -274,6 +321,9 @@ struct PipelineResult {
     bool surface_unfounded = false;   // the surface model was set aside: no paper edge to fit, or all of them straight
     bool flat_page = false;           // the net's grid was set aside: the paper is flat (PipelineOptions::flat_edge_bow)
     bool uv_rejected = false;         // UVDoc ran but disagreed with the page finder (fallback used)
+    bool uv_full_frame = false;       // the grid is SD-HR's on the padded whole photo (PipelineOptions::full_frame_net)
+    double uv_full_frame_agree = -1;  // ... its outline's agreement with the frame (-1: not run)
+    double uv_full_frame_spread[2] = {-1, -1};   // ... text-row spread of the homography's, the grid's half-size page (deg)
     int uv_zoom_quarters = -1;        // zoomed pass: quarters whose grid was used (-1: not run)
     double uv_zoom_spread[2] = {-1, -1};   // ... text-row spread with the first / the zoomed grid
     bool uv_zoom = false;             // ... the zoomed grid was kept
@@ -298,6 +348,10 @@ struct PipelineResult {
     cv::Mat finger_mask;              // CV_8U page size, 255 = filled as a finger (empty: none)
     bool fingers_over_text = false;   // ... and text runs into it
     int user_lines_used = 0;          // the user's lines (user_lines) that found ink and were straightened
+    bool lines_painted = false;       // the line stage ran on the Straighten paint only (line_paint)
+    double picture_share = -1;        // picture_guard: the share of the page it found pictures on (-1: not run)
+    cv::Mat picture_mask;             // ... and where (CV_8U, the stage-1 page, 255 there; empty if none)
+    double shape_locked = -1;         // lock_shapes: the share of the page held rigid (-1: nothing to lock)
     cv::Mat page_unerased, paper_unerased;   // with keep_unerased: page and paper before the finger fill
     bool shadows_removed = false;     // the shading map was applied to the page
     bool shade_net = false;           // ... the shadow net's map (ShadeNet)
@@ -350,6 +404,9 @@ void fill_with_paper(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper);
 void fill_finger(cv::Mat& page_bgra, const cv::Mat& mask, cv::Mat* paper);
 // Whether print runs into [mask] from the page around it (ink in a ring outside it, away from the border).
 bool finger_over_text(const cv::Mat& page_bgra, const cv::Mat& mask, const cv::Mat& paper);
+// The shape lock (PipelineOptions::lock_shapes) on a line-stage map (output -> page, 4-px grid): each piece of lock
+// (CV_8U, page size) only moves rigidly with the page around it, blended back over band px; the share held rigid.
+double lock_shapes(GridMap& m, const cv::Mat& lock, double band);
 // Flatbed scan: warp map only (warpmap.py on the scan itself).
 PipelineResult run_scan(const cv::Mat& scan_bgr, const PipelineOptions& opt);
 

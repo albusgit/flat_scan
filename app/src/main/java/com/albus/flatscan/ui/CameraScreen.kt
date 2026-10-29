@@ -156,7 +156,7 @@ private fun CameraPreview(vm: ScanViewModel) {
     val guide = remember { CameraGuide() }
     var guideState by remember { mutableStateOf(GuideState()) }
     var guiding by remember { mutableStateOf(false) }   // the analysis is bound (some cameras take only preview + photo)
-    val findPage = vm.captureMode == CaptureMode.Document && vm.settings.pageFinderNet
+    val findPage = vm.captureMode != CaptureMode.Whiteboard && vm.settings.pageFinderNet
     val findPageNow by rememberUpdatedState(findPage)
     LaunchedEffect(findPage) {
         guide.reset()
@@ -397,7 +397,7 @@ private fun PagesStack(vm: ScanViewModel, last: String, n: Int) {
     }
 }
 
-/** Document / Whiteboard, as two pills over the camera picture. */
+/** Document / Whiteboard / Screen, as pills over the camera picture. */
 @Composable
 private fun ModePills(mode: CaptureMode, onPick: (CaptureMode) -> Unit) {
     Row(Modifier.selectableGroup(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {

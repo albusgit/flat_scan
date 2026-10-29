@@ -26,12 +26,19 @@ enum class FilterKind(val id: Int, val label: String) {
         fun forMode(mode: CaptureMode): List<FilterKind> = when (mode) {
             CaptureMode.Document -> listOf(Original, Scan, Lighten, AutoColor, Grayscale, HighContrast, BlackWhite)
             CaptureMode.Whiteboard -> listOf(Whiteboard, ProjectorDark, Original, AutoColor)
+            // a screen glows in its own colours (dark and blue backgrounds): no filter that whitens the page
+            CaptureMode.Screen -> listOf(AutoColor, Original, Lighten, Grayscale, HighContrast)
         }
     }
 }
 
-/** What is being scanned: a document (the full pipeline) or a whiteboard / projector screen (perspective only, its own cleanup). */
-enum class CaptureMode(val label: String) { Document("Document"), Whiteboard("Whiteboard") }
+/**
+ * What is being scanned: a document (the full pipeline), a whiteboard / projected slide (the board's corners,
+ * perspective only, its own cleanup) or a screen (a monitor, laptop or phone: the document's outline finder, perspective
+ * only, colour filters). Screens were taken as boards before: on 41 photos of screens the board's corners cut into the
+ * screen or missed it on most, the document's found it, and its iron bent the flat screen on 15 (the iron off: worse on 1).
+ */
+enum class CaptureMode(val label: String) { Document("Document"), Whiteboard("Whiteboard"), Screen("Screen") }
 
 /**
  * Everything the user can change on the result screen; switching any of these never re-runs
@@ -144,13 +151,17 @@ object NativeLib {
      * refinement, on the CPU. The nets run on [configureNets]' backends; their timings and backends
      * are in [info]'s "accel". removeShadows: false leaves the page's shadows (neither the shading map
      * nor the shadow net). userLines: the line editor's drawn lines, [group, n, x0, y0, ...] repeated as
-     * output-page fractions (PageMeta.userLines), straightened after the line stage.
+     * output-page fractions (PageMeta.userLines), straightened after the line stage. autoLines: the line stage
+     * straightens every line it finds (off: only those in linePaint's Straighten areas, and the drawn lines);
+     * linePaint: the line brush, [mode (0 Straighten, 1 Keep as is), radius, n, x0, y0, ...] repeated
+     * (PageMeta.linePaint).
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
         flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, board: Boolean, removeShadows: Boolean, userLines: FloatArray?,
+        autoLines: Boolean, linePaint: FloatArray?,
         listener: ProgressListener?,
     ): Long
 
@@ -180,6 +191,14 @@ object NativeLib {
      * along, followed along its length (page fractions, every 4 px); empty if there is no line under most of it.
      */
     @JvmStatic external fun findLine(handle: Long, stroke: FloatArray): FloatArray
+
+    /**
+     * Page > Perspective's Upright (core/src/upright.h): the Transform sliders [rotate, vertical, horizontal] that make
+     * the page's lines ([mode] 0 Level, 1 Vertical, 2 Full, 3 Auto) or the user's [guides] (4 Guided: x0, y0, x1, y1
+     * page fractions, repeated) level and plumb on the page as shown, [hw] its height / width; empty when there is
+     * nothing to go by.
+     */
+    @JvmStatic external fun upright(handle: Long, mode: Int, guides: FloatArray?, hw: Float): FloatArray
 
     /**
      * Whiteboard mode: the board or screen in [photo] (core/src/board.cpp): [x0, y0 .. x3, y3 (TL, TR, BR,

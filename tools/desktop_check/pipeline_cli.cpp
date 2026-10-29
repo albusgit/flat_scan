@@ -254,6 +254,13 @@ int main(int argc, char** argv) {
     if (const char* gc = std::getenv("FS_GRID_COLL")) o.uv_max_collapsed = std::atof(gc);
     // FS_EDGE_GAP / FS_EDGE_FRAC: PipelineOptions::edge_gap / edge_doubt_frac
     if (const char* eg = std::getenv("FS_EDGE_GAP")) o.edge_gap = std::atof(eg);
+    // FS_NO_FULL_FRAME=1: PipelineOptions::full_frame_net off; FS_FLAT_SIDES=n: flat_min_sides (0: every side counts)
+    if (std::getenv("FS_NO_FULL_FRAME")) o.full_frame_net = false;
+    else o.uv_net = uv_net_fn(inference());   // as the app: run_photo's own SD-HR call (full_frame_net)
+    if (const char* fs = std::getenv("FS_FLAT_SIDES")) o.flat_min_sides = std::atoi(fs);
+    if (const char* fg = std::getenv("FS_FULL_FRAME_GAIN")) o.full_frame_min_gain = std::atof(fg);
+    // FS_EDGE_BAND=x: PipelineOptions::edge_stretch_band (0: the whole page measured, before round 19)
+    if (const char* eb = std::getenv("FS_EDGE_BAND")) o.edge_stretch_band = std::atof(eb);
     if (const char* ef = std::getenv("FS_EDGE_FRAC")) o.edge_doubt_frac = std::atof(ef);
     // FS_UV_OWN_PAPER: the paper share a grid needs to define the page itself (0: any, as before round 16)
     if (const char* op = std::getenv("FS_UV_OWN_PAPER")) o.uv_own_min_paper = std::atof(op);
@@ -358,6 +365,33 @@ int main(int argc, char** argv) {
             if (l.pts.size() >= 2) o.user_lines.push_back(l);
         }
     }
+    // FS_LINE_PAINT="mode,radius:x,y x,y ...;..." (output-page fractions; mode 0 Straighten, 1 Keep as is; radius a
+    // fraction of the page's width): the line brush. FS_NO_AUTO_LINES=1: only painted and drawn lines straighten
+    if (const char* lp = std::getenv("FS_LINE_PAINT")) {
+        std::stringstream ss(lp);
+        std::string item;
+        while (std::getline(ss, item, ';')) {
+            PipelineOptions::LinePaint s;
+            size_t c = item.find(':');
+            if (c == std::string::npos || std::sscanf(item.substr(0, c).c_str(), "%d,%f", &s.mode, &s.radius) != 2) continue;
+            std::stringstream ps(item.substr(c + 1));
+            std::string pt;
+            float x, y;
+            while (ps >> pt)
+                if (std::sscanf(pt.c_str(), "%f,%f", &x, &y) == 2) s.pts.emplace_back(x, y);
+            if (!s.pts.empty()) o.line_paint.push_back(s);
+        }
+    }
+    o.auto_lines = std::getenv("FS_NO_AUTO_LINES") == nullptr;
+    // FS_PICTURE_GUARD=1: pictures give no lines (PipelineOptions::picture_guard); FS_PIC_SPREAD, FS_PIC_PAPER, FS_PIC_VETO its
+    // thresholds; FS_DUMP_PICTURES=X.jpg: the stage-1 page with the pictures it found tinted
+    o.picture_guard = std::getenv("FS_PICTURE_GUARD") != nullptr;
+    o.lock_shapes = std::getenv("FS_NO_LOCK") == nullptr;   // FS_NO_LOCK=1: no shape lock (PipelineOptions::lock_shapes)
+    if (const char* v = std::getenv("FS_LOCK_BAND")) o.lock_band = std::atof(v);
+    if (const char* v = std::getenv("FS_PIC_SPREAD")) o.picture_spread = std::atof(v);
+    if (const char* v = std::getenv("FS_PIC_PAPER")) o.picture_paper = std::atof(v);
+    if (const char* v = std::getenv("FS_PIC_VETO")) o.picture_text_veto = std::atof(v);
+    if (const char* v = std::getenv("FS_PIC_MODE")) o.picture_mode = std::atoi(v);   // 2: picture_mask_strict
     // UVDoc in two steps (the net runs in Python, tools/uvdoc_check.py): FS_UVIN=X.npz writes the
     // net input for the detected corners and exits; FS_UVOUT=Y.npz ("out": 2 x 45 x 31) uses it
     std::vector<float> uv, uv_sh, uv2, p1_store;
@@ -471,7 +505,9 @@ int main(int argc, char** argv) {
             auto put = [&](const char* tag, const std::vector<float>& g, const UvCrop& c) {
                 if (g.empty()) return;
                 const UvSpec& sp = uv_spec(c.model);
-                write_npz(std::string(dump) + tag, {{"out", NpyArray::f32({2, (size_t)sp.gh, (size_t)sp.gw}, g.data())}});
+                // crop: x, y, w, h (photo px), turned (the crop was turned 90 deg clockwise), model (core/src/uvdoc.h UvCrop)
+                const float cr[6] = {(float)c.box.x, (float)c.box.y, (float)c.box.width, (float)c.box.height, c.turned ? 1.f : 0.f, (float)c.model};
+                write_npz(std::string(dump) + tag, {{"out", NpyArray::f32({2, (size_t)sp.gh, (size_t)sp.gw}, g.data())}, {"crop", NpyArray::f32({6}, cr)}});
             };
             put("_p1.npz", nets.grid_pass1, nets.crop_pass1);
             put(nets.crop1.model == 2 ? "_rc2.npz" : "_rc0.npz", nets.grid1, nets.crop1);
@@ -492,14 +528,14 @@ int main(int argc, char** argv) {
       << geom_mode_name(r.mode) << "\", \"fit_median_full_px\": "
       << num(r.detection.ok ? r.fit_median_px / r.detection.scale : -1) << ", \"needs_manual_crop\": " << strs(r.needs_manual_crop)
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
-      << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"user_lines_used\": " << r.user_lines_used << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
+      << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"user_lines_used\": " << r.user_lines_used << ", \"lines_painted\": " << (r.lines_painted ? "true" : "false") << ", \"picture_share\": " << num(r.picture_share) << ", \"shape_locked\": " << num(r.shape_locked) << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"page_hw\": " << num(r.page_hw) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"edges_bent\": " << (r.edges_bent ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_grid_check\": [[" << num(r.uv_grid_check[0][0]) << ", " << num(r.uv_grid_check[0][1]) << ", " << num(r.uv_grid_check[0][2]) << "], [" << num(r.uv_grid_check[1][0]) << ", " << num(r.uv_grid_check[1][1]) << ", " << num(r.uv_grid_check[1][2]) << "]], \"uv_agree_quad\": [" << num(r.uv_agree_quad[0]) << ", " << num(r.uv_agree_quad[1]) << "], \"uv_agree_mask\": [" << num(r.uv_agree_mask[0]) << ", " << num(r.uv_agree_mask[1]) << "]" << ", \"fuse\": [" << r.fuse_runs << ", " << num(r.fuse_worst[0]) << ", " << num(r.fuse_worst[1]) << ", " << num(r.fuse_moved_px) << ", " << num(r.fuse_area) << ", " << (r.fuse_rejected ? 1 : 0) << "]" << ", \"surface_unfounded\": " << (r.surface_unfounded ? "true" : "false") << ", \"side_n\": [" << r.side_n[0] << ", " << r.side_n[1] << ", " << r.side_n[2] << ", " << r.side_n[3] << "], \"side_edge\": [" << num(r.side_edge[0]) << ", " << num(r.side_edge[1]) << ", " << num(r.side_edge[2]) << ", " << num(r.side_edge[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"uv_grid_rejected\": [" << (r.uv_grid_rejected[0] ? 1 : 0) << ", " << (r.uv_grid_rejected[1] ? 1 : 0) << "], \"uv_composed_broken\": " << (r.uv_composed_broken ? "true" : "false") << ", \"net_edge_gap\": [" << num(r.net_edge_gap[0]) << ", " << num(r.net_edge_gap[1]) << ", " << num(r.net_edge_gap[2]) << ", " << num(r.net_edge_gap[3]) << "], \"edge_doubt\": " << (r.edge_doubt ? "true" : "false")
+      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_grid_check\": [[" << num(r.uv_grid_check[0][0]) << ", " << num(r.uv_grid_check[0][1]) << ", " << num(r.uv_grid_check[0][2]) << "], [" << num(r.uv_grid_check[1][0]) << ", " << num(r.uv_grid_check[1][1]) << ", " << num(r.uv_grid_check[1][2]) << "]], \"uv_agree_quad\": [" << num(r.uv_agree_quad[0]) << ", " << num(r.uv_agree_quad[1]) << "], \"uv_agree_mask\": [" << num(r.uv_agree_mask[0]) << ", " << num(r.uv_agree_mask[1]) << "]" << ", \"fuse\": [" << r.fuse_runs << ", " << num(r.fuse_worst[0]) << ", " << num(r.fuse_worst[1]) << ", " << num(r.fuse_moved_px) << ", " << num(r.fuse_area) << ", " << (r.fuse_rejected ? 1 : 0) << "]" << ", \"surface_unfounded\": " << (r.surface_unfounded ? "true" : "false") << ", \"side_n\": [" << r.side_n[0] << ", " << r.side_n[1] << ", " << r.side_n[2] << ", " << r.side_n[3] << "], \"side_edge\": [" << num(r.side_edge[0]) << ", " << num(r.side_edge[1]) << ", " << num(r.side_edge[2]) << ", " << num(r.side_edge[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_full_frame\": " << (r.uv_full_frame ? "true" : "false") << ", \"uv_full_frame_agree\": " << num(r.uv_full_frame_agree) << ", \"uv_full_frame_spread\": [" << num(r.uv_full_frame_spread[0]) << ", " << num(r.uv_full_frame_spread[1]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"uv_grid_rejected\": [" << (r.uv_grid_rejected[0] ? 1 : 0) << ", " << (r.uv_grid_rejected[1] ? 1 : 0) << "], \"uv_composed_broken\": " << (r.uv_composed_broken ? "true" : "false") << ", \"net_edge_gap\": [" << num(r.net_edge_gap[0]) << ", " << num(r.net_edge_gap[1]) << ", " << num(r.net_edge_gap[2]) << ", " << num(r.net_edge_gap[3]) << "], \"edge_doubt\": " << (r.edge_doubt ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
       << ", \"orient_net\": [" << r.orient_net_turn << ", " << num(r.orient_net_margin) << ", " << r.orient_net_patches << ", " << (r.orient_by_net ? 1 : 0) << "]"
       << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"flat_page\": " << (r.flat_page ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": [" << num(r.second_pass[0]) << ", " << num(r.second_pass[1]) << ", " << num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0) << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")
       << ", \"net\": [" << r.warp.net.dropped << ", " << r.warp.net.added << ", " << r.warp.net.joined << ", " << r.warp.S2.n_net_kept << "], \"spots_dropped\": "
-      << (r.lines_spots_dropped ? "true" : "false") << ", \"straightness\": [" << num(r.line_straightness[0]) << ", " << num(r.line_straightness[1]) << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
+      << (r.lines_spots_dropped ? "true" : "false") << ", \"straightness\": [" << num(r.line_straightness[0]) << ", " << num(r.line_straightness[1]) << "], \"margins\": " << r.warp.n_margins << ", \"edges\": [" << r.warp.n_edges_h << ", " << (r.warp.E_lines.size() - r.warp.n_edges_h) << ", " << r.warp.n_edge_bowed << "]" << ", \"dashes\": [" << r.warp.n_dash_h << ", " << r.warp.n_dash_v << "]" << ", \"downweighted\": " << r.warp.n_downweighted << ", \"bumps_faded\": " << num(r.bumps_faded) << ", \"zoom\": [" << r.uv_zoom_quarters << ", " << num(r.uv_zoom_spread[0]) << ", " << num(r.uv_zoom_spread[1]) << ", " << (r.uv_zoom ? 1 : 0) << "]}";
     // warp-map field size and roughness: max |displacement| and max change between grid neighbours per px
     auto field_stats = [&](const char* name, const Field& a, const Field& b) {
         double mx = 0, gr = 0;
@@ -619,12 +655,31 @@ int main(int argc, char** argv) {
             return f;
         };
         std::vector<float> h = rows(r.warp.S2.h), v = rows(r.warp.S2.v), H = lines(r.warp.H), V = lines(r.warp.V);
+        // the other sample sets of the solve, the same frame: text rows (T), text-column edges (M), colour edges
+        // (EH, EV), dashed rules (DH, DV)
+        std::vector<float> T = rows(r.warp.T), M = rows(r.warp.M), EH = rows(r.warp.EH), EV = rows(r.warp.EV),
+                           DH = rows(r.warp.DH), DV = rows(r.warp.DV);
+        auto a3 = [](const std::vector<float>& f) { return NpyArray::f32({f.size() / 3, 3}, f.data()); };
         write_npz(ds, {{"h", NpyArray::f32({h.size() / 3, 3}, h.data())}, {"v", NpyArray::f32({v.size() / 3, 3}, v.data())},
-                       {"H", NpyArray::f32({H.size() / 5, 5}, H.data())}, {"V", NpyArray::f32({V.size() / 5, 5}, V.data())}});
+                       {"H", NpyArray::f32({H.size() / 5, 5}, H.data())}, {"V", NpyArray::f32({V.size() / 5, 5}, V.data())},
+                       {"T", a3(T)}, {"M", a3(M)}, {"EH", a3(EH)}, {"EV", a3(EV)}, {"DH", a3(DH)}, {"DV", a3(DV)}});
+        // the page those samples are on (after the line stage's global stage)
+        if (!r.warp.A_img.empty()) cv::imwrite(std::string(ds) + ".page.jpg", r.warp.A_img, {cv::IMWRITE_JPEG_QUALITY, 90});
     }
     // FS_DUMP_OUTLINE=P.npz: the page finder's outline in full-resolution photo px: its contour ("contour": n x 2),
     // the points given to each side ("side0".."side3"), its corners ("corners": 4 x 2, TL TR BR BL) and the
     // detection's own corners ("det_corners")
+    if (const char* dp = std::getenv("FS_DUMP_PICTURES"); dp && !r.stage1.empty()) {
+        cv::Mat v = r.stage1.clone();
+        if (v.channels() == 4) cv::cvtColor(v, v, cv::COLOR_BGRA2BGR);
+        if (!r.picture_mask.empty()) {
+            cv::Mat tint(v.size(), v.type(), cv::Scalar(255, 0, 255));
+            cv::Mat mix;
+            cv::addWeighted(v, 0.6, tint, 0.4, 0, mix);
+            mix.copyTo(v, r.picture_mask);
+        }
+        cv::imwrite(dp, v, {cv::IMWRITE_JPEG_QUALITY, 80});
+    }
     if (const char* dol = std::getenv("FS_DUMP_OUTLINE"); dol && r.detection.ok) {
         const PageCorners& pc = r.detection;
         const double k = 1.0 / std::min(1.0, pc.scale);

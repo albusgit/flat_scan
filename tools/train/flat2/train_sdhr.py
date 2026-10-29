@@ -91,13 +91,26 @@ def app_crop(img, grid, rng, margin=(0.02, 0.10), jitter=0.02):
     return cv2.cvtColor(x, cv2.COLOR_BGR2RGB), np.stack([t[0] / (cw - 1) * 2 - 1, t[1] / (ch - 1) * 2 - 1]).astype(np.float32), turned
 
 
+def _whole_png(path):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(-12, 2)
+            return f.read(12)[4:8] == b'IEND'
+    except OSError:
+        return False
+
+
 class Mixed(Dataset):
     """one epoch = `length` samples drawn by --mix from the sources; returns (x uint8 3xHxW, target 2xGHxGW,
     kind id, is_anchor)"""
     KINDS = ['flat', 'nearflat', 'curl', 'corner', 'fold', 'fold2', 'curl_corner', 'wave_curl', 'uvdoc', 'anchor']
 
     def __init__(self, synth_dirs, uvdoc, anchor, mix, length, held=False, seed=0, all_ids=False):
-        self.synth_dirs, self.all_ids = synth_dirs, all_ids
+        # a folder given as PATH@SHARE gets that share of the synthetic draws (round 19: the real flat photos at a
+        # fixed share while the generator keeps adding synthetic ones); the other folders share the rest by size
+        self.synth_dirs = [d.rsplit('@', 1)[0] if '@' in d else d for d in synth_dirs]
+        self.dir_share = {d.rsplit('@', 1)[0]: float(d.rsplit('@', 1)[1]) for d in synth_dirs if '@' in d}
+        self.all_ids = all_ids
         self.held = held
         self.reload()
         self.uv_items, self.uv_grids = [], None
@@ -105,7 +118,11 @@ class Mixed(Dataset):
             items = json.load(open(os.path.join(uvdoc, 'index.json')))
             self.uv_grids = np.load(os.path.join(uvdoc, 'grids.npy'), mmap_mode='r')
             self.uv_root = uvdoc
-            self.uv_items = [(i, it) for i, it in enumerate(items) if it['val'] == held]
+            for it in items:   # index.json was written on Windows: '..\\img\\00000.png'
+                it['img'] = it['img'].replace('\\', '/')
+            # only photos on disk and whole (a PNG ends in its IEND chunk): the rented box trains on the part of
+            # UVDoc that has arrived when ETH's server is slow
+            self.uv_items = [(i, it) for i, it in enumerate(items) if it['val'] == held and _whole_png(os.path.join(uvdoc, it['img']))]
         self.anchor = []
         if anchor:
             for line in open(os.path.join(anchor, 'index.jsonl')):
@@ -117,6 +134,20 @@ class Mixed(Dataset):
         tot = sum(w.values())
         self.p = {k: v / tot for k, v in w.items()}
         self.length, self.seed, self.epoch = length, seed, 0
+
+    def __getstate__(self):
+        # a DataLoader worker on Windows gets the dataset pickled: a memmap pickles as a full in-RAM copy (UVDoc's
+        # grids: 868 MB in every worker, round 19). The worker maps the file itself instead
+        d = dict(self.__dict__)
+        if d.get('uv_grids') is not None:
+            d['uv_grids'] = None
+            d['_uv_grids_path'] = os.path.join(self.uv_root, 'grids.npy')
+        return d
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        if d.get('_uv_grids_path'):
+            self.uv_grids = np.load(d['_uv_grids_path'], mmap_mode='r')
 
     def reload(self):
         """(re-)read the synthetic index: make_data.py may still be adding samples while the GPU trains"""
@@ -131,6 +162,16 @@ class Mixed(Dataset):
         # held-out: every 50th shard never trains (all_ids: a folder that is all held-out)
         if not self.all_ids:
             self.synth = [r for r in self.synth if (int(r['id'].split('_')[0]) % 50 == 7) == self.held]
+        self.groups = None
+        if self.dir_share:
+            by = {}
+            for r in self.synth:
+                by.setdefault(r['root'], []).append(r)
+            fixed = sum(v for d, v in self.dir_share.items() if by.get(d))
+            rest = sum(len(v) for d, v in by.items() if d not in self.dir_share)
+            self.groups = [(self.dir_share[d] if d in self.dir_share else (1 - fixed) * len(v) / max(1, rest), v) for d, v in by.items()]
+            tot = sum(w for w, _ in self.groups)
+            self.groups = [(w / tot, v) for w, v in self.groups]
 
     def __len__(self):
         return self.length
@@ -147,7 +188,13 @@ class Mixed(Dataset):
         if self.held:   # deterministic: walk the held synthetic set
             src = 'synth'
         if src == 'synth':
-            r = self.synth[i % len(self.synth)] if self.held else self.synth[rng.integers(len(self.synth))]
+            if self.held:
+                r = self.synth[i % len(self.synth)]
+            elif self.groups:
+                g = self.groups[rng.choice(len(self.groups), p=[w for w, _ in self.groups])][1]
+                r = g[rng.integers(len(g))]
+            else:
+                r = self.synth[rng.integers(len(self.synth))]
             p = os.path.join(r['root'], r['path'])
             x = cv2.cvtColor(cv2.imread(p + '.jpg'), cv2.COLOR_BGR2RGB)
             t = np.load(p + '.npy').astype(np.float32)

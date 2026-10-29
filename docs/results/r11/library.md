@@ -12,7 +12,7 @@ Validation sets with flat ground truth (DocUNet stays the TEST set and is not in
 | docreal | 200 real photos (50 docs x 4) | flat scans | not stated (repo MIT) |
 | warpdoc | 1020 real photos, 6 categories (subset warpdoc_s170 = every 6th) | digital page (with margin) | not stated |
 | uvdoc_bench | 50 semi-synthetic (real paper warps) | flat texture | not stated |
-| inv3dreal | 360 real photos = 20 invoices x 6 warps x 3 lightings (subset inv3dreal_s90 = every 4th) | flat page + true words | MIT |
+| inv3dreal | 360 real photos = 20 invoices x 6 warps x 3 lightings (subset inv3dreal_s90 = every 4th) | flat page + true words | CC BY-NC-SA 4.0 (evaluation only; earlier listed as MIT) |
 
 Real photos without geometric GT (filters, monitor scanning, visual review):
 | set | count | what | licence |

@@ -439,6 +439,7 @@ Field solve_field(const std::vector<std::array<double, 2>>& xy, const Vec& value
     return F;
 }
 
+
 // Two fields from the same samples without weights (the global stage's x and y): one operator and
 // one hierarchy, the two solves side by side. The same fields as two solve_field calls.
 void solve_field_pair(const std::vector<std::array<double, 2>>& xy, const Vec& vx, const Vec& vy, int gw, int gh, int G,
@@ -1520,6 +1521,144 @@ std::vector<std::array<double, 3>> text_margins(const cv::Mat& Dm, const Lines& 
     return out;
 }
 
+// App (round 19): dashed printed rules as lines. A dash is too short for segments() and short_segments, so a
+// coupon's dashed border was never straightened: its top row stayed tilted where the coupon curled, out of line
+// with the picture's edge beside it. Dashes are ink blobs (D > 70, off the found rules) that are solid (>= 75 %
+// of their box) and long along the line (5-70 px, 2-14 px thick, length >= 1.8 x thickness). They are chained
+// along the line: the next dash starts 1 px to max(12, 2.5 x the chain's median length) after the last one ends,
+// its centre within 3 px + 6 % of the step of the chain's course so far (the straight line through its last 3
+// dashes: a curling row is followed), its length within 0.55-1.8 x and its thickness within 3 px of the chain's
+// medians. A chain of >= 6 dashes, evenly spaced (centre pitch CV <= 0.35), on a smooth course (rms <= 1.5 px
+// from a polynomial of degree 1 / 2 / 3 for < 8 / < 16 / more dashes, after two rejections at 2 x the median
+// residual) gives samples (along, ideal, disp) every `step` px between its end dashes, the ideal the course's
+// mean, as text_rows; a course more than 30 px from its mean is left out (no straight print). hz false: vertical
+// dashes (along y, ideal x). found: each chain as [ideal, start, end, thickness, length].
+std::vector<std::array<double, 3>> dashed_lines(const cv::Mat& Dm, const Lines& H, const Lines& V, bool hz, int& nlines, Lines* found,
+                                                double step) {
+    nlines = 0;
+    std::vector<std::array<double, 3>> out;
+    const int h = Dm.rows, w = Dm.cols;
+    cv::Mat ink = Dm > 70.f, rules = cv::Mat::zeros(h, w, CV_8U);
+    auto fill = [&](long r0, long r1, long c0, long c1) {
+        r0 = std::max(0L, r0); c0 = std::max(0L, c0);
+        r1 = std::min((long)h, r1); c1 = std::min((long)w, c1);
+        if (r1 > r0 && c1 > c0) rules(cv::Range((int)r0, (int)r1), cv::Range((int)c0, (int)c1)).setTo(255);
+    };
+    for (const auto& L : H) fill(pyint(L[0] - L[3] / 2 - 4), pyint(L[0] + L[3] / 2 + 5), pyint(L[1]), pyint(L[2]) + 1);
+    for (const auto& L : V) fill(pyint(L[1]), pyint(L[2]) + 1, pyint(L[0] - L[3] / 2 - 4), pyint(L[0] + L[3] / 2 + 5));
+    ink.setTo(0, rules);
+    if (!hz) ink = ink.t();   // vertical dashes: found as horizontal ones on the transposed page
+    cv::Mat lab, st, cen;
+    const int n = cv::connectedComponentsWithStats(ink, lab, st, cen, 8);
+    struct Dash { double x0, x1, cx, cy, len, thick; };
+    std::vector<Dash> ds;
+    // each blob measured along its own axis (second moments: a solid bar of length L has variance L^2 / 12 along
+    // it): where the paper curls the dashes lean (5-15 deg on the coupon's top row), and an upright box made a
+    // leaning dash look short, thick and hollow
+    for (int i = 1; i < n; ++i) {
+        const int x = st.at<int>(i, 0), y = st.at<int>(i, 1), ww = st.at<int>(i, 2), hh = st.at<int>(i, 3), area = st.at<int>(i, 4);
+        if (ww < 4 || ww > 80 || hh > 40 || area < 10) continue;
+        const double mx = cen.at<double>(i, 0), my = cen.at<double>(i, 1);
+        double sxx = 0, syy = 0, sxy = 0;
+        for (int r = y; r < y + hh; ++r) {
+            const int* lr = lab.ptr<int>(r);
+            for (int c = x; c < x + ww; ++c)
+                if (lr[c] == i) { const double dx = c - mx, dy = r - my; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+        }
+        sxx /= area; syy /= area; sxy /= area;
+        const double tr = sxx + syy, det = sxx * syy - sxy * sxy, disc = std::sqrt(std::max(0.0, tr * tr / 4 - det));
+        const double l1 = tr / 2 + disc, l2 = std::max(0.0, tr / 2 - disc);
+        const double len = std::sqrt(12 * l1), thick = std::max(1.0, std::sqrt(12 * l2));
+        const double ang = 0.5 * std::atan2(2 * sxy, sxx - syy) * 180 / CV_PI;   // the long axis vs the line's direction
+        const double fill = area / (len * thick);
+        if (std::fabs(ang) > 25 || len < 5 || len > 70 || thick < 2 || thick > 14 || len < 1.8 * thick || fill < 0.7 || fill > 1.4) continue;
+        ds.push_back({(double)x, (double)(x + ww - 1), mx, my, len, thick});
+    }
+    std::sort(ds.begin(), ds.end(), [](const Dash& a, const Dash& b) { return a.cx < b.cx; });
+    std::vector<char> used(ds.size(), 0);
+    for (size_t s = 0; s < ds.size(); ++s) {
+        if (used[s]) continue;
+        std::vector<size_t> ch = {s};
+        for (;;) {
+            const Dash& last = ds[ch.back()];
+            Vec ls, th;
+            for (size_t k : ch) { ls.push_back(ds[k].len); th.push_back(ds[k].thick); }
+            const double mlen = median(ls), mth = median(th), maxgap = std::max(12.0, 2.5 * mlen);
+            // the course so far: the line through the last <= 3 dashes (one dash: level)
+            double slope = 0;
+            if (ch.size() >= 2) {
+                const size_t a = ch[ch.size() >= 3 ? ch.size() - 3 : 0];
+                slope = (last.cy - ds[a].cy) / std::max(1.0, last.cx - ds[a].cx);
+            }
+            size_t best = ds.size();
+            double best_gap = 1e300;
+            for (size_t j = ch.back() + 1; j < ds.size() && ds[j].cx - last.cx < maxgap + 70; ++j) {
+                if (used[j]) continue;
+                const Dash& q = ds[j];
+                const double gap = q.x0 - last.x1;
+                if (gap < 1 || gap > maxgap) continue;
+                const double pred = last.cy + slope * (q.cx - last.cx);
+                if (std::fabs(q.cy - pred) > 3 + 0.06 * (q.cx - last.cx)) continue;
+                if (q.len < 0.55 * mlen || q.len > 1.8 * mlen || std::fabs(q.thick - mth) > 3) continue;
+                if (gap < best_gap) { best_gap = gap; best = j; }
+            }
+            if (best == ds.size()) break;
+            ch.push_back(best);
+        }
+        if (ch.size() < 6) continue;
+        Vec xs, cs, pitch;
+        for (size_t k : ch) { xs.push_back(ds[k].cx); cs.push_back(ds[k].cy); }
+        for (size_t k = 1; k < xs.size(); ++k) pitch.push_back(xs[k] - xs[k - 1]);
+        const double pm = np_mean(pitch);
+        double pv = 0;
+        for (double p : pitch) pv += (p - pm) * (p - pm);
+        if (std::sqrt(pv / pitch.size()) > 0.35 * pm) continue;
+        const int deg = xs.size() < 8 ? 1 : xs.size() < 16 ? 2 : 3;
+        std::vector<char> keep(xs.size(), 1);
+        Vec p;
+        for (int it = 0; it < 3; ++it) {
+            Vec kx, kc;
+            for (size_t k = 0; k < xs.size(); ++k)
+                if (keep[k]) { kx.push_back(xs[k]); kc.push_back(cs[k]); }
+            if ((int)kx.size() <= deg + 2) break;
+            p = polyfit(kx, kc, deg);
+            if (it == 2) break;
+            Vec r(xs.size());
+            for (size_t k = 0; k < xs.size(); ++k) r[k] = std::fabs(polyval(p, xs[k]) - cs[k]);
+            const double thr = std::max(1.0, 2.0 * median(r));
+            for (size_t k = 0; k < xs.size(); ++k) keep[k] = r[k] < thr;
+        }
+        if (p.empty()) continue;
+        double ss = 0;
+        int nk = 0;
+        for (size_t k = 0; k < xs.size(); ++k)
+            if (keep[k]) { ss += std::pow(polyval(p, xs[k]) - cs[k], 2); ++nk; }
+        if (nk < 6 || std::sqrt(ss / nk) > 1.5) continue;
+        const long nt = (long)std::floor((xs.back() - xs.front()) / step) + 1;
+        Vec tt(nt), yc(nt);
+        for (long k = 0; k < nt; ++k) { tt[k] = xs.front() + k * step; yc[k] = polyval(p, tt[k]); }
+        const double ideal = np_mean(yc);
+        double mxd = 0;
+        for (double v : yc) mxd = std::max(mxd, std::fabs(v - ideal));
+        if (mxd > 30) continue;
+        for (size_t k : ch) used[k] = 1;
+        for (long k = 0; k < nt; ++k) out.push_back({tt[k], ideal, yc[k] - ideal});
+        Vec th;
+        for (size_t k : ch) th.push_back(ds[k].thick);
+        if (found) found->push_back({ideal, xs.front(), xs.back(), median(th), xs.back() - xs.front()});
+        ++nlines;
+    }
+    return out;
+}
+
+bool dashes_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FS_NO_DASHES");
+        return !(e && *e && std::string(e) != "0");
+    }();
+    return on;
+}
+
 // App, neural pages: long straight boundaries between colour areas (a flyer's cells, a can's side)
 // as lines. The darkness map sees only dark ink, so on a page of colour blocks a cell boundary the
 // net left wavy had no constraint at all. The page is closed (grey 9x9, per channel: text and rules
@@ -1922,6 +2061,8 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         drop_whole(d.S1.v, false);
         drop_whole(d.T, true);
         drop_whole(d.TVs, false);
+        drop_whole(d.DH, true);
+        drop_whole(d.DV, false);
     };
     // ---- the solve passes on the traced lines (local_field, after the tracing below)
     auto solve_fields = [&](Clock::time_point t0) -> GridMap {
@@ -1956,17 +2097,19 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
                 double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
                 xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);   // TEXT_W = 1
             }
-            for (const auto& r : d.EH) {
-                double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
-                xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
-            }
+            for (const auto* src : {&d.EH, &d.DH})
+                for (const auto& r : *src) {
+                    double xs = r[0] - (it == 1 ? (double)Fx_prev.sample(r[0], r[1]) : 0.0);
+                    xy.push_back({xs, r[1]}); val.push_back(r[2]); wts.push_back(1.0);
+                }
             Field warm_y, warm_x;
             if (it == 1) { warm_y = grid_to_grid(Fy_prev, G, gw2, gh2); warm_x = grid_to_grid(Fx_prev, G, gw2, gh2); }
             std::vector<std::array<double, 2>> xyv;
             Vec valv;
             for (const std::vector<std::array<double, 3>>* src : {&SS.v, (const std::vector<std::array<double, 3>>*)&d.M,
                                                                   (const std::vector<std::array<double, 3>>*)&d.EV,
-                                                                  (const std::vector<std::array<double, 3>>*)&d.TVs})
+                                                                  (const std::vector<std::array<double, 3>>*)&d.TVs,
+                                                                  (const std::vector<std::array<double, 3>>*)&d.DV})
                 for (const auto& r : *src) {
                     double ys = r[0] - (it == 1 ? (double)Fy_prev.sample(r[1], r[0]) : 0.0);
                     xyv.push_back({r[1], ys}); valv.push_back(r[2]);
@@ -2168,12 +2311,23 @@ GridMap unwarp_map(const cv::Mat& src, WarpDebug* dbg, const cv::Mat* ignore, bo
         d.T = text_rows_net(d.TH, true, d.n_text);
         d.TVs = tv.get();
     }
+    // app: dashed rules (dashed_lines; FS_NO_DASHES=1: off)
+    if (faint && dashes_enabled()) {
+        Lines dh, dv;
+        auto fdv = std::async(std::launch::async, [&] { return dashed_lines(d.D, d.H, d.V, false, d.n_dash_v, &dv, 6); });
+        d.DH = dashed_lines(d.D, d.H, d.V, true, d.n_dash_h, &dh, 6);
+        d.DV = fdv.get();
+        d.D_lines = dh;
+        d.D_lines.insert(d.D_lines.end(), dv.begin(), dv.end());
+        drop(d.DH, true);
+        drop(d.DV, false);
+    }
     const int GC = 16, GF = 8;
     // (app: lines of one direction alone are straightened too - a ruled sheet, a receipt with only
     // horizontal rules, a page whose vertical "rules" the rule net found to be picture edges; the
     // other direction gets a zero field. The reference needs both.)
     // (app, with the text-line net: its text lines alone are straightened too - a page of text)
-    if (faint ? (d.H.empty() && d.V.empty() && d.T.empty() && d.TVs.empty()) : (d.H.empty() || d.V.empty())) {
+    if (faint ? (d.H.empty() && d.V.empty() && d.T.empty() && d.TVs.empty() && d.DH.empty() && d.DV.empty()) : (d.H.empty() || d.V.empty())) {
         // no table lines: nothing to straighten locally; a zero field (round 4 fix). Text-only
         // pages then get the surface model only (without the text-line net).
         d.n_text = 0;

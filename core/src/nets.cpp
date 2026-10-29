@@ -75,8 +75,43 @@ bool parse_backends(const std::string& s, std::vector<Backend>& out) {
     return true;
 }
 
+namespace {
+// which page finder the model files hold: 0 not yet known, 1 round 4 (256 x 256, 2 outputs), 2 v2 (384 x 384
+// letterboxed, 3 outputs). Both ship as pagefinder.{tflite,onnx}; the first run tries v2 and keeps whichever
+// answers in its layout (ONNX Runtime refuses the other size, LiteRT resizes: a round-4 model then gives 2 outputs).
+std::atomic<int> g_pf_version{0};
+}  // namespace
+
+int page_finder_input_side() { return g_pf_version.load() == 1 ? SEG_SIZE : SEG2_SIZE; }
+
 bool page_finder_logits(const cv::Mat& photo, Inference& inf, std::vector<float>& logits) {
     logits.clear();
+    const int ver = g_pf_version.load();
+    if (ver != 1) {
+        try {
+            SegLetterbox lb;
+            Tensor x{{1, 3, SEG2_SIZE, SEG2_SIZE}, seg2_input(photo, &lb)};
+            std::vector<Tensor> y;
+            std::string err;
+            const bool ok = inf.run(NetId::PageFinder, x, y, &err);
+            if (ok && !y.empty() && y[0].data.size() == (size_t)SEG2_OUTPUT_LEN) {
+                if (ver == 0) { g_pf_version = 2; LOGI("page finder: v2 (384 x 384 letterboxed)"); }
+                logits = seg2_to_seg(y[0].data.data(), lb);
+                return true;
+            }
+            if (ver == 2) {
+                LOGI("page finder: %s", ok ? "unexpected output size" : err.c_str());
+                return false;
+            }
+        } catch (const std::exception& e) {
+            if (ver == 2) {
+                LOGI("page finder failed: %s", e.what());
+                return false;
+            }
+        }
+        g_pf_version = 1;
+        LOGI("page finder: the round-4 model (256 x 256)");
+    }
     try {
         Tensor x{{1, 3, SEG_SIZE, SEG_SIZE}, seg_input(photo)};
         std::vector<Tensor> y;

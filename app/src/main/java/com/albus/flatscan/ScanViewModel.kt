@@ -279,13 +279,23 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     /** Lines drawn along rules the unwarp missed (PageMeta.userLines layout, being edited). */
     var userLines by mutableStateOf(listOf<Float>())
         private set
-    /** The line editor's own undo: (ignore, userLines) before each of its edits, since it opened. */
-    private val lineHistory = ArrayList<Pair<List<Float>, List<Float>>>()
+    /** The line brush's strokes (PageMeta.linePaint layout, being edited). */
+    var linePaint by mutableStateOf(listOf<Float>())
+        private set
+    /** The unwarp straightens every line it finds (off: only painted and drawn lines; being edited). */
+    var autoLines by mutableStateOf(true)
+        private set
+    /** The line editor's state before one of its edits (its own undo). */
+    private data class LineEdit(val ignore: List<Float>, val drawn: List<Float>, val paint: List<Float>, val auto: Boolean)
+    /** The line editor's own undo: its state before each of its edits, since it opened. */
+    private val lineHistory = ArrayList<LineEdit>()
     /** How many line edits Undo can take back. */
     var lineUndoSteps by mutableIntStateOf(0)
         private set
-    /** The line editor has changes to flatten with: ignore areas or drawn lines. */
-    val lineEditsChanged: Boolean get() = ignoreChanged || userLines != (sessionGeomState?.userLines?.toList() ?: emptyList<Float>())
+    /** The line editor has changes to flatten with: ignore areas, drawn lines, the brush or the automatic lines switch. */
+    val lineEditsChanged: Boolean
+        get() = ignoreChanged || userLines != (sessionGeomState?.userLines?.toList() ?: emptyList<Float>()) ||
+            linePaint != (sessionGeomState?.linePaint?.toList() ?: emptyList<Float>()) || autoLines != (sessionGeomState?.autoLines ?: true)
     /** The page's shadows are removed (Page panel switch). */
     val removeShadows: Boolean get() = sessionGeomState?.removeShadows != false
     /** The user turned the unwarp off for the current page (perspective correction only). */
@@ -653,7 +663,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             val detectMs = msSince(td)
             val c = FloatArray(8) { i -> if (i % 2 == 0) pg.corners[i / 2].x else pg.corners[i / 2].y }
             val h = NativeLib.process(
-                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, false, true, null, null,
+                bmp, c, false, 0f, true, width, true, lg, 0, pg.reasons.isNotEmpty(), false, FloatArray(0), true, 0, true, true, false, true, null,
+                true, null, null,
             )
             val pageMs = msSince(t0)
             val info = if (h != 0L) JSONObject(NativeLib.info(h)).also { NativeLib.release(h) } else null
@@ -1193,7 +1204,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     var netsAheadOff = false
 
     private suspend fun netsAhead(p: Bitmap) {
-        if (netsAheadOff || !settings.uvDoc || cropMode == CaptureMode.Whiteboard) return
+        if (netsAheadOff || !settings.uvDoc || cropMode != CaptureMode.Document) return
         if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) return
         val nets = settings.flatNets
         val plan = withContext(Dispatchers.Default) {
@@ -1240,13 +1251,20 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         reflatten()
     }
 
-    /** Switches the page on the result screen between document and whiteboard processing (processed again). */
+    /** Switches the page on the result screen between document, whiteboard and screen processing (processed again). */
     fun setPageMode(m: CaptureMode) {
         val g = sessionGeomState ?: return
         if (g.mode == m || !sourceAvailable(g.id)) return
         sessionGeomState = g.copy(mode = m)
-        params = params.copy(filter = if (m == CaptureMode.Whiteboard) FilterKind.Whiteboard else settings.defaultFilter)
-        reflatten()
+        params = params.copy(
+            filter = when (m) {
+                CaptureMode.Whiteboard -> FilterKind.Whiteboard
+                CaptureMode.Screen -> FilterKind.AutoColor
+                CaptureMode.Document -> settings.defaultFilter
+            },
+        )
+        // back to Look, where the kind was chosen (not the line tool, as after Flatten again)
+        reflatten(reopen = false)
     }
 
     /** The second page of a book spread: same photo, its own corners and gate, a new document page. */
@@ -1365,7 +1383,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
                 // the nets ahead were for the photo as it was
-                if (detected != null && cropMode != CaptureMode.Whiteboard) netsAhead(turned) else runCatching { NativeLib.cancelPrecompute() }
+                if (detected != null && cropMode == CaptureMode.Document) netsAhead(turned) else runCatching { NativeLib.cancelPrecompute() }
             } finally {
                 rotating = false
             }
@@ -1517,6 +1535,18 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 openingPreview = null
             }
         }
+    }
+
+    /**
+     * The page [step] pages after the current one in the document (-1: the one before), opened as [openPage] does: a
+     * swipe on the result screen. False at either end of the document, or when no page of it is open.
+     */
+    fun openAdjacentPage(step: Int): Boolean {
+        val i = pages.indexOf(currentId ?: return false)
+        val j = i + step
+        if (i < 0 || j !in pages.indices || screen != Screen.Result) return false
+        openPage(pages[j])
+        return true
     }
 
     private suspend fun openStored(id: String) {
@@ -2091,7 +2121,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      * Processes the photo on the crop screen. [ignoreAreas] / [perspective]: the line editor's
      * settings; null keeps the page's own (its ignore areas only while the corners are unchanged).
      */
-    fun process(ignoreAreas: List<Float>? = null, perspective: Boolean? = null, drawnLines: List<Float>? = null) {
+    fun process(
+        ignoreAreas: List<Float>? = null, perspective: Boolean? = null, drawnLines: List<Float>? = null,
+        paintStrokes: List<Float>? = null, autoLinesOn: Boolean? = null,
+    ) {
         val p = photo ?: return
         val id = photoPageId ?: return
         if (corners.size != 4) return
@@ -2107,12 +2140,16 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val ig = ignoreAreas ?: samePlace?.ignore?.toList() ?: emptyList()
         // drawn lines sit where the user saw them on this crop: a new crop drops them
         val drawn = (if (samePlace != null) drawnLines ?: samePlace.userLines.toList() else null) ?: emptyList()
+        // so does the line brush; the automatic lines switch is the page's own, whatever the crop
+        val paint = (if (samePlace != null) paintStrokes ?: samePlace.linePaint.toList() else null) ?: emptyList()
+        val autoLn = autoLinesOn ?: prev?.autoLines ?: true
         val removeSh = prev?.removeShadows ?: true
         // the page's mode: a page keeps its own (setPageMode changes it); a new page takes the crop's
         val mode = prev?.mode ?: cropMode
         val board = mode == CaptureMode.Whiteboard
-        // a board is flat: perspective correction only, whatever the unwarp switch says
-        val po = board || (perspective ?: prev?.perspectiveOnly ?: false)
+        val screenPage = mode == CaptureMode.Screen
+        // a board and a screen are flat: perspective correction only, whatever the unwarp switch says
+        val po = board || screenPage || (perspective ?: prev?.perspectiveOnly ?: false)
         val geom = PageMeta(
             id = id, corners = c, detected = detected?.let { d -> FloatArray(8) { i -> if (i % 2 == 0) d[i / 2].x else d[i / 2].y } },
             cropRotation = cropRotation, userRotated = userRotated, focalPx = focalPx,
@@ -2120,6 +2157,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             pageIndex = pageIndex, forceHomography = force,
             spreadWith = spread?.firstId ?: stored?.spreadWith ?: (if (same) sessionGeom?.spreadWith else null),
             ignore = ig.toFloatArray(), perspectiveOnly = po, mode = mode, removeShadows = removeSh, userLines = drawn.toFloatArray(),
+            linePaint = paint.toFloatArray(), autoLines = autoLn,
         )
         val key = geometryKey(geom)
         val defaults = settings.defaultParams()
@@ -2127,6 +2165,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             same -> params
             stored != null -> stored.params
             board -> defaults.copy(filter = if (boardDark) FilterKind.ProjectorDark else FilterKind.Whiteboard, solid = false, screen = ScreenMode.Off)
+            screenPage -> defaults.copy(filter = FilterKind.AutoColor, solid = false)
             else -> defaults
         }
         val startProtect = when {
@@ -2142,8 +2181,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val startLook = when {
             same -> look
             stored != null -> stored.look
-            // a board keeps its own proportions (measured from its corners), not A4's
-            board -> PageLook(shape = PageShape.Measured)
+            // a board or a screen keeps its own proportions (measured from its corners), not A4's
+            board || screenPage -> PageLook(shape = PageShape.Measured)
             else -> LookPrefs.newPageLook(getApplication())
         }
         // the page's finger and erase edits stay when it is processed again (the iron switched off or on, lines
@@ -2161,7 +2200,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         val width = settings.outputWidth
         val useUv = settings.uvDoc && !board
         val nets = settings.flatNets
-        val shadows = settings.neuralShadows && !board && removeSh
+        val shadows = settings.neuralShadows && !board && !screenPage && removeSh
         val rules = settings.ruleNet && !board
         val focal = focalPx
         recropBackup = null
@@ -2189,7 +2228,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     CrashGuard.guard(getApplication(), "processing a page", gpu = !plan.cpuOnly) {
                         NativeLib.process(
                             p, c, edited || board, focal, autoOrient, width, true, if (board) null else logits, pageIndex, force, po, ig.toFloatArray(), useUv, nets, shadows, rules, board,
-                            removeSh, drawn.toFloatArray(),
+                            removeSh, drawn.toFloatArray(), autoLn, paint.toFloatArray(),
                         ) { pct, s ->
                             viewModelScope.launch(Dispatchers.Main) { progress = pct / 100f; stage = s }
                         }
@@ -2284,6 +2323,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         lines = ln
         ignore = geom.ignore.toList()
         userLines = geom.userLines.toList()
+        linePaint = geom.linePaint.toList()
+        autoLines = geom.autoLines
         forgetLineEdits()
         erase = geom.erase.toList()
         fingersAuto = geom.fingersAuto
@@ -2335,18 +2376,21 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Flattens the current page again with the line editor's ignore areas and/or the unwarp
-     * turned on or off ([perspective]); the filters, protected areas and rotation are kept.
+     * turned on or off ([perspective]); the filters, protected areas and rotation are kept. [reopen]: the result
+     * screen opens on the line tool again (Flatten again), not on the tab it was left on.
      */
-    fun reflatten(perspective: Boolean? = null) {
+    fun reflatten(perspective: Boolean? = null, reopen: Boolean = true) {
         val id = currentId ?: return
         val geom = currentMeta() ?: return
         if (!sourceAvailable(id)) return
         val areas = ignore
         val drawn = userLines
-        reopenLines = true
+        val paint = linePaint
+        val auto = autoLines
+        reopenLines = reopen
         val p = photo
         if (photoPageId == id && p != null && recropBackup == null) {
-            process(areas, perspective, drawn)
+            process(areas, perspective, drawn, paint, auto)
             return
         }
         viewModelScope.launch {
@@ -2358,7 +2402,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 discardStaging()
                 recropBackup = null
                 setCrop(geom, bmp)
-                process(areas, perspective, drawn)
+                process(areas, perspective, drawn, paint, auto)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "reflatten failed", e)
@@ -2370,16 +2414,50 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Remembers the line edits as they are, before a change (Undo goes back to them). */
     private fun noteLineEdit() {
-        lineHistory += ignore to userLines
+        lineHistory += LineEdit(ignore, userLines, linePaint, autoLines)
         lineUndoSteps = lineHistory.size
     }
 
-    /** Line editor: takes back the last line edit (a line left out or used again, a box, a line added or removed). */
+    /**
+     * Line editor: takes back the last line edit (a line left out or used again, a box, a line added or removed, a brush
+     * stroke, the automatic lines switch).
+     */
     fun undoLineEdit() {
         val last = lineHistory.removeLastOrNull() ?: return
-        ignore = last.first
-        userLines = last.second
+        ignore = last.ignore
+        userLines = last.drawn
+        linePaint = last.paint
+        autoLines = last.auto
         lineUndoSteps = lineHistory.size
+    }
+
+    /** Line editor: the automatic lines on or off (off: only the painted and drawn lines straighten the page). */
+    fun setAutoLinesOn(on: Boolean) {
+        if (on == autoLines) return
+        noteLineEdit()
+        autoLines = on
+    }
+
+    /**
+     * Line brush: a stroke over the page ([points]: page fractions x0, y0, ...) of [radius] (page-width fraction).
+     * [straighten]: only the lines under the Straighten paint straighten the page; else Keep as is: the lines there are
+     * left out (a photo, a drawing, a logo).
+     */
+    fun addLineStroke(straighten: Boolean, radius: Float, points: List<Float>) {
+        if (points.size < 2) return
+        // at most 64 points along it (as a drawn line)
+        val n = points.size / 2
+        val step = maxOf(1, (n + 63) / 64)
+        val kept = (0 until n step step).toMutableList().also { if (it.last() != n - 1) it += n - 1 }
+        noteLineEdit()
+        linePaint = linePaint + listOf(if (straighten) 0f else 1f, radius, kept.size.toFloat()) + kept.flatMap { listOf(points[2 * it], points[2 * it + 1]) }
+    }
+
+    /** Line brush: removes every stroke. */
+    fun clearLinePaint() {
+        if (linePaint.isEmpty()) return
+        noteLineEdit()
+        linePaint = emptyList()
     }
 
     private fun forgetLineEdits() {
@@ -2447,6 +2525,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun revertIgnore() {
         ignore = sessionGeomState?.ignore?.toList() ?: emptyList()
         userLines = sessionGeomState?.userLines?.toList() ?: emptyList()
+        linePaint = sessionGeomState?.linePaint?.toList() ?: emptyList()
+        autoLines = sessionGeomState?.autoLines ?: true
         forgetLineEdits()
     }
 
@@ -2904,6 +2984,67 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         look = v
         outVersion++
     }
+
+    // ---- Page > Perspective (PageLook.transform, as Lightroom's Transform panel)
+    /** The page's perspective on screen and on export. */
+    fun setTransform(t: PageTransform) = updateLook(look.copy(transform = t))
+
+    /** The page's height / width as shown (its shape): the frame the perspective works in. */
+    val shownHw: Float get() = look.targetHw(pageWidth, pageHeight) ?: if (pageWidth > 0) pageHeight.toFloat() / pageWidth else 1f
+
+    /**
+     * Upright [mode] (0 Level, 1 Vertical, 2 Full, 3 Auto, 4 Guided by the transform's guides, -1 Off): the sliders that
+     * make the page's lines level and plumb (NativeLib.upright), the other sliders and the corners back to none.
+     */
+    fun upright(mode: Int) {
+        val t0 = look.transform
+        if (mode < 0) {
+            setTransform(PageTransform(constrain = t0.constrain, guides = t0.guides))
+            return
+        }
+        // Guided waits for its second guide
+        if (mode == 4 && t0.guides.size < 8) {
+            setTransform(t0.copy(upright = 4))
+            return
+        }
+        val h = handle
+        if (h == 0L) return
+        val hw = shownHw
+        val guides = if (mode == 4) t0.guides.toFloatArray() else null
+        viewModelScope.launch {
+            rendering = true
+            val r = withContext(nativeCtx) { if (h == nativeHandle) NativeLib.upright(h, mode, guides, hw) else FloatArray(0) }
+            rendering = false
+            if (handle != h) return@launch
+            if (r.size < 3) {
+                message = "No lines found to straighten the page by"
+                return@launch
+            }
+            val t = look.transform
+            setTransform(PageTransform(rotate = r[0], vertical = r[1], horizontal = r[2], constrain = t.constrain, upright = mode, guides = t.guides))
+        }
+    }
+
+    /**
+     * Guided: a guide drawn on the page as it is shown, from ([x0], [y0]) to ([x1], [y1]) (fractions there), kept on the
+     * core's page (at most 4, the oldest dropped); from the second on the page is solved again.
+     */
+    fun addGuide(x0: Float, y0: Float, x1: Float, y1: Float) {
+        val t = look.transform
+        val hw = shownHw
+        val inv = t.matrix(hw)?.let { PageTransform.invert(it) }
+        fun back(x: Float, y: Float): List<Float> {
+            val p = inv?.let { PageTransform.apply(it, x.toDouble(), y.toDouble()) } ?: return listOf(x, y)
+            return listOf(p.first.toFloat(), p.second.toFloat())
+        }
+        val g = back(x0, y0) + back(x1, y1)
+        if (kotlin.math.hypot(g[2] - g[0], (g[3] - g[1]) * hw) < 0.05f) return   // a tap or a short wiggle
+        val all = (t.guides + g).takeLast(16)
+        setTransform(t.copy(guides = all, upright = 4))
+        if (all.size >= 8) upright(4)
+    }
+
+    fun clearGuides() = setTransform(look.transform.copy(guides = emptyList()))
 
     /** The edits [history] tracks, as they are now. */
     fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes, fingerFill)

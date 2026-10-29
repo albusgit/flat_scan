@@ -63,8 +63,9 @@ OUT = os.path.join(REPO, 'app', 'src', 'main', 'litert', 'models')
 NETS = [('uvdoc', 'uvdoc_static.onnx', 'uvdoc_static.tflite', [1, 712, 488, 3], [1, 45, 31, 2]),
         ('sdhr', 'syntheticdoc_hr_static.onnx', 'syntheticdoc_hr_static.tflite', [1, 1440, 1024, 3], [1, 121, 177, 2]),
         ('shade', 'shadenet_512x352.onnx', 'shadenet.tflite', [1, 512, 352, 3], [1, 512, 352, 3]),
-        # the page finder: LiteRT CPU only (it never runs on the GPU), fp32 weights as in the ONNX file
-        ('finder', 'pagefinder.onnx', 'pagefinder.tflite', [1, 256, 256, 3], [1, 256, 256, 2])]
+        # the page finder (v2, round 19: 384 x 384 letterboxed, paper / gutter / edge logits; core/src/nets.cpp tells it from
+        # the round-4 256 x 256 two-output file by size): LiteRT CPU only (it never runs on the GPU), fp32 weights as in the ONNX file
+        ('finder', 'pagefinder.onnx', 'pagefinder.tflite', [1, 384, 384, 3], [1, 384, 384, 3])]
 # ShadeNet at any input size, the check's reference (work folder): made from shadenet.tflite by any_hw() after 'shade'
 SHADE_ANY = 'shadenet_any.tflite'
 # the sizes the pipeline feeds it (core/src/pipeline.cpp apply_shade_net: portrait, long side 512, W a multiple of 32)

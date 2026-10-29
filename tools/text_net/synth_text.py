@@ -19,6 +19,10 @@ import numpy as np, cv2
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'rule_net'))
 import synth, synth2   # noqa: E402
+import synth_products   # noqa: E402
+
+# round 19: the share of a page's blocks that are product shots or line drawings (synth_products.py; 0: as before)
+PRODUCTS = float(os.environ.get('TN_PRODUCTS', '0'))
 
 FONT_DIR = os.path.join(os.environ.get('TN_FONT_DIR', 'C:/Windows/Fonts'), '')   # Linux: tools/train/setup puts every font in one folder
 CORPUS = os.environ.get('TN_CORPUS', 'E:/fs_datasets/textnet/corpus.json')
@@ -407,7 +411,11 @@ def text_layout(rng, h, w):
         L = lang if rng.random() < 0.8 else other
         px = body * rng.uniform(0.85, 1.15)
         r = rng.random()
-        if r < 0.45:
+        if PRODUCTS and rng.random() < PRODUCTS:   # round 19: a product shot or a line drawing, a hard negative
+            bh = rng.uniform(0.15, 0.45) * h
+            synth_products.block(pg, x0 + rng.uniform(0, 0.3) * w, y, x1 - rng.uniform(0, 0.3) * w, y + bh)
+            y += bh
+        elif r < 0.45:
             bh = rng.uniform(0.15, 0.8) * h
             if rng.random() < 0.3:
                 mid = (x0 + x1) / 2

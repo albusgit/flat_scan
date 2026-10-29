@@ -10,10 +10,13 @@ endpoint_resize  a coordinate field resized with its end points on the end point
 map_terms     per-sample terms; target points outside [-1, 1] or not finite are masked out (never clamped inward).
 mixed_loss    synthetic / UVDoc samples: L1 + 0.25 derivative + 0.10 target curvature (flat kinds) + 1.0 border
               (one mean over the perimeter) + 2.0 cell-area floor (each cell's four corner Jacobians at least 5 % of
-              the target's, same sign: a collapsed or folded cell costs). Anchor samples (the original net as
+              the target's, same sign: a collapsed or folded cell costs) + 0.25 (FS_CURVE_FG) curvature error where the
+              page has ink (generator samples: text lines, rules; every kind of shape), their L1 weighing ink 3 x.
+              Anchor samples (the original net as
               teacher): L1 + 0.10 derivative + 0.5 border.
 BalancedBatches  exactly counts[source] samples of each source per batch, indices (source, global id)."""
 import contextlib
+import os
 
 import numpy as np
 import torch
@@ -22,6 +25,7 @@ from torch.utils.data import Sampler
 
 GH, GW = 121, 177
 FLAT_KINDS = (0, 1)   # Mixed.KINDS: flat, nearflat
+CURVE_FG = float(os.environ.get('FS_CURVE_FG', 0.25))   # the ink-weighted curvature term, every kind of shape (0: off): ~8 % of the objective at pass 3
 
 
 def endpoint_resize(field, size):
@@ -63,8 +67,11 @@ def quad_dets(g):
     return torch.stack([cr(top, left), cr(top, right), cr(bot, left), cr(bot, right)], 1)
 
 
-def map_terms(p, t):
-    """p, t: B x 2 x GH x GW -> dict of per-sample terms (float32)"""
+def map_terms(p, t, fg=None):
+    """p, t: B x 2 x GH x GW; fg: B x GH x GW in [0, 1] (ink on the page at each grid point; None or 0: none known)
+    -> dict of per-sample terms (float32). With ink: the L1 weighs ink 3 x (normalised: a sample's mean weight stays 1),
+    and 'curve_fg' is the curvature error along rows and columns where the ink is (text lines, rules: ForCenNet's
+    curvature consistency, as a second difference of the map)"""
     p, t = p.float(), t.float()
     finite = torch.isfinite(t).all(1, keepdim=True)
     valid = finite & (t.abs() <= 1).all(1, keepdim=True)
@@ -84,14 +91,25 @@ def map_terms(p, t):
     cm = valid[:, :, :-1, :-1] & valid[:, :, :-1, 1:] & valid[:, :, 1:, :-1] & valid[:, :, 1:, 1:]
     ok = cm & (ct.abs() > 1e-3)
     area = masked_mean(F.relu(0.05 - cp * ct.sign() / ct.abs().clamp_min(1e-3)), ok)
-    return dict(l1=masked_mean(e, valid), deriv=deriv, curve=curve, border=masked_mean(e, valid & border), area=area)
+    if fg is None:
+        fg = torch.zeros_like(e[:, 0])
+    fg = fg.float()[:, None] * valid
+    wl = (1 + 2 * fg) * valid
+    wl = wl / (wl.flatten(1).sum(1).clamp_min(1) / valid.flatten(1).sum(1).clamp_min(1))[:, None, None, None]
+    l1 = (e * wl).flatten(1).sum(1) / (wl.expand_as(e)).flatten(1).sum(1).clamp_min(1e-6)
+    cu, cv = torch.diff(pu - tu, dim=3).abs(), torch.diff(pv - tv, dim=2).abs()
+    fu = (fg[..., 1:-1] * (mu[..., 1:] & mu[..., :-1])).expand_as(cu)
+    fv = (fg[:, :, 1:-1] * (mv[:, :, 1:] & mv[:, :, :-1])).expand_as(cv)
+    curve_fg = ((cu * fu).flatten(1).sum(1) + (cv * fv).flatten(1).sum(1)) / (fu.flatten(1).sum(1) + fv.flatten(1).sum(1)).clamp_min(1e-6) * 2
+    return dict(l1=l1, deriv=deriv, curve=curve, border=masked_mean(e, valid & border), area=area, curve_fg=curve_fg)
 
 
-def mixed_loss(p, t, kind, anchor):
-    """mean over the batch of the per-sample objective; returns (loss, terms)"""
-    q = map_terms(p, t)
+def mixed_loss(p, t, kind, anchor, fg=None):
+    """mean over the batch of the per-sample objective; returns (loss, terms). fg: map_terms (the generator's samples:
+    their ink; others none: their objective as before round 19's fg terms)"""
+    q = map_terms(p, t, fg)
     flat = sum((kind == k) for k in FLAT_KINDS).float()
-    sup = q['l1'] + 0.25 * q['deriv'] + 0.10 * flat * q['curve'] + q['border'] + 2.0 * q['area']
+    sup = q['l1'] + 0.25 * q['deriv'] + 0.10 * flat * q['curve'] + CURVE_FG * q['curve_fg'] + q['border'] + 2.0 * q['area']
     kd = q['l1'] + 0.10 * q['deriv'] + 0.5 * q['border']
     return torch.where(anchor.bool(), kd, sup).mean(), q
 

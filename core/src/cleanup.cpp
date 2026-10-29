@@ -753,7 +753,8 @@ static inline void adjust_px(const AdjustK& k, float* t, float tint) {
 //         kScanC0 -> kScanC1) fades to neutral f(l) except on light colours (tint), so paper noise and
 //         colour casts turn white and pastels stay
 //   t     base + s (enh - base)
-static const float kScanC0 = 0.04f, kScanC1 = 0.10f;   // Scan: chroma (max - min of v) of the neutral fade-out
+static const float kScanC0 = 0.04f, kScanC1 = 0.10f;
+static const float kPaperWhite0 = 0.96f;   // the filtered value from which the strength blend fades to full (gpu.cpp)   // Scan: chroma (max - min of v) of the neutral fade-out
 static inline void scan_px(const Curve& c, const float* v, float l, float tint, float pic, float s, float* t) {
     const float wpe = c.wp + (1.f - c.wp) * tint, wbe = c.wp_base + (1.f - c.wp_base) * tint;
     const float bk = c.black * (1.f - pic);
@@ -834,7 +835,10 @@ cv::Mat filter_cpu(const cv::Mat& img, const PageParams& p, Filter f, float s, c
             adjust_px(ak, t, tint);
             if (c.gray) t[0] = t[1] = t[2] = luma(t[0], t[1], t[2]);
             uint8_t* o = out.ptr<uint8_t>(y) + 4 * x;
-            const float se = c.kind == 4 ? 1.f : s;   // Scan applies the strength inside its curve
+            float se = c.kind == 4 ? 1.f : s;   // Scan applies the strength inside its curve
+            // paper the curve made white is white at any strength (round 18: at 0.7 the paper stayed grey,
+            // a 200 paper level rendered 238; CamScanner's is white); ink and colours keep the strength blend
+            if (c.kind != 0 && c.kind != 4 && se < 1.f) se += (1.f - se) * smoothstep(kPaperWhite0, 1.f, std::min({t[0], t[1], t[2]}));
             for (int k = 0; k < 3; ++k) {
                 float orig = (float)q[k];
                 o[k] = (uint8_t)std::lrint(std::min(255.f, std::max(0.f, orig + se * (t[k] * 255.f - orig))));

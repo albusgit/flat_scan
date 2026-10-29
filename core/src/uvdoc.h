@@ -34,13 +34,18 @@ inline const UvSpec& uv_spec(int model) { return model == 2 ? SYNTHDOC_HR_SPEC :
 // The part of the photo the net sees: the bounding box of the page corners with a 6% margin;
 // turned: the box is turned 90 degrees clockwise first (the page is landscape in the photo).
 struct UvCrop {
-    cv::Rect box;
+    cv::Rect box;                         // may reach past the photo when padded: that part is kUvPadColour
     bool turned = false;
     int model = 0;
 };
 
-// corners: TL, TR, BR, BL in photo px (the crop screen's / detection's order)
-UvCrop uv_crop(cv::Size photo, const std::array<cv::Point2d, 4>& corners, int model = 0);
+// what the net sees beyond the photo in a padded crop: a plain grey table (the nets learnt pages on a background)
+const cv::Scalar kUvPadColour(90, 90, 90);
+
+// corners: TL, TR, BR, BL in photo px (the crop screen's / detection's order). The box is the corners' bounding
+// box plus a 6 % margin, cut to the photo; pad: not cut - where the photo ends inside the margin, the net sees
+// kUvPadColour (a page that fills the photo then has its margin, as in training)
+UvCrop uv_crop(cv::Size photo, const std::array<cv::Point2d, 4>& corners, int model = 0, bool pad = false);
 
 // Network input for the crop: cv::INTER_AREA resize to the model's size, RGB / 255, NCHW float.
 // blank (optional, CV_8U photo size, non-zero = hide): the other page of a book spread is
