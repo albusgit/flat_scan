@@ -12,8 +12,9 @@ B = 32
 def to_onnx(ckpt, out):
     import torch
     import orientnet as on
-    net = on.OrientNet()
-    net.load_state_dict(torch.load(ckpt, map_location='cpu'))
+    sd = torch.load(ckpt, map_location='cpu')
+    net = on.OrientNet(on.widths_of(sd))
+    net.load_state_dict(sd)
     net.eval()
     torch.onnx.export(net, torch.zeros(B, 1, on.PATCH, on.PATCH), out, input_names=['patches'], output_names=['logits'],
                       opset_version=17, dynamo=False)

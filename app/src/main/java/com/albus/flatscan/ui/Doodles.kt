@@ -247,3 +247,26 @@ private fun DrawScope.heroIron(accent: Color) {
     drawCircle(ink, radius = 3.6f, center = Offset(-10f, -2.5f), style = Stroke(width = 0.7f))
     drawLine(ink, Offset(-10f, -2.5f), Offset(-10f, -5.4f), strokeWidth = 0.7f, cap = StrokeCap.Round)
 }
+
+/**
+ * A paper clip, upright, drawn in a 16 x 44 box (scaled to the modifier's size): one wire in three legs, for the
+ * documents of several pages in the laid-out view. [wire]: the steel, [shine]: a thin highlight along it.
+ */
+@Composable
+fun PaperClip(modifier: Modifier = Modifier, wire: Color, shine: Color) {
+    Canvas(modifier) {
+        val u = min(size.width / 16f, size.height / 44f)
+        val clip = Path().apply {
+            moveTo(6 * u, 13 * u)
+            lineTo(6 * u, 32 * u)
+            arcTo(androidx.compose.ui.geometry.Rect(Offset(9 * u, 32 * u), 3 * u), 180f, -180f, false)
+            lineTo(12 * u, 6 * u)
+            arcTo(androidx.compose.ui.geometry.Rect(Offset(7 * u, 6 * u), 5 * u), 0f, -180f, false)
+            lineTo(2 * u, 37 * u)
+            arcTo(androidx.compose.ui.geometry.Rect(Offset(8 * u, 37 * u), 6 * u), 180f, -180f, false)
+            lineTo(14 * u, 15 * u)
+        }
+        drawPath(clip, wire, style = Stroke(width = 2.2f * u, cap = StrokeCap.Round, join = StrokeJoin.Round))
+        drawPath(clip, shine, style = Stroke(width = 0.7f * u, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}

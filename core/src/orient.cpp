@@ -153,7 +153,7 @@ Orientation decide_orientation(const cv::Mat& page, double min_conf, double min_
 
 namespace {
 
-const int kOPatch = 128, kOStride = 96, kOMax = 32;
+const int kOPatch = 128, kOStride = 96, kOMax = 64;
 const double kOInkMin = 0.03, kOInkMax = 0.45;
 
 // tools/orientnet/orientnet.py ink_mask: dark marks on the local background

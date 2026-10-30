@@ -20,11 +20,14 @@ import torch.nn.functional as F
 import orientnet as on
 
 P = on.PATCH
+THERMAL = float(os.environ.get('OR_THERMAL', '0'))   # round 20: the share of patches printed as on thermal paper
 
 
-def cut_patches(files, per_page, seed):
+def cut_patches(files, per_page, seed, out_path):
+    """the patches written straight into a .npy on disk (round 20: 12,000 pages did not fit in RAM as a list)"""
     rng = np.random.default_rng(seed)
-    out = []
+    arr = np.lib.format.open_memmap(out_path + '.tmp.npy', mode='w+', dtype=np.uint8, shape=(len(files) * per_page, P, P))
+    n = 0
     for f in files:
         g = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
         if g is None:
@@ -42,14 +45,25 @@ def cut_patches(files, per_page, seed):
             crop = cv2.resize(g[y:y + side, x:x + side], (P, P), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
             fr = on.ink_mask(crop).mean()
             if on.INK_MIN <= fr <= on.INK_MAX:
-                out.append(crop)
+                arr[n] = crop
+                n += 1
                 got += 1
-    return np.stack(out)
+    arr.flush()
+    del arr
+    np.save(out_path, np.load(out_path + '.tmp.npy', mmap_mode='r')[:n])
+    os.remove(out_path + '.tmp.npy')
+    return n
 
 
 def degrade(p, rng):
     """one uint8 patch, made look photographed"""
     x = p.astype(np.float32)
+    if THERMAL and rng.random() < THERMAL:   # round 20: thermal-paper print (receipts, tickets): faded, uneven ink
+        ink = (255 - x) * rng.uniform(0.55, 0.9)
+        ink = ink * (1 + rng.uniform(0.05, 0.3) * np.sin(np.arange(P)[:, None] / rng.uniform(2, 10) + rng.uniform(0, 6)))
+        if rng.random() < 0.4:   # dead print-head dots: thin streaks along the paper
+            ink[:, rng.random(P) < rng.uniform(0.02, 0.1)] *= 0.25
+        x = 255 - ink
     if rng.random() < 0.6:   # small residual skew / perspective
         a = rng.uniform(-4, 4)
         M = cv2.getRotationMatrix2D((P / 2, P / 2), a, rng.uniform(0.9, 1.1))
@@ -105,6 +119,7 @@ def main():
     ap.add_argument('--per_page', type=int, default=48)
     ap.add_argument('--bs', type=int, default=256)
     ap.add_argument('--workers', type=int, default=8)
+    ap.add_argument('--width', default='16,32,64,96,128', help='channels per stage (round 20: a wider net tried)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     cache = {}
@@ -112,9 +127,8 @@ def main():
         f = os.path.join(a.pages, f'patches_{split}.npy')
         if not os.path.exists(f):
             t = time.time()
-            arr = cut_patches(sorted(glob.glob(os.path.join(a.pages, split, '*.png'))), per, 7 if split == 'train' else 8)
-            np.save(f, arr)
-            print(f'{split}: {len(arr)} patches in {time.time() - t:.0f} s', flush=True)
+            n = cut_patches(sorted(glob.glob(os.path.join(a.pages, split, '*.png'))), per, 7 if split == 'train' else 8, f)
+            print(f'{split}: {n} patches in {time.time() - t:.0f} s', flush=True)
         cache[split] = f
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     tr = Data(cache['train'], True)
@@ -122,7 +136,7 @@ def main():
     dl = torch.utils.data.DataLoader(tr, batch_size=a.bs, shuffle=True, num_workers=a.workers, persistent_workers=True,
                                      drop_last=True)
     dv = torch.utils.data.DataLoader(va, batch_size=512, num_workers=a.workers)
-    net = on.OrientNet().to(dev)
+    net = on.OrientNet(tuple(int(c) for c in a.width.split(','))).to(dev)
     print('params', sum(p.numel() for p in net.parameters()), 'device', dev, flush=True)
     opt = torch.optim.AdamW(net.parameters(), lr=2e-3, weight_decay=1e-4)
     steps = a.epochs * len(dl)

@@ -217,6 +217,7 @@ fun PaperSurface(
     lift: Dp = 2.dp,
     ruled: Boolean = false,
     tape: Boolean = false,
+    onClickLabel: String? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val light = isPaperLight()
@@ -251,7 +252,7 @@ fun PaperSurface(
                 }
             }
             .border(1.dp, edge, shape)
-            .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier),
+            .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClickLabel = onClickLabel, onClick = onClick) else Modifier),
     ) {
         CompositionLocalProvider(LocalContentColor provides contentColor) { content() }
     }

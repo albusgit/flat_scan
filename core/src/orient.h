@@ -20,7 +20,7 @@ struct Orientation {
 // The orientation net (tools/orientnet, orientnet.onnx): in = n x 1 x 128 x 128 patches, out = n x 4 logits
 using OrientNetFn = std::function<bool(const std::vector<float>& in, int n, std::vector<float>& logits)>;
 // The net's answer for a page (tools/orientnet/orientnet.py page_patches + decide): the page in grey at two scales,
-// its text-like 128-px patches (the 32 richest in ink), the mean log-softmax over them. turn: k x 90 deg clockwise
+// its text-like 128-px patches (the 64 richest in ink), the mean log-softmax over them. turn: k x 90 deg clockwise
 // brings the page upright; margin: the lead of the best over the runner-up. false: no text patches or no net.
 bool orient_net_turn(const cv::Mat& page, const OrientNetFn& net, int* turn, double* margin, int* patches = nullptr);
 

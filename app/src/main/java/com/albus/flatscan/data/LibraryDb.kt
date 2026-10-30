@@ -115,9 +115,12 @@ interface LibraryDao {
     @Query("UPDATE documents SET modified_at = :now WHERE id = :id")
     suspend fun touch(id: String, now: Long)
 
-    /** [tags]: a documents.tags value ([com.albus.flatscan.Tags.format]). */
-    @Query("UPDATE documents SET tags = :tags, modified_at = :now WHERE id = :id")
-    suspend fun setTags(id: String, tags: String, now: Long)
+    /**
+     * [tags]: a documents.tags value ([com.albus.flatscan.Tags.format]). The modified date stays (a tag is not an edit
+     * of the pages: the list keeps its order); the upload mark is cleared instead, so the next upload sends the tags.
+     */
+    @Query("UPDATE documents SET tags = :tags, uploaded_modified = NULL WHERE id = :id")
+    suspend fun setTags(id: String, tags: String)
 
     @Query("UPDATE documents SET sync_status = :status, sync_error = :error WHERE id = :id")
     suspend fun setSync(id: String, status: SyncStatus, error: String?)

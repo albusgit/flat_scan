@@ -15,7 +15,7 @@ PATCH = 128
 LONG = (1024, 1536)      # two scales: small and large print
 STRIDE = 96
 INK_MIN, INK_MAX = 0.03, 0.45
-MAX_PATCHES = 32
+MAX_PATCHES = 64
 
 
 def ink_mask(g):
@@ -68,6 +68,11 @@ class OrientNet(nn.Module):
 
     def forward(self, x):
         return self.head(self.f(x).mean(dim=(2, 3)))
+
+
+def widths_of(state_dict):
+    """the channels per stage of a saved OrientNet (two convolutions per stage)"""
+    return tuple(v.shape[0] for k, v in state_dict.items() if k.startswith('f.') and v.dim() == 4)[::2]
 
 
 def decide(logp_mean, min_margin):

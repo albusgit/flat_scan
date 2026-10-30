@@ -98,8 +98,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -353,11 +351,17 @@ private fun SearchTopBar(query: String, hasText: Boolean, onQuery: (String) -> U
 
 // ---------------------------------------------------------------- browsing
 
-/** The document still open: add a page to it or open it, without hunting for it in the list. */
+/**
+ * The document still open, on a sticky note taped to the desk: add a page to it or open it (the whole note opens
+ * it), without hunting for it in the list.
+ */
 @Composable
 private fun CarryOnCard(vm: ScanViewModel, d: DocumentSummary, onAdd: () -> Unit, onOpen: () -> Unit) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    PaperSurface(Modifier.fillMaxWidth().padding(top = 12.dp).testTag("carry_on"), tape = true) {
+    PaperSurface(
+        Modifier.fillMaxWidth().padding(top = 12.dp).testTag("carry_on"), onClick = onOpen, onClickLabel = "Open ${d.title}",
+        color = if (isPaperLight()) Palette.StickyNote else Graphite.StickyNote, tape = true,
+    ) {
         Row(Modifier.padding(start = 12.dp, end = 14.dp, top = 16.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
             PageThumb(vm, d.firstPage, d.modifiedAt, d.pageCount, width = 62.dp, tilt = true)
             Spacer(Modifier.width(14.dp))
@@ -368,6 +372,7 @@ private fun CarryOnCard(vm: ScanViewModel, d: DocumentSummary, onAdd: () -> Unit
                     pageCount(d.pageCount) + " · " + relativeDate(d.modifiedAt),
                     style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
+                TagMarks(remember(d.tags) { Tags.parse(d.tags) }, Modifier.padding(top = 4.dp), max = 3)
                 // with large text the two buttons do not fit side by side: Open goes under Add a page
                 FlowRow(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     InkPressable(
@@ -433,10 +438,10 @@ private fun ViewChoice(icon: ImageVector, label: String, on: Boolean, onClick: (
     val shape = RoundedCornerShape(7.dp)
     Box(
         Modifier.size(42.dp, 34.dp)
-            .then(if (on) Modifier.shadow(1.dp, shape).background(MaterialTheme.colorScheme.surfaceContainerLowest, shape) else Modifier)
+            .then(if (on) Modifier.background(MaterialTheme.colorScheme.onSurface, shape) else Modifier)
             .clip(shape).clickable(role = Role.RadioButton, onClickLabel = label, onClick = onClick),
         contentAlignment = Alignment.Center,
-    ) { Icon(icon, label, Modifier.size(19.dp), tint = if (on) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant) }
+    ) { Icon(icon, label, Modifier.size(19.dp), tint = if (on) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.onSurfaceVariant) }
 }
 
 /**
@@ -518,7 +523,7 @@ private fun LedgerRow(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(pageCount(d.pageCount), style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = muted, maxLines = 1)
                 SyncLine(d, Modifier.padding(start = 8.dp))
-                DocTags(d, Modifier.padding(start = 8.dp).weight(1f, fill = false))
+                TagMarks(remember(d.tags) { Tags.parse(d.tags) }, Modifier.padding(start = 8.dp).weight(1f, fill = false))
             }
         }
         when {
@@ -595,6 +600,10 @@ private fun PageTile(
                 "OPEN", style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontWeight = FontWeight.ExtraBold, letterSpacing = 0.1.em),
                 color = Palette.Ink, modifier = Modifier.offset(2.dp, 8.dp).rotate(-8f).background(Palette.Highlighter.copy(alpha = 0.9f)).padding(horizontal = 10.dp, vertical = 2.dp),
             )
+            if (d.pageCount > 1 && !selecting) PaperClip(
+                Modifier.align(Alignment.TopEnd).padding(end = 26.dp).size(14.dp, 38.dp).rotate(10f),
+                wire = if (isPaperLight()) Color(0xFF7D8696) else Color(0xFFB7BDC8), shine = Color.White.copy(alpha = 0.55f),
+            )
             if (d.pageCount > 1) Text(
                 "${d.pageCount}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontWeight = FontWeight.Bold), color = Color.White,
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 8.dp, bottom = 4.dp).clip(RoundedCornerShape(11.dp)).background(Palette.Ink).padding(horizontal = 7.dp, vertical = 3.dp),
@@ -607,6 +616,7 @@ private fun PageTile(
             style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono, fontSize = 11.sp),
             color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, modifier = Modifier.padding(horizontal = 4.dp),
         )
+        TagMarks(remember(d.tags) { Tags.parse(d.tags) }, Modifier.padding(start = 4.dp, end = 4.dp, top = 3.dp))
     }
 }
 
@@ -616,7 +626,10 @@ private fun TrashLine(count: Int, last: Boolean, onClick: () -> Unit) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val body: @Composable () -> Unit = {
         Row(Modifier.fillMaxWidth().height(54.dp).clickable(onClickLabel = "Open the trash", onClick = onClick), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.width(60.dp), contentAlignment = Alignment.Center) { Icon(Icons.Outlined.Delete, null, Modifier.size(19.dp), tint = muted) }
+            // a crumpled sheet in the margin: the trash
+            Box(Modifier.width(60.dp), contentAlignment = Alignment.Center) {
+                CrumpledBall(Modifier.size(24.dp), seed = 3, paper = MaterialTheme.colorScheme.surfaceContainerLowest, ink = muted)
+            }
             Spacer(Modifier.width(12.dp))
             Text("Trash", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold), color = muted)
             Spacer(Modifier.width(8.dp))
@@ -677,10 +690,13 @@ private fun SearchResultRow(vm: ScanViewModel, d: DocumentSummary, query: String
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(d.title, style = MaterialTheme.typography.titleSmall.copy(fontSize = 15.sp, fontWeight = FontWeight.Bold), maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (snippet != null) Text(snippet, style = MaterialTheme.typography.bodySmall.copy(fontSize = 13.sp, lineHeight = 19.sp), color = muted, maxLines = 3, overflow = TextOverflow.Ellipsis)
-            Text(
-                pageCount(d.pageCount) + " · " + relativeDate(d.modifiedAt),
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono), color = muted, maxLines = 1,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    pageCount(d.pageCount) + " · " + relativeDate(d.modifiedAt),
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono), color = muted, maxLines = 1,
+                )
+                TagMarks(remember(d.tags) { Tags.parse(d.tags) }, Modifier.padding(start = 8.dp).weight(1f, fill = false))
+            }
         }
     }
 }
@@ -742,14 +758,17 @@ private fun FirstRun(modifier: Modifier, onScan: () -> Unit, onImport: () -> Uni
                 Icon(Icons.AutoMirrored.Filled.ArrowForward, null, Modifier.size(22.dp))
             }
         }
-        Row(
-            Modifier.padding(top = 8.dp, bottom = 10.dp).fillMaxWidth().height(48.dp).clip(RoundedCornerShape(10.dp))
-                .clickable(role = Role.Button, onClick = onImport).navigationBarsPadding().testTag("import"),
-            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
+        InkPressable(
+            onClick = onImport, shape = RoundedCornerShape(12.dp), depth = 3.dp,
+            container = MaterialTheme.colorScheme.surfaceContainerLowest, contentColor = MaterialTheme.colorScheme.onSurface,
+            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.onSurface), shadow = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(top = 12.dp, bottom = 10.dp).navigationBarsPadding().fillMaxWidth().height(54.dp).testTag("import"),
         ) {
-            Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(19.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Import photos", style = MaterialTheme.typography.titleSmall)
+            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(19.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Import photos", style = MaterialTheme.typography.titleSmall)
+            }
         }
     }
 }
@@ -765,9 +784,19 @@ private fun HomeDock(modifier: Modifier, onImport: () -> Unit, onScan: () -> Uni
             .navigationBarsPadding().padding(start = 16.dp, end = 16.dp, top = 28.dp, bottom = 14.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Bottom,
     ) {
-        PaperSurface(onClick = onImport, modifier = Modifier.weight(1f).padding(bottom = 4.dp).height(60.dp).testTag("import")) {
-            Box(Modifier.fillMaxWidth().padding(top = 9.dp).height(1.dp).background(MaterialTheme.colorScheme.error.copy(alpha = 0.5f)))
-            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+        // an index card (its red heading rule), outlined in ink over a hard shadow like Add a page: on graphite a
+        // plain sheet was lost against the desk
+        InkPressable(
+            onClick = onImport, shape = RoundedCornerShape(12.dp), depth = 4.dp,
+            container = MaterialTheme.colorScheme.surfaceContainerLowest, contentColor = MaterialTheme.colorScheme.onSurface,
+            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.onSurface), shadow = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f).height(64.dp).testTag("import"),
+        ) {
+            val heading = MaterialTheme.colorScheme.error.copy(alpha = 0.6f)
+            Row(
+                Modifier.fillMaxSize().drawBehind { drawLine(heading, Offset(0f, 10.dp.toPx()), Offset(size.width, 10.dp.toPx()), strokeWidth = 1.dp.toPx()) },
+                horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Icon(Icons.Outlined.PhotoLibrary, null, Modifier.size(21.dp))
                 Spacer(Modifier.width(9.dp))
                 Text("Import", style = MaterialTheme.typography.titleMedium)
@@ -855,18 +884,6 @@ private fun PaperRow(selected: Boolean, outlined: Boolean, modifier: Modifier, o
             verticalAlignment = Alignment.CenterVertically,
         ) { content() }
     }
-}
-
-/** A document's tags in its list row, after the page count; nothing without tags. */
-@Composable
-private fun DocTags(d: DocumentSummary, modifier: Modifier = Modifier) {
-    val tags = remember(d.tags) { Tags.parse(d.tags) }
-    if (tags.isEmpty()) return
-    Text(
-        tags.joinToString(" · "), style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-        color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis,
-        modifier = modifier.semantics { contentDescription = "Tags: " + tags.joinToString(", ") },
-    )
 }
 
 /** The tag chips picked leave no document (none has all of them). */

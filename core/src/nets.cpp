@@ -378,20 +378,26 @@ RuleNetFn rule_net_fn(Inference& inf, double* ms) {
 
 OrientNetFn orient_net_fn(Inference& inf, double* ms) {
     return [&inf, ms](const std::vector<float>& in, int n, std::vector<float>& logits) {
-        // the model takes a fixed batch of 32 patches (tools/orientnet/export.py): fewer are padded with zeros
+        // the model takes a fixed batch of 32 patches (tools/orientnet/export.py): more run in batches, the last one
+        // padded with zeros
         const int B = 32;
-        if (n <= 0 || n > B || in.size() != (size_t)n * 128 * 128) return false;
-        Tensor x{{B, 1, 128, 128}, in};
-        x.data.resize((size_t)B * 128 * 128, 0.f);
-        std::vector<Tensor> y;
-        std::string err;
-        if (!inf.run(NetId::OrientNet, x, y, &err)) {
-            LOGI("orientation net: %s", err.c_str());
-            return false;
+        const size_t P = 128 * 128;
+        if (n <= 0 || in.size() != (size_t)n * P) return false;
+        logits.clear();
+        for (int i0 = 0; i0 < n; i0 += B) {
+            const int m = std::min(B, n - i0);
+            Tensor x{{B, 1, 128, 128}, std::vector<float>(in.begin() + i0 * P, in.begin() + (i0 + m) * P)};
+            x.data.resize((size_t)B * P, 0.f);
+            std::vector<Tensor> y;
+            std::string err;
+            if (!inf.run(NetId::OrientNet, x, y, &err)) {
+                LOGI("orientation net: %s", err.c_str());
+                return false;
+            }
+            if (y.empty() || y[0].data.size() != (size_t)B * 4) return false;
+            logits.insert(logits.end(), y[0].data.begin(), y[0].data.begin() + (size_t)m * 4);
+            if (ms) *ms += inf.last_ms(NetId::OrientNet);
         }
-        if (y.empty() || y[0].data.size() != (size_t)B * 4) return false;
-        logits.assign(y[0].data.begin(), y[0].data.begin() + (size_t)n * 4);
-        if (ms) *ms += inf.last_ms(NetId::OrientNet);
         return true;
     };
 }

@@ -59,22 +59,21 @@ class Library(
     suspend fun setTags(doc: String, tags: List<String>) = io {
         val d = dao.document(doc) ?: return@io
         val v = Tags.format(tags)
-        if (v != d.tags) dao.setTags(doc, v, clock())
+        if (v != d.tags) dao.setTags(doc, v)
     }
 
     /**
      * Puts [tag] on ([on]) or takes it off each of [docs] (feature round 5, the tag sheet). Only documents
-     * whose tags change are touched; their modified date moves, so the next upload sends the new tags.
+     * whose tags change are written; their modified date stays, and they count as changed since their last upload.
      */
     suspend fun setTag(docs: Collection<String>, tag: String, on: Boolean) = io {
         if (Tags.clean(tag).isEmpty()) return@io
         db.withTransaction {
-            val now = clock()
             for (id in docs.distinct()) {
                 val d = dao.document(id) ?: continue
                 val old = Tags.parse(d.tags)
                 val v = Tags.format(if (on) Tags.plus(old, tag) else Tags.minus(old, tag))
-                if (v != d.tags) dao.setTags(id, v, now)
+                if (v != d.tags) dao.setTags(id, v)
             }
         }
     }

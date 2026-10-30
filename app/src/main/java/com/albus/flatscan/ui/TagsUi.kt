@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -50,8 +52,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -82,7 +90,9 @@ fun TagFilterRow(tags: List<String>, picked: List<String>, onToggle: (String) ->
             FilterChip(
                 selected = on, onClick = { onToggle(t) },
                 label = { Text(t, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                leadingIcon = if (on) ({ Icon(Icons.Outlined.Check, null, Modifier.size(FilterChipDefaults.IconSize)) }) else null,
+                // the tag's highlighter ink as a dot, as on its labels
+                leadingIcon = if (on) ({ Icon(Icons.Outlined.Check, null, Modifier.size(FilterChipDefaults.IconSize)) })
+                else ({ Box(Modifier.size(10.dp).clip(CircleShape).background(tagInk(t))) }),
                 modifier = Modifier.testTag("tag_chip_${Tags.key(t)}"),
             )
         }
@@ -116,16 +126,46 @@ fun DocumentTagsRow(tags: List<String>, onEdit: () -> Unit, modifier: Modifier =
     }
 }
 
-/** A tag as a small label (not a button). */
+/** Highlighter inks for tags: each tag keeps one, picked by its name ([Tags.key]), so it reads the same everywhere. */
+private val TagInks = listOf(
+    Color(0xFFFFE45C), Color(0xFF9BE58C), Color(0xFFFFA8C5), Color(0xFFFFC266), Color(0xFF96D3FF), Color(0xFFC9B3FF),
+)
+
+fun tagInk(tag: String): Color = TagInks[Math.floorMod(Tags.key(tag).hashCode(), TagInks.size)]
+
+/**
+ * A tag as a small label (not a button): its name over a highlighter stroke in the tag's own ink ([tagInk]), a
+ * little ragged at the ends like a marker. On graphite the ink is dimmed and the name stays light.
+ */
 @Composable
-fun TagLabel(tag: String, modifier: Modifier = Modifier) {
-    val shape = RoundedCornerShape(6.dp)
+fun TagLabel(tag: String, modifier: Modifier = Modifier, small: Boolean = false) {
+    val light = isPaperLight()
+    val ink = tagInk(tag).copy(alpha = if (light) 0.85f else 0.32f)
     Text(
-        tag, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), maxLines = 1,
-        color = MaterialTheme.colorScheme.onPrimaryContainer,
-        modifier = modifier.clip(shape).background(MaterialTheme.colorScheme.primaryContainer)
-            .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f), shape).padding(horizontal = 8.dp, vertical = 3.dp),
+        tag, style = (if (small) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium).copy(fontWeight = FontWeight.SemiBold),
+        maxLines = 1, overflow = TextOverflow.Ellipsis,
+        color = if (light) Palette.Ink else MaterialTheme.colorScheme.onSurface,
+        modifier = modifier.drawBehind {
+            val r = 3.dp.toPx()
+            drawRoundRect(ink, Offset(-1.dp.toPx(), size.height * 0.08f), Size(size.width + 2.dp.toPx(), size.height * 0.86f), CornerRadius(r, r))
+        }.padding(horizontal = if (small) 5.dp else 7.dp, vertical = if (small) 1.dp else 2.dp),
     )
+}
+
+/** A document's tags in a list row or a card: the first [max] as labels, then "+n" for the rest; nothing without tags. */
+@Composable
+fun TagMarks(tags: List<String>, modifier: Modifier = Modifier, max: Int = 2) {
+    if (tags.isEmpty()) return
+    Row(
+        modifier.semantics(mergeDescendants = true) { contentDescription = "Tags: " + tags.joinToString(", ") },
+        horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically,
+    ) {
+        tags.take(max).forEach { TagLabel(it, Modifier.weight(1f, fill = false), small = true) }
+        if (tags.size > max) Text(
+            "+${tags.size - max}", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+        )
+    }
 }
 
 /**

@@ -69,6 +69,8 @@ object Palette {
     val Ruled = Color(0xFFC3D3EC)
     val Highlighter = Color(0xFFFFE45C)
     val RedPen = Color(0xFFD9473A)
+    /** The home screen's carry-on note. */
+    val StickyNote = Color(0xFFFFF6CC)
 }
 
 /** The light screens' dark theme: neutral graphite. */
@@ -81,6 +83,7 @@ object Graphite {
     val Pencil = Color(0xFFA4A6AD)
     val Accent = Color(0xFF9FB5F2)
     val Highlighter = Color(0xFFFFE066)
+    val StickyNote = Color(0xFF2D2B22)
 }
 
 /** The always-dark editor (camera, crop, result): a neutral ink well with a highlighter accent. */
@@ -124,7 +127,7 @@ private val Dark = darkColorScheme(
     surfaceVariant = Graphite.Raised, onSurfaceVariant = Graphite.Pencil,
     surfaceContainerLowest = Graphite.Sheet, surfaceContainerLow = Graphite.Sheet,
     surfaceContainer = Graphite.Sheet, surfaceContainerHigh = Graphite.Raised, surfaceContainerHighest = Color(0xFF303136),
-    outline = Color(0xFF45474D), outlineVariant = Graphite.Ruled,
+    outline = Color(0xFF63666E), outlineVariant = Graphite.Ruled,
     error = Color(0xFFFF7A6B), onError = Graphite.Ground,
     inverseSurface = Graphite.Text, inverseOnSurface = Graphite.Ground, inversePrimary = Palette.Accent,
 )
