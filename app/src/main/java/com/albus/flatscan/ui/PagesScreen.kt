@@ -1,5 +1,11 @@
 package com.albus.flatscan.ui
 
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.animation.core.animateFloatAsState
+import com.albus.flatscan.batch.ItemState
+import com.albus.flatscan.batch.BatchState
+import com.albus.flatscan.batch.BatchItem
 import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -227,6 +233,9 @@ fun PagesScreen(vm: ScanViewModel) {
             colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         )
         if (!selecting && docTags != null) DocumentTagsRow(docTags, onEdit = { tagging = true }, modifier = Modifier.padding(horizontal = 8.dp))
+        val batch = vm.batchState
+        val coming = vm.docId?.let { d -> batch.items.filter { it.doc == d && (it.state == ItemState.Queued || it.state == ItemState.Working) } }.orEmpty()
+        if (coming.isNotEmpty()) BatchStrip(batch, onStop = { vm.stopBatch() })
         ReorderablePageGrid(
             pages = vm.pages,
             onMove = { from, to -> vm.dragMove(from, to) },
@@ -234,7 +243,9 @@ fun PagesScreen(vm: ScanViewModel) {
             dragEnabled = !selecting,
             modifier = Modifier.weight(1f).fillMaxWidth(),
             footer = {
-                if (n == 0) item(key = "empty", span = { GridItemSpan(maxLineSpan) }) { EmptyPages() }
+                if (n == 0 && coming.isEmpty()) item(key = "empty", span = { GridItemSpan(maxLineSpan) }) { EmptyPages() }
+                // the batch's photos still being processed: their pages take these places as they are done
+                items(coming, key = { "batch_${it.seq}" }) { BatchPageTile(it) }
                 if (!selecting) item(key = "add") { AddPageTile { adding = AddTarget(null) } }
                 if (!selecting && n > 1) item(key = "reorder_hint", span = { GridItemSpan(maxLineSpan) }) {
                     Text(
@@ -532,6 +543,61 @@ private fun RowScope.SourceButton(icon: ImageVector, label: String, onClick: () 
         Icon(icon, null, Modifier.size(26.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.height(8.dp))
         Text(label, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+/**
+ * A background batch under way: how many photos are done, a bar, and Stop (the ones being processed still finish).
+ * The same progress shows in the notification while the app is left.
+ */
+@Composable
+private fun BatchStrip(s: BatchState, onStop: () -> Unit) {
+    val now = (s.finished + 1).coerceAtMost(s.total)
+    PaperSurface(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), shape = MaterialTheme.shapes.small) {
+        Column(Modifier.padding(start = 14.dp, end = 4.dp, top = 8.dp, bottom = 10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Processing photo $now of ${s.total}", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        listOfNotNull(
+                            if (s.workers > 1) "${s.workers} at a time" else "one at a time",
+                            if (s.failed > 0) "${s.failed} failed" else null,
+                        ).joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = onStop) { Text("Stop") }
+            }
+            val shown by animateFloatAsState(s.fraction, tween(400), label = "batch")
+            LinearProgressIndicator(
+                progress = { shown }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp, end = 10.dp).height(6.dp).clip(RoundedCornerShape(3.dp)),
+                drawStopIndicator = {},
+            )
+        }
+    }
+}
+
+/** A page still being made by the batch: a blank ruled sheet with its progress ring (an empty ring while it waits). */
+@Composable
+private fun BatchPageTile(item: BatchItem) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(Modifier.fillMaxWidth()) {
+        PaperSurface(Modifier.fillMaxWidth().height(CardHeight), ruled = true) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                if (item.state == ItemState.Working) {
+                    val p by animateFloatAsState(item.progress, tween(300), label = "page")
+                    CircularProgressIndicator(progress = { p }, modifier = Modifier.size(40.dp), strokeWidth = 3.dp, gapSize = 0.dp)
+                } else {
+                    // waiting its turn: the ring's empty track, still
+                    CircularProgressIndicator(progress = { 0f }, modifier = Modifier.size(40.dp), strokeWidth = 3.dp, trackColor = muted.copy(alpha = 0.25f))
+                }
+            }
+        }
+        Text(
+            if (item.state == ItemState.Working) "flattening…" else "waiting",
+            style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono), color = muted,
+            modifier = Modifier.padding(start = 2.dp, top = 6.dp),
+        )
     }
 }
 

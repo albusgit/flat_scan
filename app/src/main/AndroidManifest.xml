@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- sync to the user's own server (feature 6) only; nothing else uses the network -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- background batches (BatchService): the process kept alive while photos are processed, and its progress shown -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".FlatScanApp"
@@ -33,6 +38,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- mediaProcessing from Android 15, dataSync before it (BatchService.onStartCommand) -->
+        <service
+            android:name=".batch.BatchService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|mediaProcessing" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.files"

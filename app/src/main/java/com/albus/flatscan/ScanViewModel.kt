@@ -92,6 +92,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val library = Library.get(app)
     private val store = library.store
 
+    /** Background batches (several photos picked at once): BatchProcessor, for the process's life. */
+    private val batchProcessor = com.albus.flatscan.batch.BatchProcessor.get(app)
+    /** The batch as the screens show it (the pages screen's progress strip and its pages still to come). */
+    var batchState by mutableStateOf(com.albus.flatscan.batch.BatchState())
+        private set
+    /** Ask for the notification permission (Android 13+): MainActivity asks once a batch has started. */
+    var askNotifications by mutableStateOf(false)
+    private val placeBatchPages: (com.albus.flatscan.batch.PagesAdded) -> Boolean = { p -> placeBatchPages(p) }
+
     var screen by mutableStateOf(Screen.Home)
 
     /** The paper screens' theme (Settings > Appearance): Settings.THEME_LIGHT, THEME_DARK or THEME_SYSTEM. */
@@ -494,6 +503,20 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         // main thread; a net asked for before this ran waits for it (jni_bridge.cpp assets_locked)
         viewModelScope.launch(nativeCtx) { synchronized(configLock) { if (!netsConfigured) configureNets(netPlan) } }
         setUpGpu()
+        batchProcessor.onPages = placeBatchPages
+        viewModelScope.launch {
+            var waiting = emptyMap<String, Int>()
+            batchProcessor.state.collect { s ->
+                batchState = s
+                // a document whose batch is done and which is no longer open: its text and upload, as on leaving it
+                val now = s.items.groupBy { it.doc }.mapValues { (d, _) -> s.waiting(d) }
+                for ((d, n) in waiting) if (n > 0 && (now[d] ?: 0) == 0 && d != docId) {
+                    backgroundOcr(d)
+                    autoUpload(d)
+                }
+                waiting = now
+            }
+        }
     }
 
     /** Settings: the user asks for the GPU again after a crash turned it off. */
@@ -748,11 +771,13 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch {
             val sb = StringBuilder("open test: ${photos.size} photos of $dir\n")
+            val tBatch = android.os.SystemClock.elapsedRealtime()
             importUris(photos.map { Uri.fromFile(it) })
             val done = withTimeoutOrNull(900_000) {
-                snapshotFlow { screen == Screen.Pages && !batch && pages.size >= photos.size }.first { it }
+                snapshotFlow { screen == Screen.Pages && !batch && pages.size >= photos.size && !batchState.running }.first { it }
             }
             if (done == null) sb.append("TIMEOUT waiting for the batch (screen $screen, ${pages.size} pages)\n")
+            else sb.append("batch: ${android.os.SystemClock.elapsedRealtime() - tBatch} ms for ${photos.size} photos, ${batchState.workers} at a time, ${batchState.failed} failed\n")
             for (round in 0 until rounds)
                 for (id in pages.toList()) {
                     delay(1500)   // the last page's session store and render settle
@@ -1060,6 +1085,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun importUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
         lastSource = ImportSource.Gallery
+        if (uris.size > 1 && !settings.reviewCrops && !flatImport) {
+            startBackgroundBatch(uris)
+            return
+        }
         pending.clear()
         pending.addAll(uris.drop(1))
         pendingTotal = uris.size
@@ -1082,6 +1111,48 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Index (1-based) of the imported image being worked on. */
     val importIndex: Int get() = pendingTotal - pending.size
+
+    /**
+     * Several photos picked at once: processed in the background ([com.albus.flatscan.batch.BatchProcessor]), several at
+     * a time, while the pages screen shows them arriving and a notification how far the batch is. The nets' backends
+     * are set up first, as processing sets them up (not Auto's first benchmark: until it has run, the batch takes the CPU).
+     */
+    private fun startBackgroundBatch(uris: List<Uri>) {
+        viewModelScope.launch {
+            commitCurrent()
+            val d = ensureDocument()
+            val anchor = insertAt
+            insertAt = null
+            val plan = withContext(Dispatchers.Default) {
+                runCatching {
+                    if (settings.acceleration == Accel.AUTO && Accel.autoPlan(settings.autoChoice) == null) netPlan
+                    else synchronized(netsLock) { currentPlan().also { if (it != netPlan) configureNets(it) } }
+                }.onFailure { Log.e(TAG, "batch net set-up failed", it) }.getOrDefault(netPlan)
+            }
+            batchProcessor.enqueue(d, docTitle ?: "", uris, anchor, com.albus.flatscan.batch.BatchConfig(captureMode, plan, gpuInfo))
+            askNotifications = true
+            pagesReturnTo = Screen.Home
+            screen = Screen.Pages
+            message = "Processing ${uris.size} photos - they appear here as they are done"
+        }
+    }
+
+    /** A batch's finished pages, put in place when their document is the open one (else the batch writes the library). */
+    private fun placeBatchPages(p: com.albus.flatscan.batch.PagesAdded): Boolean {
+        if (p.doc != docId) return false
+        val items = batchProcessor.state.value.items
+        val anchor = items.firstOrNull { it.seq == p.seq }?.anchor
+        val fresh = p.ids.filter { it !in pages }
+        val at = com.albus.flatscan.batch.BatchProcessor.insertionIndex(pages, p.seq, anchor, items.filter { it.doc == p.doc && it.seq != p.seq })
+        pages.addAll(at, fresh)
+        for (id in fresh) pageVersions[id] = 0
+        pagesHistory?.let { h -> if (h.state.current == docId) { h.apply(h.state.copy(docs = h.state.docs + (h.state.current to pages.toList()))); updateUndoFlags() } }
+        saveOrder()
+        return true
+    }
+
+    /** Stops the background batch after the photos being processed (the notification's Stop, too). */
+    fun stopBatch() = batchProcessor.stop()
 
     /** The batch's next photo, or its end: the pages screen with every page. */
     private fun continueBatch() {
@@ -1576,10 +1647,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         return false
     }
 
-    private fun geometryKey(m: PageMeta) =
-        m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
-            "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=9|rulenet=" + settings.ruleNet + "|pass1=1|hrfirst=2|fold=1" +
-            currentPlan().let { if (it.cpuOnly) "" else "|accel=${it.key()}" }
+    private fun geometryKey(m: PageMeta) = pageGeometryKey(m, settings, currentPlan())
 
     /**
      * Opens a page of the document: from its stored session when its geometry is unchanged (no
@@ -2702,71 +2770,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         return a
     }
 
-    private fun describe(info: JSONObject, edited: Boolean, forced: Boolean, perspectiveOnly: Boolean, nIgnore: Int): String {
-        val sb = StringBuilder()
-        if (perspectiveOnly) sb.append("Unwarp: off (perspective correction only)\n")
-        else if (nIgnore > 0) sb.append("Unwarp: lines in $nIgnore area${if (nIgnore == 1) "" else "s"} ignored\n")
-        val mode = info.optString("mode")
-        val gate = info.optJSONArray("needs_manual_crop")
-        val reasons = if (gate != null) List(gate.length()) { gate.optString(it) } else emptyList()
-        sb.append(
-            when {
-                mode == "uvdoc" -> "Geometry: %s neural flattening (outline agreement %.2f)".format(
-                    if (info.optInt("uv_model") == 2) "SyntheticDoc high-res" else "UVDoc", info.optDouble("uv_agreement")) +
-                    (info.optJSONArray("uv_spread")?.let { a ->
-                        if (a.optDouble(0, -1.0) >= 0 && a.optDouble(1, -1.0) >= 0)
-                            "\nNets compared: text-row spread %.2f / %.2f deg".format(a.optDouble(0), a.optDouble(1)) else ""
-                    } ?: "") +
-                    if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
-                    else "\nLine refinement: applied" + (if (info.optBoolean("spots_dropped")) " (lines left out where they overstretched the page)" else "") +
-                        (info.optJSONArray("net")?.takeIf { info.optBoolean("rule_net") }?.let { a ->
-                            "\n  rule net: %d lines dropped, %d added, %d pieces joined, %d bent rules kept".format(a.optInt(0), a.optInt(1), a.optInt(2), a.optInt(3))
-                        } ?: "")
-                edited -> "Geometry: homography (corners adjusted by hand)"
-                reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"
-                info.optBoolean("uv_rejected") && mode == "surface" ->
-                    "Geometry: page surface model (UVDoc disagreed with the page outline, %.2f)".format(info.optDouble("uv_agreement"))
-                info.optBoolean("fell_back") -> "Geometry: homography (surface fit rejected, outline residual %.1f px)".format(info.optDouble("fit_median_px"))
-                mode == "surface" -> "Geometry: page surface model (outline residual %.2f px)".format(info.optDouble("fit_median_px"))
-                else -> "Geometry: $mode"
-            },
-        )
-        if (info.optBoolean("edge_doubt")) sb.append("\nEdges: the two flattening nets disagree on where an edge is (check the corners)")
-        if (info.has("rot")) sb.append("\nOrientation: ").append(
-            when (info.optInt("rot")) { 0 -> "turned 90 degrees clockwise"; 2 -> "turned 90 degrees counter-clockwise"; 1 -> "turned 180 degrees"; else -> "as photographed" },
-        )
-        if (info.has("finder")) {
-            sb.append("\nPage finder: ").append(if (info.optString("finder") == "net") "net + edge snapping" else "colour threshold")
-            if (info.optBoolean("whole_frame")) sb.append(" (no page found: whole frame)")
-            if (info.optInt("n_pages", 1) == 2) sb.append(", book spread page ").append(info.optInt("page_index") + 1).append(" of 2")
-            if (info.optString("finder") == "net") sb.append("\n  net margin %.2f, edge strength %.2f, at limit %.2f".format(
-                info.optDouble("net_margin"), info.optDouble("edge_strength"), info.optDouble("edge_at_limit")))
-        }
-        if (info.optBoolean("shadows_removed")) sb.append(if (info.optBoolean("shade_net")) "\nShadows: removed (shadow net)" else "\nShadows: removed (shading map)")
-        if (info.optDouble("fingers_erased", 0.0) > 0) sb.append("\nFingers: erased (%.1f%% of the page)".format(100 * info.optDouble("fingers_erased")))
-        sb.append("\nResample: ").append(if (info.optBoolean("gpu_resample")) "GPU" else "CPU fallback")
-        sb.append("\n").append(gpuInfo)
-        info.optJSONObject("accel")?.let { a ->
-            val ac = a.optJSONObject("acceleration")
-            sb.append("\n\nAcceleration: %s%s".format(Accel.CHOICES.firstOrNull { it.first == ac?.optString("setting") }?.second?.substringBefore(':') ?: "?",
-                ac?.optString("note")?.takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""))
-            sb.append("\nNets (%s), run / other ms, backend:".format(a.optString("runtime")))
-            val n = a.optJSONObject("nets")
-            for ((k, label) in NET_LABELS) n?.optJSONObject(k)?.let { t ->
-                sb.append("\n%s: %.0f / %.0f ms, %s".format(label, t.optDouble("run_ms"), t.optDouble("input_ms"), t.optString("backend")))
-                if (t.optBoolean("reused")) sb.append(" (ran on the crop screen)")
-                else if (t.optBoolean("first_use")) sb.append(" (first use: other includes loading)")
-            }
-            sb.append("\nFlattening nets: %d ms; processing (incl. shadow net): %d ms".format(a.optInt("flattening_nets_ms"), a.optInt("process_ms")))
-            sb.append("\nSoC: ").append(a.optString("soc"))
-        }
-        val ms = info.optJSONObject("ms")
-        if (ms != null) {
-            sb.append("\n\nStage times (ms):")
-            for (k in ms.keys()) sb.append("\n").append(k).append(": ").append(ms.optLong(k))
-        }
-        return sb.toString()
-    }
+    private fun describe(info: JSONObject, edited: Boolean, forced: Boolean, perspectiveOnly: Boolean, nIgnore: Int): String =
+        describePage(info, edited, forced, perspectiveOnly, nIgnore, gpuInfo)
 
     private fun currentMeta(): PageMeta? =
         sessionGeom?.copy(
@@ -3392,6 +3397,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        // the batch goes on without this screen model: its pages then go into the library directly
+        if (batchProcessor.onPages === placeBatchPages) batchProcessor.onPages = null
         // release on the native thread, after any render still running there
         nativeExec.execute {
             if (nativeHandle != 0L) NativeLib.release(nativeHandle)
@@ -3416,6 +3423,79 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 }
+
+/** The processing details of a page ([info]: NativeLib.info), as Settings > Processing details shows them. */
+internal fun describePage(info: JSONObject, edited: Boolean, forced: Boolean, perspectiveOnly: Boolean, nIgnore: Int, gpuInfo: String): String {
+    val sb = StringBuilder()
+    if (perspectiveOnly) sb.append("Unwarp: off (perspective correction only)\n")
+    else if (nIgnore > 0) sb.append("Unwarp: lines in $nIgnore area${if (nIgnore == 1) "" else "s"} ignored\n")
+    val mode = info.optString("mode")
+    val gate = info.optJSONArray("needs_manual_crop")
+    val reasons = if (gate != null) List(gate.length()) { gate.optString(it) } else emptyList()
+    sb.append(
+        when {
+            mode == "uvdoc" -> "Geometry: %s neural flattening (outline agreement %.2f)".format(
+                if (info.optInt("uv_model") == 2) "SyntheticDoc high-res" else "UVDoc", info.optDouble("uv_agreement")) +
+                (info.optJSONArray("uv_spread")?.let { a ->
+                    if (a.optDouble(0, -1.0) >= 0 && a.optDouble(1, -1.0) >= 0)
+                        "\nNets compared: text-row spread %.2f / %.2f deg".format(a.optDouble(0), a.optDouble(1)) else ""
+                } ?: "") +
+                if (info.optBoolean("lines_rejected")) "\nLine refinement: skipped (it would have distorted the page, %.2f)".format(info.optDouble("line_distortion"))
+                else "\nLine refinement: applied" + (if (info.optBoolean("spots_dropped")) " (lines left out where they overstretched the page)" else "") +
+                    (info.optJSONArray("net")?.takeIf { info.optBoolean("rule_net") }?.let { a ->
+                        "\n  rule net: %d lines dropped, %d added, %d pieces joined, %d bent rules kept".format(a.optInt(0), a.optInt(1), a.optInt(2), a.optInt(3))
+                    } ?: "")
+            edited -> "Geometry: homography (corners adjusted by hand)"
+            reasons.isNotEmpty() || forced -> "Geometry: homography (doubtful automatic crop${if (reasons.isNotEmpty()) ": " + reasons.joinToString("; ") else ""})"
+            info.optBoolean("uv_rejected") && mode == "surface" ->
+                "Geometry: page surface model (UVDoc disagreed with the page outline, %.2f)".format(info.optDouble("uv_agreement"))
+            info.optBoolean("fell_back") -> "Geometry: homography (surface fit rejected, outline residual %.1f px)".format(info.optDouble("fit_median_px"))
+            mode == "surface" -> "Geometry: page surface model (outline residual %.2f px)".format(info.optDouble("fit_median_px"))
+            else -> "Geometry: $mode"
+        },
+    )
+    if (info.optBoolean("edge_doubt")) sb.append("\nEdges: the two flattening nets disagree on where an edge is (check the corners)")
+    if (info.has("rot")) sb.append("\nOrientation: ").append(
+        when (info.optInt("rot")) { 0 -> "turned 90 degrees clockwise"; 2 -> "turned 90 degrees counter-clockwise"; 1 -> "turned 180 degrees"; else -> "as photographed" },
+    )
+    if (info.has("finder")) {
+        sb.append("\nPage finder: ").append(if (info.optString("finder") == "net") "net + edge snapping" else "colour threshold")
+        if (info.optBoolean("whole_frame")) sb.append(" (no page found: whole frame)")
+        if (info.optInt("n_pages", 1) == 2) sb.append(", book spread page ").append(info.optInt("page_index") + 1).append(" of 2")
+        if (info.optString("finder") == "net") sb.append("\n  net margin %.2f, edge strength %.2f, at limit %.2f".format(
+            info.optDouble("net_margin"), info.optDouble("edge_strength"), info.optDouble("edge_at_limit")))
+    }
+    if (info.optBoolean("shadows_removed")) sb.append(if (info.optBoolean("shade_net")) "\nShadows: removed (shadow net)" else "\nShadows: removed (shading map)")
+    if (info.optDouble("fingers_erased", 0.0) > 0) sb.append("\nFingers: erased (%.1f%% of the page)".format(100 * info.optDouble("fingers_erased")))
+    sb.append("\nResample: ").append(if (info.optBoolean("gpu_resample")) "GPU" else "CPU fallback")
+    sb.append("\n").append(gpuInfo)
+    info.optJSONObject("accel")?.let { a ->
+        val ac = a.optJSONObject("acceleration")
+        sb.append("\n\nAcceleration: %s%s".format(Accel.CHOICES.firstOrNull { it.first == ac?.optString("setting") }?.second?.substringBefore(':') ?: "?",
+            ac?.optString("note")?.takeIf { it.isNotEmpty() }?.let { " ($it)" } ?: ""))
+        sb.append("\nNets (%s), run / other ms, backend:".format(a.optString("runtime")))
+        val n = a.optJSONObject("nets")
+        for ((k, label) in ScanViewModel.NET_LABELS) n?.optJSONObject(k)?.let { t ->
+            sb.append("\n%s: %.0f / %.0f ms, %s".format(label, t.optDouble("run_ms"), t.optDouble("input_ms"), t.optString("backend")))
+            if (t.optBoolean("reused")) sb.append(" (ran on the crop screen)")
+            else if (t.optBoolean("first_use")) sb.append(" (first use: other includes loading)")
+        }
+        sb.append("\nFlattening nets: %d ms; processing (incl. shadow net): %d ms".format(a.optInt("flattening_nets_ms"), a.optInt("process_ms")))
+        sb.append("\nSoC: ").append(a.optString("soc"))
+    }
+    val ms = info.optJSONObject("ms")
+    if (ms != null) {
+        sb.append("\n\nStage times (ms):")
+        for (k in ms.keys()) sb.append("\n").append(k).append(": ").append(ms.optLong(k))
+    }
+    return sb.toString()
+}
+
+/** What a stored session was processed with: a page whose key changed is processed again when opened. */
+internal fun pageGeometryKey(m: PageMeta, settings: Settings, plan: Accel.Plan) =
+    m.geometryKey(settings.outputWidth, settings.autoRotate && !m.userRotated, settings.pageFinderNet) +
+        "|uv=" + settings.uvDoc + "|nets=" + settings.flatNets + "|shadows=" + settings.neuralShadows + "|shadenet=1|hr=1|lines=9|rulenet=" + settings.ruleNet + "|pass1=1|hrfirst=2|fold=1" +
+        plan.let { if (it.cpuOnly) "" else "|accel=${it.key()}" }
 
 /** A new bitmap: this one turned [q] clockwise quarter turns (a plain copy for 0). */
 fun Bitmap.rotatedCopy(q: Int): Bitmap {

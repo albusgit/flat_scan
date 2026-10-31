@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="60" android:viewportHeight="60">
+    <!-- the status-bar icon: the launcher's outline and straightening line (ic_launcher_monochrome), white -->
+    <group android:translateX="-25.5" android:translateY="-24">
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="3.6" android:strokeLineJoin="round"
+            android:pathData="M36,28h28l11,11v41H36zM64,28v11h11" />
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="3.4" android:strokeLineCap="round"
+            android:pathData="M42,49c3,-4 5,4 8,0s5,4 8,0 3,-1 4,-1h7" />
+    </group>
+</vector>

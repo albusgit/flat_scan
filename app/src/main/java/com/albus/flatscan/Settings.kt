@@ -84,6 +84,11 @@ class Settings(ctx: Context) {
         get() = p.getBoolean("rule_net", Features.RULE_NET)
         set(v) = p.edit().putBoolean("rule_net", v).apply()
 
+    /** Photos a background batch processes at once: 1-3, or 0 for the phone's choice (BatchProcessor.workers). */
+    var batchWorkers: Int
+        get() = p.getInt("batch_workers", 0)
+        set(v) = p.edit().putInt("batch_workers", v).apply()
+
     /** Show the crop screen for every page; otherwise only doubtful crops (quality gate) stop there. */
     var reviewCrops: Boolean
         get() = p.getBoolean("review_crops", false)

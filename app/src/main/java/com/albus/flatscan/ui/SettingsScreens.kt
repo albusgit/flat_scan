@@ -1,5 +1,6 @@
 package com.albus.flatscan.ui
 
+import com.albus.flatscan.batch.BatchProcessor
 import android.content.Intent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -102,6 +103,8 @@ fun SettingsScreen(vm: ScanViewModel) {
     var bookRtl by remember { mutableStateOf(s.bookRightToLeft) }
     var ocrAfter by remember { mutableStateOf(s.ocrAfterScan) }
     var width by remember { mutableIntStateOf(s.outputWidth) }
+    var workers by remember { mutableIntStateOf(s.batchWorkers) }
+    val ctx = LocalContext.current
     var sheet by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) { vm.measureStorage() }
     SettingsPage("Settings", onBack = { vm.back() }) {
@@ -123,6 +126,11 @@ fun SettingsScreen(vm: ScanViewModel) {
             SwitchRow("Always check the crop", "Off: the crop screen opens only when the edges look doubtful.", reviewCrops) {
                 reviewCrops = it; s.reviewCrops = it
             }
+            RowDivider()
+            NavRow(
+                "Photos processed at once", "Several photos picked together are processed in the background, with their progress in a notification.",
+                value = if (workers == 0) "Auto (${BatchProcessor.workers(ctx, 0)})" else "$workers",
+            ) { sheet = "workers" }
             RowDivider()
             SwitchRow("Book pages: right page first", "For Hebrew and Arabic books photographed as a spread.", bookRtl) {
                 bookRtl = it; s.bookRightToLeft = it
@@ -174,6 +182,16 @@ fun SettingsScreen(vm: ScanViewModel) {
             "Page quality", "The width pages are saved at. Finding and flattening the page always work at 1600 px.",
             Settings.OUTPUT_QUALITY.map { Choice(it.first, it.second, it.third) }, width,
             onPick = { width = it; s.outputWidth = it }, onDismiss = { sheet = null },
+        )
+        "workers" -> ChoiceSheet(
+            "Photos processed at once", "More at once finishes a batch sooner and takes more of the phone's memory.",
+            listOf(
+                Choice(0, "Auto", "Two on phones with 6 GB of memory or more, else one"),
+                Choice(1, "One", "The least memory"),
+                Choice(2, "Two", "About a third faster than one"),
+                Choice(3, "Three", "A little faster again; for phones with 8 GB or more"),
+            ),
+            workers, onPick = { workers = it; s.batchWorkers = it }, onDismiss = { sheet = null },
         )
     }
 }

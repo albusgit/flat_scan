@@ -1,12 +1,16 @@
 package com.albus.flatscan
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.SizeTransform
@@ -24,6 +28,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
 import com.albus.flatscan.ui.CameraScreen
@@ -47,6 +52,9 @@ import com.albus.flatscan.ui.SyncScreen
 class MainActivity : ComponentActivity() {
     private val vm: ScanViewModel by viewModels()
 
+    /** Android 13+: the batch's progress notification needs the permission; asked once, when a first batch starts. */
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -54,15 +62,47 @@ class MainActivity : ComponentActivity() {
             FlatScanTheme(vm.themeMode) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Box(Modifier.fillMaxSize().graphPaper()) { App(vm) }
+                    LaunchedEffect(vm.askNotifications) {
+                        if (vm.askNotifications) {
+                            vm.askNotifications = false
+                            askNotificationsOnce()
+                        }
+                    }
                 }
             }
         }
-        if (savedInstanceState == null) startBatch(intent)
+        if (savedInstanceState == null) {
+            openFromNotification(intent)
+            startBatch(intent)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        openFromNotification(intent)
         startBatch(intent)
+    }
+
+    /** The batch's notification: its document on the pages screen. */
+    private fun openFromNotification(i: Intent?) {
+        val doc = i?.getStringExtra(EXTRA_OPEN_DOCUMENT) ?: return
+        i.removeExtra(EXTRA_OPEN_DOCUMENT)
+        vm.openDocument(doc)
+    }
+
+    /** Asks for the notification permission the first time a batch starts (not again once answered). */
+    private fun askNotificationsOnce() {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        if (prefs.getBoolean("notifications_asked", false)) return
+        prefs.edit().putBoolean("notifications_asked", true).apply()
+        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    companion object {
+        /** The batch notification's document id ([com.albus.flatscan.batch.BatchService]). */
+        const val EXTRA_OPEN_DOCUMENT = "com.albus.flatscan.OPEN_DOCUMENT"
     }
 
     /**
@@ -93,6 +133,8 @@ class MainActivity : ComponentActivity() {
             vm.open(Screen.Settings)
             return
         }
+        // `--ei batch_workers N` with any extra: photos a background batch processes at once (0: the phone's choice)
+        if (i.hasExtra("batch_workers")) vm.settings.batchWorkers = i.getIntExtra("batch_workers", 0)
         // `--ez no_ahead true` with any extra: the flattening nets do not start ahead of processing (A/B checks)
         if (i.hasExtra("no_ahead")) vm.netsAheadOff = i.getBooleanExtra("no_ahead", false)
         // `--ei threads N` with any extra: the CPU nets on N threads (0: the default) from the next net configuration
