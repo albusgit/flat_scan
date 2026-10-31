@@ -148,9 +148,21 @@ int main(int argc, char** argv) {
         cv::Mat bgra, shown, bgr;
         cv::cvtColor(img, bgra, cv::COLOR_BGR2BGRA);
         PageParams pp = page_params(bgra, false);
-        shown = render_page(bgra, cv::Mat(), pp, Filter::AutoColor, 0.7f, false, {}, false);
+        // FS_SHADOW=AMOUNT,CONTRAST: the render's shadows (cleanup.h ShadowAdjust; the app's Auto is 1,0)
+        RenderParams rp;
+        if (const char* sh = std::getenv("FS_SHADOW")) std::sscanf(sh, "%f,%f", &rp.shadow.amount, &rp.shadow.contrast);
+        shown = render_page(bgra, cv::Mat(), pp, rp, {}, false);
         cv::cvtColor(shown, bgr, cv::COLOR_BGRA2BGR);
         cv::imwrite(argv[2], bgr, {cv::IMWRITE_JPEG_QUALITY, 88});
+        // FS_DUMP_ILLUM=PNG: the paper luminance S (quarter grid) and its paper samples side by side
+        if (const char* di = std::getenv("FS_DUMP_ILLUM")) {
+            cv::Mat s8, m8, both;
+            pp.illum.convertTo(s8, CV_8U);
+            pp.samples.convertTo(m8, CV_8U, 255.0);
+            if (m8.size() != s8.size()) m8 = cv::Mat::zeros(s8.size(), CV_8U);
+            cv::hconcat(s8, m8, both);
+            cv::imwrite(di, both);
+        }
         return 0;
     }
     std::vector<float> lg;
@@ -287,6 +299,7 @@ int main(int argc, char** argv) {
     if (const char* op = std::getenv("FS_UV_OWN_PAPER")) o.uv_own_min_paper = std::atof(op);
     // FS_NO_SNAP: no border snap; FS_SNAP_LOST / FS_SNAP_DEAD: its thresholds
     if (std::getenv("FS_NO_SNAP")) o.snap_border = false;
+    if (std::getenv("FS_NO_FRAME_SNAP")) o.frame_snap = false;
     if (const char* sl = std::getenv("FS_SNAP_LOST")) o.snap_lost = std::atof(sl);
     if (const char* sd = std::getenv("FS_SNAP_DEAD")) o.snap_dead_px = std::atof(sd);
     // FS_NO_FLAT: no flat-paper test; FS_FLAT_BOW: its threshold (side bow / side length)
@@ -315,6 +328,7 @@ int main(int argc, char** argv) {
     if (shade_model) {
         o.shade_net = shade_net_fn(inference(), &shade_ms);
         o.shade_after_uv = std::getenv("FS_SHADE_AFTER") != nullptr;
+        o.shade_tint = std::getenv("FS_NO_SHADE_TINT") == nullptr;
         if (const char* ls = std::getenv("FS_SHADE_LS")) o.shade_long_side = std::atoi(ls);
         if (const char* sf = std::getenv("FS_SHADE_FLOOR")) o.shade_floor = (float)std::atof(sf);   // the map clamp
     }
@@ -551,7 +565,7 @@ int main(int argc, char** argv) {
       << ", \"rot\": " << r.rot << ", \"n_ctrl\": " << r.warp.n_ctrl << ", \"lines\": [" << r.warp.H.size() << ", " << r.warp.V.size()
       << "], \"text_rows\": " << r.warp.n_text << ", \"text_rows_v\": " << r.warp.n_text_v << ", \"text_net\": " << (r.warp.text_net ? "true" : "false") << ", \"fitted_lines\": " << r.lines.size() << ", \"user_lines_used\": " << r.user_lines_used << ", \"lines_painted\": " << (r.lines_painted ? "true" : "false") << ", \"picture_share\": " << num(r.picture_share) << ", \"shape_locked\": " << num(r.shape_locked) << ", \"n_ignored\": " << r.warp.n_ignored << ", \"uv_agreement\": " << num(r.uv_agreement) << ", \"uv_rejected\": " << (r.uv_rejected ? "true" : "false")
       << ", \"line_distortion\": " << num(r.line_distortion) << ", \"page_hw\": " << num(r.page_hw) << ", \"lines_rejected\": " << (r.lines_rejected ? "true" : "false") << ", \"edges_bent\": " << (r.edges_bent ? "true" : "false") << ", \"fingers_erased\": " << num(r.fingers_erased) << ", \"uv_model\": " << r.uv_model
-      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_grid_check\": [[" << num(r.uv_grid_check[0][0]) << ", " << num(r.uv_grid_check[0][1]) << ", " << num(r.uv_grid_check[0][2]) << "], [" << num(r.uv_grid_check[1][0]) << ", " << num(r.uv_grid_check[1][1]) << ", " << num(r.uv_grid_check[1][2]) << "]], \"uv_agree_quad\": [" << num(r.uv_agree_quad[0]) << ", " << num(r.uv_agree_quad[1]) << "], \"uv_agree_mask\": [" << num(r.uv_agree_mask[0]) << ", " << num(r.uv_agree_mask[1]) << "]" << ", \"fuse\": [" << r.fuse_runs << ", " << num(r.fuse_worst[0]) << ", " << num(r.fuse_worst[1]) << ", " << num(r.fuse_moved_px) << ", " << num(r.fuse_area) << ", " << (r.fuse_rejected ? 1 : 0) << "]" << ", \"surface_unfounded\": " << (r.surface_unfounded ? "true" : "false") << ", \"side_n\": [" << r.side_n[0] << ", " << r.side_n[1] << ", " << r.side_n[2] << ", " << r.side_n[3] << "], \"side_edge\": [" << num(r.side_edge[0]) << ", " << num(r.side_edge[1]) << ", " << num(r.side_edge[2]) << ", " << num(r.side_edge[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_full_frame\": " << (r.uv_full_frame ? "true" : "false") << ", \"uv_full_frame_agree\": " << num(r.uv_full_frame_agree) << ", \"uv_full_frame_spread\": [" << num(r.uv_full_frame_spread[0]) << ", " << num(r.uv_full_frame_spread[1]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"uv_grid_rejected\": [" << (r.uv_grid_rejected[0] ? 1 : 0) << ", " << (r.uv_grid_rejected[1] ? 1 : 0) << "], \"uv_composed_broken\": " << (r.uv_composed_broken ? "true" : "false") << ", \"net_edge_gap\": [" << num(r.net_edge_gap[0]) << ", " << num(r.net_edge_gap[1]) << ", " << num(r.net_edge_gap[2]) << ", " << num(r.net_edge_gap[3]) << "], \"edge_doubt\": " << (r.edge_doubt ? "true" : "false")
+      << ", \"uv_consistency\": " << num(r.uv_consistency) << ", \"uv_paper_share\": [" << num(r.uv_paper_share[0]) << ", " << num(r.uv_paper_share[1]) << "], \"snap_px\": [" << num(r.snap_px[0]) << ", " << num(r.snap_px[1]) << "], \"snap_sides\": " << r.snap_sides << ", \"frame_snap\": [" << num(r.frame_snap_px) << ", " << r.frame_snap_sides << "]" << ", \"side_bow\": [" << num(r.side_bow[0]) << ", " << num(r.side_bow[1]) << ", " << num(r.side_bow[2]) << ", " << num(r.side_bow[3]) << "]" << ", \"uv_grid_check\": [[" << num(r.uv_grid_check[0][0]) << ", " << num(r.uv_grid_check[0][1]) << ", " << num(r.uv_grid_check[0][2]) << "], [" << num(r.uv_grid_check[1][0]) << ", " << num(r.uv_grid_check[1][1]) << ", " << num(r.uv_grid_check[1][2]) << "]], \"uv_agree_quad\": [" << num(r.uv_agree_quad[0]) << ", " << num(r.uv_agree_quad[1]) << "], \"uv_agree_mask\": [" << num(r.uv_agree_mask[0]) << ", " << num(r.uv_agree_mask[1]) << "]" << ", \"fuse\": [" << r.fuse_runs << ", " << num(r.fuse_worst[0]) << ", " << num(r.fuse_worst[1]) << ", " << num(r.fuse_moved_px) << ", " << num(r.fuse_area) << ", " << (r.fuse_rejected ? 1 : 0) << "]" << ", \"surface_unfounded\": " << (r.surface_unfounded ? "true" : "false") << ", \"side_n\": [" << r.side_n[0] << ", " << r.side_n[1] << ", " << r.side_n[2] << ", " << r.side_n[3] << "], \"side_edge\": [" << num(r.side_edge[0]) << ", " << num(r.side_edge[1]) << ", " << num(r.side_edge[2]) << ", " << num(r.side_edge[3]) << "]" << ", \"uv_flat_resid\": [" << num(r.uv_flat_resid[0]) << ", " << num(r.uv_flat_resid[1]) << ", " << num(r.uv_flat_resid[2]) << "]" << ", \"uv_full_frame\": " << (r.uv_full_frame ? "true" : "false") << ", \"uv_full_frame_agree\": " << num(r.uv_full_frame_agree) << ", \"uv_full_frame_spread\": [" << num(r.uv_full_frame_spread[0]) << ", " << num(r.uv_full_frame_spread[1]) << "]" << ", \"uv_lost_page\": " << (r.uv_lost_page ? "true" : "false") << ", \"uv_defines_page\": " << (r.uv_defines_page ? "true" : "false") << ", \"uv_grid_rejected\": [" << (r.uv_grid_rejected[0] ? 1 : 0) << ", " << (r.uv_grid_rejected[1] ? 1 : 0) << "], \"uv_composed_broken\": " << (r.uv_composed_broken ? "true" : "false") << ", \"net_edge_gap\": [" << num(r.net_edge_gap[0]) << ", " << num(r.net_edge_gap[1]) << ", " << num(r.net_edge_gap[2]) << ", " << num(r.net_edge_gap[3]) << "], \"edge_doubt\": " << (r.edge_doubt ? "true" : "false")
       << ", \"orient\": [" << num(r.orient_sh) << ", " << num(r.orient_sv) << ", " << num(r.orient_upright) << "]"
       << ", \"orient_net\": [" << r.orient_net_turn << ", " << num(r.orient_net_margin) << ", " << r.orient_net_patches << ", " << (r.orient_by_net ? 1 : 0) << "]"
       << ", \"uv_spread\": [" << num(r.uv_spread[0]) << ", " << num(r.uv_spread[1]) << "], \"flat_page\": " << (r.flat_page ? "true" : "false") << ", \"shade_net\": " << (r.shade_net ? "true" : "false") << ", \"bowed\": [" << r.warp.S1.n_bowed << ", " << r.warp.S2.n_bowed << "], \"extended\": [" << r.warp.S1.n_extended << ", " << r.warp.S2.n_extended << "], \"second\": [" << num(r.second_pass[0]) << ", " << num(r.second_pass[1]) << ", " << num(r.second_pass[2]) << ", " << (r.second_pass_kept ? 1 : 0) << "], \"corners\": [" << r.warp.S1.n_corners << ", " << r.warp.S2.n_corners << "], \"rule_net\": " << (r.rule_net ? "true" : "false")

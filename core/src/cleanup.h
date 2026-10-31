@@ -129,13 +129,34 @@ struct Adjust {
 // (jni_bridge.cpp Session caches them per page).
 enum class ScreenMode : int { Off = 0, On = 1, Auto = 2 };
 
+// Shadows in a render (NativeLib.kt RenderParams.shadow): the filters flatten the page's lighting (v = I / P), but at a
+// strength below 1 the page itself is blended back in, its shadows with it. amount 0..1 flattens the lighting of that
+// page too (I x (Pm / P)^amount per channel, Pm the paper colour at its brightest), with the params changed to match
+// (P^(1 - amount) Pm^amount), so the filter curve itself is unchanged; contrast 0..1 then deepens what lay in shadow
+// (t^(1 + 2 contrast d), d the shadow's depth from the paper luminance S; ink only, not what renders near paper), where
+// shadows wash ink out. Not in
+// Original, not on boards.
+struct ShadowAdjust {
+    float amount = 0.f;
+    float contrast = 0.f;
+    bool identity() const { return amount <= 0.f && contrast <= 0.f; }
+};
+
 struct RenderParams {
     Filter filter = Filter::AutoColor;
     float strength = 0.7f;
     bool solid = false;
     Adjust adj;
     ScreenMode screen = ScreenMode::Auto;
+    ShadowAdjust shadow;
 };
+
+// ShadowAdjust's two steps, at any size of the page (the filters' quarter-grid mapping): the page with its lighting
+// flattened by `amount`, and the params that go with it in *out_pp; then a render's shadows deepened by `contrast`.
+cv::Mat deshadow_page(const cv::Mat& page_bgra, const PageParams& p, float amount, PageParams* out_pp);
+void deepen_shadows(cv::Mat& out_bgra, const PageParams& p, float contrast);
+// A render's filter step with its ShadowAdjust (the thumbnails' path; render_page does the same)
+cv::Mat filter_with_shadows(const cv::Mat& img_bgra, const PageParams& p, const RenderParams& rp);
 
 // Adjustment constants (shared by the CPU and GPU code).
 struct AdjustK {

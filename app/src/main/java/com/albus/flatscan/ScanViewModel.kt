@@ -320,6 +320,8 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     val perspectiveOnly: Boolean get() = sessionGeomState?.perspectiveOnly == true
     /** The page was flattened again from the line editor: the result screen opens it again. */
     var reopenLines = false
+    /** The editor's open tab (ResultTab's name) and the page it was open on: a page processed again opens on it again. */
+    var resultTab: Pair<String?, String>? = null
     /** Serialises writes of stored sessions (DocumentStore.saveSession). */
     private val sessionStoreMutex = Mutex()
 
@@ -969,22 +971,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         else -> Screen.Home
     }
 
-    /** The crop screen was opened by Back from the editor: Back there leaves the document. */
-    private var outlineFromBack = false
-
     /** The crop screen shows a page already made (its outline edited again): Continue keeps the page's edits. */
     val recropping: Boolean get() = recropBackup != null
 
     fun back() {
-        // the editor: back to the page's outline (the crop screen), where Continue keeps every edit; back again leaves
-        if (screen == Screen.Result && !outlineFromBack) {
-            val id = currentId
-            if (id != null && ((photoPageId == id && photo != null) || store.hasSource(id))) {
-                outlineFromBack = true
-                recrop()
-                return
-            }
-        }
         screen = when (screen) {
             Screen.Camera -> fallback()
             Screen.Crop -> {
@@ -1002,14 +992,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                     forceHomography = b.forceHomography
                     cropPageIndex = b.pageIndex
                     recropBackup = null
-                    if (outlineFromBack) {
-                        outlineFromBack = false
-                        persist()
-                        adjustOpen = false
-                        documentDone()
-                        screen = Screen.Home
-                        return
-                    }
                 } else {
                     discardStaging()
                     spreadNext = null
@@ -1018,11 +1000,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
                 batch = false
                 fallback()
             }
+            // the editor: back to the document's pages (its images); back again leaves the document
             Screen.Result -> {
                 persist()
                 adjustOpen = false
-                documentDone()
-                Screen.Home
+                pagesReturnTo = Screen.Home
+                Screen.Pages
             }
             Screen.Pages -> if (pagesReturnTo == Screen.Result && handle != 0L) Screen.Result else Screen.Home.also { documentDone() }
             Screen.Settings -> returnTo
@@ -1356,12 +1339,29 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (auto && !settings.reviewCrops && (found != null || batch)) process()
     }
 
+    /**
+     * Clean up > Shadows: Off processes the page again without its shadow removal (and leaving Off, with it); Auto and
+     * Manual are only renders of the page as it is.
+     */
+    fun setShadowMode(m: ShadowMode) {
+        if (m == params.shadow) return
+        params = params.copy(shadow = m)
+        if (removeShadows == (m == ShadowMode.Off)) setRemoveShadows(m != ShadowMode.Off) else requestRender(false)
+    }
+
+    /** Manual shadows: how far the lighting is flattened ([amount]) and the ink in shadow deepened ([contrast]), 0..1. */
+    fun setShadowLevels(amount: Float = params.shadowAmount, contrast: Float = params.shadowContrast) {
+        params = params.copy(shadowAmount = amount.coerceIn(0f, 1f), shadowContrast = contrast.coerceIn(0f, 1f))
+        requestRender(false)
+    }
+
     /** Page panel: the page's shadows removed or left as photographed (processed again). */
     fun setRemoveShadows(on: Boolean) {
         val g = sessionGeomState ?: return
         if (g.removeShadows == on || !sourceAvailable(g.id)) return
         sessionGeomState = g.copy(removeShadows = on)
-        reflatten()
+        // back to the tab it was switched on (Clean up), not to the line tool as after Flatten again
+        reflatten(reopen = false)
     }
 
     /** Switches the page on the result screen between document, whiteboard and screen processing (processed again). */
@@ -1584,10 +1584,7 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The crop screen's Cancel: back to the page as it was when its outline was opened again, else as Back. */
-    fun cancelCrop() {
-        if (recropBackup != null) outlineFromBack = false
-        back()
-    }
+    fun cancelCrop() = back()
 
     /**
      * The crop screen's Continue: the page again with its outline; an outline opened again and left as it was goes
@@ -1595,7 +1592,6 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun continueCrop() {
         val b = recropBackup
-        outlineFromBack = false
         if (b != null && handle != 0L && photo === b.photo && corners == b.corners && edgePoints == b.edges && cropRotation == b.cropRotation &&
             userRotated == b.userRotated && cropPageIndex == b.pageIndex
         ) {
@@ -2440,11 +2436,15 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             }
             // the processed page is kept on disk: opening it again needs no re-processing
             storeSession(id, key, info, text, withContext(nativeCtx) { if (h == nativeHandle) NativeLib.snapshot(h) else 0L })
-            activate(h, geomL, startParams, startProtect, startRotation, text, restored = false)
+            // an undo / redo step processed back to its geometry: its look as it was (not the shape measured again), from
+            // the first frame, so the history sees the step itself and keeps its redo
+            val restoring = restoringEdit
+            restoringEdit = null
+            activate(h, if (restoring != null) geomL.copy(look = restoring.look) else geomL, startParams, startProtect, startRotation, text, restored = false)
             // Upright Auto: on a new document page (as the user left it on a page already made), and again for an Auto
             // page whose outline changed; a board or a screen is straightened by its corners alone
             val t = geomL.look.transform
-            if (mode == CaptureMode.Document && ((!same && stored == null && t == PageTransform()) || (t.upright == 3 && samePlace == null))) {
+            if (restoring == null && mode == CaptureMode.Document && ((!same && stored == null && t == PageTransform()) || (t.upright == 3 && samePlace == null))) {
                 upright(3, quiet = true)
             }
             // a book spread: its second page follows from the same photo
@@ -3135,7 +3135,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     fun clearGuides() = setTransform(look.transform.copy(guides = emptyList()))
 
     /** The edits [history] tracks, as they are now. */
-    fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes, fingerFill)
+    fun editState() = EditState(params, look, rotation, protect, erase, fingersAuto, fingerStrokes, fingerFill, sessionGeom?.let { GeomState.of(it) })
+
+    /** An undo / redo step being processed back to its geometry: its look is put back exactly once it is done. */
+    private var restoringEdit: EditState? = null
 
     fun undo() {
         // a change still inside the debounce is the one to undo
@@ -3147,6 +3150,12 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun applyEditState(s: EditState) {
         if (handle == 0L) return
+        val g = s.geom
+        val cur = sessionGeom
+        if (g != null && cur != null && GeomState.of(cur) != g) {
+            restoreGeometry(s, g, cur)
+            return
+        }
         if (s.params != params || s.protect != protect) {
             params = s.params
             protect = s.protect
@@ -3163,6 +3172,46 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
             fingerStrokes = s.fingerStrokes
             fingerFill = s.fingerFill
             applyPageEdits()
+        }
+    }
+
+    /**
+     * Undo / redo to a step of another geometry: the page processed again with that step's outline, flattening, lines,
+     * kind and shadow removal, its edits carried through (process keeps a page's own edits on the same outline), and
+     * its look put back exactly afterwards (processing measures the page's shape again).
+     */
+    private fun restoreGeometry(s: EditState, g: GeomState, cur: PageMeta) {
+        val id = cur.id
+        if (!sourceAvailable(id)) return
+        val target = g.applyTo(cur)
+        params = s.params
+        protect = s.protect
+        rotation = s.rotation
+        look = s.look
+        erase = s.erase
+        fingersAuto = s.fingersAuto
+        fingerStrokes = s.fingerStrokes
+        fingerFill = s.fingerFill
+        sessionGeom = target
+        restoringEdit = s
+        viewModelScope.launch {
+            screen = Screen.Processing
+            progress = 0f
+            stage = "Opening the photo"
+            try {
+                val bmp = if (photoPageId == id && photo != null && cropRotation == g.cropRotation && recropBackup == null) photo!!
+                else withContext(Dispatchers.IO) { store.loadSource(id).bitmap.rotatedQuarterTurns(g.cropRotation) }
+                if (bmp !== photo) discardStaging()
+                recropBackup = null
+                setCrop(target, bmp)
+                process(g.ignore, g.perspectiveOnly, g.userLines, g.linePaint, g.autoLines)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "undo to another geometry failed", e)
+                restoringEdit = null
+                message = "Could not open the photo"
+                screen = Screen.Result
+            }
         }
     }
 
@@ -3217,8 +3266,10 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Page [id] (not the live one) rendered again with [p], the colours of [lk] and result rotation [rot] (null: its own): its meta and out.jpg. */
-    private suspend fun renderStoredPage(id: String, p: RenderParams, lk: PageLook, rot: Int? = null): Boolean {
+    private suspend fun renderStoredPage(id: String, p0: RenderParams, lk: PageLook, rot: Int? = null): Boolean {
         val m = withContext(Dispatchers.IO) { store.loadMeta(id) }
+        // a page keeps its own shadows (Off is how it was processed; each photo's shadows are its own)
+        val p = p0.copy(shadow = m.params.shadow, shadowAmount = m.params.shadowAmount, shadowContrast = m.params.shadowContrast)
         val dir = withContext(Dispatchers.IO) { store.sessionDir(id) } ?: return false
         val look2 = m.look.withColorsOf(lk)
         val bmp = withContext(nativeCtx) {

@@ -14,6 +14,7 @@
 #include <set>
 #include <thread>
 
+#include "cleanup.h"
 #include "gpu.h"
 #include "log.h"
 #include "orient.h"
@@ -576,7 +577,105 @@ cv::Mat picture_mask_strict(const cv::Mat& page, const cv::Mat& PH, const cv::Ma
 // portrait (landscape pages turned for the net and back), its shading map bilinearly back at page
 // size, the page divided by it: brighten only, by at most 1 / floor (PipelineOptions::shade_floor; the map
 // is clamped there so that a misread map cannot blow out ink).
-bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side, float shade_floor) {
+// A coloured cast shadow (blue skylight in a shadow on a sunlit page) after the shadow net: the net evens its
+// brightness, its colour stays (a lavender patch, which the filters then keep as a pale colour, not paper). Where the
+// net's shading S says there was a shadow (its mean below 0.95, fully below 0.8), the page's local background colour
+// is brought to the paper's colour outside the shadows - colour balance only, its brightness kept - and only where that
+// background is near the paper's colour (a coloured bar or a photo in the shadow keeps its colour), bluer than it, and
+// in a shaded area that reaches the page's edge (a pale printed box inside the page is not a cast shadow).
+static void neutralise_shadow_tint(cv::Mat& page_bgra, const cv::Mat& S) {
+    const cv::Mat B = background_quarter_cpu(page_bgra);   // CV_8UC4, quarter grid: the local background colour
+    if (B.empty()) return;
+    cv::Mat Sq;
+    cv::resize(S, Sq, B.size(), 0, 0, cv::INTER_AREA);
+    auto lum = [](double b, double g, double r) { return 0.114 * b + 0.587 * g + 0.299 * r; };
+    // the paper's colour where there was no shadow: the median background there, per channel, as a chromaticity
+    std::vector<float> ch[3];
+    int shadowed = 0;
+    for (int i = 0; i < B.rows; ++i)
+        for (int j = 0; j < B.cols; ++j) {
+            const cv::Vec3f s = Sq.at<cv::Vec3f>(i, j);
+            const double sl = (s[0] + s[1] + s[2]) / 3;
+            if (sl < 0.9) ++shadowed;
+            if (sl < 0.97) continue;
+            const cv::Vec4b b = B.at<cv::Vec4b>(i, j);
+            const double l = lum(b[0], b[1], b[2]);
+            if (l < 60) continue;
+            for (int c = 0; c < 3; ++c) ch[c].push_back((float)(b[c] / l));
+        }
+    if (ch[0].size() < 200 || shadowed < 0.02 * B.total()) return;
+    double pc[3];
+    for (int c = 0; c < 3; ++c) {
+        std::nth_element(ch[c].begin(), ch[c].begin() + ch[c].size() / 2, ch[c].end());
+        pc[c] = ch[c][ch[c].size() / 2];
+    }
+    // a cast shadow comes from outside the page: the shaded areas (S below 0.85) that reach the page's edge and cover
+    // at least 1 % of it; a pale printed box the net also lightened a little lies inside the page (a green box went white)
+    cv::Mat shade8(B.size(), CV_8U, cv::Scalar(0));
+    for (int i = 0; i < B.rows; ++i)
+        for (int j = 0; j < B.cols; ++j) {
+            const cv::Vec3f s = Sq.at<cv::Vec3f>(i, j);
+            if ((s[0] + s[1] + s[2]) / 3 < 0.85) shade8.at<uint8_t>(i, j) = 255;
+        }
+    cv::Mat lab, stats, cent;
+    const int nl = cv::connectedComponentsWithStats(shade8, lab, stats, cent, 8, CV_32S);
+    std::vector<char> cast(nl, 0);
+    for (int k = 1; k < nl; ++k) {
+        const int x = stats.at<int>(k, cv::CC_STAT_LEFT), y = stats.at<int>(k, cv::CC_STAT_TOP);
+        const int w = stats.at<int>(k, cv::CC_STAT_WIDTH), h = stats.at<int>(k, cv::CC_STAT_HEIGHT);
+        const bool edge = x <= 2 || y <= 2 || x + w >= B.cols - 2 || y + h >= B.rows - 2;
+        cast[k] = edge && stats.at<int>(k, cv::CC_STAT_AREA) >= 0.01 * B.total();
+    }
+    cv::Mat castm(B.size(), CV_32F, cv::Scalar(0));
+    for (int i = 0; i < B.rows; ++i)
+        for (int j = 0; j < B.cols; ++j) castm.at<float>(i, j) = cast[lab.at<int>(i, j)] ? 1.f : 0.f;
+    cv::GaussianBlur(castm, castm, cv::Size(0, 0), 4.0);
+    {
+        double mx = 0;
+        cv::minMaxLoc(castm, nullptr, &mx);
+        if (mx <= 0.05) return;
+    }
+    // the gain per quarter cell: paper chromaticity / local chromaticity, weighted by the shadow's depth and by how
+    // near the local background is to paper (its chromaticity within 0.26 of the paper's, faded out from 0.16)
+    cv::Mat G(B.size(), CV_32FC3, cv::Scalar(1, 1, 1));
+    for (int i = 0; i < B.rows; ++i)
+        for (int j = 0; j < B.cols; ++j) {
+            const cv::Vec3f s = Sq.at<cv::Vec3f>(i, j);
+            const double sl = (s[0] + s[1] + s[2]) / 3;
+            const double w_sh = std::min(1.0, std::max(0.0, (0.95 - sl) / 0.15));
+            if (w_sh <= 0) continue;
+            const cv::Vec4b b = B.at<cv::Vec4b>(i, j);
+            const double l = lum(b[0], b[1], b[2]);
+            if (l < 40) continue;
+            double d = 0, lc[3];
+            for (int c = 0; c < 3; ++c) { lc[c] = b[c] / l; d = std::max(d, std::fabs(lc[c] - pc[c])); }
+            const double w_near = 1.0 - std::min(1.0, std::max(0.0, (d - 0.16) / 0.10));
+            // skylight in a shadow is bluer than the paper (BGR: channel 0); a warmer or greener patch is print
+            const double w_blue = std::min(1.0, std::max(0.0, (lc[0] - pc[0]) / 0.04));
+            const double w = w_sh * w_near * w_blue * castm.at<float>(i, j);
+            cv::Vec3f& g = G.at<cv::Vec3f>(i, j);
+            for (int c = 0; c < 3; ++c) g[c] = (float)(1.0 + w * (std::min(1.4, std::max(0.7, pc[c] / std::max(lc[c], 0.05))) - 1.0));
+        }
+    cv::GaussianBlur(G, G, cv::Size(0, 0), 3.0);
+    cv::resize(G, G, page_bgra.size(), 0, 0, cv::INTER_LINEAR);
+    cv::parallel_for_(cv::Range(0, page_bgra.rows), [&](const cv::Range& R) {
+        for (int y = R.start; y < R.end; ++y) {
+            cv::Vec4b* p = page_bgra.ptr<cv::Vec4b>(y);
+            const cv::Vec3f* g = G.ptr<cv::Vec3f>(y);
+            for (int x = 0; x < page_bgra.cols; ++x) {
+                // colour balance only: the pixel's brightness as before
+                const double l0 = lum(p[x][0], p[x][1], p[x][2]);
+                double v[3];
+                for (int c = 0; c < 3; ++c) v[c] = p[x][c] * g[x][c];
+                const double l1 = lum(v[0], v[1], v[2]);
+                const double k = l1 > 1e-6 ? l0 / l1 : 1.0;
+                for (int c = 0; c < 3; ++c) p[x][c] = cv::saturate_cast<uint8_t>(v[c] * k);
+            }
+        }
+    });
+}
+
+bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<float>&, int, int)>& fn, int long_side, float shade_floor, bool tint) {
     if (page_bgra.empty() || !fn) return false;
     cv::Mat bgr;
     cv::cvtColor(page_bgra, bgr, cv::COLOR_BGRA2BGR);
@@ -610,6 +709,7 @@ bool apply_shade_net(cv::Mat& page_bgra, const std::function<bool(std::vector<fl
                 for (int c = 0; c < 3; ++c) p[x][c] = cv::saturate_cast<uint8_t>(p[x][c] / q[x][c]);
         }
     });
+    if (tint) neutralise_shadow_tint(page_bgra, S);
     return true;
 }
 
@@ -2355,6 +2455,44 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
                 }
                 r.ms.emplace_back("border snap", ms_since(tb));
             }
+            // the page running off the photo: its border out to the photo's edge where the outline lies on it (frame_snap)
+            // Not when the grid drew the page itself (its border was cut and bent: a book's curled foot repeated, a dark
+            // receipt's table taken in); the page finder's outline is what says the paper runs on
+            if (opt.frame_snap && use_mask && !snapped_lost && !r.uv_defines_page && U.mode == GeomMode::Neural &&
+                std::max({r.side_edge[0], r.side_edge[1], r.side_edge[2], r.side_edge[3]}) >= 0.2) {
+                auto tf = Clock::now();
+                // a grid side may go out only where the page finder's outline side nearest it lies on the photo's edge
+                // (frame_snap_side of its points): the mask alone took a wooden table for paper
+                bool allow[4] = {false, false, false, false};
+                {
+                    const UvGrid& G = U.uv;
+                    const cv::Point2d mid[4] = {G.pts[(size_t)G.gw / 2], G.pts[(size_t)(G.gh - 1) * G.gw + G.gw / 2],
+                                                G.pts[(size_t)(G.gh / 2) * G.gw], G.pts[(size_t)(G.gh / 2) * G.gw + G.gw - 1]};
+                    for (int k = 0; k < 4; ++k) {
+                        int best = -1;
+                        double bd = 1e300;
+                        for (int s = 0; s < 4; ++s) {
+                            const cv::Point2d a = pc.det.corners[s], b = pc.det.corners[(s + 1) % 4];
+                            const cv::Point2d ab = b - a;
+                            const double t = std::min(1.0, std::max(0.0, (mid[k] - a).dot(ab) / std::max(1e-9, ab.dot(ab))));
+                            const double dd = cv::norm(mid[k] - (a + ab * t));
+                            if (dd < bd) { bd = dd; best = s; }
+                        }
+                        allow[k] = best >= 0 && r.side_edge[best] >= opt.frame_snap_side;
+                    }
+                }
+                FrameExtend fe;
+                UvGrid fg = uv_extend_to_frame(U.uv, pc.det.paper, pc.scale, opt.frame_snap_search, &fe, allow);
+                if (fe.sides > 0) {
+                    const GridValidity gv = uv_grid_validity(fg, photo.size());
+                    if (gv.folded <= 0.001 && !grid_broken(gv)) {
+                        U.uv = std::move(fg);
+                        r.frame_snap_px = std::max({fe.px[0], fe.px[1], fe.px[2], fe.px[3]});
+                        r.frame_snap_sides = fe.sides;
+                    }
+                }
+                r.ms.emplace_back("frame snap", ms_since(tf));
+            }
             // the composed grid (fusion, border snap) checked again: a fold made there is not used either
             if (!snapped_lost && U.mode == GeomMode::Neural && (opt.uv_max_folded > 0 || opt.uv_max_collapsed > 0) &&
                 grid_broken(uv_grid_validity(U.uv, photo.size()))) {
@@ -2500,7 +2638,7 @@ PipelineResult run_photo(const cv::Mat& photo, const PipelineOptions& opt_in) {
     auto shade = [&] {
         auto ts = Clock::now();
         report(opt, 92, "Removing shadows");
-        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side, opt.shade_floor);
+        r.shade_net = apply_shade_net(r.page, opt.shade_net, opt.shade_long_side, opt.shade_floor, opt.shade_tint);
         r.shadows_removed |= r.shade_net;
         r.ms.emplace_back("shadow net", ms_since(ts));
     };

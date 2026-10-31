@@ -168,6 +168,12 @@ struct PipelineOptions {
     // within snap_search x the page's size; displacements below snap_dead_px (photo px) are left; a side most of
     // whose points need more than snap_lost x the page's size: the net lost the page (the page before the nets)
     bool snap_border = false;   // off: on 121 photos 2 pages better (coupon, bill a little), 12 worse (the mask edge is too rough: wavy text)
+    // Frame snap (uvdoc.h uv_extend_to_frame): where the page runs off the photo, the page extended past the grid's border
+    // to the photo's edge, the grid continued straight on (the nets put the end of a page that runs off the photo inside
+    // it: a flyer lost its top line, a receipt its number), searched within frame_snap_search x the page's size
+    bool frame_snap = true;
+    double frame_snap_search = 0.08;
+    double frame_snap_side = 0.3;   // the outline side's share of points on the photo's edge for its grid side to go out
     double snap_search = 0.08;
     double snap_dead_px = 3.0;
     double snap_lost = 0.06;
@@ -295,6 +301,7 @@ struct PipelineOptions {
     int shade_long_side = 512;
     // the map's clamp: a pixel is brightened by at most 1 / shade_floor (the net of round 16 is trained for 0.12)
     float shade_floor = 0.3f;
+    bool shade_tint = true;      // a coloured cast shadow's colour taken out after the net (pipeline.cpp neutralise_shadow_tint)
     bool scan_flattened = false;      // run_scan: the input is a page another method flattened (neural-page line stage + guards)
     bool shade_after_uv = false;
 };
@@ -320,6 +327,8 @@ struct PipelineResult {
     double uv_paper_share[2] = {-1, -1};   // share of each net's page that the page finder's mask calls paper (-1: not measured)
     double snap_px[2] = {-1, -1};     // border snap: median / max displacement (photo px; -1: not run)
     int snap_sides = -1;              // ... sides moved
+    double frame_snap_px = -1;        // frame snap: the largest move out to the photo's edge (photo px; -1: none)
+    int frame_snap_sides = 0;         // ... sides moved
     double side_bow[4] = {-1, -1, -1, -1};   // page finder's sides (top, right, bottom, left): p95 bow from the chord / its length
     int side_n[4] = {0, 0, 0, 0};             // the outline points on each side
     double side_edge[4] = {-1, -1, -1, -1};  // their share on the photo's own edge (the paper runs out of the photo there)

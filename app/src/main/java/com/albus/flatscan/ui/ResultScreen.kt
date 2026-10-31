@@ -143,6 +143,7 @@ import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.PostAdd
 import androidx.compose.material3.Switch
 import androidx.compose.runtime.saveable.rememberSaveable
+import com.albus.flatscan.ShadowMode
 import com.albus.flatscan.CaptureMode
 import com.albus.flatscan.FilterKind
 import com.albus.flatscan.ImportSource
@@ -222,7 +223,12 @@ fun ResultScreen(vm: ScanViewModel) = EditorTheme {
         // back from flattening again in the line editor: show the new lines
         mutableStateOf(if (vm.reopenLines) AreaMode.Lines else AreaMode.None).also { vm.reopenLines = false }
     }
-    var tab by rememberSaveable { mutableStateOf(if (vm.adjustOpen) ResultTab.Adjust else ResultTab.Look) }
+    // the tab it was left on when this page comes back from processing again (Remove shadows, Flatten again), else Look
+    var tab by rememberSaveable {
+        val kept = vm.resultTab?.takeIf { it.first == vm.currentId }?.let { k -> ResultTab.entries.firstOrNull { it.name == k.second } }
+        mutableStateOf(kept ?: if (vm.adjustOpen) ResultTab.Adjust else ResultTab.Look)
+    }
+    LaunchedEffect(tab, vm.currentId) { vm.resultTab = vm.currentId to tab.name }
     // counts taps on the tab already open: its panel starts again at its first level (Adjust's first tool)
     var tabReset by remember { mutableIntStateOf(0) }
     val exporter = rememberExportActions(vm)
@@ -938,11 +944,9 @@ private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> 
     val ne = vm.erase.size / 4
     val np = vm.protect.size / 4
     Column(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (doc) ShadowControls(vm)
         Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (doc) {
-                CleanTile("Shadows", if (vm.removeShadows) "Removed" else "Kept", Icons.Outlined.Contrast, Modifier.weight(1f).fillMaxHeight(), on = vm.removeShadows, toggle = true) {
-                    vm.setRemoveShadows(!vm.removeShadows)
-                }
                 CleanTile(
                     "Fingers", if (!vm.fingersAuto) "Off" else if (vm.fingerStrokes.isNotEmpty()) "Edited" else "Auto", Icons.Outlined.TouchApp,
                     Modifier.weight(1f).fillMaxHeight(), onClick = onFingers,
@@ -963,6 +967,46 @@ private fun CleanPanel(vm: ScanViewModel, onErase: () -> Unit, onFingers: () -> 
         }
         // no screen switch here: on real photos of screens its descreen changed nothing visible (a pixel grid's moire
         // shows only in close-ups); it stays on Auto, and screens are a kind of page (Look)
+    }
+}
+
+/**
+ * Clean up > Shadows: Off, Auto or Manual (the shadows are found automatically in each); Manual adds how much of the
+ * shadow is removed and how much the ink that lay in it is deepened. Off and back process the page again; the rest
+ * is a render of the page as it is.
+ */
+@Composable
+private fun ShadowControls(vm: ScanViewModel) {
+    val p = vm.params
+    Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Contrast, null, Modifier.size(18.dp), tint = Editor.Muted)
+            Spacer(Modifier.width(8.dp))
+            Text("Shadows", style = MaterialTheme.typography.titleSmall, modifier = Modifier.width(80.dp))
+            EditorSegments(
+                "Shadows", listOf(ShadowMode.Off to "Off", ShadowMode.Auto to "Auto", ShadowMode.Manual to "Manual"), p.shadow,
+                Modifier.weight(1f), wide = true,
+            ) { vm.setShadowMode(it) }
+        }
+        if (p.shadow == ShadowMode.Manual) {
+            ShadowSlider("Remove", p.shadowAmount) { vm.setShadowLevels(amount = it) }
+            ShadowSlider("Contrast", p.shadowContrast) { vm.setShadowLevels(contrast = it) }
+        }
+    }
+}
+
+@Composable
+private fun ShadowSlider(label: String, value: Float, onChange: (Float) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 1, modifier = Modifier.width(88.dp).padding(start = 26.dp))
+        Slider(
+            value = value, onValueChange = onChange, colors = editorSliderColors(),
+            modifier = Modifier.weight(1f).semantics { contentDescription = "Shadow $label" },
+        )
+        Text(
+            "${(value * 100).roundToInt()}%", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+            color = Editor.Muted, textAlign = TextAlign.End, modifier = Modifier.width(44.dp),
+        )
     }
 }
 

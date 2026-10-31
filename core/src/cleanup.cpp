@@ -899,7 +899,107 @@ std::vector<int> luma_histogram(const cv::Mat& img) {
     return h;
 }
 
-cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams& p, const RenderParams& rp,
+// the paper luminance of the brightest paper (97th percentile of S): where the page is not in shadow
+static float paper_ref(const PageParams& p) {
+    std::vector<float> v;
+    v.reserve(p.illum.total());
+    for (int y = 0; y < p.illum.rows; ++y) {
+        const float* r = p.illum.ptr<float>(y);
+        for (int x = 0; x < p.illum.cols; ++x) if (r[x] > 1.f) v.push_back(r[x]);
+    }
+    if (v.empty()) return 0.f;
+    auto k = v.begin() + (ptrdiff_t)(0.97 * (v.size() - 1));
+    std::nth_element(v.begin(), k, v.end());
+    return *k;
+}
+
+cv::Mat deshadow_page(const cv::Mat& img, const PageParams& p, float amount, PageParams* out_pp) {
+    const float a = std::min(std::max(amount, 0.f), 1.f);
+    const float sref = paper_ref(p);
+    if (out_pp) *out_pp = p;
+    if (a <= 0.f || sref <= 0.f || p.paper.empty()) return img;
+    const float Pm[3] = {sref * p.wb[0], sref * p.wb[1], sref * p.wb[2]};
+    // the gain on the quarter grid: (Pm / P)^a, at most 4x (a deep shadow's noise) and at least 0.8 (paper above the reference)
+    cv::Mat G(p.paper.size(), CV_32FC4, cv::Scalar(1, 1, 1, 1));
+    for (int i = 0; i < G.rows; ++i)
+        for (int j = 0; j < G.cols; ++j) {
+            const cv::Vec4f P = p.paper.at<cv::Vec4f>(i, j);
+            cv::Vec4f& g = G.at<cv::Vec4f>(i, j);
+            for (int c = 0; c < 3; ++c) g[c] = std::min(4.f, std::max(0.8f, std::pow(Pm[c] / std::max(P[c], 1.f), a)));
+        }
+    if (out_pp) {
+        // P' = P x gain and S' = S^(1 - a) Sref^a: v = I' / P' is the filters' v as before
+        for (int i = 0; i < G.rows; ++i)
+            for (int j = 0; j < G.cols; ++j) {
+                cv::Vec4f& P = out_pp->paper.at<cv::Vec4f>(i, j);
+                const cv::Vec4f g = G.at<cv::Vec4f>(i, j);
+                for (int c = 0; c < 3; ++c) P[c] *= g[c];
+            }
+        out_pp->paper = out_pp->paper.clone();
+        cv::Mat S = p.illum.clone();
+        for (int i = 0; i < S.rows; ++i) {
+            float* r = S.ptr<float>(i);
+            for (int j = 0; j < S.cols; ++j) r[j] = std::pow(std::max(r[j], 1.f), 1.f - a) * std::pow(sref, a);
+        }
+        out_pp->illum = S;
+    }
+    cv::Mat out(img.size(), CV_8UC4);
+    const bool full = img.cols == p.page_w && img.rows == p.page_h;
+    const float sx = (float)p.page_w / img.cols, sy = (float)p.page_h / img.rows;
+    cv::parallel_for_(cv::Range(0, img.rows), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; ++y) {
+            const uint8_t* q = img.ptr<uint8_t>(y);
+            uint8_t* o = out.ptr<uint8_t>(y);
+            const float py = full ? (float)y : (y + 0.5f) * sy - 0.5f;
+            for (int x = 0; x < img.cols; ++x, q += 4, o += 4) {
+                const float px = full ? (float)x : (x + 0.5f) * sx - 0.5f;
+                float g[3];
+                paper_at(G, px, py, g);
+                for (int c = 0; c < 3; ++c) o[c] = cv::saturate_cast<uint8_t>(q[c] * g[c]);
+                o[3] = q[3];
+            }
+        }
+    });
+    return out;
+}
+
+void deepen_shadows(cv::Mat& out, const PageParams& p, float contrast) {
+    const float k = 2.f * std::min(std::max(contrast, 0.f), 1.f);
+    const float sref = paper_ref(p);
+    if (k <= 0.f || sref <= 0.f || p.illum.empty()) return;
+    const bool full = out.cols == p.page_w && out.rows == p.page_h;
+    const float sx = (float)p.page_w / out.cols, sy = (float)p.page_h / out.rows;
+    cv::parallel_for_(cv::Range(0, out.rows), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; ++y) {
+            uint8_t* o = out.ptr<uint8_t>(y);
+            const float py = full ? (float)y : (y + 0.5f) * sy - 0.5f;
+            for (int x = 0; x < out.cols; ++x, o += 4) {
+                const float px = full ? (float)x : (x + 0.5f) * sx - 0.5f;
+                // the shadow's depth: 0 on paper at the reference brightness, 1 at 40 % of it or darker
+                const float d = std::min(std::max((sref - illum_at(p.illum, px, py)) / (0.6f * sref), 0.f), 1.f);
+                if (d <= 0.f) continue;
+                // ink only: what renders near paper (above 85 %) keeps its level, the deepening grows below 55 %
+                const float l = luma(o[0], o[1], o[2]) * (1.f / 255.f);
+                const float ink = 1.f - std::min(std::max((l - 0.55f) / 0.30f, 0.f), 1.f);
+                const float e = 1.f + k * d * ink;
+                if (e <= 1.f) continue;
+                for (int c = 0; c < 3; ++c) o[c] = cv::saturate_cast<uint8_t>(255.f * std::pow(o[c] * (1.f / 255.f), e));
+            }
+        }
+    });
+}
+
+cv::Mat filter_with_shadows(const cv::Mat& img, const PageParams& p, const RenderParams& rp) {
+    const bool sh = !rp.shadow.identity() && rp.filter != Filter::Original && !is_board(rp.filter);
+    if (!sh) return filter_cpu(img, p, rp.filter, rp.strength, rp.adj);
+    PageParams q;
+    cv::Mat src = deshadow_page(img, p, rp.shadow.amount, &q);
+    cv::Mat out = filter_cpu(src, q, rp.filter, rp.strength, rp.adj);
+    deepen_shadows(out, p, rp.shadow.contrast);
+    return out;
+}
+
+cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams& p_in, const RenderParams& rp,
                     const std::vector<Rect01>& protect, bool use_gpu, RenderStats* st) {
     RenderStats local;
     RenderStats& s = st ? *st : local;
@@ -912,7 +1012,12 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
         s.ms_filter = ms_since(t0);
         return out;
     }
-    cv::Mat src = apply_paper(page, paper, p);
+    cv::Mat src = apply_paper(page, paper, p_in);
+    // the shadows' amount: the page and its params lit flat together (ShadowAdjust); Original shows the photo as it is
+    const bool shadows = !rp.shadow.identity() && f != Filter::Original;
+    PageParams p_sh;
+    if (shadows && rp.shadow.amount > 0.f) src = deshadow_page(src, p_in, rp.shadow.amount, &p_sh);
+    const PageParams& p = shadows && rp.shadow.amount > 0.f ? p_sh : p_in;
     bool sol = rp.solid && f != Filter::BlackWhite;
     // Solid colors in Grayscale: fill in colour, then desaturate
     Filter ff = (sol && f == Filter::Grayscale) ? Filter::AutoColor : f;
@@ -921,6 +1026,7 @@ cv::Mat render_page(const cv::Mat& page, const cv::Mat& paper, const PageParams&
     s.gpu_filter = !trivial && use_gpu && Gpu::instance().filter(src, p, ff, strength, rp.adj, out);
     if (!s.gpu_filter) out = filter_cpu(src, p, ff, strength, rp.adj);
     else post_filter(out, p, filter_curve(ff, p.sigma, p.ink), strength);   // CPU stages after the GPU curve (Scan's sharpening)
+    if (shadows) deepen_shadows(out, p_in, rp.shadow.contrast);
     s.ms_filter = ms_since(t0);
     if (sol) {
         t0 = std::chrono::steady_clock::now();

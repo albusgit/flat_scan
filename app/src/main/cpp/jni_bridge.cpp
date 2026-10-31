@@ -331,14 +331,16 @@ std::string escape(const std::string& s) {
     return o;
 }
 
-// RenderParams.toArray(): [filter, strength, solid, bgCleanup, black, white, gamma, screen]
-// (screen: 0 off, 1 on, 2 auto; arrays without it are auto)
+// RenderParams.toArray(): [filter, strength, solid, bgCleanup, black, white, gamma, screen, shadow amount, shadow contrast]
+// (screen: 0 off, 1 on, 2 auto; arrays without it are auto; without the shadow pair: none, as before it)
 RenderParams parse_params(JNIEnv* env, jfloatArray a) {
     RenderParams rp;
     if (!a) return rp;
     jsize n = env->GetArrayLength(a);
-    float v[8] = {(float)Filter::AutoColor, 0.7f, 0.f, 0.f, 0.f, 1.f, 1.f, (float)ScreenMode::Auto};
-    env->GetFloatArrayRegion(a, 0, std::min<jsize>(n, 8), v);
+    float v[10] = {(float)Filter::AutoColor, 0.7f, 0.f, 0.f, 0.f, 1.f, 1.f, (float)ScreenMode::Auto, 0.f, 0.f};
+    env->GetFloatArrayRegion(a, 0, std::min<jsize>(n, 10), v);
+    rp.shadow.amount = std::isfinite(v[8]) ? std::min(1.f, std::max(0.f, v[8])) : 0.f;
+    rp.shadow.contrast = std::isfinite(v[9]) ? std::min(1.f, std::max(0.f, v[9])) : 0.f;
     int f = (int)std::lround(v[0]);
     rp.filter = (Filter)std::min(kFilterCount - 1, std::max(0, f));
     rp.strength = std::isfinite(v[1]) ? std::min(1.f, std::max(0.f, v[1])) : 0.7f;
@@ -1312,7 +1314,7 @@ JNIEXPORT void JNICALL Java_com_albus_flatscan_NativeLib_renderThumb(JNIEnv* env
     try {
         const bool scr = s->screen_on(rp);
         cv::Mat src = s->filled_at(bs, scr);
-        cv::Mat t = filter_cpu(src, s->pp_for(scr), rp.filter, rp.strength, rp.adj);
+        cv::Mat t = filter_with_shadows(src, s->pp_for(scr), rp);
         bgra_to_bitmap(env, t, out);
     } catch (const std::exception& e) {
         LOGI("renderThumb failed: %s", e.what());

@@ -8,7 +8,11 @@ import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 
-/** What undo / redo on the result screen restores: every edit that does not re-run the geometry. */
+/**
+ * What undo / redo on the result screen restores: every edit of the page, and the geometry it was processed with
+ * ([geom]): a step back to another outline, flattening, line edits, kind of page or shadow removal processes the page
+ * again with that geometry (ScanViewModel.applyEditState), so undo gives back the page as it was.
+ */
 data class EditState(
     val params: RenderParams,
     val look: PageLook,
@@ -18,7 +22,37 @@ data class EditState(
     val fingersAuto: Boolean = true,
     val fingerStrokes: List<Float> = emptyList(),
     val fingerFill: Int = 0,
+    val geom: GeomState? = null,
 )
+
+/** The parts of a page's geometry ([PageMeta]) a change of which processes the page again, comparable by value. */
+data class GeomState(
+    val corners: List<Float>,
+    val edgePts: List<Float>,
+    val cropRotation: Int,
+    val userRotated: Boolean,
+    val perspectiveOnly: Boolean,
+    val ignore: List<Float>,
+    val userLines: List<Float>,
+    val linePaint: List<Float>,
+    val autoLines: Boolean,
+    val removeShadows: Boolean,
+    val mode: CaptureMode,
+) {
+    /** [m] with this geometry. */
+    fun applyTo(m: PageMeta) = m.copy(
+        corners = corners.toFloatArray(), edgePts = edgePts.toFloatArray(), cropRotation = cropRotation, userRotated = userRotated,
+        perspectiveOnly = perspectiveOnly, ignore = ignore.toFloatArray(), userLines = userLines.toFloatArray(),
+        linePaint = linePaint.toFloatArray(), autoLines = autoLines, removeShadows = removeShadows, mode = mode,
+    )
+
+    companion object {
+        fun of(m: PageMeta) = GeomState(
+            m.corners.toList(), m.edgePts.toList(), m.cropRotation, m.userRotated, m.perspectiveOnly, m.ignore.toList(),
+            m.userLines.toList(), m.linePaint.toList(), m.autoLines, m.removeShadows, m.mode,
+        )
+    }
+}
 
 /**
  * Undo / redo of one page's edits. [record] is given every settled state (after a debounce, see

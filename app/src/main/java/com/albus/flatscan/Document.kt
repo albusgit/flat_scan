@@ -81,6 +81,9 @@ data class PageMeta(
             put("white", params.white.toDouble())
             put("gamma", params.gamma.toDouble())
             put("screen", params.screen.name)
+            put("shadow", params.shadow.name)
+            put("shadow_amount", params.shadowAmount.toDouble())
+            put("shadow_contrast", params.shadowContrast.toDouble())
         })
         put("protect", protect.toJson())
         put("rotation", rotation)
@@ -122,6 +125,11 @@ data class PageMeta(
                     white = p.optDouble("white", d.white.toDouble()).toFloat(),
                     gamma = p.optDouble("gamma", d.gamma.toDouble()).toFloat(),
                     screen = ScreenMode.entries.firstOrNull { it.name == p.optString("screen") } ?: d.screen,
+                    // pages from before the shadow modes: Off where their shadows were kept, else Auto
+                    shadow = ShadowMode.entries.firstOrNull { it.name == p.optString("shadow") }
+                        ?: if (j.optBoolean("remove_shadows", true)) ShadowMode.Auto else ShadowMode.Off,
+                    shadowAmount = p.optDouble("shadow_amount", d.shadowAmount.toDouble()).toFloat(),
+                    shadowContrast = p.optDouble("shadow_contrast", d.shadowContrast.toDouble()).toFloat(),
                 ),
                 protect = j.optJSONArray("protect")?.toFloats() ?: FloatArray(0),
                 rotation = j.optInt("rotation"),

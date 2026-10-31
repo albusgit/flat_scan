@@ -51,6 +51,13 @@ enum class ScreenMode(val id: Int, val label: String) {
     Auto(2, "Auto"),                     // on when the core detects a screen photo (info() "screen")
 }
 
+/**
+ * Shadows on a page: Off (left as photographed: the page is processed again without its shadow removal), Auto (the
+ * page's lighting flattened in full) or Manual (how much, and how much ink that lay in shadow is deepened). The
+ * shadows are found automatically in every mode (core/src/cleanup.h ShadowAdjust).
+ */
+enum class ShadowMode { Off, Auto, Manual }
+
 data class RenderParams(
     val filter: FilterKind = FilterKind.AutoColor,   // Scan whitened pale colour areas on 9 of 34 real pages (docs/results/r11/filters.md): a choice, not the default
     val strength: Float = 0.7f,          // 0..1, 0 = Original
@@ -60,10 +67,19 @@ data class RenderParams(
     val white: Float = 1f,               // levels white point, 0.5..1
     val gamma: Float = 1f,               // levels midtones, 0.3..3 (> 1 brightens mid-tones)
     val screen: ScreenMode = ScreenMode.Auto,
+    val shadow: ShadowMode = ShadowMode.Auto,
+    val shadowAmount: Float = 1f,        // Manual: 0..1, how far the lighting is flattened
+    val shadowContrast: Float = 0.3f,    // Manual: 0..1, how much ink that lay in shadow is deepened
 ) {
-    /** Layout read by jni_bridge.cpp: [filter, strength, solid, bgCleanup, black, white, gamma, screen]. */
-    fun toArray(): FloatArray =
-        floatArrayOf(filter.id.toFloat(), strength, if (solid) 1f else 0f, bgCleanup, black, white, gamma, screen.id.toFloat())
+    /** Layout read by jni_bridge.cpp: [filter, strength, solid, bgCleanup, black, white, gamma, screen, shadow amount, shadow contrast]. */
+    fun toArray(): FloatArray {
+        val (a, c) = when (shadow) {
+            ShadowMode.Off -> 0f to 0f
+            ShadowMode.Auto -> 1f to 0f
+            ShadowMode.Manual -> shadowAmount to shadowContrast
+        }
+        return floatArrayOf(filter.id.toFloat(), strength, if (solid) 1f else 0f, bgCleanup, black, white, gamma, screen.id.toFloat(), a, c)
+    }
 }
 
 /** JNI entry points of the C++ core (app/src/main/cpp/jni_bridge.cpp). */

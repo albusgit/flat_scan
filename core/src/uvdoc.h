@@ -139,6 +139,17 @@ struct BorderSnap {
 UvGrid uv_snap_border(const UvGrid& g, const cv::Mat& mask, double scale, BorderSnap* st = nullptr, double search = 0.08,
                       double dead_px = 3.0, double lost = 0.06);
 
+// The page running off the photo: the nets put the end of a page they cannot see the end of inside the photo, and cut
+// off what lies between (a flyer lost its top line, a receipt its number). Per side of the grid whose points reach the
+// photo's edge on paper (the mask) within search x the page's size, the page is extended past the grid's border, the
+// grid continued straight on (its last cell's direction) to the median of those points' distances - the grid itself is
+// unchanged inside, only spread over a larger page (moving the border instead bent the page inside); by the 20th
+// percentile of those distances, so a bowed side does not go past the photo. allow: the grid's sides that may be
+// extended (top, bottom, left, right; null: all). st: the extension per side (photo px, 0: none).
+struct FrameExtend { double px[4] = {0, 0, 0, 0}; int sides = 0; };
+UvGrid uv_extend_to_frame(const UvGrid& g, const cv::Mat& mask, double scale, double search, FrameExtend* st = nullptr,
+                          const bool* allow = nullptr);
+
 // The page's corners along a grid, TL, TR, BR, BL of the output page (landscape when turned), photo px.
 std::array<cv::Point2d, 4> uv_corners(const UvGrid& g);
 // The re-crop: the net's own page outline (inside the photo) plus the 6% margin, turned when that

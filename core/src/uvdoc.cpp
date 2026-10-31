@@ -428,6 +428,81 @@ UvGrid uv_snap_border(const UvGrid& g, const cv::Mat& mask, double scale, Border
     return o;
 }
 
+UvGrid uv_extend_to_frame(const UvGrid& g, const cv::Mat& mask, double scale, double search, FrameExtend* st, const bool* allow) {
+    FrameExtend fe;
+    if (st) *st = fe;
+    if (!g.ok || mask.empty() || g.gw < 4 || g.gh < 4) return g;
+    const int gw = g.gw, gh = g.gh;
+    auto P = [&](int r, int c) { return g.pts[(size_t)r * gw + c]; };
+    const double size = 0.5 * (cv::norm(P(0, 0) - P(gh - 1, gw - 1)) + cv::norm(P(0, gw - 1) - P(gh - 1, 0))) / std::sqrt(2.0);
+    const int steps = std::max(2, (int)std::ceil(search * size * scale));
+    const double fw = mask.cols / scale - 1.0, fh = mask.rows / scale - 1.0;
+    // per side: the border point, the next one inwards; the extension in grid steps (one step = the last cell)
+    double ext[4] = {0, 0, 0, 0};
+    for (int k = 0; k < 4; ++k) {
+        if (allow && !allow[k]) continue;
+        const int n = k < 2 ? gw : gh;
+        std::vector<double> reach;   // grid steps to the frame, where the way there is paper
+        for (int i = 0; i < n; ++i) {
+            const cv::Point2d p = k == 0 ? P(0, i) : k == 1 ? P(gh - 1, i) : k == 2 ? P(i, 0) : P(i, gw - 1);
+            const cv::Point2d q = k == 0 ? P(1, i) : k == 1 ? P(gh - 2, i) : k == 2 ? P(i, 1) : P(i, gw - 2);
+            cv::Point2d dir = p - q;   // outwards, one grid step long
+            const double step = cv::norm(dir);
+            if (step < 1e-6) continue;
+            const cv::Point2d u = dir * (1.0 / step);
+            int paper = 0, cnt = 0;
+            bool hit = false;
+            for (int t = 0; t <= steps; ++t) {
+                const cv::Point2d m = (p + u * (t / scale)) * scale;
+                const int x = (int)std::lround(m.x), y = (int)std::lround(m.y);
+                if (x < 1 || y < 1 || x >= mask.cols - 1 || y >= mask.rows - 1) { hit = cnt > 0 && paper >= 0.9 * cnt; break; }
+                paper += mask.at<uint8_t>(y, x) > 127;
+                ++cnt;
+            }
+            if (!hit) continue;
+            // the distance to the photo's edge along u, in photo px, then in grid steps
+            double tmax = 1e300;
+            if (u.x < -1e-9) tmax = std::min(tmax, (0.0 - p.x) / u.x);
+            if (u.x > 1e-9) tmax = std::min(tmax, (fw - p.x) / u.x);
+            if (u.y < -1e-9) tmax = std::min(tmax, (0.0 - p.y) / u.y);
+            if (u.y > 1e-9) tmax = std::min(tmax, (fh - p.y) / u.y);
+            if (tmax < 1e299 && tmax > 0) reach.push_back(tmax / step);
+        }
+        // a side with a few points on the frame (a corner off the photo) is not one running off it
+        if ((int)reach.size() < std::max(3, n / 5)) continue;
+        const size_t q = (size_t)(0.2 * (reach.size() - 1));
+        std::nth_element(reach.begin(), reach.begin() + q, reach.end());
+        ext[k] = reach[q];
+        // below 2 px: nothing to add
+        const double px_step = cv::norm(k == 0 ? P(0, n / 2) - P(1, n / 2) : k == 1 ? P(gh - 1, n / 2) - P(gh - 2, n / 2)
+                                         : k == 2 ? P(n / 2, 0) - P(n / 2, 1) : P(n / 2, gw - 1) - P(n / 2, gw - 2));
+        fe.px[k] = ext[k] * px_step;
+        if (fe.px[k] < 2.0) { ext[k] = 0; fe.px[k] = 0; continue; }
+        ++fe.sides;
+    }
+    if (st) *st = fe;
+    if (fe.sides == 0) return g;
+    // the old grid at (r, c) in its own steps, continued straight on past its border (the last cell's direction)
+    auto sample = [&](double r, double c) {
+        const double rc = std::min(std::max(r, 0.0), gh - 1.0), cc = std::min(std::max(c, 0.0), gw - 1.0);
+        const int r0 = std::min((int)rc, gh - 2), c0 = std::min((int)cc, gw - 2);
+        const double fr = rc - r0, fc = cc - c0;
+        const cv::Point2d a = P(r0, c0), b = P(r0, c0 + 1), c2 = P(r0 + 1, c0), d = P(r0 + 1, c0 + 1);
+        cv::Point2d q = (a * (1 - fc) + b * fc) * (1 - fr) + (c2 * (1 - fc) + d * fc) * fr;
+        // past a border: along that border's last cell
+        const cv::Point2d dr = (c2 * (1 - fc) + d * fc) - (a * (1 - fc) + b * fc);   // one step down
+        const cv::Point2d dc = (b * (1 - fr) + d * fr) - (a * (1 - fr) + c2 * fr);   // one step right
+        q += dr * (r - rc) + dc * (c - cc);
+        return q;
+    };
+    UvGrid o = g;
+    const double r0 = -ext[0], r1 = gh - 1 + ext[1], c0 = -ext[2], c1 = gw - 1 + ext[3];
+    for (int r = 0; r < gh; ++r)
+        for (int c = 0; c < gw; ++c)
+            o.pts[(size_t)r * gw + c] = sample(r0 + (r1 - r0) * r / (gh - 1.0), c0 + (c1 - c0) * c / (gw - 1.0));
+    return o;
+}
+
 UvCrop uv_crop_on_grid(cv::Size photo, const UvGrid& g, int model) {
     double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
     for (const auto& p : g.outline()) {
