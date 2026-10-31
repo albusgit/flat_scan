@@ -25,6 +25,11 @@ class FileNameTemplateTest {
     }
 
     @Test
+    fun automaticNamesGetADash() {
+        assertEquals("2026-03-07_Scan - Oct 30", FileNameTemplate.render(FileNameTemplate.DEFAULT, "Scan · Oct 30", at, 1))
+    }
+
+    @Test
     fun hebrewTitlesAndUnsafeCharacters() {
         assertEquals("2026-03-07_חשבון חשמל", FileNameTemplate.render(FileNameTemplate.DEFAULT, "חשבון חשמל", at, 1))
         assertEquals("2026-03-07_a b c", FileNameTemplate.render(FileNameTemplate.DEFAULT, "a/b:c", at, 1))

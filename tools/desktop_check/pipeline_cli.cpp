@@ -220,6 +220,27 @@ int main(int argc, char** argv) {
         o.corners_edited = true;
         o.corners = {cv::Point2d(0, 0), cv::Point2d(img.cols - 1, 0), cv::Point2d(img.cols - 1, img.rows - 1), cv::Point2d(0, img.rows - 1)};
     }
+    // FS_CORNERS="x0,y0,...,x3,y3" (TL TR BR BL, photo px): corners set by hand; FS_EDGE_PTS="k,x,y;k,x,y;...": the
+    // crop screen's outline points on side k between them (PipelineOptions::edge_pts)
+    if (const char* cs = std::getenv("FS_CORNERS")) {
+        double v[8];
+        if (std::sscanf(cs, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7) == 8) {
+            o.corners_edited = true;
+            for (int k = 0; k < 4; ++k) o.corners[k] = cv::Point2d(v[2 * k], v[2 * k + 1]);
+        }
+        if (const char* es = std::getenv("FS_EDGE_PTS")) {
+            std::string e = es;
+            size_t at = 0;
+            while (at < e.size()) {
+                size_t end = e.find(';', at);
+                if (end == std::string::npos) end = e.size();
+                int k;
+                double x, y;
+                if (std::sscanf(e.substr(at, end - at).c_str(), "%d,%lf,%lf", &k, &x, &y) == 3 && k >= 0 && k < 4) o.edge_pts[k].emplace_back(x, y);
+                at = end + 1;
+            }
+        }
+    }
     o.auto_orient = std::getenv("FS_NO_ORIENT") == nullptr;
     // FS_BOARD=1 (or =dark): whiteboard mode as the app runs it: the board's corners (find_board; the whole
     // frame when none is reliable), perspective only, no finger erase, no orientation decision; with

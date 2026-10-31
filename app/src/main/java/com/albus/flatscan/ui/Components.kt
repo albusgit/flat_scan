@@ -1,5 +1,8 @@
 package com.albus.flatscan.ui
 
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.text.TextAutoSize
+import androidx.compose.foundation.text.BasicText
 import android.graphics.Bitmap
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -11,12 +14,20 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.BasicAlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
@@ -36,6 +47,11 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.ImageShader
 import androidx.compose.ui.graphics.Outline
@@ -200,12 +216,18 @@ private fun PillRow(body: @Composable RowScope.() -> Unit) {
 /** Pill label text (16 sp bold). */
 @Composable
 fun PillText(text: String) {
-    Text(text, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+    // shrinks rather than clipping when large text leaves the pill too narrow ("Shar")
+    val style = MaterialTheme.typography.titleMedium
+    BasicText(
+        text, style = style.copy(color = LocalContentColor.current), maxLines = 1, softWrap = false,
+        autoSize = TextAutoSize.StepBased(minFontSize = 10.sp, maxFontSize = style.fontSize),
+    )
 }
 
 /**
  * A sheet of paper: [color] with crisp corners, a soft shadow, a faint grain, optionally ruled
- * lines and a strip of tape over the top edge.
+ * lines and a strip of tape over the top edge. [lifted]: its bottom corners curl up off the desk
+ * ([liftedCorners]); [peel]: the bottom-right corner is turned up that far, as a sticky note's.
  */
 @Composable
 fun PaperSurface(
@@ -217,6 +239,8 @@ fun PaperSurface(
     lift: Dp = 2.dp,
     ruled: Boolean = false,
     tape: Boolean = false,
+    lifted: Boolean = false,
+    peel: Dp = 0.dp,
     onClickLabel: String? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
@@ -224,11 +248,15 @@ fun PaperSurface(
     val edge = if (light) Palette.OutlineSoft else MaterialTheme.colorScheme.outlineVariant
     val rule = ruledColor()
     val shadow = if (light) Palette.Ink.copy(alpha = 0.35f) else Color.Black
-    val tapeColor = if (light) Color(0x99F4F1E4) else Color(0x66D9D6C8)
+    val tapeColor = tapeColor()
+    val cornerShadow = paperCornerShadow()
+    val outline = if (peel > 0.dp) PeeledShape(peel) else shape
     Box(
         modifier
+            .then(if (lifted) Modifier.liftedCorners(cornerShadow, lift) else Modifier)
             .drawWithContent {
                 drawContent()
+                if (peel > 0.dp) drawPeel(peel.toPx(), color, shadow)
                 if (tape) {
                     val w = 64.dp.toPx()
                     val h = 18.dp.toPx()
@@ -237,8 +265,8 @@ fun PaperSurface(
                     }
                 }
             }
-            .shadow(lift, shape, ambientColor = shadow, spotColor = shadow)
-            .clip(shape)
+            .shadow(lift, outline, ambientColor = shadow, spotColor = shadow)
+            .clip(outline)
             .background(color)
             .drawBehind {
                 drawRect(Grain.brush, alpha = if (light) 1f else 0.6f)
@@ -251,10 +279,126 @@ fun PaperSurface(
                     }
                 }
             }
-            .border(1.dp, edge, shape)
+            .border(1.dp, edge, outline)
             .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClickLabel = onClickLabel, onClick = onClick) else Modifier),
     ) {
         CompositionLocalProvider(LocalContentColor provides contentColor) { content() }
+    }
+}
+
+/** The shadow under a lifted paper corner: ink on light paper, black on graphite and in the editor. */
+@Composable
+fun paperCornerShadow(): Color = if (isPaperLight()) Palette.Ink.copy(alpha = 0.4f) else Color.Black.copy(alpha = 0.6f)
+
+/**
+ * Lifted corners: the paper's bottom corners curl up off the desk, so their shadow reaches further out than the
+ * middle's: a soft oval under each corner, tipped outwards, [depth] below the edge. Drawn behind the paper.
+ */
+fun Modifier.liftedCorners(color: Color, depth: Dp = 6.dp): Modifier = drawBehind {
+    val d = depth.toPx()
+    val r = size.width * 0.24f
+    for (side in intArrayOf(-1, 1)) {
+        val c = Offset(if (side < 0) r + d * 0.5f else size.width - r - d * 0.5f, size.height - d * 0.15f)
+        // the outer end dips: the corner is the part that lifts
+        rotate(side * 4f, pivot = c) {
+            scale(1f, d * 1.3f / r, pivot = c) {
+                drawCircle(Brush.radialGradient(listOf(color, color.copy(alpha = 0f)), center = c, radius = r), radius = r, center = c)
+            }
+        }
+    }
+}
+
+/** A paper outline with its bottom-right corner cut on the diagonal [peel] across, where the turned-up flap sits. */
+private class PeeledShape(private val peel: Dp) : Shape {
+    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
+        val p = with(density) { peel.toPx() }.coerceAtMost(minOf(size.width, size.height) / 2)
+        return Outline.Generic(
+            Path().apply {
+                moveTo(0f, 0f); lineTo(size.width, 0f); lineTo(size.width, size.height - p)
+                lineTo(size.width - p, size.height); lineTo(0f, size.height); close()
+            },
+        )
+    }
+}
+
+/**
+ * The turned-up corner of a [PeeledShape] [p] across: the flap folded over onto the paper, the back of the sheet
+ * catching the light along the fold and shading toward its tip, with a soft shadow on the paper under it.
+ */
+private fun DrawScope.drawPeel(p: Float, paper: Color, shadow: Color) {
+    val w = size.width
+    val h = size.height
+    val k = p.coerceAtMost(minOf(w, h) / 2)
+    val a = Offset(w, h - k)
+    val b = Offset(w - k, h)
+    // the corner folded flat over the cut: its tip lands just short of the mirror point
+    val tip = Offset(w - k * 0.91f, h - k * 0.91f)
+    val flap = Path().apply { moveTo(a.x, a.y); lineTo(tip.x, tip.y); lineTo(b.x, b.y); close() }
+    translate(-k * 0.08f, -k * 0.08f) { drawPath(flap, shadow.copy(alpha = shadow.alpha * 0.45f)) }
+    val fold = Offset((a.x + b.x) / 2, (a.y + b.y) / 2)
+    drawPath(flap, Brush.linearGradient(listOf(lerp(paper, Color.White, 0.35f), lerp(paper, Color.Black, 0.12f)), start = fold, end = tip))
+    drawPath(flap, lerp(paper, Color.Black, 0.18f), style = Stroke(width = 0.75f * density))
+}
+
+/** Masking tape: translucent cream on paper, fainter on graphite and in the editor. */
+@Composable
+fun tapeColor(): Color = if (isPaperLight()) Color(0x99F4F1E4) else Color(0x66D9D6C8)
+
+/**
+ * The drag handle of the bottom sheets: a strip of masking tape holding the sheet to the desk, the tape the home
+ * screen's note and dialogs carry, in place of the grey bar.
+ */
+@Composable
+fun TapeHandle() {
+    val tape = if (isPaperLight()) Color(0xFFEAE4CC) else Color(0xFF4A4840)
+    androidx.compose.foundation.Canvas(Modifier.padding(top = 10.dp, bottom = 14.dp).size(72.dp, 18.dp)) {
+        rotate(-2f) {
+            // torn ends: a few small teeth at each end of the strip
+            val t = size.height / 6f
+            val path = Path().apply {
+                moveTo(t, 0f); lineTo(size.width - t, 0f)
+                for (i in 0 until 6) lineTo(size.width - (if (i % 2 == 0) 0f else t), t * (i + 1))
+                lineTo(t, size.height)
+                for (i in 0 until 6) lineTo(if (i % 2 == 0) 0f else t, size.height - t * (i + 1))
+                close()
+            }
+            drawPath(path, tape)
+        }
+    }
+}
+
+/**
+ * A dialog on a sheet of paper taped to the desk: the title in the display face, the text, and the buttons at the
+ * bottom end. The same slots as Material's AlertDialog.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PaperDialog(
+    onDismissRequest: () -> Unit,
+    confirmButton: @Composable () -> Unit,
+    dismissButton: (@Composable () -> Unit)? = null,
+    title: (@Composable () -> Unit)? = null,
+    text: (@Composable () -> Unit)? = null,
+) {
+    BasicAlertDialog(onDismissRequest = onDismissRequest) {
+        PaperSurface(Modifier.padding(top = 10.dp).widthIn(min = 280.dp, max = 560.dp).fillMaxWidth(), shape = MaterialTheme.shapes.medium, lift = 8.dp, tape = true, lifted = true) {
+            Column(Modifier.padding(start = 24.dp, end = 16.dp, top = 26.dp, bottom = 12.dp)) {
+                if (title != null) {
+                    ProvideTextStyle(MaterialTheme.typography.headlineSmall) { Box(Modifier.padding(end = 8.dp)) { title() } }
+                    Spacer(Modifier.size(12.dp))
+                }
+                if (text != null) {
+                    CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurfaceVariant) {
+                        ProvideTextStyle(MaterialTheme.typography.bodyMedium) { Box(Modifier.padding(end = 8.dp)) { text() } }
+                    }
+                    Spacer(Modifier.size(12.dp))
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) {
+                    dismissButton?.invoke()
+                    confirmButton()
+                }
+            }
+        }
     }
 }
 

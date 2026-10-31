@@ -15,7 +15,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -53,7 +60,6 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.VerticalAlignBottom
 import androidx.compose.material.icons.outlined.VerticalAlignTop
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -171,12 +177,15 @@ fun PagesScreen(vm: ScanViewModel) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f, fill = false)) {
-                        Text(
-                            docName ?: "Document", style = MaterialTheme.typography.titleLarge.copy(fontSize = 18.sp),
+                        // a little smaller before it is cut: a long name fits then
+                        val st = MaterialTheme.typography.titleLarge.copy(fontSize = 18.sp)
+                        BasicText(
+                            docName ?: "Document", style = st.copy(color = LocalContentColor.current),
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            autoSize = TextAutoSize.StepBased(minFontSize = 14.sp, maxFontSize = st.fontSize),
                         )
                         Text(
-                            (if (n == 1) "1 page" else "$n pages") + if (n > 1) " · hold and drag to reorder" else "",
+                            if (n == 1) "1 page" else "$n pages",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
                         )
                     }
@@ -189,7 +198,8 @@ fun PagesScreen(vm: ScanViewModel) {
                 else IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
             },
             actions = {
-                IconButton(onClick = { vm.undoPages() }, enabled = vm.canUndoPages) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
+                // only when there is something to undo: the title keeps the room
+                if (vm.canUndoPages) IconButton(onClick = { vm.undoPages() }) { Icon(Icons.AutoMirrored.Outlined.Undo, "Undo") }
                 if (vm.canRedoPages) IconButton(onClick = { vm.redoPages() }) { Icon(Icons.AutoMirrored.Outlined.Redo, "Redo") }
                 if (selecting) {
                     TextButton(onClick = { selected = if (selected.size == n) emptySet() else vm.pages.toSet() }) { Text(if (selected.size == n) "None" else "All") }
@@ -226,6 +236,13 @@ fun PagesScreen(vm: ScanViewModel) {
             footer = {
                 if (n == 0) item(key = "empty", span = { GridItemSpan(maxLineSpan) }) { EmptyPages() }
                 if (!selecting) item(key = "add") { AddPageTile { adding = AddTarget(null) } }
+                if (!selecting && n > 1) item(key = "reorder_hint", span = { GridItemSpan(maxLineSpan) }) {
+                    Text(
+                        "Hold a page and drag it to reorder", textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono), color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 8.dp),
+                    )
+                }
             },
         ) { id, i, dragging, m ->
             PageCard(
@@ -297,7 +314,7 @@ fun PagesScreen(vm: ScanViewModel) {
     }
     if (renaming) {
         var text by remember { mutableStateOf(docName ?: "") }
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { renaming = false },
             title = { Text("Rename the document") },
             text = {
@@ -311,7 +328,7 @@ fun PagesScreen(vm: ScanViewModel) {
         )
     }
     moving?.let { ids ->
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { moving = null },
             title = { Text(if (ids.size == 1) "Move the page" else "Move ${ids.size} pages") },
             text = {
@@ -330,7 +347,7 @@ fun PagesScreen(vm: ScanViewModel) {
     }
     pickDocFor?.let { ids ->
         val docs by vm.library.documents.collectAsState(initial = emptyList())
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { pickDocFor = null },
             title = { Text("Move to which document?") },
             text = {
@@ -432,14 +449,7 @@ private fun PageCard(
             } else if (!loaded) {
                 CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
             } else {
-                Text("No preview", style = MaterialTheme.typography.bodySmall, color = muted)
-            }
-            Box(
-                Modifier.align(Alignment.BottomStart).padding(8.dp).defaultMinSize(minWidth = 26.dp).height(24.dp)
-                    .background(Palette.Ink, RoundedCornerShape(3.dp)).padding(horizontal = 7.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("${index + 1}", style = MaterialTheme.typography.labelMedium.copy(fontFamily = RecursiveMono, fontWeight = FontWeight.Bold), color = Color.White)
+                Icon(Icons.Outlined.Description, "No preview", Modifier.size(36.dp), tint = muted.copy(alpha = 0.6f))
             }
             if (selecting) {
                 Icon(
@@ -451,10 +461,14 @@ private fun PageCard(
             if (crush.value > 0f) CrumpledBall(Modifier.size(96.dp).alpha(crush.value), seed = id.hashCode())
         }
         Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            // the page number as a folio in the typed face (the black badge on the page is gone: the page shows clean)
             Text(
-                if (current) "${vm.params.filter.label} · editing" else "Page ${index + 1}",
+                buildAnnotatedString {
+                    withStyle(SpanStyle(fontFamily = RecursiveMono, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)) { append("p.${index + 1}") }
+                    if (current) append("  ${vm.params.filter.label} · editing")
+                },
                 style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
-                color = muted, maxLines = 1, modifier = Modifier.weight(1f),
+                color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(start = 2.dp),
             )
             if (!selecting) Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreHoriz, "Page ${index + 1} actions", tint = muted) }
@@ -492,7 +506,7 @@ private fun EmptyPages() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddPagesSheet(note: String, onPick: (Source) -> Unit, onDismiss: () -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = MaterialTheme.colorScheme.surfaceContainerLowest) {
+    ModalBottomSheet(onDismissRequest = onDismiss, dragHandle = { TapeHandle() }, containerColor = MaterialTheme.colorScheme.surfaceContainerLowest) {
         Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 24.dp)) {
             Text("Add pages", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(14.dp))

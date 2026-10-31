@@ -4,6 +4,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.layout.Box
@@ -15,6 +18,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -25,6 +31,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.RotateRight
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.CropSquare
 import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.Gesture
 import androidx.compose.material.icons.outlined.WarningAmber
@@ -36,7 +43,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -59,7 +65,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -68,9 +73,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.albus.flatscan.NoEdges
 import com.albus.flatscan.ScanViewModel
 import kotlin.math.abs
-import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -92,7 +97,7 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
     LaunchedEffect(queued, vm.detecting) {
         if (!queued || vm.detecting) return@LaunchedEffect
         queued = false
-        if (vm.corners.size == 4) vm.process()
+        if (vm.corners.size == 4) vm.continueCrop()
     }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(
@@ -114,7 +119,7 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
                         vm.detecting -> "Finding the page"
                         circling -> "Draw a loop around the whole page; it is found inside it"
                         vm.cropPageIndex == 1 -> "The other page of the book spread"
-                        else -> "Drag a corner or an edge onto the page's edge"
+                        else -> "Pull a + to bend an edge"
                     },
                     style = MaterialTheme.typography.bodySmall, color = Editor.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
@@ -167,25 +172,29 @@ fun CropScreen(vm: ScanViewModel) = EditorTheme {
             }
         }
         val tools = !vm.detecting && photo != null
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             CropTool(Icons.AutoMirrored.Outlined.RotateRight, "Rotate", enabled = tools && !circling) { vm.rotatePhoto() }
             CropTool(Icons.Outlined.Gesture, "Circle page", enabled = tools, on = circling) { circling = !circling }
             CropTool(Icons.Outlined.Fullscreen, "Whole photo", enabled = tools && !circling) { vm.cropWholePhoto(); noteClosed = true }
+            // the points between the corners away: straight sides again
+            if (vm.edgePoints.any { it.isNotEmpty() }) {
+                CropTool(Icons.Outlined.CropSquare, "Reset edges", enabled = tools && !circling) { vm.edgePoints = NoEdges }
+            }
         }
         Row(
             Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            SecondaryPill(onClick = { vm.back() }, container = Editor.Raised, border = Editor.Outline, modifier = Modifier.weight(1f)) {
+            SecondaryPill(onClick = { vm.cancelCrop() }, container = Editor.Raised, border = Editor.Outline, modifier = Modifier.weight(1f)) {
                 PillText("Cancel")
             }
             PrimaryPill(
-                onClick = { if (vm.detecting) queued = true else vm.process() },
+                onClick = { if (vm.detecting) queued = true else vm.continueCrop() },
                 enabled = !circling && photo != null && (vm.detecting || vm.corners.size == 4),
                 container = Editor.Accent, content = Editor.Ground,
                 modifier = Modifier.weight(1.6f),
             ) {
-                PillText("Flatten page")
+                PillText(if (vm.recropping) "Continue" else "Flatten page")
                 Spacer(Modifier.width(8.dp))
                 if (queued) CircularProgressIndicator(Modifier.size(18.dp), color = Editor.Ground, strokeWidth = 2.dp)
                 else Icon(Icons.AutoMirrored.Filled.ArrowForward, null, Modifier.size(18.dp))
@@ -204,44 +213,63 @@ private fun RowScope.CropTool(icon: ImageVector, label: String, enabled: Boolean
         else -> Editor.Text.copy(alpha = 0.4f)
     }
     Column(
-        Modifier.weight(1f).height(62.dp).clip(shape).background(if (on) Editor.Accent else Color.Transparent)
+        Modifier.weight(1f).fillMaxHeight().heightIn(min = 62.dp).clip(shape).background(if (on) Editor.Accent else Color.Transparent)
             .border(1.dp, if (on) Editor.Accent else Editor.Outline, shape)
             .toggleable(value = on, enabled = enabled, role = Role.Button, onValueChange = { onClick() }),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
         Icon(icon, null, Modifier.size(21.dp), tint = fg)
         Spacer(Modifier.height(4.dp))
-        Text(
-            label, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold), color = fg,
-            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 6.dp),
+        val style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold, color = fg, textAlign = TextAlign.Center)
+        // two lines at most with large text, then smaller
+        BasicText(
+            label, style = style, maxLines = 2, modifier = Modifier.padding(horizontal = 4.dp),
+            autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = style.fontSize),
         )
     }
 }
 
-/**
- * Corners after edge [k] (from corner k to corner k + 1) moved by [d] photo px along its normal:
- * each end slides along its other edge, so the neighbouring edges keep their direction (a plain
- * shift where an edge is nearly parallel to the moved one).
- */
-private fun moveEdge(c: List<Offset>, k: Int, d: Float): List<Offset> {
-    val a = k
-    val b = (k + 1) % 4
-    val e = c[b] - c[a]
-    val len = e.getDistance().coerceAtLeast(1e-3f)
-    val n = Offset(-e.y / len, e.x / len)
-    val shift = n * d
-    fun slide(i: Int, other: Int): Offset {
-        val dir = c[i] - c[other]
-        val den = dir.x * n.x + dir.y * n.y
-        // the corner moves along its other edge until it reaches the moved line
-        return if (abs(den) < 0.2f * dir.getDistance()) c[i] + shift else c[i] + dir * (d / den)
-    }
-    val out = c.toMutableList()
-    out[a] = slide(a, (a + 3) % 4)
-    out[b] = slide(b, (b + 1) % 4)
-    return out
+/** A handle of the outline editor: a corner (0..3), a point between the corners, or a side's "+" (a new point). */
+private sealed interface Grip {
+    data class Corner(val i: Int) : Grip
+    /** Point [j] of side [k] (ScanViewModel.edgePoints). */
+    data class Point(val k: Int, val j: Int) : Grip
 }
 
+/** Side [k] from corner k to corner k + 1 through its points (photo px). */
+private fun sidePath(corners: List<Offset>, edges: List<List<Offset>>, k: Int): List<Offset> =
+    listOf(corners[k]) + edges[k] + corners[(k + 1) % 4]
+
+/**
+ * [p] moved along the side's normal [n] (unit, photo px) onto the strongest step in brightness within [reach] photo px
+ * (the paper's edge against the background), on the display copy [bmp] of a [pw] px wide photo; [p] when there is none.
+ */
+private fun snapToEdge(bmp: android.graphics.Bitmap, pw: Int, p: Offset, n: Offset, reach: Float): Offset {
+    val k = bmp.width.toFloat() / pw
+    fun lum(q: Offset): Float {
+        val x = (q.x * k).roundToInt().coerceIn(0, bmp.width - 1)
+        val y = (q.y * k).roundToInt().coerceIn(0, bmp.height - 1)
+        val c = bmp.getPixel(x, y)
+        return 0.299f * ((c shr 16) and 0xFF) + 0.587f * ((c shr 8) and 0xFF) + 0.114f * (c and 0xFF)
+    }
+    val step = 1f / k   // one display px
+    val m = (reach / step).toInt().coerceAtLeast(1)
+    var best = 0f
+    var at = 0
+    for (i in -m..m) {
+        val g = abs(lum(p + n * ((i + 1) * step)) - lum(p + n * ((i - 1) * step)))
+        // the nearest of nearly equal steps
+        if (g > best * 1.15f || (g >= best && abs(i) < abs(at))) { best = g; at = i }
+    }
+    return if (best >= 24f) p + n * (at * step) else p
+}
+
+/**
+ * The page outline over the photo: the four corners (squares in the accent) and points between them (round, in
+ * blue) that bend a side along a curled or torn page edge. Each side shows a "+" between its handles: pulling it
+ * adds a point there, which settles on the paper's edge when let go. A tap on a point removes it. A loupe shows the
+ * handle being dragged.
+ */
 @Composable
 private fun CornerEditor(
     vm: ScanViewModel, pw: Int, ph: Int, display: android.graphics.Bitmap, circling: Boolean,
@@ -249,17 +277,16 @@ private fun CornerEditor(
 ) {
     val image = remember(display) { display.asImageBitmap() }
     var box by remember { mutableStateOf(IntSize.Zero) }
-    // 0..3: a corner, 4..7: edge (k - 4), from corner k - 4 to the next one
-    var active by remember { mutableIntStateOf(-1) }
-    val corners by rememberUpdatedState(vm.corners)
+    var active by remember { mutableStateOf<Grip?>(null) }
     val edit by rememberUpdatedState(onEdit)
     val loopDone by rememberUpdatedState(onLoop)
     val loop = remember { mutableStateListOf<Offset>() }
     val primary = Editor.Accent
+    val pointColor = OutlinePoint
     val density = LocalDensity.current
     val margin = with(density) { 28.dp.toPx() }
     val handleR = with(density) { 12.dp.toPx() }
-    val touchR = with(density) { 44.dp.toPx() }
+    val touchR = with(density) { 40.dp.toPx() }
     val loupeR = with(density) { 64.dp.toPx() }
     // photo pixels -> screen: fit inside the box with a margin so corner handles stay reachable
     val scale = if (box.width == 0) 1f else min((box.width - 2 * margin) / pw, (box.height - 2 * margin) / ph)
@@ -268,7 +295,30 @@ private fun CornerEditor(
     fun toScreen(p: Offset) = Offset(ox + p.x * scale, oy + p.y * scale)
     fun toPhoto(q: Offset) = Offset(((q.x - ox) / scale).coerceIn(0f, pw - 1f), ((q.y - oy) / scale).coerceIn(0f, ph - 1f))
     fun clampPhoto(p: Offset) = Offset(p.x.coerceIn(0f, pw - 1f), p.y.coerceIn(0f, ph - 1f))
-    var dragStart by remember { mutableStateOf(listOf<Offset>()) }
+    // each side's "+": the middles between its consecutive handles (side k, after handle s)
+    fun pluses(): List<Triple<Int, Int, Offset>> = if (vm.corners.size != 4) emptyList() else (0 until 4).flatMap { k ->
+        val v = sidePath(vm.corners, vm.edgePoints, k)
+        (0 until v.size - 1).map { s -> Triple(k, s, (v[s] + v[s + 1]) / 2f) }
+    }
+    fun dist(p: Offset, pos: Offset) = toScreen(p).let { hypot(it.x - pos.x, it.y - pos.y) }
+    // the handle under [pos], and whether it is a side's "+" (then Grip.Point is where its new point goes)
+    fun gripAt(pos: Offset, withPluses: Boolean): Pair<Grip, Boolean>? {
+        if (vm.corners.size != 4) return null
+        var best: Pair<Grip, Boolean>? = null
+        var bd = touchR
+        vm.corners.forEachIndexed { i, c -> dist(c, pos).let { if (it < bd) { bd = it; best = Grip.Corner(i) to false } } }
+        // a corner within reach wins over a point or a "+" near it, a point over a "+"
+        if (best != null) return best
+        vm.edgePoints.forEachIndexed { k, side -> side.forEachIndexed { j, c -> dist(c, pos).let { if (it < bd) { bd = it; best = Grip.Point(k, j) to false } } } }
+        if (best != null || !withPluses) return best
+        for ((k, s, m) in pluses()) dist(m, pos).let { if (it < bd) { bd = it; best = Grip.Point(k, s) to true } }
+        return best
+    }
+    fun positionOf(g: Grip): Offset? = when (g) {
+        is Grip.Corner -> vm.corners.getOrNull(g.i)
+        is Grip.Point -> vm.edgePoints.getOrNull(g.k)?.getOrNull(g.j)
+    }
+    var dragStart by remember { mutableStateOf(Offset.Zero) }
     var dragTotal by remember { mutableStateOf(Offset.Zero) }
     val gestures = if (circling) {
         Modifier.pointerInput(pw, ph, scale, circling) {
@@ -290,42 +340,59 @@ private fun CornerEditor(
         Modifier.pointerInput(pw, ph, scale, circling) {
             detectDragGestures(
                 onDragStart = { pos ->
-                    val pts = corners.map { toScreen(it) }
-                    if (pts.size != 4) return@detectDragGestures
-                    val dc = pts.map { hypot(it.x - pos.x, it.y - pos.y) }
-                    val ic = dc.indices.minBy { dc[it] }
-                    val mids = List(4) { (pts[it] + pts[(it + 1) % 4]) / 2f }
-                    val de = mids.map { hypot(it.x - pos.x, it.y - pos.y) }
-                    val ie = de.indices.minBy { de[it] }
-                    // corners win when both are in reach
-                    active = when {
-                        dc[ic] < touchR -> ic
-                        de[ie] < touchR -> 4 + ie
-                        else -> -1
-                    }
-                    dragStart = corners
+                    val hit = gripAt(pos, withPluses = true)
+                    val g = hit?.first
+                    active = g
                     dragTotal = Offset.Zero
-                    if (active >= 0) edit()
-                },
-                onDragEnd = { active = -1 },
-                onDragCancel = { active = -1 },
-                onDrag = { change, delta ->
-                    if (active >= 0) {
-                        change.consume()
-                        dragTotal += delta / scale
-                        val next = if (active < 4) {
-                            dragStart.toMutableList().also { it[active] = clampPhoto(dragStart[active] + dragTotal) }
-                        } else {
-                            val k = active - 4
-                            val e = dragStart[(k + 1) % 4] - dragStart[k]
-                            val len = e.getDistance().coerceAtLeast(1e-3f)
-                            val d = (dragTotal.x * -e.y + dragTotal.y * e.x) / len
-                            moveEdge(dragStart, k, d).map { clampPhoto(it) }
+                    when {
+                        g is Grip.Point && hit.second -> {
+                            // a "+": a new point in the middle of that stretch of the side
+                            val v = sidePath(vm.corners, vm.edgePoints, g.k)
+                            val m = (v[g.j] + v[g.j + 1]) / 2f
+                            vm.edgePoints = vm.edgePoints.mapIndexed { k, side -> if (k == g.k) side.toMutableList().also { it.add(g.j, m) } else side }
+                            dragStart = m
                         }
-                        vm.corners = next
+                        g != null -> dragStart = positionOf(g) ?: Offset.Zero
+                    }
+                    if (g != null) edit()
+                },
+                onDragEnd = {
+                    // a point settles on the paper's edge, along the side's normal
+                    val g = active
+                    if (g is Grip.Point) {
+                        val v = sidePath(vm.corners, vm.edgePoints, g.k)
+                        val e = v[g.j + 2] - v[g.j]
+                        val len = e.getDistance()
+                        if (len > 1f) {
+                            val n = Offset(-e.y / len, e.x / len)
+                            val p = vm.edgePoints[g.k][g.j]
+                            val snapped = clampPhoto(snapToEdge(display, pw, p, n, 14f / scale))
+                            vm.edgePoints = vm.edgePoints.mapIndexed { k, side -> if (k == g.k) side.toMutableList().also { it[g.j] = snapped } else side }
+                        }
+                    }
+                    active = null
+                },
+                onDragCancel = { active = null },
+                onDrag = { change, delta ->
+                    val g = active ?: return@detectDragGestures
+                    change.consume()
+                    dragTotal += delta / scale
+                    val p = clampPhoto(dragStart + dragTotal)
+                    when (g) {
+                        is Grip.Corner -> vm.corners = vm.corners.toMutableList().also { it[g.i] = p }
+                        is Grip.Point -> vm.edgePoints = vm.edgePoints.mapIndexed { k, side -> if (k == g.k) side.toMutableList().also { it[g.j] = p } else side }
                     }
                 },
             )
+        }.pointerInput(pw, ph, scale) {
+            detectTapGestures(onTap = { pos ->
+                // a tap on a point takes it away (the side straightens there)
+                val g = gripAt(pos, withPluses = false)?.first
+                if (g is Grip.Point) {
+                    vm.edgePoints = vm.edgePoints.mapIndexed { k, side -> if (k == g.k) side.filterIndexed { j, _ -> j != g.j } else side }
+                    edit()
+                }
+            })
         }
     }
     Canvas(Modifier.fillMaxSize().onSizeChanged { box = it }.then(gestures)) {
@@ -346,38 +413,43 @@ private fun CornerEditor(
             }
             return@Canvas
         }
-        if (corners.size != 4) return@Canvas
-        val pts = corners.map { toScreen(it) }
-        val quad = Path().apply { moveTo(pts[0].x, pts[0].y); pts.drop(1).forEach { lineTo(it.x, it.y) }; close() }
-        drawPath(quad, Editor.Accent.copy(alpha = 0.10f))
+        if (vm.corners.size != 4) return@Canvas
+        val ring = (0 until 4).flatMap { k -> sidePath(vm.corners, vm.edgePoints, k).dropLast(1) }
+        val pts = ring.map { toScreen(it) }
+        val outline = Path().apply { moveTo(pts[0].x, pts[0].y); pts.drop(1).forEach { lineTo(it.x, it.y) }; close() }
+        drawPath(outline, Editor.Accent.copy(alpha = 0.10f))
         // a clean dashed outline over a dark rim (visible on white paper)
-        drawPath(quad, Editor.Ground.copy(alpha = 0.6f), style = Stroke(width = 4.dp.toPx(), join = StrokeJoin.Round))
-        drawPath(quad, primary, style = Stroke(width = 2.dp.toPx(), join = StrokeJoin.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8.dp.toPx(), 5.dp.toPx()))))
-        // edge handles: short pills along each edge's middle
-        for (k in 0 until 4) {
-            val a = pts[k]
-            val b = pts[(k + 1) % 4]
-            val mid = (a + b) / 2f
-            val deg = Math.toDegrees(atan2((b.y - a.y).toDouble(), (b.x - a.x).toDouble())).toFloat()
-            val on = active == 4 + k
-            val w = (if (on) 34.dp else 28.dp).toPx()
-            val h = (if (on) 10.dp else 8.dp).toPx()
-            rotate(deg, pivot = mid) {
-                drawRect(if (on) Color.White else primary, topLeft = mid - Offset(w / 2, h / 2), size = Size(w, h))
-                drawRect(Editor.Ground, topLeft = mid - Offset(w / 2, h / 2), size = Size(w, h), style = Stroke(width = 1.5.dp.toPx()))
+        drawPath(outline, Editor.Ground.copy(alpha = 0.6f), style = Stroke(width = 4.dp.toPx(), join = StrokeJoin.Round))
+        drawPath(outline, primary, style = Stroke(width = 2.dp.toPx(), join = StrokeJoin.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8.dp.toPx(), 5.dp.toPx()))))
+        // the sides' "+": small rings with a cross, to pull out a new point
+        val pr = 9.dp.toPx()
+        for ((_, _, m) in pluses()) {
+            val c = toScreen(m)
+            drawCircle(Editor.Ground.copy(alpha = 0.75f), radius = pr, center = c)
+            drawCircle(pointColor, radius = pr, center = c, style = Stroke(width = 1.5.dp.toPx()))
+            val a = pr * 0.5f
+            drawLine(pointColor, c - Offset(a, 0f), c + Offset(a, 0f), strokeWidth = 1.5.dp.toPx())
+            drawLine(pointColor, c - Offset(0f, a), c + Offset(0f, a), strokeWidth = 1.5.dp.toPx())
+        }
+        vm.edgePoints.forEachIndexed { k, side ->
+            side.forEachIndexed { j, p ->
+                val on = active == Grip.Point(k, j)
+                val r = if (on) handleR * 1.2f else handleR * 0.75f
+                drawCircle(if (on) Color.White else pointColor, radius = r, center = toScreen(p))
+                drawCircle(Editor.Ground, radius = r, center = toScreen(p), style = Stroke(width = 2.dp.toPx()))
             }
         }
-        pts.forEachIndexed { i, p ->
+        vm.corners.forEachIndexed { i, p ->
             // solid square tabs in the highlighter; the one being dragged turns white and grows
-            val r = if (i == active) handleR * 1.3f else handleR * 0.85f
-            val tl = p - Offset(r, r)
-            drawRect(if (i == active) Color.White else primary, topLeft = tl, size = Size(2 * r, 2 * r))
+            val on = active == Grip.Corner(i)
+            val r = if (on) handleR * 1.3f else handleR * 0.85f
+            val tl = toScreen(p) - Offset(r, r)
+            drawRect(if (on) Color.White else primary, topLeft = tl, size = Size(2 * r, 2 * r))
             drawRect(Editor.Ground, topLeft = tl, size = Size(2 * r, 2 * r), style = Stroke(width = 2.dp.toPx()))
         }
-        if (active >= 0) {
-            // magnifier loupe above the finger (below it near the top edge), 3x the display scale; an
-            // edge shows its middle
-            val target = if (active < 4) corners[active] else (corners[active - 4] + corners[(active - 3) % 4]) / 2f
+        val target = active?.let { positionOf(it) }
+        if (target != null) {
+            // magnifier loupe above the finger (below it near the top edge), 3x the display scale
             val p = toScreen(target)
             val lc = if (p.y - 2.2f * loupeR > 0) Offset(p.x, p.y - 2.2f * loupeR) else Offset(p.x, p.y + 2.2f * loupeR)
             val zoom = 3f * scale * pw / image.width            // screen px per display-bitmap px in the loupe
@@ -399,17 +471,21 @@ private fun CornerEditor(
                     dstSize = IntSize(((sx1.toInt() - sx0.toInt()) * zoom).roundToInt(), ((sy1.toInt() - sy0.toInt()) * zoom).roundToInt()),
                 )
                 // the page outline inside the loupe
-                val loupePts = corners.map { lc + (Offset(it.x * image.width / pw, it.y * image.height / ph) - dp) * zoom }
+                val loupePts = ring.map { lc + (Offset(it.x * image.width / pw, it.y * image.height / ph) - dp) * zoom }
                 val lq = Path().apply { moveTo(loupePts[0].x, loupePts[0].y); loupePts.drop(1).forEach { lineTo(it.x, it.y) }; close() }
                 drawPath(lq, primary, style = Stroke(width = 1.5.dp.toPx()))
             }
             drawCircle(Color.White, radius = loupeR, center = lc, style = Stroke(width = 3.dp.toPx()))
             val a = 10.dp.toPx()
-            drawLine(primary, lc - Offset(a, 0f), lc + Offset(a, 0f), strokeWidth = 2.dp.toPx())
-            drawLine(primary, lc - Offset(0f, a), lc + Offset(0f, a), strokeWidth = 2.dp.toPx())
+            val cross = if (active is Grip.Point) pointColor else primary
+            drawLine(cross, lc - Offset(a, 0f), lc + Offset(a, 0f), strokeWidth = 2.dp.toPx())
+            drawLine(cross, lc - Offset(0f, a), lc + Offset(0f, a), strokeWidth = 2.dp.toPx())
         }
     }
 }
+
+/** The outline points' colour (the corners are in the accent). */
+private val OutlinePoint = Color(0xFF6CC4FF)
 
 /** Dashed outline style shared by the area editors. */
 internal fun dashed(widthPx: Float, onPx: Float) = Stroke(width = widthPx, pathEffect = PathEffect.dashPathEffect(floatArrayOf(onPx, onPx)))

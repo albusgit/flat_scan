@@ -111,6 +111,11 @@ class Settings(ctx: Context) {
         get() = p.getString("last_document", null)
         set(v) = p.edit().apply { if (v == null) remove("last_document") else putString("last_document", v) }.apply()
 
+    /** The documents' old automatic names were shortened ([com.albus.flatscan.data.Library.shortenOldTitles]), once. */
+    var titlesShortened: Boolean
+        get() = p.getBoolean("titles_shortened", false)
+        set(v) = p.edit().putBoolean("titles_shortened", v).apply()
+
     /** The one-time "Press and hold to see the original" hint was dismissed. */
     var holdHintShown: Boolean
         get() = p.getBoolean("hold_hint_shown", false)

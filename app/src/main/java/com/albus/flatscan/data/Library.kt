@@ -35,10 +35,10 @@ class Library(
 
     suspend fun document(id: String): DocumentEntity? = io { dao.document(id) }
 
-    /** A new, empty document titled [title] (default: "Scan" and the date). */
-    suspend fun createDocument(title: String? = null): DocumentEntity = io {
+    /** A new, empty document titled [title] (default: [kind] and the date). */
+    suspend fun createDocument(title: String? = null, kind: String = "Scan"): DocumentEntity = io {
         val now = clock()
-        val d = DocumentEntity(UUID.randomUUID().toString(), title?.takeIf { it.isNotBlank() } ?: defaultTitle(now), now, now)
+        val d = DocumentEntity(UUID.randomUUID().toString(), title?.takeIf { it.isNotBlank() } ?: defaultTitle(now, kind), now, now)
         dao.insertDocument(d)
         d
     }
@@ -161,6 +161,19 @@ class Library(
         result
     }
 
+    /**
+     * The long automatic names of earlier versions ("Scan 2026-10-30 16.04", a split's " (2)" kept) become today's
+     * ("Scan · Oct 30 (2)"); a name the user typed is left alone. The modified date stays (the list keeps its order).
+     */
+    suspend fun shortenOldTitles() = io {
+        val old = Regex("""^Scan (\d{4}-\d{2}-\d{2} \d{2}\.\d{2})((?: \(\d+\))*)$""")
+        for (d in dao.allDocuments()) {
+            val m = old.matchEntire(d.title) ?: continue
+            val at = runCatching { SimpleDateFormat("yyyy-MM-dd HH.mm", Locale.US).parse(m.groupValues[1])?.time }.getOrNull() ?: continue
+            dao.updateDocument(d.copy(title = defaultTitle(at) + m.groupValues[2]))
+        }
+    }
+
     // ---- OCR text (feature 3)
     suspend fun setPageText(page: String, text: String?) = io { dao.setPageText(page, text) }
 
@@ -183,7 +196,12 @@ class Library(
     companion object {
         const val TRASH_DAYS = 30L
 
-        fun defaultTitle(at: Long): String = "Scan " + SimpleDateFormat("yyyy-MM-dd HH.mm", Locale.US).format(Date(at))
+        /** "Scan · Oct 30" ([kind] "Board" or "Screen" for those pages; the year only when it is not this one). */
+        fun defaultTitle(at: Long, kind: String = "Scan"): String {
+            val year = { t: Long -> java.util.Calendar.getInstance().apply { timeInMillis = t }.get(java.util.Calendar.YEAR) }
+            val pattern = if (year(at) == year(System.currentTimeMillis())) "MMM d" else "MMM d, yyyy"
+            return "$kind · " + SimpleDateFormat(pattern, Locale.getDefault()).format(Date(at))
+        }
 
         @Volatile private var instance: Library? = null
 

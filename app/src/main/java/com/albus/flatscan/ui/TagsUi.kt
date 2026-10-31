@@ -190,7 +190,7 @@ fun TagSheet(subtitle: String?, edit: TagEdit, known: List<String>, onSet: (Stri
         text = ""
     }
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = state, containerColor = MaterialTheme.colorScheme.surfaceContainerLowest) {
+    ModalBottomSheet(onDismissRequest = onDismiss, dragHandle = { TapeHandle() }, sheetState = state, containerColor = MaterialTheme.colorScheme.surfaceContainerLowest) {
         Column(Modifier.navigationBarsPadding().verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) {
             Text("Tags", style = MaterialTheme.typography.titleLarge)
             if (subtitle != null) Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)

@@ -39,14 +39,13 @@ import androidx.compose.material.icons.outlined.GridOn
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.SaveAlt
 import androidx.compose.material.icons.outlined.Share
-import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -225,12 +224,13 @@ fun ExportSheet(
     val folderName = o.folder?.let { Uri.parse(it).lastPathSegment?.substringAfterLast(':') ?: "chosen folder" }
     val fileName = vm.exportFileName(o) + if (pdf) ".pdf" else ""
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = state) {
+    ModalBottomSheet(onDismissRequest = onDismiss, dragHandle = { TapeHandle() }, sheetState = state) {
         Column(Modifier.navigationBarsPadding()) {
             Column(
                 Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
+                Text(if (share) "Share" else "Save a copy", style = MaterialTheme.typography.titleLarge)
                 OutlinedTextField(
                     value = name, onValueChange = { name = it.take(80) },
                     label = { Text("Name") }, placeholder = { Text(placeholder) }, singleLine = true,
@@ -295,7 +295,7 @@ fun ExportSheet(
                             Text(
                                 listOfNotNull(
                                     if (pdf) (if (o.pageSize == PdfPageSize.Fit) "Page size" else o.pageSize.label) else null,
-                                    if (pdf && o.pageSize != PdfPageSize.Fit) "${o.margin.label.lowercase()} margins" else null,
+                                    if (pdf && o.pageSize != PdfPageSize.Fit) if (o.margin == PdfMargin.None) "no margins" else "${o.margin.label.lowercase()} margins" else null,
                                     fileName,
                                 ).joinToString(" · "),
                                 style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1,
@@ -356,25 +356,25 @@ fun ExportSheet(
             }
             // the two actions, always in view
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            // the app's pressable buttons (ink shadow), the one the sheet was opened for filled
             Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                val shape = RoundedCornerShape(26.dp)
-                val shareContent: @Composable () -> Unit = {
+                val shareContent: @Composable RowScope.() -> Unit = {
                     Icon(Icons.Outlined.Share, null, Modifier.size(20.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Share", style = MaterialTheme.typography.titleMedium)
+                    PillText("Share")
                 }
-                val saveContent: @Composable () -> Unit = {
+                val saveContent: @Composable RowScope.() -> Unit = {
                     Icon(Icons.Outlined.SaveAlt, null, Modifier.size(20.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text(if (toFolder) "Save to folder" else "Save", style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                    PillText(if (toFolder) "Save to folder" else "Save")
                 }
-                val m = Modifier.weight(1f).height(52.dp)
+                val m = Modifier.weight(1f)
                 if (share) {
-                    Button(onClick = { go(true) }, modifier = m, shape = shape) { shareContent() }
-                    OutlinedButton(onClick = { go(false) }, modifier = m, shape = shape) { saveContent() }
+                    PrimaryPill(onClick = { go(true) }, modifier = m, body = shareContent)
+                    SecondaryPill(onClick = { go(false) }, modifier = m, body = saveContent)
                 } else {
-                    OutlinedButton(onClick = { go(true) }, modifier = m, shape = shape) { shareContent() }
-                    Button(onClick = { go(false) }, modifier = m, shape = shape) { saveContent() }
+                    SecondaryPill(onClick = { go(true) }, modifier = m, body = shareContent)
+                    PrimaryPill(onClick = { go(false) }, modifier = m, body = saveContent)
                 }
             }
         }

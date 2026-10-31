@@ -38,7 +38,6 @@ import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -49,7 +48,6 @@ import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Snackbar
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -76,6 +74,10 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
@@ -192,23 +194,29 @@ fun MessageHost(vm: ScanViewModel) {
         delay(if (action != null) 5000 else 3500)
         vm.message = null
     }
+    // a sticky note taped on at the bottom, a little askew, as the home screen's note: it drops in (220 ms)
+    val reduced = rememberReducedMotion()
+    val t = remember(m) { Animatable(if (reduced) 1f else 0f) }
+    LaunchedEffect(m) { t.animateTo(1f, tween(220, easing = LinearOutSlowInEasing)) }
+    val drop = with(LocalDensity.current) { 20.dp.toPx() }
     Box(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), contentAlignment = Alignment.BottomCenter) {
-        Snackbar(
-            shape = MaterialTheme.shapes.small,
-            action = action?.let { a ->
-                {
-                    TextButton(onClick = { vm.message = null; a.run() }) {
-                        Text(a.label, color = MaterialTheme.colorScheme.inversePrimary, fontWeight = FontWeight.Bold)
-                    }
-                }
-            },
+        PaperSurface(
+            Modifier.padding(top = 10.dp).widthIn(max = 560.dp).fillMaxWidth()
+                .graphicsLayer { rotationZ = -0.8f; translationY = drop * (1f - t.value); alpha = t.value }
+                .semantics { liveRegion = LiveRegionMode.Polite },
+            color = if (isPaperLight()) Palette.StickyNote else Graphite.StickyNote, lift = 6.dp, tape = true, lifted = true, peel = 16.dp,
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.heightIn(min = 52.dp).padding(start = 16.dp, end = 14.dp, top = 6.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (m.startsWith("Saved")) {
                     PaperPlaneLanding(m)
                     Spacer(Modifier.width(12.dp))
                 }
-                Text(m)
+                Text(m, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 8.dp))
+                action?.let { a ->
+                    TextButton(onClick = { vm.message = null; a.run() }) {
+                        Text(a.label, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                    }
+                }
             }
         }
     }
@@ -230,6 +238,6 @@ private fun PaperPlaneLanding(key: Any) {
             rotationZ = -20f * k
             alpha = min(1f, t.value * 2f)
         },
-        tint = MaterialTheme.colorScheme.inversePrimary,
+        tint = MaterialTheme.colorScheme.primary,
     )
 }

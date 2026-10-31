@@ -86,7 +86,7 @@ object ExportPrefs {
 
 /** Document names: the default name and what a file name may hold. The name itself is the document's title (Library). */
 object DocumentName {
-    fun default(): String = "Scan " + SimpleDateFormat("yyyy-MM-dd HH.mm", Locale.US).format(Date())
+    fun default(): String = com.albus.flatscan.data.Library.defaultTitle(System.currentTimeMillis())
 
     /** No path separators or characters file providers reject. */
     fun clean(s: String): String = s.replace(Regex("[\\\\/:*?\"<>|\\n\\r\\t]"), " ").trim().take(80)

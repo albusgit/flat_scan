@@ -1014,7 +1014,8 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
                                                                   jint page_index, jboolean force_homography, jboolean perspective_only, jfloatArray ignore,
                                                                   jboolean flatten, jint flat_nets, jboolean shadows, jboolean rules,
                                                                   jboolean board, jboolean remove_shadows, jfloatArray user_lines,
-                                                                  jboolean auto_lines, jfloatArray line_paint, jobject listener) {
+                                                                  jboolean auto_lines, jfloatArray line_paint, jfloatArray edge_pts,
+                                                                  jobject listener) {
     auto s = std::make_unique<Session>();
     s->use_gpu = use_gpu;
     PipelineResult& r = s->result;
@@ -1031,6 +1032,16 @@ JNIEXPORT jlong JNICALL Java_com_albus_flatscan_NativeLib_process(JNIEnv* env, j
         for (int k = 0; k < 4; ++k) o.corners[k] = cv::Point2d(v[2 * k], v[2 * k + 1]);
     } else {
         o.corners_edited = false;
+    }
+    // the crop screen's outline points between the corners: [side, x, y] repeated, photo px (PipelineOptions::edge_pts)
+    if (o.corners_edited && edge_pts) {
+        jsize n = env->GetArrayLength(edge_pts);
+        std::vector<float> v(n);
+        if (n) env->GetFloatArrayRegion(edge_pts, 0, n, v.data());
+        for (size_t i = 0; i + 3 <= v.size(); i += 3) {
+            const int k = (int)std::lround(v[i]);
+            if (k >= 0 && k < 4) o.edge_pts[k].emplace_back(v[i + 1], v[i + 2]);
+        }
     }
     o.focal_px = focal_px;
     std::vector<float> lg = read_logits(env, logits);

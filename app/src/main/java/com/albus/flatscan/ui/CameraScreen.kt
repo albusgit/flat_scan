@@ -1,5 +1,7 @@
 package com.albus.flatscan.ui
 
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import android.Manifest
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
@@ -400,11 +402,12 @@ private fun PagesStack(vm: ScanViewModel, last: String, n: Int) {
 /** Document / Whiteboard / Screen, as pills over the camera picture. */
 @Composable
 private fun ModePills(mode: CaptureMode, onPick: (CaptureMode) -> Unit) {
-    Row(Modifier.selectableGroup(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    // with large text the three pills scroll sideways rather than one breaking into a column of letters
+    Row(Modifier.selectableGroup().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         for (m in CaptureMode.entries) {
             val on = m == mode
             Text(
-                m.label.uppercase(),
+                m.label.uppercase(), maxLines = 1, softWrap = false,
                 style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, letterSpacing = 0.04.em, fontWeight = if (on) FontWeight.ExtraBold else FontWeight.SemiBold),
                 color = if (on) Editor.Ground else Editor.Text,
                 modifier = Modifier.clip(RoundedCornerShape(18.dp)).background(if (on) Editor.Accent else Editor.Panel.copy(alpha = 0.7f))

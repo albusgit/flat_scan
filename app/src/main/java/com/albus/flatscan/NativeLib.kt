@@ -154,14 +154,15 @@ object NativeLib {
      * output-page fractions (PageMeta.userLines), straightened after the line stage. autoLines: the line stage
      * straightens every line it finds (off: only those in linePaint's Straighten areas, and the drawn lines);
      * linePaint: the line brush, [mode (0 Straighten, 1 Keep as is), radius, n, x0, y0, ...] repeated
-     * (PageMeta.linePaint).
+     * (PageMeta.linePaint). edgePts: with edited corners, the crop screen's outline points between them, [side, x, y]
+     * repeated (side k from corner k to corner k + 1, bitmap px): the page is then fitted to that outline.
      */
     @JvmStatic external fun process(
         photo: Bitmap, corners: FloatArray?, cornersEdited: Boolean, focalPx: Float,
         autoOrient: Boolean, renderWidth: Int, useGpu: Boolean, logits: FloatArray?, pageIndex: Int,
         forceHomography: Boolean, perspectiveOnly: Boolean, ignore: FloatArray?,
         flatten: Boolean, flatNets: Int, shadows: Boolean, rules: Boolean, board: Boolean, removeShadows: Boolean, userLines: FloatArray?,
-        autoLines: Boolean, linePaint: FloatArray?,
+        autoLines: Boolean, linePaint: FloatArray?, edgePts: FloatArray?,
         listener: ProgressListener?,
     ): Long
 

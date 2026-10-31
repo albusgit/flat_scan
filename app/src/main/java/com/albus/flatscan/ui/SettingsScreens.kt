@@ -37,7 +37,6 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.PhoneAndroid
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -200,7 +199,7 @@ fun AdvancedSettingsScreen(vm: ScanViewModel) {
         TechnicalDetails(vm)
     }
     if (confirmReset) {
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { confirmReset = false },
             title = { Text("Restore the defaults?") },
             text = { Text("Flattening, cleaning and speed go back to how the app ships. Your scans, theme and other settings stay.") },
@@ -228,7 +227,7 @@ private fun AdvancedChoices(vm: ScanViewModel) {
     var solid by remember { mutableStateOf(s.solidColors) }
     var accel by remember { mutableStateOf(s.acceleration) }
     var sheet by remember { mutableStateOf(false) }
-    PaperSurface(Modifier.fillMaxWidth().padding(top = 18.dp), tape = true) {
+    PaperSurface(Modifier.fillMaxWidth().padding(top = 18.dp), tape = true, lifted = true) {
         Row(Modifier.padding(start = 14.dp, end = 14.dp, top = 16.dp, bottom = 14.dp)) {
             Icon(Icons.Outlined.Info, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(12.dp))
@@ -394,7 +393,7 @@ fun StorageScreen(vm: ScanViewModel) {
         }
     }
     days?.let { d ->
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { days = null },
             title = { Text("Remove original photos?") },
             text = { Text("The original photos of documents not changed in the last ${if (d == 365) "year" else "$d days"} are deleted. Their pages stay, but can no longer be re-cropped.") },
@@ -600,7 +599,7 @@ private fun OcrPackBox(vm: ScanViewModel) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun <T> ChoiceSheet(title: String, caption: String, options: List<Choice<T>>, selected: T, onPick: (T) -> Unit, onDismiss: () -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, dragHandle = { TapeHandle() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.navigationBarsPadding().padding(bottom = 12.dp)) {
             Column(Modifier.padding(horizontal = 16.dp)) {
                 Text(title, style = MaterialTheme.typography.titleLarge)
@@ -619,7 +618,7 @@ private fun <T> ChoiceSheet(title: String, caption: String, options: List<Choice
 @Composable
 private fun LookSheet(selected: FilterKind, onPick: (FilterKind) -> Unit, onDismiss: () -> Unit) {
     val looks = FilterKind.forMode(CaptureMode.Document)
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, dragHandle = { TapeHandle() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.navigationBarsPadding().padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) {
             Text("Default look", style = MaterialTheme.typography.titleLarge)
             Text("Used for new pages. You can still change the look of any page after scanning.", style = RowCaption(), color = muted())

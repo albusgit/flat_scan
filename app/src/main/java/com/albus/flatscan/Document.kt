@@ -46,6 +46,9 @@ data class PageMeta(
     // output-page fractions (kept only while the corners are unchanged, as userLines)
     val linePaint: FloatArray = FloatArray(0),
     val autoLines: Boolean = true,            // the unwarp straightens every line it finds (off: only painted and drawn ones)
+    // the crop screen's outline points between the corners: [side, x, y] repeated (side k from corner k to k + 1, the
+    // same pixels as [corners]); the page is fitted to that outline (NativeLib.process edgePts)
+    val edgePts: FloatArray = FloatArray(0),
 ) {
     /** Edits after processing beyond the automatic ones (setEdits needed when a page is opened). */
     val hasEdits: Boolean get() = erase.isNotEmpty() || !fingersAuto || fingerStrokes.isNotEmpty() || fingerFill != 0
@@ -59,7 +62,8 @@ data class PageMeta(
         forceHomography, ignore.joinToString(","), perspectiveOnly, renderWidth, autoOrient, net,
     ).joinToString("|") + (if (mode == CaptureMode.Document) "" else "|mode=${mode.name}") +
         (if (removeShadows) "" else "|shadows=kept") + (if (userLines.isEmpty()) "" else "|drawn=" + userLines.joinToString(",")) +
-        (if (linePaint.isEmpty()) "" else "|paint=" + linePaint.joinToString(",")) + (if (autoLines) "" else "|lines=manual")
+        (if (linePaint.isEmpty()) "" else "|paint=" + linePaint.joinToString(",")) + (if (autoLines) "" else "|lines=manual") +
+        (if (edgePts.isEmpty()) "" else "|outline=" + edgePts.joinToString(","))
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -95,6 +99,7 @@ data class PageMeta(
         if (userLines.isNotEmpty()) put("user_lines", userLines.toJson())
         if (linePaint.isNotEmpty()) put("line_paint", linePaint.toJson())
         if (!autoLines) put("auto_lines", false)
+        if (edgePts.isNotEmpty()) put("edge_pts", edgePts.toJson())
     }
 
     companion object {
@@ -135,6 +140,7 @@ data class PageMeta(
                 userLines = j.optJSONArray("user_lines")?.toFloats() ?: FloatArray(0),
                 linePaint = j.optJSONArray("line_paint")?.toFloats() ?: FloatArray(0),
                 autoLines = j.optBoolean("auto_lines", true),
+                edgePts = j.optJSONArray("edge_pts")?.toFloats() ?: FloatArray(0),
             )
         }
 

@@ -19,7 +19,8 @@ object FileNameTemplate {
         val date = runCatching { SimpleDateFormat(dateFormat, Locale.US).format(Date(at)) }.getOrElse { SimpleDateFormat(DEFAULT_DATE, Locale.US).format(Date(at)) }
         val time = SimpleDateFormat("HH-mm", Locale.US).format(Date(at))
         val out = template.ifBlank { DEFAULT }
-            .replace("{title}", title)
+            // the automatic names' " · " (Scan · Oct 30) as a plain dash: not every server or tool takes the dot
+            .replace("{title}", title.replace(" · ", " - "))
             .replace("{date}", date)
             .replace("{time}", time)
             .replace("{pages}", pages.toString())

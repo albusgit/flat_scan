@@ -77,6 +77,14 @@ const int kFingerAdaptiveSkin = 2;  // skin colour sampled from the hand outside
 const int kFingerShape = 4;         // finger width: 2-16 % of the page width
 const int kFingerSkinRegion = 8;    // also skin areas the page mask counted as paper (needs the hand outside the page)
 const int kFingerHandColour = 16;   // redder / less blue than the paper on average; from at most two sides
+// kFingerSkinRegion's hand colour, also: within 4 (not 3) spreads of the hand's sampled colour, or in the general skin
+// box with Cb >= 95 (orange juice: Cb 79) (still redder / less blue than the paper): a thumb on the page lit unlike
+// the hand below it (Cr 148 vs 138). Not on a page whose paper is dark (Y < 120: the finder framed a scene)
+const int kFingerLooseSkin = 32;
+// a finger found also takes the smooth, even-coloured, non-paper area joined to it within 0.6 x its half width, up to
+// half its own area: a painted nail, its rim. Not an area that mostly lies further away (a magazine's red border along
+// the edge) or of several colours (a logo strip beside the thumb)
+const int kFingerGrow = 64;
 
 struct PipelineOptions {
     bool corners_edited = false;      // user moved a corner -> homography path
@@ -185,7 +193,7 @@ struct PipelineOptions {
                                       // the warp map 24 % faster; 1.6 s of a 5.4 s page on the S24 FE)
     bool faint_lines = true;          // also find and trace printed rules too pale for the darkness-45 threshold (warpmap faint_rules)
     bool erase_fingers = true;        // fill skin-coloured non-paper areas at the page border with paper
-    int finger_rules = kFingerSkinRegion | kFingerHandColour;   // finger tests (kFinger* bits; tools/fingers/eval.py measures each)
+    int finger_rules = kFingerSkinRegion | kFingerHandColour | kFingerLooseSkin | kFingerGrow;   // finger tests (kFinger* bits; tools/fingers/eval.py measures each)
     bool keep_unerased = false;       // keep the page before the finger fill (PipelineResult::page_unerased; the app's brush)
     double max_local_rescale = 0.35;  // neural pages: line corrections that rescale a spot by more than this are faded out there (0: off;
                                       // 0.15 also faded real crease corrections, 0.5 left part of a bump)
@@ -224,6 +232,12 @@ struct PipelineOptions {
     // again (the same values). Null: made here.
     const PageAssessment* assessed = nullptr;
     std::array<cv::Point2d, 4> corners;   // used when corners_edited (full-res px)
+    // with corners_edited: the user's outline between the corners (the crop screen's edge points), full-res px;
+    // edge_pts[k] lies on side k, from corners[k] to corners[k + 1]. A point on any side makes the user's outline
+    // the page's as the page finder's would be (outline_corners: its surface model, the nets checked against its
+    // paper), instead of the 4-corner homography of a plain corner edit.
+    std::array<std::vector<cv::Point2d>, 4> edge_pts;
+    bool user_outline() const { return corners_edited && (!edge_pts[0].empty() || !edge_pts[1].empty() || !edge_pts[2].empty() || !edge_pts[3].empty()); }
     double focal_px = 0;              // full-res focal length from EXIF / camera; 0 = 0.72*max side
     bool auto_orient = true;          // decide 0/90/180/270 on the homography page
     bool orient_on_stage1 = false;    // reference-code behaviour (decide on stage 1); off = brief
@@ -387,6 +401,10 @@ struct PipelineResult {
 // down to max_analysis_side, corners are returned in full-resolution pixels. With seg_logits the
 // page finder net (+ edge snapping) runs on the full photo, as the reference; otherwise the
 // colour-threshold paper_mask. page_index picks the page of a book spread.
+// The page as the user outlined it (PipelineOptions::corners / edge_pts, full-res px) in the page finder's form: its
+// outline, the points of each side, the paper inside it, on the analysis copy of max_analysis_side.
+PageCorners outline_corners(const cv::Mat& photo_bgr, const std::array<cv::Point2d, 4>& corners,
+                            const std::array<std::vector<cv::Point2d>, 4>& edge_pts, int max_analysis_side = 2400);
 PageCorners detect_corners(const cv::Mat& photo_bgr, int max_analysis_side = 2400, const float* seg_logits = nullptr,
                            int page_index = 0);
 // Every page of the photo (1, or 2 for a book spread) with its surface fit and quality gate.

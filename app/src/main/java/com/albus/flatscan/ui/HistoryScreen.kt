@@ -64,7 +64,6 @@ import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
@@ -272,7 +271,7 @@ fun HomeScreen(vm: ScanViewModel) {
     }
     renaming?.let { d ->
         var text by remember(d.id) { mutableStateOf(d.title) }
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { renaming = null },
             title = { Text("Rename the document") },
             text = { OutlinedTextField(value = text, onValueChange = { text = it.take(80) }, singleLine = true, label = { Text("Name") }) },
@@ -293,7 +292,7 @@ fun HomeScreen(vm: ScanViewModel) {
     }
     if (confirmDelete) {
         val n = selected.size
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text(if (n == 1) "Move this document to the trash?" else "Move $n documents to the trash?") },
             text = { Text("The trash keeps it for ${Library.TRASH_DAYS} days.") },
@@ -360,7 +359,7 @@ private fun CarryOnCard(vm: ScanViewModel, d: DocumentSummary, onAdd: () -> Unit
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     PaperSurface(
         Modifier.fillMaxWidth().padding(top = 12.dp).testTag("carry_on"), onClick = onOpen, onClickLabel = "Open ${d.title}",
-        color = if (isPaperLight()) Palette.StickyNote else Graphite.StickyNote, tape = true,
+        color = if (isPaperLight()) Palette.StickyNote else Graphite.StickyNote, tape = true, lifted = true, peel = 18.dp,
     ) {
         Row(Modifier.padding(start = 12.dp, end = 14.dp, top = 16.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
             PageThumb(vm, d.firstPage, d.modifiedAt, d.pageCount, width = 62.dp, tilt = true)
@@ -488,11 +487,11 @@ private fun SheetStrip(top: Boolean = false, bottom: Boolean = false, rule: Bool
 }
 
 @Composable
-private fun AgeLabel(label: String) {
+private fun AgeLabel(label: String, start: Dp = 72.dp) {
     val marker = if (isPaperLight()) Palette.Highlighter.copy(alpha = 0.9f) else Graphite.Highlighter.copy(alpha = 0.35f)
     Text(
         label, style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontWeight = FontWeight.Bold, letterSpacing = 0.12.em),
-        modifier = Modifier.padding(start = 72.dp, top = 14.dp, bottom = 6.dp).drawBehind {
+        modifier = Modifier.padding(start = start, top = 14.dp, bottom = 6.dp).drawBehind {
             drawRect(marker, Offset(-3.dp.toPx(), size.height * 0.5f), androidx.compose.ui.geometry.Size(size.width + 6.dp.toPx(), size.height * 0.45f))
         },
     )
@@ -511,10 +510,18 @@ private fun LedgerRow(
             .combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(end = 14.dp, top = 6.dp, bottom = 6.dp).testTag("doc_${d.id}"),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            marginLabel(d.modifiedAt, now), style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontSize = 11.sp),
-            color = muted, textAlign = TextAlign.Center, maxLines = 1, modifier = Modifier.width(60.dp),
-        )
+        Column(Modifier.width(60.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                marginLabel(d.modifiedAt, now), style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontSize = 11.sp),
+                color = muted, textAlign = TextAlign.Center, maxLines = 1,
+            )
+            marginTime(d.modifiedAt, now)?.let {
+                Text(
+                    it, style = MaterialTheme.typography.labelSmall.copy(fontFamily = RecursiveMono, fontSize = 10.sp, fontWeight = FontWeight.Normal),
+                    color = muted.copy(alpha = 0.75f), textAlign = TextAlign.Center, maxLines = 1,
+                )
+            }
+        }
         Spacer(Modifier.width(12.dp))
         PageThumb(vm, d.firstPage, d.modifiedAt, d.pageCount, width = 36.dp)
         Spacer(Modifier.width(10.dp))
@@ -553,16 +560,22 @@ private fun LazyListScope.laidOutPages(
 ) {
     val now = System.currentTimeMillis()
     val tilts = floatArrayOf(-1.2f, 1f, 0.6f, -0.8f, 1.3f, -0.5f)
-    docs.chunked(2).forEachIndexed { row, pair ->
-        item("pages_${pair.first().id}") {
-            Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                pair.forEachIndexed { k, d ->
-                    PageTile(
-                        vm, d, now, tilts[(row * 2 + k) % tilts.size], selected = d.id in selected, selecting = selected.isNotEmpty(), open = d.id == vm.docId,
-                        onClick = { onTap(d) }, onLongClick = { onLong(d.id) }, modifier = Modifier.weight(1f),
-                    )
+    var row = 0
+    // the same age groups as the ruled list, their labels highlighted on the desk
+    for ((age, group) in docs.groupBy { ageOf(it.modifiedAt, now) }.toSortedMap()) {
+        item("age_${age.name}") { AgeLabel(age.label, start = 14.dp) }
+        group.chunked(2).forEach { pair ->
+            val r = row++
+            item("pages_${pair.first().id}") {
+                Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    pair.forEachIndexed { k, d ->
+                        PageTile(
+                            vm, d, now, tilts[(r * 2 + k) % tilts.size], selected = d.id in selected, selecting = selected.isNotEmpty(), open = d.id == vm.docId,
+                            onClick = { onTap(d) }, onLongClick = { onLong(d.id) }, modifier = Modifier.weight(1f),
+                        )
+                    }
+                    if (pair.size == 1) Spacer(Modifier.weight(1f))
                 }
-                if (pair.size == 1) Spacer(Modifier.weight(1f))
             }
         }
     }
@@ -588,6 +601,7 @@ private fun PageTile(
             }
             Box(
                 Modifier.padding(start = 10.dp, end = 14.dp, top = 8.dp, bottom = 10.dp).fillMaxSize().rotate(tilt)
+                    .liftedCorners(paperCornerShadow(), 5.dp)
                     .then(if (selected) Modifier.border(3.dp, MaterialTheme.colorScheme.primary, sheet).padding(4.dp) else Modifier)
                     .shadow(3.dp, sheet).background(Color.White, sheet).border(1.dp, Palette.Outline, sheet).clip(sheet),
                 contentAlignment = Alignment.Center,
@@ -612,7 +626,10 @@ private fun PageTile(
         }
         Text(d.title, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 4.dp))
         Text(
-            listOf(pageCount(d.pageCount), marginLabel(d.modifiedAt, now).lowercase().replaceFirstChar { it.titlecase() }).joinToString(" · "),
+            listOfNotNull(
+                pageCount(d.pageCount),
+                listOfNotNull(marginLabel(d.modifiedAt, now).lowercase().replaceFirstChar { it.titlecase() }, marginTime(d.modifiedAt, now)).joinToString(" "),
+            ).joinToString(" · "),
             style = MaterialTheme.typography.bodySmall.copy(fontFamily = RecursiveMono, fontSize = 11.sp),
             color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, modifier = Modifier.padding(horizontal = 4.dp),
         )
@@ -870,6 +887,19 @@ private fun marginLabel(t: Long, now: Long): String {
     }
 }
 
+/**
+ * The time under [marginLabel] for this week's days (YEST., MON...), which a day's documents share: it tells two of
+ * them apart now the automatic names hold only the date. Null today (the label is the time) and before.
+ */
+@Composable
+private fun marginTime(t: Long, now: Long): String? {
+    val ctx = LocalContext.current
+    return remember(t, now / 60_000) {
+        val today = startOfToday(now)
+        if (t >= today || t < today - TimeUnit.DAYS.toMillis(6)) null else DateFormat.getTimeFormat(ctx).format(Date(t))
+    }
+}
+
 /** A history entry on a sheet of paper; selected or open, it is outlined in the accent. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1003,7 +1033,7 @@ fun TrashScreen(vm: ScanViewModel) {
         }
     }
     confirm?.let { ids ->
-        AlertDialog(
+        PaperDialog(
             onDismissRequest = { confirm = null },
             title = { Text(if (ids.size == 1) "Delete forever?" else "Delete ${ids.size} documents forever?") },
             text = { Text("Their pages and photos are removed from the phone. This cannot be undone.") },
